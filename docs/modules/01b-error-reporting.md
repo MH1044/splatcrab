@@ -43,6 +43,12 @@ a = [4 8]; a.\2   % elementwise left divide
   and the evaluation arm. Add the backslash to the number lexer's "do not
   swallow the dot" exclusion list in the same change, or `2.\x` will silently
   keep meaning `2 \ x`.
+- Cap the allocation in `range`, so `x = 1:1e15` raises a clean error instead
+  of aborting in the allocator. Cycle 01 routed every builtin size through
+  `args::check_size`, but `:` is an operator and never reaches a builtin, so
+  this is the last member of the panic family that this cycle can close. Reuse
+  `check_size`'s limit and message wording rather than inventing a second
+  policy.
 
 ## Out of scope
 
@@ -52,6 +58,10 @@ a = [4 8]; a.\2   % elementwise left divide
 - Column numbers and source snippets in errors. Line granularity is enough.
 - Chained ranges such as `1:2:3:4`, which are still rejected. Low impact; see
   "Known bugs" in `docs/ARCHITECTURE.md`.
+- The other two open members of the panic family, `printf` width and
+  precision. `fprintf('%.65536f', 1)` panics and `fprintf('%2147483647d', 1)`
+  hangs. Both belong with the printf rework in cycle 11. Do not fix them here,
+  and do not let any document claim invariant 6 is restored while they stand.
 
 ## Design notes
 
@@ -96,9 +106,12 @@ Each becomes at least one golden case in `tests/cases/01b-error-reporting/`.
 11. `disp([2 4].\[8 8])` → `     4     2`
 12. `a = 1...` newline `+ 2; disp(a)` → `     3`, and the forms that already
     work stay working: `1 ...`, `x...`, `)...`, `]...` and `1.0...`.
-13. Unit: `lex` produces a `DotBackslash` for `a.\b` and a `Num` followed by
+13. `x = 1:1e15` -> a clean error naming the requested size, exit code 1, and
+    no abort. Check the exit code is 1 and not 101: a panic now exits 101, so
+    a case that only asserted the error text could pass on a panic.
+14. Unit: `lex` produces a `DotBackslash` for `a.\b` and a `Num` followed by
     `DotBackslash` for `2.\b`, not a `Backslash`.
-14. Unit: every distinct error message the interpreter can raise is
+15. Unit: every distinct error message the interpreter can raise is
     constructed through `error.rs`, checked by grepping for stray
     `.to_string()` error literals in the evaluator.
 
