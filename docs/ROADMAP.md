@@ -4,7 +4,10 @@ One row per module. Each has a spec in `docs/modules/`, and each is built in a
 single cycle.
 
 Ordering rationale: lock the infrastructure first, because every later module
-registers builtins through it. Lock classes and display second, because every
+registers builtins through it. That work was split in two at planning: the
+registry migration and the error-type change each ripple widely, the first
+through a 409-line match and the second through 43 lexer assertions, and one
+cycle should not carry both. Lock classes and display second, because every
 later golden file depends on them and re-blessing expected output later is the
 main source of churn. Then indexing forms, which also lands the access-chain
 AST and multi-assignment so that cycles 04 through 07 never need to touch the
@@ -15,7 +18,8 @@ environment last.
 | NN | Module | Goal | Status |
 |---|---|---|---|
 | 00 | [baseline](modules/00-baseline.md) | The stage-0 interpreter: expressions, matrices, indexing, control flow, 78 builtins | Done (2026-09-27) |
-| 01 | [registry-and-errors](modules/01-registry-and-errors.md) | Error type with line numbers and a call stack; builtins moved into a registry that knows `nargout`; interpreter on a large stack; `tic`/`toc` | Planned |
+| 01 | [registry-and-builtins](modules/01-registry-and-builtins.md) | The 78 builtins moved out of one 409-line match into a registry that knows `nargout`; arity checks; `tic`/`toc`; interpreter on a 256 MB stack | Planned |
+| 01b | [error-reporting](modules/01b-error-reporting.md) | An error type carrying a line number, `Error: Line N` in script mode, and the two lexer defects found in cycle 0 | Planned |
 | 02 | [classes-and-display](modules/02-classes-and-display.md) | Logical and char classes as a tag on `Matrix`; class propagation; MATLAB display fidelity | Planned |
 | 03 | [indexing-forms](modules/03-indexing-forms.md) | Logical indexing, element deletion, in-place assignment, access-chain AST, multiple return values | Planned |
 | 04 | [switch-try-commands](modules/04-switch-try-commands.md) | `switch`, `try`/`catch` with an error struct, `warning`, `assert`, command syntax, block comments | Planned |

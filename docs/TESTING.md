@@ -27,9 +27,14 @@ A case is a `.m` file with a sibling `.out`:
 | `<name>.err` | optional. A substring that must appear in stderr; the process must exit 1 |
 | `<name>.stdin` | optional. Piped to the script's stdin |
 
-An `.m` file with no `.out` is not a case. It is a helper: a function or
-script file that a case next to it calls by name. Each case runs with its own
-directory as the working directory, so helpers resolve without a path.
+A `.m` file is a case when it has a sibling `.out`, **or** when its first line
+is the `% covers:` marker. The marker is what makes a brand new case
+discoverable before its `.out` exists, so `UPDATE_GOLDEN=1` can create one; a
+case with neither fails loudly rather than being skipped in silence.
+
+A `.m` with no marker and no `.out` is a helper: a function or script file that
+a case next to it calls by name. Each case runs with its own directory as the
+working directory, so helpers resolve without a path.
 
 Without an `.err` file the process must exit 0. With one it must exit 1 and
 stderr must contain the substring. A case may have both an `.out` and an

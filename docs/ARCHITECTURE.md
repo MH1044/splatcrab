@@ -94,9 +94,10 @@ compiling untouched. Only the constructors of results decide the class.
 These are decided and should not be re-litigated inside a cycle. The full
 rationale is in the plan that produced this repo.
 
-**Errors (cycle 01).** `MError { msg, line, stack }`. Every message text is
-defined in one place. Script mode prints `Error: <msg>` followed by one
-`  in <fn> (line N)` per stack frame.
+**Errors (cycle 01b).** `MError { msg, line }`. Every message text is defined
+in one place. Script mode prints `Error: Line N: <msg>`. The `stack` field and
+the `  in <fn> (line N)` trace wait for cycle 05, since a stack only means
+something once user functions exist; design `MError` so adding it is additive.
 
 **Registry (cycle 01).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
@@ -140,21 +141,52 @@ cycle named:
 
 ## Known bugs
 
-Found while writing the cycle-0 unit tests, recorded rather than silently
-patched. Each is scheduled to a module; none is fixed in cycle 0, which changes
-no interpreter behaviour.
+Found while writing the cycle-0 unit tests and during the adversarial pass over
+the baseline, recorded rather than silently patched. Each is scheduled to a
+module; none is fixed in cycle 0, which changes no interpreter behaviour.
 
 | Bug | Symptom | Fixed in |
 |---|---|---|
-| Line continuation defeats the bracket whitespace rule | `[1 ...` newline `-2]` yields one element worth `-1` instead of two elements. The `...` branch in `lex` skips past the newline and leaves the cursor on the minus, so the branch that inserts the separating `Comma` never runs. Writing a leading space on the continued line is correct by accident | 01 |
-| No elementwise left divide | `a.\b` is `unexpected character '.'`. There is no `DotBackslash` token and no elementwise left-division operator | 01 |
+| Line continuation defeats the bracket whitespace rule | `[1 ...` newline `-2]` yields one element worth `-1` instead of two elements. The `...` branch in `lex` skips past the newline and leaves the cursor on the minus, so the branch that inserts the separating `Comma` never runs. Writing a leading space on the continued line is correct by accident | 01b |
+| No elementwise left divide | `a.\b` is `unexpected character '.'`. There is no `DotBackslash` token and no elementwise left-division operator | 01b |
 | Chained ranges are rejected | `1:2:3:4` is a parse error; MATLAB reads it as `(1:2:3):4`. `parse_range` handles at most two colons and does not loop | later, low impact |
 | `matmul` swallows `Inf` and `NaN` | `[Inf 0] * [0; 1]` gives `0`; MATLAB gives `NaN`. The `if b == 0.0 { continue }` sparsity shortcut skips the multiply, so `Inf * 0` and `NaN * 0` never happen | 08 |
 | `solve` uses an absolute pivot tolerance | `[1e-15 0; 0 1e-15] \ [1; 1]` reports a singular matrix, but it is diagonal and perfectly conditioned; only its scale trips the fixed `1e-14` threshold. The threshold should be relative to the matrix norm. This also means `det` and `solve` disagree about what singular means | 08 |
 | `%d` saturates at 64 bits | `fprintf('%d', 1e30)` prints `9223372036854775807`. Any integral value at or above `2^63` prints the clamp. `Inf` and `NaN` are handled correctly | 11 |
 | `printf` ignores precision on strings | `fprintf('[%5.2s]', 'abcdef')` gives `[abcdef]`; C and MATLAB give `[   ab]`, truncating before padding | 11 |
+| **`num2str` of an infinity panics** | `num2str(Inf)` aborts the process with "attempt to add with overflow". `log10(Inf)` is `Inf`, the cast to `i32` saturates, and the `+ 5` overflows. A panic, not an error, so it kills the REPL. Violates invariant 6 | 01 |
+| **A huge size argument panics** | `zeros(1e10)` aborts with "attempt to multiply with overflow" when `rows * cols` is computed. Reachable through `ones`, `rand`, `eye`, `reshape`, `repmat` and index growth. MATLAB raises a catchable error. Violates invariant 6 | 01 |
+| `sort` scrambles finite values when any element is `NaN` | `sort([5 4 NaN 2 1])` gives `4 5 NaN 1 2`; MATLAB gives `1 2 4 5 NaN`. The comparator maps an incomparable pair to `Equal`, which is not a total order, so the sort misplaces the finite elements too | 01 |
+| `clear` with an argument wipes the whole workspace | `clear('a')` clears everything. The argument is never read. Silent data loss | 01 |
+| `cumsum` and `cumprod` ignore the dimension argument | `cumsum([1 2; 3 4], 2)` gives the dimension-1 answer. `docs/FEATURES.md` claims the dimension argument works, and the baseline case never passes one | 01 |
+| Reductions accept an out-of-range dimension | `sum(A, 3)` and `sum(A, 0)` both return the dimension-2 answer. MATLAB returns `A` unchanged for a singleton dimension and errors on `0`. `size(A, 0)` returns 1 where MATLAB errors | 01 |
+| `printf` ignores the `+`, space and `#` flags | `fprintf('[%+d]', 5)` gives `[5]`; C and MATLAB give `[+5]`. The flags are parsed and discarded | 01 |
+| `printf` ignores precision on integer conversions | `fprintf('[%.3d]', 5)` gives `[5]`; C gives `[005]` | 01 |
+| `%d` with a non-integer falls back to `%g` | `fprintf('%d', pi)` gives `3.14159`; MATLAB switches to `%e` and gives `3.141593e+00` | 01 |
+| `%s` with a number prints the number | `fprintf('%s', 65)` gives `65`; MATLAB gives `A` | 01 |
+| A char argument is not expanded per character | `fprintf('[%d %d]', 'AB')` gives truncated output; MATLAB expands the char array to one argument per character and gives `[65 66]` | 01 |
+| `sign(NaN)` is 0 | MATLAB gives `NaN`. The NaN case falls through to the zero branch | 01 |
+| Negative sizes are rejected instead of giving an empty | `zeros(-1)` errors; MATLAB treats a negative dimension as 0 and gives `0x0` | 01 |
+| Constructor arguments to constants are discarded | `NaN(2)` and `Inf(2,3)` return a scalar with the arguments silently ignored; MATLAB fills a matrix. `true(n)` and `false(n)` are cycle 02 | 01 |
+| Builtins never reject extra arguments | `abs(1, 2)` returns 1 and `disp('a','b')` prints `a`. Only lower bounds are checked, so a whole class of typos passes silently | 01 |
+| Reductions on an empty with an explicit dimension collapse to a scalar | `sum([], 1)` gives the scalar `0`; MATLAB gives a `1x0` empty. The no-dimension forms are all correct | 01 |
+| A continuation straight after a digit fails to lex | `a = 1...` newline `+ 2;` is "unexpected character '.'". The number lexer's exclusion list omits the dot itself, so `1...` lexes as `1` then a stray `..`. Distinct from the bracket-whitespace continuation bug, and in the same list as the `2.\x` trap | 01b |
+| Indexed assignment into a char silently makes it numeric | `s = 'abc'; s(1) = 'X'` yields `88 98 99` rather than `Xbc`. Indexed growth and string indexing are both claimed for the baseline; the class conversion is silent | 02 |
+| `&&` and `\|\|` accept non-scalar and empty operands | `[1 1] && 1` gives 1; MATLAB requires operands convertible to a logical scalar and errors. Short-circuiting itself is correct | 02 |
+| Wide matrices print on one unwrapped line | `linspace(1, 2)` prints roughly 1300 characters; MATLAB wraps into `Columns 1 through 13` blocks | 02 |
+| Empty-result shapes differ in several builtins | `find([])` and `diag([])` give `0x1` where MATLAB gives `0x0`; `size('')` gives `1 0` where MATLAB gives `0 0`; `s(:)` on a char gives a row where MATLAB gives a column; `disp([])` prints `[]` where MATLAB prints nothing | 02 |
+| `mod` and `rem` with an infinite divisor, unverified | `mod(5, Inf)` gives `NaN`; C `fmod` semantics suggest `5`. Not checked against a real MATLAB, so confirm before acting. Every other `mod` and `rem` edge tested is correct | verify first |
+| Loop variable after a zero-iteration `for`, unverified | After `for k = []; end` the variable keeps its previous value. MATLAB may assign the empty instead. Not checked against a real MATLAB | verify first |
 
 A trap to remember when adding `.\`: the number lexer's "do not swallow the
 dot" exclusion list covers `*`, `/`, `^` and the quote, but not the backslash,
 so `2.\x` already lexes as matrix left division. Adding `.\` without adding the
 backslash to that list would leave `2.\x` silently meaning `2 \ x`.
+
+The rows above in bold are process-killing panics. They break invariant 6,
+"errors are values, not panics", and are the first thing cycle 01 fixes.
+
+Two entries are marked "verify first". They were found by reading the code and
+reasoning about MATLAB, not by running MATLAB, and the entries
+say so. Confirm the real behaviour before writing a test that asserts either
+way: an expected-output file that encodes a guess is worse than no test.

@@ -22,6 +22,14 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
   widths, the common scale factor `1.0e+03 *`, and typed empty headers
 - Console UTF-8 on Windows via a `SetConsoleOutputCP` FFI call, so the
   multiplication sign in size headers renders
+- Indexed assignment into a char keeps it char: `s = 'abc'; s(1) = 'X'` must
+  give `Xbc`, not `88 98 99`. Growth likewise
+- `&&` and `||` reject non-scalar and empty operands, as MATLAB does
+- Wide matrices wrap into `Columns N through M` blocks instead of printing on
+  one long line
+- Empty-result shapes match MATLAB: `find([])` and `diag([])` are `0x0`,
+  `size('')` is `0 0`, `s(:)` on a char is a column, and `disp([])` prints
+  nothing at all
 
 ## Out of scope
 

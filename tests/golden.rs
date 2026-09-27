@@ -28,7 +28,22 @@ fn cases_root() -> PathBuf {
         .join("cases")
 }
 
-/// Collects `.m` files that have a sibling `.out`, in a deterministic order.
+/// True when a `.m` file declares itself a case by opening with the
+/// `% covers:` marker. This is what lets a brand new case, which has no `.out`
+/// yet, still be discovered so `UPDATE_GOLDEN=1` can create one. A helper
+/// function or script file carries no marker and is never run as a case.
+fn declares_itself_a_case(p: &Path) -> bool {
+    match fs::read_to_string(p) {
+        Ok(s) => s
+            .lines()
+            .next()
+            .is_some_and(|l| l.trim_start().starts_with("% covers:")),
+        Err(_) => false,
+    }
+}
+
+/// Collects `.m` files that are cases, in a deterministic order. A `.m` is a
+/// case when it has a sibling `.out`, or when it opens with `% covers:`.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
@@ -38,7 +53,9 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     for p in entries {
         if p.is_dir() {
             collect_cases(&p, out);
-        } else if p.extension().is_some_and(|x| x == "m") && p.with_extension("out").exists() {
+        } else if p.extension().is_some_and(|x| x == "m")
+            && (p.with_extension("out").exists() || declares_itself_a_case(&p))
+        {
             out.push(p);
         }
     }
