@@ -2454,7 +2454,8 @@ fprintf('%d %d\n', v);
 ```
 
 The second call stops mid-format when the values run out, dropping the rest of
-the template — MATLAB does the same.
+the template — MATLAB does the same. Note the last line is `3 ` with a
+trailing space and no newline, because the `\n` was never reached.
 
 ```matlab
 A = [1 2; 3 4];
