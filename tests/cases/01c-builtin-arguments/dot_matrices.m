@@ -1,0 +1,12 @@
+% covers: 13 - dot of same-size matrices is column-wise (QA D10); dot(A, B, dim) chooses; vectors may differ in orientation
+disp(dot([1 2; 3 4], [1 2; 3 4]))
+disp(dot([1 2; 3 4], [1 2; 3 4], 2)')
+disp(dot([1 2 3], [4; 5; 6]))
+disp(dot([1 2], [3 4], 1))
+disp(dot([1 2], [3 4], 2))
+disp(dot([1; 2; 3], [4; 5; 6]))
+disp(dot([1 2 3; 4 5 6], [1 1 1; 2 2 2]))
+disp(dot([1 2 3; 4 5 6], [1 1 1; 2 2 2], 2)')
+disp(size(dot([1 2 3; 4 5 6], [1 1 1; 2 2 2])))
+disp(dot([1 2; 3 4], [5 6; 7 8], 1))
+disp(dot([2; 3], [4; 5], 2)')

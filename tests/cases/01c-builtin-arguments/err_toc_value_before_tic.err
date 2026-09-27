@@ -1,0 +1,1 @@
+You must call TIC without an output argument before calling TOC without an input argument.

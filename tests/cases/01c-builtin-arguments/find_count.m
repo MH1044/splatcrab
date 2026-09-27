@@ -1,0 +1,12 @@
+% covers: 4 - find(X, n), find(X, n, 'first') and find(X, n, 'last'); orientation kept, the last n ascending
+disp(find([0 1 1 1 0 1], 2))
+disp(find([0 1 1 1 0 1], 2, 'last'))
+disp(find([0 1 1 1 0 1], 2, 'first'))
+disp(find([0; 1; 1], 5)')
+disp(size(find([0; 1; 1], 1)))
+disp(size(find([0; 1; 1], 5)))
+disp(find([1 0; 1 1], 2)')
+disp(size(find([1 0; 1 1], 2)))
+disp(find([1 0; 1 1], 2, 'last')')
+disp(find([5 0 7 8], 3, 'last'))
+disp(size(find([0 0 0], 1)))

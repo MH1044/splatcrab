@@ -1,0 +1,22 @@
+% covers: 8 - num2str(x, n) formats a scalar with %.{n}g; num2str(x, formatSpec) is sprintf, leading space trimmed
+% NOTE: leading whitespace is compared exactly, so the '%10.4f' and '% 10.2f'
+% NOTE: lines prove the trim; the second is the MATLAB num2str page's example.
+disp(num2str(pi, 8))
+disp(num2str(pi, 2))
+disp(num2str(123456, 3))
+disp(num2str(7, 3))
+disp(num2str(-0.5, 3))
+disp(num2str(Inf, 3))
+disp(num2str(1/3, 20))
+disp(num2str(pi, '%10.4f'))
+disp(num2str(pi, 100))
+disp(num2str(42.67, '% 10.2f'))
+disp(num2str(-pi, 4))
+disp(num2str(1e-5, 3))
+disp(num2str(100, 1))
+disp(num2str(12345.678, 10))
+disp(num2str(0.1, 25))
+disp(num2str(7, '%d'))
+disp(num2str(pi, '%8.3e'))
+disp(num2str(NaN, 5))
+disp(num2str(-Inf, 2))

@@ -12,6 +12,11 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - `switch/case/otherwise` (numeric, char, `case {…}`)
 - `try/catch e` with `e.message/identifier/stack` via a minimal struct
 - `error('id:x', fmt, …)`
+- The rest of `error`'s argument rules (QA D9), from the MATLAB `error` page.
+  With one argument the message is literal, with no format or escape
+  processing, so `error('100% sure')` reports `100% sure`. When every input is
+  empty, `error('')` throws nothing. Today the first reports `100ure` and the
+  second exits 1
 - `rethrow lasterr warning assert isequal`
 - command syntax (`hold on`, `format long`, `clear x y`)
 - block comments `%{ %}`
@@ -52,6 +57,8 @@ Every new error message needs an `err_*` case.
 11. `%{\nthis is\na block comment\n%}\ndisp(1)` → `     1`
 12. `switch [1 2], case 1, end` → err `SWITCH expression must be a scalar or a character vector.`
 13. `warning('careful %d', 1)` → stderr `Warning: careful 1`, exit code 0.
+14. `error('100% sure')` → err `100% sure`; `error('a\nb')` → err containing `a\nb` literally, the backslash and the `n` included.
+15. `error(''); disp(2)` → `     2`, exit code 0.
 
 ## Status
 

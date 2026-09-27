@@ -15,11 +15,19 @@ parser again. Then statements, functions, handles and containers, which
 complete the language. Numerics come after the language, plotting and the
 environment last.
 
+Between 01b and 02 come three bug-fix cycles, 01c, 01d and 01e. They clear the
+"Known bugs" table of `docs/ARCHITECTURE.md`, including the defects found by
+the Phase 0 QA pass: 01c the builtin argument forms, 01d numerics and
+`printf`, 01e display and the parser. Each adds its row here when its spec is
+written. A row that belongs to a roadmap module more naturally stays there,
+and the table names the cycle that owns it.
+
 | NN | Module | Goal | Status |
 |---|---|---|---|
 | 00 | [baseline](modules/00-baseline.md) | The stage-0 interpreter: expressions, matrices, indexing, control flow, 79 builtins | Done (2026-09-27) |
 | 01 | [registry-and-builtins](modules/01-registry-and-builtins.md) | The 79 builtins moved out of one 409-line match into a registry that knows `nargout`, plus `tic`/`toc` for 81; arity checks; interpreter on a 256 MB stack | Done (2026-09-27) |
 | 01b | [error-reporting](modules/01b-error-reporting.md) | `MError` carrying a line number and every message text, `Error: Line N` in script mode, the three lexer defects found in cycle 0, elementwise `.\`, and a capped range | Done (2026-09-27) |
+| 01c | [builtin-arguments](modules/01c-builtin-arguments.md) | The argument forms that cycle 01's arity checks turned into errors (`sort` direction, `find` count, `norm` order, `diag` offset, `num2str` precision, `round` digits), size vectors such as `zeros(size(A))`, `true(n)`, `eps(x)`, `'all'`, and the QA pass's argument defects in the same builtins | Done (2026-09-27) |
 | 02 | [classes-and-display](modules/02-classes-and-display.md) | Logical and char classes as a tag on `Matrix`; class propagation; MATLAB display fidelity | Planned |
 | 03 | [indexing-forms](modules/03-indexing-forms.md) | Logical indexing, element deletion, in-place assignment, access-chain AST, multiple return values | Planned |
 | 04 | [switch-try-commands](modules/04-switch-try-commands.md) | `switch`, `try`/`catch` with an error struct, `warning`, `assert`, command syntax, block comments | Planned |

@@ -1,8 +1,8 @@
 //! Constants, constructors, shape queries, output, the workspace and timing.
 
-use std::f64::consts::{E, PI};
+use std::f64::consts::PI;
 
-use super::args::{at_most, check_size, dim, mat, need, scalar, size_arg, string};
+use super::args::{at_most, check_shape, dim, mat, need, scalar, shape, string};
 use super::{Registry, add, none, one, one_mat};
 use crate::error;
 use crate::interp::{Interp, R, fmt_e, fmt_g};
@@ -15,21 +15,20 @@ use crate::value::{Matrix, Value, nonfinite};
 pub fn register(r: &mut Registry) {
     // ---- constants ---------------------------------------------------
     add(r, "pi", pi, "pi - ratio of a circle's circumference to its diameter.");
-    add(r, "e", e, "e - base of the natural logarithm.");
-    add(r, "Inf", inf, "Inf, Inf(n), Inf(r,c) - infinity.");
-    add(r, "inf", inf, "inf, inf(n), inf(r,c) - infinity.");
-    add(r, "NaN", nan, "NaN, NaN(n), NaN(r,c) - not-a-number.");
-    add(r, "nan", nan, "nan, nan(n), nan(r,c) - not-a-number.");
-    add(r, "eps", eps, "eps - distance from 1.0 to the next larger double.");
-    add(r, "true", tru, "true - logical 1. true(n) waits for the logical class.");
-    add(r, "false", fls, "false - logical 0. false(n) waits for the logical class.");
+    add(r, "Inf", inf, "Inf, Inf(n), Inf(r,c), Inf(sz) - infinity.");
+    add(r, "inf", inf, "inf, inf(n), inf(r,c), inf(sz) - infinity.");
+    add(r, "NaN", nan, "NaN, NaN(n), NaN(r,c), NaN(sz) - not-a-number.");
+    add(r, "nan", nan, "nan, nan(n), nan(r,c), nan(sz) - not-a-number.");
+    add(r, "eps", eps, "eps, eps(x), eps('double') - spacing of doubles, at 1 or at abs(x).");
+    add(r, "true", tru, "true, true(n), true(r,c), true(sz) - ones; doubles until the logical class.");
+    add(r, "false", fls, "false, false(n), false(r,c), false(sz) - zeros; doubles until the logical class.");
 
     // ---- constructors ------------------------------------------------
-    add(r, "zeros", zeros, "zeros(n), zeros(r,c) - a matrix of zeros.");
-    add(r, "ones", ones, "ones(n), ones(r,c) - a matrix of ones.");
-    add(r, "eye", eye, "eye(n), eye(r,c) - ones on the main diagonal.");
-    add(r, "rand", rand, "rand(n), rand(r,c) - uniform values in [0, 1).");
-    add(r, "linspace", linspace, "linspace(a,b,n) - n points evenly spaced from a to b.");
+    add(r, "zeros", zeros, "zeros(n), zeros(r,c), zeros(sz) - a matrix of zeros.");
+    add(r, "ones", ones, "ones(n), ones(r,c), ones(sz) - a matrix of ones.");
+    add(r, "eye", eye, "eye(n), eye(r,c), eye(sz) - ones on the main diagonal.");
+    add(r, "rand", rand, "rand(n), rand(r,c), rand(sz) - uniform values in [0, 1).");
+    add(r, "linspace", linspace, "linspace(a,b,n) - floor(n) points evenly spaced from a to b.");
 
     // ---- shape queries -----------------------------------------------
     add(r, "size", size, "size(A), size(A,dim) - the dimensions of A.");
@@ -37,13 +36,13 @@ pub fn register(r: &mut Registry) {
     add(r, "length", length, "length(A) - the longest dimension, or 0 if empty.");
     add(r, "isempty", isempty, "isempty(A) - true when A has no elements.");
     add(r, "isscalar", isscalar, "isscalar(A) - true when A is 1x1.");
-    add(r, "isvector", isvector, "isvector(A) - true when A is a non-empty vector.");
+    add(r, "isvector", isvector, "isvector(A) - true when A is 1-by-N or N-by-1, N >= 0.");
 
     // ---- output ------------------------------------------------------
     add(r, "disp", disp, "disp(X) - display X without printing its name.");
     add(r, "fprintf", fprintf, "fprintf(fmt,...) - write formatted text.");
     add(r, "sprintf", sprintf, "sprintf(fmt,...) - format text into a string.");
-    add(r, "num2str", num2str_fn, "num2str(x) - convert a number to text.");
+    add(r, "num2str", num2str_fn, "num2str(x), num2str(x,n), num2str(x,fmt) - convert a number to text.");
     add(r, "error", error, "error(fmt,...) - raise an error with a message.");
 
     // ---- workspace ---------------------------------------------------
@@ -65,11 +64,11 @@ fn constant(args: &[Value], name: &str, v: f64) -> R<Vec<Value>> {
     one_mat(Matrix::scalar(v))
 }
 
-/// A constant that fills a matrix when given a size, as `NaN(2)` does.
+/// A constant that fills a matrix when given a size, as `NaN(2)` does. It
+/// takes every size form a constructor does, trailing ones included.
 fn filled_constant(args: &[Value], name: &str, v: f64) -> R<Vec<Value>> {
-    at_most(args, 2, name)?;
-    let (r, c) = shape(args, name)?;
-    check_size(r, c)?;
+    let (r, c) = shape(args, 0, name, usize::MAX)?;
+    let (r, c) = check_shape(r, c)?;
     one_mat(Matrix::filled(r, c, v))
 }
 
@@ -77,22 +76,53 @@ fn pi(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     constant(a, "pi", PI)
 }
 
-fn e(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    constant(a, "e", E)
-}
-
+/// `eps`, `eps(x)` and `eps('double')`. `eps(2)` is the spacing at 2, not a
+/// 2x2: `eps` is the one constant whose argument is a value.
 fn eps(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    constant(a, "eps", f64::EPSILON)
+    at_most(a, 1, "eps")?;
+    match a.first() {
+        None => one_mat(Matrix::scalar(f64::EPSILON)),
+        Some(Value::Str(s)) if s.eq_ignore_ascii_case("double") => {
+            one_mat(Matrix::scalar(f64::EPSILON))
+        }
+        Some(Value::Str(_)) => Err(error::eps_class()),
+        Some(Value::Mat(m)) => one_mat(m.map(eps_at)),
+    }
 }
 
-/// `true` and `false` stay scalars: `true(n)` needs the logical class, which
-/// is cycle 02.
+/// The distance from `abs(x)` to the next larger double, read off the
+/// exponent field rather than computed as `next - x`: the successor of the
+/// largest double is `Inf`, and `eps(1e308)` must be `2^971`. Zero and the
+/// subnormals share the smallest spacing, `2^-1074`; `Inf` and `NaN` give
+/// `NaN`, as the MATLAB page says.
+pub fn eps_at(x: f64) -> f64 {
+    if !x.is_finite() {
+        return f64::NAN;
+    }
+    let biased = (x.abs().to_bits() >> 52) as i32;
+    if biased == 0 {
+        return f64::from_bits(1);
+    }
+    pow2(biased - 1023 - 52)
+}
+
+/// `2^k` for `-1074 <= k <= 1023`, built from its bits so it is exact.
+fn pow2(k: i32) -> f64 {
+    if k >= -1022 {
+        f64::from_bits(((k + 1023) as u64) << 52)
+    } else {
+        f64::from_bits(1u64 << (k + 1074))
+    }
+}
+
+/// `true` and `false` fill like `NaN` and `Inf`. They return doubles until
+/// cycle 02 gives them the logical class.
 fn tru(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    constant(a, "true", 1.0)
+    filled_constant(a, "true", 1.0)
 }
 
 fn fls(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    constant(a, "false", 0.0)
+    filled_constant(a, "false", 0.0)
 }
 
 fn inf(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -105,19 +135,6 @@ fn nan(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 
 // ---- constructors ----------------------------------------------------
 
-/// The `(rows, cols)` shared by every constructor: none, one, or two size
-/// arguments. A negative size is `0`, exactly as in MATLAB.
-fn shape(args: &[Value], name: &str) -> R<(usize, usize)> {
-    match args.len() {
-        0 => Ok((1, 1)),
-        1 => {
-            let n = size_arg(args, 0, name)?;
-            Ok((n, n))
-        }
-        _ => Ok((size_arg(args, 0, name)?, size_arg(args, 1, name)?)),
-    }
-}
-
 /// Which of the four constructors that share one implementation is running.
 #[derive(Clone, Copy)]
 enum Fill {
@@ -127,10 +144,18 @@ enum Fill {
     Rand,
 }
 
+/// The shape comes from `args::shape`, which takes a scalar, a size vector or
+/// several sizes with trailing ones. `eye` alone keeps MATLAB's limit of two
+/// sizes, as arguments and as the elements of a size vector.
 fn construct(it: &mut Interp, args: &[Value], name: &str, kind: Fill) -> R<Vec<Value>> {
-    at_most(args, 2, name)?;
-    let (r, c) = shape(args, name)?;
-    check_size(r, c)?;
+    let max_dims = if matches!(kind, Fill::Eye) {
+        at_most(args, 2, name)?;
+        2
+    } else {
+        usize::MAX
+    };
+    let (r, c) = shape(args, 0, name, max_dims)?;
+    let (r, c) = check_shape(r, c)?;
     let m = match kind {
         Fill::Zeros => Matrix::filled(r, c, 0.0),
         Fill::Ones => Matrix::filled(r, c, 1.0),
@@ -162,16 +187,22 @@ fn rand(it: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     construct(it, a, "rand", Fill::Rand)
 }
 
+/// `linspace(a, b, n)` gives `floor(n)` points, and none for an `n` below 1,
+/// as the MATLAB page says. A `NaN` count is no points, as in Octave.
 fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 3, "linspace")?;
     let a = scalar(args, 0, "linspace")?;
     let b = scalar(args, 1, "linspace")?;
     let n = if args.len() >= 3 {
-        size_arg(args, 2, "linspace")?
+        if let Some(Value::Str(_)) = args.get(2) {
+            return Err(error::bad_size_arg("linspace"));
+        }
+        let n = scalar(args, 2, "linspace")?.floor();
+        if n.is_nan() { 0.0 } else { n.max(0.0) }
     } else {
-        100
+        100.0
     };
-    check_size(1, n)?;
+    let (_, n) = check_shape(1.0, n)?;
     let data = (0..n)
         .map(|k| {
             if n == 1 {
@@ -260,19 +291,46 @@ fn sprintf(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     one(Value::Str(format_printf(args)?))
 }
 
+/// `num2str(x)`, `num2str(x, n)` and `num2str(x, formatSpec)`. A char input
+/// comes back unchanged, as in MATLAB. A non-scalar keeps the one-row output
+/// it has always had, elements joined by two spaces, until the char matrices
+/// of cycle 02 let cycle 11 give it one row per matrix row.
 fn num2str_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(args, 1, "num2str")?;
+    at_most(args, 2, "num2str")?;
     need(args, 1, "num2str")?;
-    let s = match &args[0] {
-        Value::Str(s) => s.clone(),
-        Value::Mat(m) => m
-            .data
-            .iter()
-            .map(|v| num2str(*v))
-            .collect::<Vec<_>>()
-            .join("  "),
+    let m = match &args[0] {
+        Value::Str(s) => return one(Value::Str(s.clone())),
+        Value::Mat(m) => m,
+    };
+    let s = match args.get(1) {
+        None => join_elements(m, num2str),
+        Some(Value::Str(fmt)) => {
+            // sprintf(formatSpec, x), with the leading spaces trimmed even
+            // when the format asked for them: num2str(42.67, '% 10.2f') is
+            // '42.67' on the MATLAB page.
+            let text = format_printf(&[Value::Str(fmt.clone()), Value::Mat(m.clone())])?;
+            text.trim_start().to_string()
+        }
+        Some(Value::Mat(p)) => {
+            let n = num2str_precision(p)?;
+            join_elements(m, |v| fmt_g(v, n))
+        }
     };
     one(Value::Str(s))
+}
+
+/// The precision of `num2str(x, n)`: a positive integer. Any `n` past 800 is
+/// clamped, because no double has more than about 770 significant digits to
+/// show, so `num2str(pi, 1e9)` neither panics nor allocates a gigabyte.
+fn num2str_precision(p: &Matrix) -> R<usize> {
+    match p.scalar_value() {
+        Some(n) if n >= 1.0 && n.fract() == 0.0 => Ok(n.min(800.0) as usize),
+        _ => Err(error::num2str_precision()),
+    }
+}
+
+fn join_elements(m: &Matrix, f: impl Fn(f64) -> String) -> String {
+    m.data.iter().map(|v| f(*v)).collect::<Vec<_>>().join("  ")
 }
 
 fn error(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
@@ -334,14 +392,16 @@ fn tic(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
         // so a nested tic/toc pair cannot disturb an outer one.
         return one_mat(Matrix::scalar(now));
     }
-    it.tic_mark = now;
+    it.tic_mark = Some(now);
     none()
 }
 
+/// A bare `toc` needs an earlier bare `tic`; `t = tic` does not count, since
+/// it leaves the shared mark alone. `toc(t)` needs only its handle.
 fn toc(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(args, 1, "toc")?;
     let base = if args.is_empty() {
-        it.tic_mark
+        it.tic_mark.ok_or_else(error::toc_without_tic)?
     } else {
         scalar(args, 0, "toc")?
     };
@@ -664,9 +724,158 @@ mod tests {
             Value::Str(_) => panic!("expected a matrix"),
         }
         assert_eq!(shape_of(inf, &[]), (1, 1));
-        // pi and true take no size argument yet; see "Known bugs".
-        assert!(call(pi, &[num(2.0)], 1).is_err());
-        assert!(call(tru, &[num(2.0)], 1).is_err());
+        // pi has the single syntax `p = pi` on the MATLAB page.
+        assert_eq!(
+            call(pi, &[num(2.0)], 1).unwrap_err().msg,
+            "Too many input arguments."
+        );
+    }
+
+    fn mat_of(f: super::super::BuiltinFn, args: &[Value]) -> Matrix {
+        call(f, args, 1).unwrap()[0].clone().into_mat()
+    }
+
+    fn row(v: &[f64]) -> Value {
+        Value::Mat(Matrix::row(v.to_vec()))
+    }
+
+    #[test]
+    fn true_and_false_fill_like_nan_and_inf() {
+        assert_eq!(shape_of(tru, &[]), (1, 1));
+        assert_eq!(shape_of(tru, &[num(2.0)]), (2, 2));
+        assert_eq!(shape_of(fls, &[num(2.0), num(3.0)]), (2, 3));
+        assert_eq!(shape_of(tru, &[row(&[1.0, 4.0])]), (1, 4));
+        assert_eq!(shape_of(fls, &[num(-1.0)]), (0, 0));
+        assert_eq!(shape_of(tru, &[num(2.0), num(2.0), num(1.0)]), (2, 2));
+        assert!(mat_of(tru, &[num(3.0)]).data.iter().all(|v| *v == 1.0));
+        assert!(mat_of(fls, &[num(3.0)]).data.iter().all(|v| *v == 0.0));
+        assert!(call(tru, &[num(2.0), num(2.0), num(2.0)], 1).is_err());
+    }
+
+    #[test]
+    fn eps_is_the_spacing_at_abs_x() {
+        let at = |x: f64| eps_at(x);
+        assert_eq!(at(1.0), f64::EPSILON);
+        assert_eq!(at(2.0), 2.0 * f64::EPSILON);
+        assert_eq!(at(-2.0), at(2.0));
+        // Just below a power of two the spacing is the smaller one.
+        assert_eq!(at(1.9999), f64::EPSILON);
+        assert_eq!(at(0.75), f64::EPSILON / 2.0);
+        assert!((at(1e10) - 1.907_348_632_812_5e-6).abs() < 1e-20);
+        // Zero and every subnormal share the smallest spacing, 2^-1074.
+        let tiny = f64::from_bits(1);
+        assert_eq!(at(0.0), tiny);
+        assert_eq!(at(-0.0), tiny);
+        assert_eq!(at(1e-320), tiny);
+        assert_eq!(at(f64::MIN_POSITIVE / 2.0), tiny);
+        // The smallest normal is spaced like the subnormals below it.
+        assert_eq!(at(f64::MIN_POSITIVE), tiny);
+        // The largest doubles are 2^971 apart, not Inf.
+        assert_eq!(at(1e308), 2f64.powi(971));
+        assert_eq!(at(f64::MAX), 2f64.powi(971));
+        assert!(at(f64::INFINITY).is_nan());
+        assert!(at(f64::NEG_INFINITY).is_nan());
+        assert!(at(f64::NAN).is_nan());
+        // Each spacing is exact: x + eps(x) is the next double up.
+        for x in [1.0, 3.0, 1e-300, 12345.678, 1e300] {
+            assert_eq!(x + at(x), f64::from_bits(x.to_bits() + 1), "{x}");
+        }
+    }
+
+    #[test]
+    fn eps_takes_a_value_or_the_class_name_double() {
+        assert_eq!(mat_of(eps, &[]).data, [f64::EPSILON]);
+        assert_eq!(mat_of(eps, &[num(2.0)]).data, [2.0 * f64::EPSILON]);
+        let m = mat_of(eps, &[row(&[1.0, 4.0])]);
+        assert_eq!((m.rows, m.cols), (1, 2));
+        assert_eq!(m.data, [f64::EPSILON, 4.0 * f64::EPSILON]);
+        let double = Value::Str("double".to_string());
+        assert_eq!(mat_of(eps, &[double]).data, [f64::EPSILON]);
+        assert_eq!(
+            call(eps, &[Value::Str("single".to_string())], 1)
+                .unwrap_err()
+                .msg,
+            "Only 'double' is supported as a class name for 'eps'."
+        );
+        assert!(call(eps, &[num(1.0), num(2.0)], 1).is_err());
+    }
+
+    #[test]
+    fn constructors_take_a_size_vector_and_trailing_ones() {
+        assert_eq!(shape_of(zeros, &[row(&[2.0, 3.0])]), (2, 3));
+        assert_eq!(shape_of(ones, &[row(&[3.0, 1.0])]), (3, 1));
+        assert_eq!(shape_of(rand, &[row(&[2.0, 3.0, 1.0])]), (2, 3));
+        assert_eq!(shape_of(nan, &[row(&[2.0, 3.0])]), (2, 3));
+        assert_eq!(shape_of(zeros, &[row(&[4.0])]), (4, 4));
+        assert_eq!(
+            shape_of(ones, &[num(2.0), num(3.0), num(1.0), num(1.0)]),
+            (2, 3)
+        );
+        match &call(eye, &[row(&[2.0, 3.0])], 1).unwrap()[0] {
+            Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            Value::Str(_) => panic!("expected a matrix"),
+        }
+        let nd = "N-D arrays are not supported.";
+        assert_eq!(
+            call(zeros, &[num(2.0), num(3.0), num(4.0)], 1)
+                .unwrap_err()
+                .msg,
+            nd
+        );
+        // eye keeps its two-size limit.
+        assert_eq!(
+            call(eye, &[num(2.0), num(3.0), num(1.0)], 1)
+                .unwrap_err()
+                .msg,
+            "Too many input arguments."
+        );
+        assert_eq!(call(eye, &[row(&[2.0, 3.0, 1.0])], 1).unwrap_err().msg, nd);
+        let col = Value::Mat(Matrix::col(vec![2.0, 3.0]));
+        assert_eq!(
+            call(zeros, &[col], 1).unwrap_err().msg,
+            "Size vector for 'zeros' must be a row vector."
+        );
+        // A char is never read as its character codes.
+        assert!(call(zeros, &[Value::Str("a".to_string())], 1).is_err());
+    }
+
+    #[test]
+    fn a_size_past_usize_is_named_as_asked() {
+        let e = call(zeros, &[num(1e300)], 1).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 1e+300x1e+300 array exceeds the maximum array size."
+        );
+        let e = call(ones, &[row(&[1.0, 1e300])], 1).unwrap_err().msg;
+        assert!(e.contains("1x1e+300"), "{e}");
+    }
+
+    #[test]
+    fn linspace_floors_its_count() {
+        let lin = |n: f64| mat_of(linspace, &[num(0.0), num(1.0), num(n)]);
+        assert_eq!(lin(2.7).data, [0.0, 1.0]);
+        assert_eq!(lin(3.0).data, [0.0, 0.5, 1.0]);
+        assert_eq!(lin(1.5).data, [1.0]);
+        for none in [0.5, 0.0, -2.0, f64::NAN] {
+            let m = lin(none);
+            assert_eq!((m.rows, m.cols), (1, 0), "{none}");
+        }
+        let e = call(linspace, &[num(0.0), num(1.0), num(f64::INFINITY)], 1)
+            .unwrap_err()
+            .msg;
+        assert!(e.contains("1xInf"), "{e}");
+        assert_eq!(mat_of(linspace, &[num(0.0), num(1.0)]).numel(), 100);
+    }
+
+    #[test]
+    fn isvector_counts_an_empty_row_or_column() {
+        let isv = |m: Matrix| mat_of(isvector, &[Value::Mat(m)]).data[0];
+        assert_eq!(isv(Matrix::new(1, 0, vec![])), 1.0);
+        assert_eq!(isv(Matrix::new(0, 1, vec![])), 1.0);
+        assert_eq!(isv(Matrix::empty()), 0.0);
+        assert_eq!(isv(Matrix::new(2, 0, vec![])), 0.0);
+        assert_eq!(isv(Matrix::scalar(5.0)), 1.0);
+        assert_eq!(isv(Matrix::filled(2, 2, 0.0)), 0.0);
     }
 
     #[test]
@@ -714,6 +923,15 @@ mod tests {
     #[test]
     fn tic_and_toc_depend_on_nargout() {
         let mut it = Interp::with_output(Box::new(std::io::sink()));
+        // Before any bare tic, a bare toc has nothing to measure from, and a
+        // `t = tic` does not count as one.
+        let msg = "You must call TIC without an output argument before calling TOC \
+                   without an input argument.";
+        assert_eq!(toc(&mut it, &[], 0).unwrap_err().msg, msg);
+        let handle = tic(&mut it, &[], 1).unwrap();
+        assert_eq!(toc(&mut it, &[], 1).unwrap_err().msg, msg);
+        // toc(t) needs only its handle.
+        assert_eq!(toc(&mut it, &handle, 1).unwrap().len(), 1);
         // As a statement, tic produces no value and toc prints one.
         assert!(tic(&mut it, &[], 0).unwrap().is_empty());
         assert!(toc(&mut it, &[], 0).unwrap().is_empty());
@@ -737,6 +955,51 @@ mod tests {
         assert_eq!(num2str(3.5), "3.5");
         assert_eq!(num2str(-0.25), "-0.25");
         assert_eq!(num2str(1.0e17), "100000000000000000");
+    }
+
+    fn n2s(args: &[Value]) -> R<String> {
+        match &call(num2str_fn, args, 1)?[0] {
+            Value::Str(s) => Ok(s.clone()),
+            Value::Mat(_) => panic!("expected a string"),
+        }
+    }
+
+    #[test]
+    fn num2str_with_a_precision_is_percent_g() {
+        let p = |x: f64, n: f64| n2s(&[num(x), num(n)]).unwrap();
+        assert_eq!(p(std::f64::consts::PI, 8.0), "3.1415927");
+        assert_eq!(p(std::f64::consts::PI, 2.0), "3.1");
+        assert_eq!(p(123456.0, 3.0), "1.23e+05");
+        assert_eq!(p(7.0, 3.0), "7");
+        assert_eq!(p(-0.5, 3.0), "-0.5");
+        assert_eq!(p(f64::INFINITY, 3.0), "Inf");
+        assert_eq!(p(1.0 / 3.0, 20.0), "0.33333333333333331483");
+        // The exact binary expansion, and no more.
+        let exact = "3.141592653589793115997963468544185161590576171875";
+        assert_eq!(p(std::f64::consts::PI, 100.0), exact);
+        // A huge precision is clamped rather than allocated.
+        assert_eq!(p(std::f64::consts::PI, 1e9), exact);
+        for bad in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(
+                n2s(&[num(1.0), num(bad)]).unwrap_err().msg,
+                "Precision for 'num2str' must be a positive integer.",
+                "{bad}"
+            );
+        }
+        assert!(n2s(&[num(1.0), row(&[1.0, 2.0])]).is_err());
+    }
+
+    #[test]
+    fn num2str_with_a_format_is_sprintf_with_leading_spaces_trimmed() {
+        let f = |x: f64, fmt: &str| n2s(&[num(x), Value::Str(fmt.to_string())]).unwrap();
+        assert_eq!(f(std::f64::consts::PI, "%10.4f"), "3.1416");
+        // The MATLAB page's own example: even a space flag is trimmed.
+        assert_eq!(f(42.67, "% 10.2f"), "42.67");
+        assert_eq!(f(5.0, "%d apples"), "5 apples");
+        // A char input comes back unchanged.
+        let s = Value::Str("abc".to_string());
+        assert_eq!(n2s(&[s, num(3.0)]).unwrap(), "abc");
+        assert!(n2s(&[num(1.0), num(2.0), num(3.0)]).is_err());
     }
 
     // ---- printf ------------------------------------------------------

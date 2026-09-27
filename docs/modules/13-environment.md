@@ -13,6 +13,11 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - history file
 - tab completion from registry + variables + path
 - `help which whos format eval evalc run pwd cd ls dir datestr now clock pause getenv system version exit`
+- `exit` and `quit` as real statements everywhere (QA D28): in a script, as
+  `exit;` or `quit;`, inside a block, and as `exit(n)`, which exits with code
+  `n`. Today they work only as a bare REPL line, a script ending in `exit`
+  fails with "Undefined function or variable 'exit'.", and the REPL's final
+  exit code is always 0
 
 ## Out of scope
 
@@ -47,6 +52,7 @@ Every new error message needs an `err_*` case.
 8. Unit tests for the line-editor state machine (key events → buffer/cursor/history index) and history-file round trip.
 9. `t = tic; pause(0.05); disp(toc(t) >= 0.04)` → `     1`
 10. REPL transcript: pipe `1+1\nx = 3;\nx\nexit\n` into the binary with no args; lock the transcript as a golden.
+11. A script `disp(1)\nexit\ndisp(2)` → `     1`, exit code 0; a script `disp(1)\nexit(3)` → `     1` and exit code 3. The golden harness expects exit 0 without an `.err` file, so this case needs an exit-code expectation added to it in this cycle.
 
 ## Status
 

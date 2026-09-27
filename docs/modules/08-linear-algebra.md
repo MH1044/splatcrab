@@ -17,7 +17,9 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - one-sided Jacobi SVD
 - `rank pinv null orth kron cross triu tril magic cond`
 - matrix `norm` (1, 2, inf, fro)
-- Singular systems warn instead of erroring
+- Singular systems warn instead of erroring, and so do `inv` and `A^-1` of a
+  singular matrix (QA D26), which return `Inf` matrices as MATLAB and Octave
+  do: `inv([1 2; 2 4])` is `Inf Inf; Inf Inf`, and `inv(0)` is `Inf`
 - Fix `matmul` swallowing `Inf` and `NaN`: the `if b == 0.0 { continue }`
   sparsity shortcut skips the multiply, so `[Inf 0] * [0; 1]` gives `0`
   where MATLAB gives `NaN`. See "Known bugs" in `docs/ARCHITECTURE.md`
@@ -57,9 +59,10 @@ Every new error message needs an `err_*` case.
 5. `disp(sort(eig([4 1; 2 3]))'); e = eig([2 1; 1 2]); fprintf('%.4f %.4f\n', e); [V, D] = eig([2 0; 0 3]); disp(diag(D)')` → `     2     5\n1.0000 3.0000\n     2     3`
 6. `disp(svd([3 0; 0 4])'); [U, S, V] = svd([1 2; 3 4]); fprintf('%.4f\n', norm(U * S * V' - [1 2; 3 4]))` → `     4     3\n0.0000`
 7. `disp(rank([1 2; 2 4])); disp(rank(eye(3))); fprintf('%.4f ', pinv([1 2; 2 4])); fprintf('\n')` → `     1\n     3\n0.0400 0.0800 0.0800 0.1600 `
-8. `A = [1 2; 3 4]; fprintf('%.4f %.4f %.4f %.4f %.4f\n', norm(A), norm(A, 'fro'), norm(A, 1), norm(A, inf), cond(A))` → `5.4650 5.4772 6.0000 7.0000 14.9331`; `fprintf('%d %d\n', norm([3 4], 1), norm([3 4], inf))` → `7 4`
+8. `A = [1 2; 3 4]; fprintf('%.4f %.4f %.4f %.4f %.4f\n', norm(A), norm(A, 'fro'), norm(A, 1), norm(A, inf), cond(A))` → `5.4650 5.4772 6.0000 7.0000 14.9331`. The vector p-norms, such as `norm([3 4], 1)`, landed in cycle 01c and are not claimed here
 9. `disp(kron([1 2], [1; 1])); disp(cross([1 0 0], [0 1 0])); disp(magic(3))` → `     1     2\n     1     2\n     0     0     1\n     8     1     6\n     3     5     7\n     4     9     2`
 10. `x = [1 2; 2 4] \ [1; 2]` → stderr `Warning: Matrix is singular to working precision.` with a result on stdout and exit 0; regression `disp([1 2; 3 4] \ [5; 6])` → `   -4.0000\n    4.5000`
+11. `x = inv([1 2; 2 4])` → stderr `Warning: Matrix is singular to working precision.`, then `x =\n\n   Inf   Inf\n   Inf   Inf\n` on stdout, exit 0; `y = [1 2; 2 4]^-1` behaves the same
 
 ## Status
 

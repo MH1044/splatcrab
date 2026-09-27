@@ -9,7 +9,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
 | Numbers `12`, `1.5`, `.5`, `1e-3`, `2.5E+2` | 00 | `display_formats` | |
-| Single-quoted strings, `''` escape | 00 | `strings` | Displays with quotes; MATLAB shows char bare |
+| Single-quoted strings, `''` escape | 00 | `strings` | `s = 'abc'` displays `'abc'` with quotes, as MATLAB R2018a+ does; `disp('abc')` is bare |
 | Double-quoted strings | 00 | `strings` | Treated as char; MATLAB has a separate string class |
 | `%` comments | 00 | every case | |
 | `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
@@ -59,15 +59,17 @@ What SplatCrab does today, with the golden case that proves each area works.
 
 ## Builtins
 
-81 names, each an ordinary function in `src/builtins/` registered by name in
+80 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`; the shared-arm groups also by the `*_shared_arm` cases in
-`01-registry-and-builtins`. The count was 79 before this cycle, not the 78
-this table used to claim.
+`01-registry-and-builtins`. Cycle 01 counted 81. Cycle 01c removed `e`, which
+MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
+ordinary name, free to be a variable (`e_is_an_ordinary_name`,
+`err_e_undefined`, `err_e_undefined_after_clear`).
 
 | Group | Names | Since | File |
 |---|---|---|---|
-| Constants | `pi e Inf inf NaN nan eps true false` | 00 | `core.rs` |
+| Constants | `pi Inf inf NaN nan eps true false` | 00 | `core.rs` |
 | Constructors | `zeros ones eye rand linspace` | 00 | `core.rs` |
 | Shape queries | `size numel length isempty isscalar isvector` | 00 | `core.rs` |
 | Rearrangement | `reshape repmat fliplr flipud` | 00 | `linalg.rs` |
@@ -83,8 +85,11 @@ this table used to claim.
 
 Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
 a dimension past the array's returns the input unchanged and `0` is an error.
-`max` and `min` also take two arrays. `norm` and `sort` accept vectors only,
-until cycles 08 and 09. `sort` puts `NaN` last.
+`sum`, `prod`, `mean`, `any` and `all` also take `'all'`, and so do `max` and
+`min` as their third argument. `max` and `min` also take two arrays. `norm` and
+`sort` accept vectors only, until cycles 08 and 09. `sort` puts `NaN` last
+when ascending and first when descending. The argument forms each builtin
+takes are in [Builtin arguments](#builtin-arguments).
 
 ### Calling convention
 
@@ -96,9 +101,38 @@ until cycles 08 and 09. `sort` puts `NaN` last.
 | A dimension argument must be a positive integer | 01 | `err_reduction_dim_zero`, `err_size_dim_zero` | |
 | A negative size is an empty, not an error | 01 | `negative_size_is_empty` | `zeros(-1)` is `0x0` |
 | A size that would overflow is a clean error | 01 | `err_huge_size_*` | `zeros(1e10)` used to abort the process |
-| `NaN(n)` and `Inf(r,c)` fill a matrix | 01 | `nan_inf_constructors` | `true(n)` and `false(n)` wait for cycle 02 |
+| `NaN(n)` and `Inf(r,c)` fill a matrix | 01 | `nan_inf_constructors` | `true(n)` and `false(n)` too, since 01c |
 | `tic`, `toc` and `toc(t)` | 01 | `tic_toc_value`, `tic_toc_handle` | `t = tic` returns a handle; bare `toc` prints the elapsed time |
-| A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread |
+| A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread. This holds below about 96,000 levels; deeper still aborts (Known bugs, cycle 01e) |
+
+### Builtin arguments
+
+Cycle 01 made every builtin reject arguments it did not understand. Cycle 01c
+implements the ones MATLAB code actually uses. Cases are in
+`01c-builtin-arguments`.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `true(n)`, `true(r,c)`, `true(sz)`, and the same for `false` | 01c | `constants_true_false_sizes` | Doubles until cycle 02 gives them the logical class. `pi(2)` stays an error, as in MATLAB (`err_pi_takes_no_size`) |
+| `eps(x)`, element-wise, and `eps('double')` | 01c | `eps_spacing`, `err_eps_class_name` | The spacing at `abs(x)`, from the exponent field: `eps(1e308)` is `2^971`, `eps(0)` is `2^-1074`, `eps(Inf)` is `NaN`. `eps('single')` waits for cycle 02 |
+| Size vectors: `zeros(size(A))` | 01c | `size_vectors_constructors`, `err_size_vector_column` | `zeros`, `ones`, `eye`, `rand`, `NaN`, `Inf`, `true`, `false`. The vector must be a row |
+| `reshape(A, sz)`, `reshape(A, r, [])`, `repmat(A, sz)` | 01c | `size_vectors_reshape_repmat`, `err_reshape_placeholder_divisible`, `err_reshape_two_placeholders` | One `[]` placeholder, for the size that makes the count come out |
+| Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_third_size`, `err_nd_zero_third_size`, `err_nd_fourth_size`, `err_nd_size_vector`, `err_nd_reshape` | `zeros(2, 3, 1)` is 2x3. Any other third size, `0` included, is "N-D arrays are not supported."; N-D arrays are not built yet. `eye` still takes two sizes |
+| A size past `usize` is named as asked | 01c | `err_size_overflow_named`, `err_size_overflow_g_form`, `err_size_overflow_range_inf` | `zeros(1e300)` reports `1e+300x1e+300`, and `0:1e-300:1e300` reports `1xInf`, not the `usize::MAX` clamp. Indexed growth still names the clamp (cycle 03) |
+| `linspace` floors its count | 01c | `linspace_floor_count` | `linspace(0, 1, 2.7)` is two points; a count below 1 is 1x0 |
+| `sort(v, 'descend')`, `sort(v, dim)`, `sort(v, dim, direction)` | 01c | `sort_direction`, `sort_descend_stable`, `err_sort_direction` | Stable in both directions; `NaN` first when descending |
+| `find(X, n)`, `find(X, n, 'first')`, `find(X, n, 'last')` | 01c | `find_count`, `err_find_count_zero`, `err_find_count_fraction`, `err_find_direction` | The last `n` stay in ascending order; `n` must be a positive integer |
+| `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | Vectors only until cycle 08. `p = 0` and a negative finite `p` are refused |
+| `norm` without overflow; an empty sum is `+0` | 01c | `norm_scaled_and_empty_sum` | `norm([1e200 1e200])` is `1.4142e+200`, not `Inf`. `sum([])`, `norm([])` and `dot([], [])` print `0.0000`, not `-0.0000` |
+| `diag(v, k)` and `diag(A, k)` | 01c | `diag_offset`, `err_diag_offset` | A `k` past the matrix gives a 0x1 |
+| `num2str(x, n)` and `num2str(x, formatSpec)` | 01c | `num2str_precision`, `err_num2str_precision` | `%.{n}g`, and `sprintf` with the leading spaces trimmed. A non-scalar keeps its one-row output until cycle 11 |
+| `round(x, n)`, `round(x, n, 'decimals')`, `round(x, n, 'significant')` | 01c | `round_digits`, `err_round_digits`, `err_round_significant_digits`, `err_round_type` | Any integer `n`, ties away from zero. `round(pi, 20)` is `pi` and `round(5, -400)` is `0` |
+| `max` and `min` of an empty follow MATLAB's rule | 01c | `max_min_empty_shape` | `max(zeros(3, 0))` is 1x0, `max(zeros(0, 3))` is 0x3 |
+| `dot(A, B)` of matrices, and `dot(A, B, dim)` | 01c | `dot_matrices`, `err_dot_sizes`, `err_dot_vector_length`, `err_dot_dim_orientation` | Column-wise; two vectors of equal length may differ in orientation, but not with `dim` |
+| `any` ignores `NaN` | 01c | `any_ignores_nan` | `any(NaN)` is `0`, as the MATLAB page says, and GNU Octave 8.4 agrees. `all(NaN)` is `1` |
+| `isvector` of a 1x0 or a 0x1 is true | 01c | `isvector_empty` | A 0x0 is not a vector |
+| A bare `toc` needs an earlier bare `tic` | 01c | `toc_after_bare_tic`, `err_toc_before_tic`, `err_toc_value_before_tic`, `err_toc_after_handle_tic` | `t = tic` does not count; `toc(t)` is unaffected |
+| `'all'`, and no char is ever a dimension | 01c | `reduction_all_option`, `err_reduction_char_dim`, `err_cumsum_all`, `err_max_char_dim`, `err_size_char` | `sum(A, 'x')` used to reduce along dimension 120 |
 
 ## Output and formatting
 

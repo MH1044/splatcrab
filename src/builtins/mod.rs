@@ -71,8 +71,9 @@ fn none() -> R<Vec<Value>> {
 mod tests {
     use super::*;
 
-    /// The 79 builtins that existed before this cycle, plus `tic` and `toc`.
-    const EXPECTED: usize = 81;
+    /// The 79 builtins that existed before cycle 01, plus `tic` and `toc`,
+    /// less `e`, which cycle 01c removed: MATLAB has no `e` constant.
+    const EXPECTED: usize = 80;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -82,7 +83,6 @@ mod tests {
         // shared arm.
         for name in [
             "pi",
-            "e",
             "Inf",
             "inf",
             "NaN",
@@ -165,6 +165,9 @@ mod tests {
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }
+        // `exp(1)` is the MATLAB spelling; `e` is an Octave extension, and an
+        // ordinary name here, free to be a variable.
+        assert!(!r.contains_key("e"), "'e' is back in the registry");
     }
 
     #[test]

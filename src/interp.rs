@@ -25,8 +25,9 @@ pub struct Interp {
     builtins: Registry,
     /// When this interpreter started, the origin for every tic/toc reading.
     start: Instant,
-    /// Nanoseconds since `start` at the last bare `tic`.
-    pub(crate) tic_mark: f64,
+    /// Nanoseconds since `start` at the last bare `tic`, and `None` before
+    /// the first one: a bare `toc` then has nothing to measure from.
+    pub(crate) tic_mark: Option<f64>,
     /// Everything the interpreter prints goes here. Nothing in this crate
     /// outside `main.rs` may use `print!`, so tests can capture output.
     pub out: Box<dyn Write>,
@@ -64,7 +65,7 @@ impl Interp {
             rng: 0x9E37_79B9_7F4A_7C15,
             builtins: builtins::registry(),
             start: Instant::now(),
-            tic_mark: 0.0,
+            tic_mark: None,
             out,
         }
     }
@@ -508,22 +509,18 @@ impl Interp {
 
 /// `a:b` and `a:s:b`. The `:` operator never reaches a builtin, so this is the
 /// one remaining place a user-supplied number becomes an allocation length
-/// without passing `args::check_size`. It uses that helper rather than a
-/// second policy, so `x = 1:1e15` gets the same limit and the same message as
-/// `zeros(1e10)` instead of aborting in the allocator.
+/// without passing through a builtin. It uses `args::check_shape` rather than
+/// a second policy, so `x = 1:1e15` gets the same limit and the same message
+/// as `zeros(1e10)` instead of aborting in the allocator.
 fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
     if s == 0.0 || (b - a) / s < 0.0 || !a.is_finite() || !b.is_finite() || !s.is_finite() {
         return Ok(Matrix::new(1, 0, Vec::new()));
     }
-    // The count stays in `f64` until it is known to fit: casting the floor
-    // straight to `usize` saturates, and the `+ 1` would then overflow.
+    // The count stays in `f64` until `check_shape` has judged it, so a count
+    // past `usize` is named as asked: `0:1e-300:1e300` overflows `f64` itself
+    // and reports `1xInf`, where it used to report the `usize::MAX` clamp.
     let count = ((b - a) / s + 1e-10).floor() + 1.0;
-    let len = if count >= usize::MAX as f64 {
-        usize::MAX
-    } else {
-        count as usize
-    };
-    let n = crate::builtins::args::check_size(1, len)?;
+    let (_, n) = crate::builtins::args::check_shape(1.0, count)?;
     Ok(Matrix::row((0..n).map(|k| a + k as f64 * s).collect()))
 }
 
@@ -1091,14 +1088,56 @@ mod tests {
         let e = err_msg("x = 1:1e15");
         assert!(e.contains("1x1000000000000000"), "{e}");
         assert!(e.contains("exceeds the maximum array size"), "{e}");
-        // The limit is `check_size`'s, not a second policy of its own: one
+        // The limit is `check_shape`'s, not a second policy of its own: one
         // element past the cap is refused. (The range at the cap is 2 GiB, so
-        // it is left to `check_size`'s own test rather than built here.)
+        // it is left to `check_shape`'s own test rather than built here.)
         let cap = crate::builtins::args::MAX_ELEMS as f64;
         assert!(range(1.0, 1.0, cap + 1.0).is_err());
-        // A step that makes the count saturate a `usize` is refused too,
-        // rather than wrapping round to a small length.
-        assert!(range(0.0, 1e-300, 1e300).is_err());
+        // A count that overflows `f64` itself is refused under its own
+        // name, not as the `usize::MAX` it used to saturate to.
+        let e = err_msg("x = 0:1e-300:1e300;");
+        assert_eq!(e, "Requested 1xInf array exceeds the maximum array size.");
+        let e = range(0.0, 1.0, 1e300).unwrap_err().msg;
+        assert!(e.contains("1x1e+300"), "{e}");
+    }
+
+    #[test]
+    fn a_constructor_names_a_size_past_usize_as_asked() {
+        assert_eq!(
+            err_msg("zeros(1e300)"),
+            "Requested 1e+300x1e+300 array exceeds the maximum array size."
+        );
+        // Indexed growth is cycle 03's, and still names the clamp.
+        assert!(err_msg("x = []; x(1e300) = 1;").contains("18446744073709551615"));
+    }
+
+    #[test]
+    fn e_is_an_ordinary_name() {
+        assert_eq!(err_msg("disp(e)"), "Undefined function or variable 'e'.");
+        assert_eq!(ok_out("e = 5; disp(e)"), "     5\n");
+        assert_eq!(ok_out("fprintf('%.4f\\n', exp(1))"), "2.7183\n");
+    }
+
+    #[test]
+    fn toc_needs_an_earlier_bare_tic() {
+        let msg = "You must call TIC without an output argument before calling TOC \
+                   without an input argument.";
+        assert_eq!(err_msg("toc"), msg);
+        assert_eq!(err_msg("x = toc;"), msg);
+        // A handle from `t = tic` is not a bare tic.
+        assert_eq!(err_msg("t = tic; x = toc;"), msg);
+        assert_eq!(ok_out("t = tic; disp(toc(t) >= 0)"), "     1\n");
+        assert_eq!(ok_out("tic; x = toc; disp(x >= 0)"), "     1\n");
+    }
+
+    #[test]
+    fn size_vectors_reach_the_constructors_through_a_call() {
+        assert_eq!(
+            ok_out("A = ones(2, 3); disp(size(zeros(size(A))))"),
+            "     2     3\n"
+        );
+        assert_eq!(ok_out("disp(size(reshape(1:6, [], 2)))"), "     3     2\n");
+        assert_eq!(ok_out("disp(sum([1 2; 3 4], 'all'))"), "    10\n");
     }
 
     #[test]

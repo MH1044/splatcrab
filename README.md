@@ -24,7 +24,7 @@ x =
 ```
 
 SplatCrab is early software (version 0.1.0). The core language works:
-matrices, indexing, control flow, formatted output and 81 builtins. User
+matrices, indexing, control flow, formatted output and 80 builtins. User
 functions, cells, structs, complex numbers and plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
@@ -124,9 +124,16 @@ z
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`
 - Square `A\b`, `inv`, `det`, integer matrix powers
-- 81 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 80 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`
+- The argument forms MATLAB code uses: size vectors such as
+  `zeros(size(A))` and `reshape(A, [], 2)`, `true(n)` and `eps(x)`,
+  `sort(v, 'descend')`, `find(x, n, 'last')`, `norm(v, p)`, `diag(v, k)`,
+  `num2str(x, n)`, `round(x, n)` and `round(x, n, 'significant')`,
+  `sum(A, 'all')` and `max(A, [], 'all')`, and `dot` of two matrices. A char
+  option is never read as a dimension, and a third size other than `1` is the
+  clear error "N-D arrays are not supported."
 - A builtin that produces no value, such as `disp`, is legal as a statement
   and is "Too many output arguments." in an expression; every builtin rejects
   extra arguments with "Too many input arguments."
@@ -152,7 +159,7 @@ time.
               tokens       Stmt / Expr   tree-walking   column-major
               + lines      + lines       evaluator      f64 matrices
                                               │
-                                         builtins/    the 81 builtins,
+                                         builtins/    the 80 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

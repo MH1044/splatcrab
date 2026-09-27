@@ -105,10 +105,22 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 
 Use the helpers in `src/builtins/args.rs` for argument access; they produce
 the MATLAB-style messages. `need` and `at_most` bound the argument count,
-`mat`, `scalar` and `string` fetch one, `dim` reads a dimension argument
-(a positive integer), `size_arg` reads a size (a negative size is `0`), and
-`check_size` is the only sanctioned way to turn a user-supplied shape into an
-allocation length.
+`mat`, `scalar` and `string` fetch one, and `option` returns a char option
+such as `'descend'` for the caller to match. `dim` reads a dimension argument
+(a positive integer, never a char), and `dim_or_all` also accepts `'all'`,
+for the reductions that take it.
+
+A shape the user asks for goes through the size helpers and stays `f64` until
+it is judged, so that an oversized request is named as asked. `shape` reads a
+constructor's sizes: none (1x1), a scalar `n` (n x n), a row size vector, or
+two or more scalars, with trailing sizes of `1` dropped and any other third
+size the N-D error. `size_list` and `trailing_ones` are its lower layers, for
+a builtin such as `reshape` that takes a `[]` placeholder or has no n-by-n
+rule. `size_arg` and `size_value` read one size as an `f64`, where a negative
+size is `0`. `check_shape(rows, cols)` is the only sanctioned way to turn a
+requested shape into allocation lengths. `check_size` takes sizes that are
+already `usize` and serves indexed growth alone; do not use it for a new
+builtin.
 
 ### Add a statement
 
@@ -174,7 +186,6 @@ cycle named:
 
 | Deviation | Fixed in |
 |---|---|
-| Char arrays display with quotes; MATLAB shows them bare | 02 |
 | An exact zero prints as `0.0000` in a fixed-point row; MATLAB prints `0` | 02 |
 | Empty values print as `[]`; MATLAB prints `1x0 empty double row vector` | 02 |
 | Integer columns are too narrow for values of 1000 and above | 02 |
@@ -184,61 +195,108 @@ cycle named:
 | `norm` and `sort` accept vectors only | 08, 09 |
 | Backslash solves square systems only, and errors instead of warning | 08 |
 
+A row that read "Char arrays display with quotes; MATLAB shows them bare" was
+removed, because it misstated MATLAB. Since R2018a, `s = 'abc'` displays as
+`s =`, a blank line and `    'abc'`, with the quotes, which is what SplatCrab
+already prints; `disp('abc')` is bare in both. A multi-row char shows a
+`2×3 char array` header with each row quoted. Cycle 02 must keep the quotes.
+
 ## Known bugs
 
 Found while writing the cycle-0 unit tests, during the adversarial pass over
-the baseline, while migrating the builtins in cycle 01 and while closing
-cycle 01b; recorded rather than silently patched. Each is scheduled to a
-module. Cycle 01 fixed the sixteen rows scheduled to it, including the two
-process-killing panics, and cycle 01b the four scheduled to it: the two
-line-continuation defects, the missing `.\`, and the uncapped range. Fixed
-rows are removed from the table rather than marked done.
+the baseline, while migrating the builtins in cycle 01, while closing cycle
+01b, in the Phase 0 QA pass, and at the close of cycle 01c. The QA pass tested every FEATURES row, every
+builtin and an adversarial set against MATLAB's documentation and GNU Octave
+8.4. Its rows carry a "QA Dn" tag. Each row is recorded rather than silently
+patched, and each is scheduled to a cycle. The table is grouped by that cycle.
+Cycle 01 fixed the sixteen rows scheduled to it, including the two
+process-killing panics. Cycle 01b fixed the four scheduled to it: the two
+line-continuation defects, the missing `.\`, and the uncapped range. Cycle
+01c fixed the eighteen scheduled to it, the builtin argument forms and the
+QA pass's argument defects in the same builtins; it narrowed a nineteenth,
+"Constructors take two sizes only", which stays. Fixed rows are removed from
+the table rather than marked done.
+
+A row scheduled to a roadmap module that already lists it in its Scope stays
+there. A row scheduled to a bug-fix cycle (01c, 01d, 01e) is written into that
+cycle's spec when the spec is drafted. When a cycle fixes a row that a later
+spec also lists, it removes the row from that spec in the same commit.
 
 | Bug | Symptom | Fixed in |
 |---|---|---|
-| Chained ranges are rejected | `1:2:3:4` is a parse error; MATLAB reads it as `(1:2:3):4`. `parse_range` handles at most two colons and does not loop | later, low impact |
-| A parse error names the token by its `Debug` name | `y = x + ;` reports `unexpected Semi in expression`; the 01b spec's own example renders it `unexpected ';' in expression`. Only the rendering is wrong: the line number and the position are right. `err_line_parse.err` therefore asserts the `Line N:` prefix alone | later, low impact |
-| The REPL prints errors to stdout | `main`'s REPL branch uses `println!`, so a piped session cannot tell diagnostics from output; script mode correctly uses stderr. Visible in `repl_error_has_no_line.out`, which is why that case has no `.err` file | later, low impact |
-| A size past `usize` is named as the clamp | `x = 0:1e-300:1e300` and `zeros(1e300)` both report "Requested 1x18446744073709551615 array exceeds the maximum array size.", naming `usize::MAX` rather than the size actually asked for, because `args::clamp_to_usize` saturates before `check_size` sees the value. The refusal is clean and the limit is right; only the number in the message is an artefact. Pre-existing in `check_size`; cycle 01b gave it one more way in by routing `:` through the same helper | later, low impact |
-| `matmul` swallows `Inf` and `NaN` | `[Inf 0] * [0; 1]` gives `0`; MATLAB gives `NaN`. The `if b == 0.0 { continue }` sparsity shortcut skips the multiply, so `Inf * 0` and `NaN * 0` never happen | 08 |
-| `solve` uses an absolute pivot tolerance | `[1e-15 0; 0 1e-15] \ [1; 1]` reports a singular matrix, but it is diagonal and perfectly conditioned; only its scale trips the fixed `1e-14` threshold. The threshold should be relative to the matrix norm. This also means `det` and `solve` disagree about what singular means | 08 |
-| `%d` saturates at 64 bits | `fprintf('%d', 1e30)` prints `9223372036854775807`. Any integral value at or above `2^63` prints the clamp. `Inf` and `NaN` are handled correctly | 11 |
-| `printf` ignores precision on strings | `fprintf('[%5.2s]', 'abcdef')` gives `[abcdef]`; C and MATLAB give `[   ab]`, truncating before padding | 11 |
-| Indexed assignment into a char silently makes it numeric | `s = 'abc'; s(1) = 'X'` yields `88 98 99` rather than `Xbc`. Indexed growth and string indexing are both claimed for the baseline; the class conversion is silent | 02 |
-| `&&` and `\|\|` accept non-scalar and empty operands | `[1 1] && 1` gives 1; MATLAB requires operands convertible to a logical scalar and errors. Short-circuiting itself is correct | 02 |
-| Wide matrices print on one unwrapped line | `linspace(1, 2)` prints roughly 1300 characters; MATLAB wraps into `Columns 1 through 13` blocks | 02 |
-| A non-finite element forces the whole row to four decimals | `disp([1 2 NaN])` gives `    1.0000    2.0000       NaN`; MATLAB gives `     1     2   NaN`, because a `NaN` or an `Inf` does not stop MATLAB using the integer column format. `disp(NaN)` is `       NaN` rather than `   NaN`. This is what makes the `disp` half of cycle-01 acceptance bullets 15, 23 and 25 unwritable: `sort_nan_last`, `sign_nan` and `nan_inf_constructors` assert those values through `fprintf('%g')` instead and carry a `% NOTE` saying so. When this is fixed, give those three cases back the `disp` lines the spec bullets name. Already visible in `00-baseline/display_formats` as `x6` | 02 |
-| Empty-result shapes differ in several builtins | `find([])` and `diag([])` give `0x1` where MATLAB gives `0x0`; `size('')` gives `1 0` where MATLAB gives `0 0`; `s(:)` on a char gives a row where MATLAB gives a column; `disp([])` prints `[]` where MATLAB prints nothing | 02 |
-| Constants take no size argument | `pi(2)`, `e(2)` and `eps(2)` are now "Too many input arguments."; MATLAB fills a 2x2. Cycle 01 gave `NaN` and `Inf` their size arguments and added arity checks everywhere, which turned the old silent discard into an error. Belongs with `true(n)` and `false(n)` | 02 |
-| `sort` takes no direction | `sort(v, 'descend')` is now "Too many input arguments."; MATLAB sorts descending. The old code accepted the argument and ignored it, so it returned the ascending sort. Same family as the constants above: the cycle-01 arity checks turned a silently wrong answer into an honest error | 09 |
-| `find` takes no count | `find(x, k)` is now "Too many input arguments."; MATLAB returns the first `k` nonzero indices. The old code ignored `k` and returned every index | 03 |
-| `norm` takes no order | `norm(v, p)` is now "Too many input arguments."; MATLAB returns the p-norm. The old code ignored `p` and returned the 2-norm. Lands with matrix `norm` (1, 2, inf, fro) | 08 |
-| `diag` takes no offset | `diag(A, k)` and `diag(v, k)` are now "Too many input arguments."; MATLAB reads the k-th diagonal, or places the vector on it. The old code ignored `k` and used the main diagonal | 08 |
-| `num2str` takes no precision | `num2str(x, n)` is now "Too many input arguments."; MATLAB formats to `n` significant digits. The old code ignored `n`. Already named in cycle 11's Goal as `num2str(x,prec)` | 11 |
-| `round` takes no digit count | `round(x, n)` is now "Too many input arguments."; MATLAB rounds to `n` decimal places. The old code ignored `n` and rounded to an integer, like every other element-wise unary | 09 |
-| Constructors take two sizes only | `zeros(r, c, p)`, `ones(r, c, p)` and `rand(r, c, p)` are now "Too many input arguments."; MATLAB builds an r-by-c-by-p array. The old code built the 2-D array and dropped the third size. Needs N-D arrays, which no module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
-| `max` and `min` on an empty ignore the dimension | `max([], [], 1)` gives `0x0`; MATLAB gives `1x0`. The empty check comes before the dimension argument is read. Reductions were fixed in cycle 01; `max` and `min` return an empty either way, so this one is a shape difference rather than a wrong value | 02 |
-| `mod` and `rem` with an infinite divisor, unverified | `mod(5, Inf)` gives `NaN`; C `fmod` semantics suggest `5`. Not checked against a real MATLAB, so confirm before acting. Every other `mod` and `rem` edge tested is correct | verify first |
-| Loop variable after a zero-iteration `for`, unverified | After `for k = []; end` the variable keeps its previous value. MATLAB may assign the empty instead. Not checked against a real MATLAB | verify first |
-| `printf` checks neither width nor precision | `fprintf('%.65536f', 1)` panics with "Formatting argument out of range", because Rust's formatter holds precision in a `u16` and 65536 overflows it; 65535 is fine. `fprintf('%2147483647d', 1)` hangs instead, building a two-gigabyte pad. Both are reachable from one line of user input and kill the REPL. Pre-existing, not a cycle-01 regression | 11 |
+| `matmul` swallows `Inf` and `NaN` | `[Inf 0] * [0; 1]` gives `0`; MATLAB gives `NaN`. The `if b == 0.0 { continue }` sparsity shortcut skips the multiply, so `Inf * 0` and `NaN * 0` never happen. Also listed in cycle 08's Scope, which 01d removes it from | 01d |
+| `solve` uses an absolute pivot tolerance | `[1e-15 0; 0 1e-15] \ [1; 1]` reports a singular matrix, but it is diagonal and perfectly conditioned; only its scale trips the fixed `1e-14` threshold. The threshold should be relative to the matrix norm. This also means `det` and `solve` disagree about what singular means. Also listed in cycle 08's Scope | 01d |
+| `%d` saturates at 64 bits | `fprintf('%d', 1e30)` and `fprintf('%d', 2^63)` print `9223372036854775807`. Any integral value at or above `2^63` prints the clamp. `Inf` and `NaN` are handled correctly. Also listed in cycle 11's Scope | 01d |
+| `printf` ignores precision on strings | `fprintf('[%5.2s]', 'abcdef')` gives `[abcdef]`; C and MATLAB give `[   ab]`, truncating before padding. Also listed in cycle 11's Scope | 01d |
+| `printf` checks neither width nor precision (with QA D3) | `fprintf('%.65536f', 1)` panics with "Formatting argument out of range", because Rust's formatter holds precision in a `u16`. `fprintf('%.65535e\n', 1)` panics too (`assertion failed: ndigits > 0`), so the old note "65535 is fine" held for `%f` only; `%g`, `%s` of a non-integer and `%d` of a non-integer reach the same panics through their fallbacks. `fprintf('%2147483647d', 1)` builds a two-gigabyte pad and aborts in the allocator. `sprintf('%99999999999999999999d', 1)` silently ignores the width (`parse().unwrap_or(0)`). All are one line of user input and kill the REPL; the fix bounds width and precision for every conversion, and an absurd one is a clean error | 01d |
+| Result sizes are never checked (QA D1) | `x = ones(1e5, 1) + ones(1, 1e5);` aborts in the allocator (`memory allocation of 80000000000 bytes failed`, exit 134), and the REPL dies with it. So do `ones(1e5, 1) * ones(1, 1e5)`, `A(ones(1, 1e5), ones(1, 1e5))`, `sum(zeros(0, 1e15))` and `mean(zeros(1e15, 0), 2)`. `check_shape` guards constructors and `:`, and `check_size` guards growth, but neither guards broadcasting (`zip`), `matmul`, two-subscript indexing or `reduce` | 01d |
+| The `matmul` result size wraps, then panics (QA D2) | `x = zeros(2^32, 0) * zeros(0, 2^32); disp(size(x))` prints `4294967296 4294967296`, then `y = x';` panics with an index out of bounds (exit 101). `rows * cols` overflows in `Matrix::filled`; only a `debug_assert` guards `Matrix::new`. MATLAB raises a maximum-array-size error on the first line | 01d |
+| Results that should be complex are a silent `NaN` (QA D14) | `sqrt(-4)`, `log(-1)`, `log2(-8)`, `log10(-10)`, `asin(2)`, `acos(-2)`, `(-8)^(1/3)`, `(-8).^(1/3)` and `power(-2, 0.5)` all give `NaN`, exit 0. MATLAB gives complex values. Until cycle 10 a clean error is the honest answer; spec 09 already says such results "must error clearly until cycle 10" | 01d |
+| The colon operator and `linspace` miss their end points (QA D15) | `x = 0:0.1:0.3; x(end) == 0.3` is `0`, and `x = -1:0.01:1; all(x + fliplr(x) == 0)` is `0`; MATLAB gives `1` for both, because colon computes the second half from the right-hand end point, so the vector is symmetric and ends exactly on `b` (MATLAB Answers 53912, quoting the MathWorks technical note; Octave agrees). `x = linspace(-2.9, 1.17, 7); x(end) == 1.17` is `0`; linspace "always includes the endpoints". `size(1:Inf:5)` is `1 0`; MATLAB gives `1 1`, since the documented count `fix((k-j)/i)` is `0` | 01d |
+| A non-finite range end point gives an empty | `0:Inf` and `-Inf:1:0` are 1x0; MATLAB refuses them, and so does Octave 8.4 ("range with infinite number of elements cannot be stored"). `1:NaN` is 1x0 where Octave gives the 1x1 `NaN`; MATLAB is unverified there, so assert only the infinite cases. `range` returns early on any non-finite end point before the count is taken. Found at the close of cycle 01c | 01d |
+| `trace([])` is `-0` | `fprintf('%.4f', trace([]))` prints `-0.0000`; MATLAB gives `0`. The same root as QA D12: `trace` still uses Rust's `.sum()`, whose empty sum is `-0.0`. Cycle 01c fixed `sum`, `mean`, `norm` and `dot` through `math::sum0`, but `trace` was outside that bullet. Found at the close of cycle 01c | 01d |
+| `printf` conversions and flags differ from MATLAB (QA D16) | (a) `%E` and `%G` print a lower-case `e`. (b) `%s` of a non-integer uses `%g`: `sprintf('%s', pi)` is `3.14159` where the MATLAB `sprintf` page's own example gives `3.141593e+00`. (c) The `#` flag is ignored: `sprintf('%#.0f', 3)` is `3`, MATLAB `3.`. (d) The `0` flag pads a non-finite value: `sprintf('%05d', -Inf)` is `-0Inf`, MATLAB and C ` -Inf`. (e) The escapes `\xN`, `\N` (octal), `\a`, `\b`, `\f` and `\v` are not processed. (f) `%x`, `%X`, `%o` and a `*` width or precision are errors; MATLAB gives `ff` for `sprintf('%x', 255)` and `    3` for `sprintf('%*d', 5, 3)`. (g) An invalid conversion or a trailing `%` is an error; MATLAB "prints all text up to the invalid operator ... and discards the rest", so `sprintf('abc%q', 1)` is `abc` | 01d |
+| `mod` and `rem` with an infinite divisor, verify first | `mod(5, Inf)` and `rem(5, Inf)` give `NaN`. Octave 8.4 gives `NaN` too, and so do MATLAB's documented formulas `a - m.*floor(a./m)` and `a - b.*fix(a./b)` (the `mod` and `rem` reference pages). Nothing found supports the `5` that C `fmod` semantics would give, which this row used to suggest. It is still unverified against a real MATLAB, so no golden case asserts either way | 01d (verify first) |
+| Loop variable after a zero-iteration `for` | After `k = 7; for k = []; end`, `k` is still `7`; a loop variable that did not exist before stays undefined. MATLAB assigns an empty: in MATLAB Answers 499257 (R2015a), `whos` shows the index as `0x0 double` after a loop that did not run. Octave 8.4 assigns `[](0x0)` for `for k = []` and `[](1x0)` for `for j = 1:0`. The row used to say "unverified"; the bug is now settled, but the exact empty shape MATLAB gives for `1:0` is not | 01d |
+| `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a real MATLAB run | 01d (verify first) |
+| Chained ranges are rejected | `1:2:3:4` is a parse error; MATLAB reads it as `(1:2:3):4`. `parse_range` handles at most two colons and does not loop | 01e |
+| A parse error names the token by its `Debug` name | `y = x + ;` reports `unexpected Semi in expression`; the 01b spec's own example renders it `unexpected ';' in expression`. Likewise `Ident("x1F")`, `Num(0.3)`, `RParen` and `Eof`. Only the rendering is wrong: the line number and the position are right. `err_line_parse.err` therefore asserts the `Line N:` prefix alone | 01e |
+| The REPL prints errors to stdout | `main`'s REPL branch uses `println!`, so a piped session cannot tell diagnostics from output; script mode correctly uses stderr. Visible in `repl_error_has_no_line.out`, which is why that case has no `.err` file. Update that case deliberately and say so in the commit body | 01e |
+| Indexed assignment into a char silently makes it numeric | `s = 'abc'; s(1) = 'X'` yields `88 98 99` rather than `Xbc`, and growth `s(4) = 'd'` yields `97 98 0 100`. Indexed growth and string indexing are both claimed for the baseline; the class conversion is silent. Also listed in cycle 02's Scope, which 01e removes it from | 01e |
+| `&&` and `\|\|` accept non-scalar and empty operands | `[1 1] && 1` gives 1 and `[] \|\| 1` gives 1; MATLAB requires operands convertible to a logical scalar and errors. Short-circuiting itself is correct. Also listed in cycle 02's Scope | 01e |
+| `NaN` converts silently to a logical (QA D5) | `if NaN, disp('true'), end` prints `true`; `NaN & 1` is `1` and `~NaN` is `0`. MATLAB: "NaN's cannot be converted to logicals." Octave errors too. The same conversion as the `&&` row above | 01e |
+| Wide matrices print on one unwrapped line | `linspace(1, 2)` prints roughly 1300 characters; MATLAB wraps into `Columns 1 through 13` blocks. Also listed in cycle 02's Scope | 01e |
+| A non-finite element forces the whole row to four decimals | `disp([1 2 NaN])` gives `    1.0000    2.0000       NaN`; MATLAB gives `     1     2   NaN`, because a `NaN` or an `Inf` does not stop MATLAB using the integer column format. `disp(NaN)` is `       NaN` rather than `   NaN`. This is what makes the `disp` half of cycle-01 acceptance bullets 15, 23 and 25 unwritable: `sort_nan_last`, `sign_nan` and `nan_inf_constructors` assert those values through `fprintf('%g')` instead and carry a `% NOTE` saying so. When this is fixed, give those three cases back the `disp` lines the spec bullets name. Already visible in `00-baseline/display_formats` as `x6` | 01e |
+| Empty-result shapes differ in several builtins | `find([])` and `diag([])` give `0x1` where MATLAB gives `0x0`; `size('')` gives `1 0` where MATLAB gives `0 0`; `s(:)` on a char gives a row where MATLAB gives a column; `disp([])` prints `[]` where MATLAB prints nothing; `num2str([])` is 1x0. Also listed in cycle 02's Scope | 01e |
+| Deep nesting overflows the stack (QA D4) | About 96,000 nested parentheses (`x = ((…1…));`) abort with a stack overflow, exit 134. So do `[[…]]`, `abs(abs(…))`, `x(x(…))`, and a flat `1+1+…+1` of about 280,000 terms. 5,000 levels and 100,000 flat terms pass. MATLAB gives a clean error. A depth limit in the parser, with its own message, turns this into exit 1 | 01e |
+| `break` or `continue` outside a loop ends the script silently (QA D8) | `disp(1)` newline `break` newline `disp(2)` prints `1` and exits 0, and `disp(2)` never runs. MATLAB errors; Octave 8.4 gives the parse error "break must appear within a loop", and the same for `continue` | 01e |
+| An error in an `elseif` condition names the `if` line (QA D27) | `if 0` newline `elseif undefined_d` newline `end` reports `Line 1`; MATLAB and Octave report line 2 | 01e |
+| A UTF-8 BOM is rejected, and a non-UTF-8 file fails outside the `Error:` format (QA D29) | A file of the bytes `EF BB BF` then `disp(1)` gives `Error: Line 1: unexpected character '\u{feff}'`; MATLAB and Octave print `1`. A Windows-1252 comment (`% caf<E9>`) or a UTF-16LE file gives `Cannot read <path>: stream did not contain valid UTF-8`, which MATLAB and Octave read. A Windows editor or PowerShell produces both. The BOM fix is two lines; a lossy fallback for invalid UTF-8 is a decision for the spec | 01e |
+| Several error texts differ from current MATLAB (QA D33) | `Undefined function or variable 'x'.` is `Unrecognized function or variable 'x'.` in MATLAB R2020a+; `Arrays have incompatible sizes for operator '+' (1x3 vs 1x2).` is `Arrays have incompatible sizes for this operation.`; the `x(0)` text ends `... must be positive integers or logical values.` in MATLAB. From knowledge, and secondary to behaviour. Decide the policy once and record it | 01e |
+| The REPL discards an incomplete block at EOF (QA D36) | `printf 'for k=1:3\ndisp(k)\n' \| splatcrab` prints nothing and exits 0. MATLAB has no EOF equivalent; Octave reports a parse error | 01e |
+| Char arrays lose their class in rearrangement (QA D17) | `fliplr('abc')` displays `99 98 97`; MATLAB gives `'cba'`. The same holds for `'ab'.'`, `flipud`, `repmat`, `reshape`, `sort('cab')` and `s = []; s = [s 'abc']`. The reverse too: `x = +'a'` stays `'a'`, where MATLAB gives `97`. Several of these need a multi-row char, which only exists once `Value::Str` is gone | 02 |
+| Scalar display ignores MATLAB's fixed-point range (QA D20) | `x = 1234.5` displays ` 1234.5000`; MATLAB `   1.2345e+03`. `x = 12345.6` gives `12345.6000` flush left, `x = 0.001` gives `    0.0010` (MATLAB and Octave `1.0000e-03`), and `x = 1e10` gives `   10000000000` (MATLAB `   1.0000e+10`). Cycle 02's acceptance test 10 claims it | 02 |
+| `disp` of a comparison uses the double width (QA D38) | `disp(3 > 1)` prints `     1`; MATLAB's logical display prints `   1`. README's quick tour shows it | 02 |
+| A logical mask with no zeros indexes element 1 (QA D6) | `x = [5 6 7]; x(x > 0)` gives `5 5 5`, and `x(x > 0) = 0` gives `0 6 7`; MATLAB gives `5 6 7` and `0 0 0`. Comparisons return doubles today, so the mask is read as a list of indices. Cycle 02 makes comparisons logical and must then refuse a logical index rather than read it as indices; cycle 03 implements logical indexing | 03 |
+| Trailing singleton subscripts are rejected (QA D22) | `A = [1 2; 3 4]; A(2, 1, 1)` is "Only 1-D and 2-D indexing is supported."; MATLAB gives `3` (Octave agrees) | 03 |
+| A size past `usize` is named as the clamp: indexed growth | `x = []; x(1e300) = 1` reports `Requested 1x18446744073709551615 array exceeds the maximum array size.`, because `eval_index_args` saturates the index before `check_size` sees it. Split from the constructor row, which cycle 01c fixed; cycle 03 rewrites `assign_index` | 03 |
+| Multiple assignment is unsupported (QA D32) | `[r, c] = size(ones(2, 3))` is "invalid assignment target". Cycle 03 claims `Stmt::MultiAssign` | 03 |
+| `%{ … %}` block comments execute (QA D7) | `%{` newline `disp(111)` newline `%}` prints `111`; MATLAB prints nothing. Cycle 04 claims block comments | 04 |
+| `error` misreads its arguments (QA D9) | `error('100% sure')` reports `100ure`; with one argument MATLAB applies no format or escape processing, so the message is `100% sure` (the `error` page). `error('MyPkg:myId', 'Value %d too big', 7)` reports `MyPkg:myId`; MATLAB reports `Value 7 too big` and attaches the identifier. `error('')` followed by `disp(2)` exits 1; "If all inputs to error are empty, MATLAB does not throw an error", so `2` prints. Cycle 04 owns `error('id:x', fmt, …)` | 04 |
+| Command syntax is unsupported (QA D31) | `x = 1; clear x` is a parse error, and so are `clear all`, `format long` and `disp hello`. A newcomer hits it in the first minute. Cycle 04 claims command syntax | 04 |
+| `inv` and `A^-1` of a singular matrix are errors (QA D26) | `inv([1 2; 2 4])` exits 1 with "Matrix is singular to working precision."; MATLAB prints that text as a warning and returns `Inf Inf; Inf Inf`, and `inv(0)` is `Inf` (Octave the same). It needs `warning` from cycle 04, and goes with the backslash deviation | 08 |
+| `num2str` of a matrix gives one row in column-major order (QA D13) | `num2str([1 2; 3 4])` is the 1x10 `'1  3  2  4'`; MATLAB gives the 2x4 char `'1  2'` / `'3  4'`. `num2str([1 -2 300])` spaces its columns differently too. It needs the multi-row char of cycle 02 | 11 |
+| `fprintf` rejects a file id and cannot return a byte count (QA D25) | `fprintf(1, 'hi\n')` is "The first argument must be a format string."; MATLAB writes `hi`, and `fprintf(2, ...)` writes to stderr. `n = fprintf('hi\n')` prints `hi` then "Too many output arguments."; MATLAB sets `n = 3`. Cycle 11 owns `fprintf(fid, ...)`; a file id of 2 needs the stderr sink that cycle 04's `warning` introduces | 11 |
+| Non-BMP characters count as one element (QA D37) | `length('😀')` is `1`; MATLAB, whose char is UTF-16, gives `2` | 11 |
+| `exit` and `quit` work only as bare REPL lines (QA D28) | A script ending in `exit` fails with "Undefined function or variable 'exit'." In the REPL, `exit;`, `quit;`, `exit(3)` and an `exit` inside a block are not recognised, and the final exit code is always 0. MATLAB's `exit` ends the session, and `exit(3)` exits with code 3. Cycle 13 claims `exit` | 13 |
+| Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
+| Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected Ident("x1F")`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 
-The two process-killing panics that used to head this list, `num2str(Inf)` and
-`zeros(1e10)`, were the first thing cycle 01 fixed, before a single builtin
-moved. Cycle 01b closed the third, the uncapped range, by routing the `:`
-operator through `args::check_size` like every builtin shape. **Two rows of
-that family are still open**, both pre-existing rather than regressions:
-`printf` checks neither its width nor its precision. `check_size` covers a
-size that arrives at a builtin and now the `:` operator too, but not a digit
-count taken from a format string. **Invariant 6 is therefore not yet
-restored**, and no document should claim it is until those two rows are gone.
+**The process-killing family.** The two panics that used to head this list,
+`num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a
+single builtin moved. Cycle 01b closed the third, the uncapped range, by
+routing the `:` operator through `args::check_size` like every builtin shape
+(since cycle 01c, both go through `args::check_shape`).
+The QA pass found that the family is larger than the two `printf` rows that
+were left. `printf` width and precision still panic or abort. A result size
+from broadcasting, `matmul`, two-subscript indexing or a reduction is never
+checked, so it aborts in the allocator (QA D1). A `matmul` size can wrap and
+then panic (QA D2). Deep nesting overflows the stack (QA D4). The first three
+are cycle 01d's and the last is 01e's. **Invariant 6 is therefore not yet
+restored**, and no document should claim it is until those rows are gone.
 
 Because of this, `src/main.rs` joins the interpreter thread with
 `unwrap_or(101)`, not `unwrap_or(1)`. A panic must stay distinguishable from a
 clean error by exit code, since that is the golden harness's main tripwire: a
 case with an `.err` file expects exit 1, so a panic reported as 1 could pass a
-test that was meant to prove the opposite.
+test that was meant to prove the opposite. An allocator abort or a stack
+overflow exits 134, which is distinguishable from both.
 
-Two entries are marked "verify first". They were found by reading the code and
-reasoning about MATLAB, not by running MATLAB, and the entries
-say so. Confirm the real behaviour before writing a test that asserts either
-way: an expected-output file that encodes a guess is worse than no test.
+Two entries are marked "verify first": `mod` and `rem` with an infinite
+divisor, and `for` over a matrix with no rows. Both were found by reasoning
+about MATLAB rather than by running it. The QA pass checked them against the
+MATLAB pages and Octave and could not settle either. Confirm the real
+behaviour before writing a test that asserts either way: an expected-output
+file that encodes a guess is worse than no test. The third former "verify
+first" row, the loop variable after a zero-iteration `for`, is now settled as
+a real bug.

@@ -1,0 +1,13 @@
+% covers: 10 - max and min on an empty: the reduced dimension becomes 1 unless its size is 0, then the input's size
+disp(size(max(zeros(3, 0))))
+disp(size(max(zeros(0, 3))))
+disp(size(max(zeros(0, 3), [], 2)))
+disp(size(min(zeros(3, 0), [], 2)))
+disp(size(max([], [], 1)))
+disp(size(min(zeros(1, 0))))
+disp(size(max([])))
+disp(size(min(zeros(0, 1))))
+disp(size(max(zeros(1, 0), [], 1)))
+disp(size(min([], [], 2)))
+disp(size(max(zeros(0, 3), [], 1)))
+disp(size(min(zeros(3, 0), [], 1)))

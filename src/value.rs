@@ -96,8 +96,10 @@ impl Matrix {
         self.data.is_empty()
     }
 
+    /// MATLAB's `isvector`: 1-by-N or N-by-1, where N may be `0`. A 1x0 and a
+    /// 0x1 are vectors; a 0x0 is not.
     pub fn is_vector(&self) -> bool {
-        (self.rows == 1 || self.cols == 1) && !self.is_empty()
+        self.rows == 1 || self.cols == 1
     }
 
     pub fn get(&self, r: usize, c: usize) -> f64 {
@@ -423,6 +425,11 @@ mod tests {
         assert!(Matrix::col(vec![1.0, 2.0]).is_vector());
         assert!(!rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).is_vector());
         assert!(!Matrix::empty().is_vector());
+        // 1-by-N or N-by-1 with N = 0 is still a vector; 2x0 is not.
+        assert!(Matrix::new(1, 0, vec![]).is_vector());
+        assert!(Matrix::new(0, 1, vec![]).is_vector());
+        assert!(!Matrix::new(2, 0, vec![]).is_vector());
+        assert!(Matrix::scalar(1.0).is_vector());
         assert_eq!(Matrix::identity(2, 3).data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         // MATLAB truthiness: non-empty and every element non-zero.
         assert!(Matrix::row(vec![1.0, 2.0]).is_true());

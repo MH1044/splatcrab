@@ -17,6 +17,17 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - `Expr::Access(name, Vec<Access>)` + `LValue`
 - `Stmt::MultiAssign` with `~`
 - `nargout`-aware `max min sort size find`
+- Trailing singleton subscripts (QA D22): `A(2, 1, 1)`, `A(:, :, 1)` and
+  `A(1, 2, 1) = 9` work, with `end` equal to 1 in a third position, and a
+  third index past 1 is the usual "Index in position 3 exceeds array bounds"
+  error
+- A logical mask is a mask, never a list of indices, including a mask with
+  no zeros (QA D6): `x(x > 0)` on `[5 6 7]` is `5 6 7`, not `5 5 5`
+- The size-overflow message for indexed growth names the size asked for:
+  `x = []; x(1e300) = 1` reports `1x1e+300`, not `usize::MAX`. Keep the
+  requested size as `f64` and judge it with `args::check_shape`, whose
+  `fmt_dim` formatting cycle 01c added for constructors and the colon;
+  `check_size`, which growth reaches today, renders the saturated `usize`
 
 ## Out of scope
 
@@ -56,6 +67,9 @@ Every new error message needs an `err_*` case.
 12. `[a, b] = 5` → err `Insufficient number of outputs from right hand side of equal sign to satisfy assignment.`; `[a, b] = sum([1 2])` → err `Too many output arguments.`
 13. Perf guard: `z = []; for k = 1:200000, z(end+1) = k; end; disp(numel(z))` → `    200000` well under one second.
 14. Parser unit tests: `x{2}`, `s.a`, `s.(n)`, `c{1}(2).b` produce the expected `Access` chains; `[a, ~, c] = f(x)` parses to `MultiAssign`.
+15. `A = [1 2; 3 4]; disp(A(2, 1, 1)); disp(A(:, :, 1)); A(1, 2, 1) = 9; disp(A)` → `     3\n     1     2\n     3     4\n     1     9\n     3     4`; `A(1, 1, 2)` → err `Index in position 3 exceeds array bounds. Index must not exceed 1.`
+16. `x = [5 6 7]; disp(x(x > 0)); x(x > 0) = 0; disp(x)` → `     5     6     7\n     0     0     0`
+17. `x = []; x(1e300) = 1` → err containing `Requested 1x1e+300 array`, exit code 1.
 
 ## Status
 

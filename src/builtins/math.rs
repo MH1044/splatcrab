@@ -1,7 +1,8 @@
 //! Reductions, element-wise math and the two-argument numeric functions.
 
-use super::args::{at_most, dim, mat, need};
+use super::args::{Along, at_most, dim, dim_or_all, mat, need, option};
 use super::{Registry, add, one_mat};
+use crate::error;
 use crate::interp::R;
 use crate::value::{Matrix, Value};
 
@@ -9,13 +10,13 @@ use crate::value::{Matrix, Value};
 #[rustfmt::skip]
 pub fn register(r: &mut Registry) {
     // ---- reductions --------------------------------------------------
-    add(r, "sum", |_, a, _| reduction(a, "sum", Red::Sum), "sum(A), sum(A,dim) - sum of the elements.");
-    add(r, "prod", |_, a, _| reduction(a, "prod", Red::Prod), "prod(A), prod(A,dim) - product of the elements.");
-    add(r, "mean", |_, a, _| reduction(a, "mean", Red::Mean), "mean(A), mean(A,dim) - average of the elements.");
-    add(r, "any", |_, a, _| reduction(a, "any", Red::Any), "any(A), any(A,dim) - true if any element is non-zero.");
-    add(r, "all", |_, a, _| reduction(a, "all", Red::All), "all(A), all(A,dim) - true if every element is non-zero.");
-    add(r, "max", |_, a, _| extremum(a, "max", true), "max(A), max(A,B), max(A,[],dim) - largest elements.");
-    add(r, "min", |_, a, _| extremum(a, "min", false), "min(A), min(A,B), min(A,[],dim) - smallest elements.");
+    add(r, "sum", |_, a, _| reduction(a, "sum", Red::Sum), "sum(A), sum(A,dim), sum(A,'all') - sum of the elements.");
+    add(r, "prod", |_, a, _| reduction(a, "prod", Red::Prod), "prod(A), prod(A,dim), prod(A,'all') - product of the elements.");
+    add(r, "mean", |_, a, _| reduction(a, "mean", Red::Mean), "mean(A), mean(A,dim), mean(A,'all') - average of the elements.");
+    add(r, "any", |_, a, _| reduction(a, "any", Red::Any), "any(A), any(A,dim), any(A,'all') - true if any element is non-zero, ignoring NaN.");
+    add(r, "all", |_, a, _| reduction(a, "all", Red::All), "all(A), all(A,dim), all(A,'all') - true if every element is non-zero.");
+    add(r, "max", |_, a, _| extremum(a, "max", true), "max(A), max(A,B), max(A,[],dim), max(A,[],'all') - largest elements.");
+    add(r, "min", |_, a, _| extremum(a, "min", false), "min(A), min(A,B), min(A,[],dim), min(A,[],'all') - smallest elements.");
     add(r, "cumsum", |_, a, _| cumulative(a, "cumsum", true), "cumsum(A), cumsum(A,dim) - cumulative sum.");
     add(r, "cumprod", |_, a, _| cumulative(a, "cumprod", false), "cumprod(A), cumprod(A,dim) - cumulative product.");
 
@@ -37,7 +38,7 @@ pub fn register(r: &mut Registry) {
     add(r, "tanh", |_, a, _| unary(a, "tanh", f64::tanh), "tanh(X) - hyperbolic tangent.");
     add(r, "floor", |_, a, _| unary(a, "floor", f64::floor), "floor(X) - round towards minus infinity.");
     add(r, "ceil", |_, a, _| unary(a, "ceil", f64::ceil), "ceil(X) - round towards plus infinity.");
-    add(r, "round", |_, a, _| unary(a, "round", f64::round), "round(X) - round to the nearest integer.");
+    add(r, "round", |_, a, _| round(a), "round(X), round(X,n), round(X,n,'significant') - round, ties away from zero.");
     add(r, "fix", |_, a, _| unary(a, "fix", f64::trunc), "fix(X) - round towards zero.");
     add(r, "sign", |_, a, _| unary(a, "sign", sign_of), "sign(X) - -1, 0 or 1 by sign; NaN stays NaN.");
 
@@ -106,22 +107,40 @@ enum Red {
     All,
 }
 
+/// The sum of `xs`, starting from `+0`. Rust's `f64` `Sum` starts from `-0`,
+/// which made `fprintf('%.4f', sum([]))` print `-0.0000`; MATLAB gives `0`.
+pub fn sum0(xs: &[f64]) -> f64 {
+    xs.iter().fold(0.0, |acc, v| acc + v)
+}
+
 fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
     at_most(args, 2, name)?;
     let m = mat(args, 0, name)?;
-    let d = if args.len() >= 2 {
-        Some(dim(args, 1, name)?)
+    let along = if args.len() >= 2 {
+        Some(dim_or_all(args, 1, name)?)
     } else {
         None
     };
     let f: fn(&[f64]) -> f64 = match kind {
-        Red::Sum => |xs| xs.iter().sum(),
+        Red::Sum => sum0,
         Red::Prod => |xs| xs.iter().product(),
-        Red::Mean => |xs| xs.iter().sum::<f64>() / xs.len() as f64,
-        Red::Any => |xs| xs.iter().any(|v| *v != 0.0) as u8 as f64,
+        Red::Mean => |xs| sum0(xs) / xs.len() as f64,
+        // "any ignores elements of A that are NaN" (the MATLAB page).
+        Red::Any => |xs| xs.iter().any(|v| *v != 0.0 && !v.is_nan()) as u8 as f64,
         Red::All => |xs| xs.iter().all(|v| *v != 0.0) as u8 as f64,
     };
-    one_mat(reduce(&m, d, f))
+    one_mat(match along {
+        None => reduce(&m, None, f),
+        Some(Along::Dim(d)) => reduce(&m, Some(d), f),
+        Some(Along::All) => reduce_all(&m, f),
+    })
+}
+
+/// The reduction over `A(:)`, which is what `'all'` means: one 1x1 answer
+/// from every element at once. An empty `A` gives the identity element, so
+/// `sum([], 'all')` is `0` and `prod([], 'all')` is `1`.
+fn reduce_all(m: &Matrix, f: impl Fn(&[f64]) -> f64) -> Matrix {
+    Matrix::scalar(f(&m.data))
 }
 
 fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
@@ -143,13 +162,11 @@ fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
         };
         return one_mat(m.zip(&b, name, f)?);
     }
-    if m.is_empty() {
-        return one_mat(Matrix::empty());
-    }
-    let d = if args.len() >= 3 {
-        Some(dim(args, 2, name)?)
+    let along = if args.len() >= 3 {
+        dim_or_all(args, 2, name)?
     } else {
-        None
+        // The first non-singleton dimension, which for a 0x0 is the first.
+        Along::Dim(if m.rows == 1 { 2 } else { 1 })
     };
     let f = move |xs: &[f64]| {
         xs.iter()
@@ -165,7 +182,116 @@ fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
                 }
             })
     };
-    one_mat(reduce(&m, d, f))
+    match along {
+        // No identity element, so an empty stays empty: `max([], [], 'all')`
+        // is the 0x0 `[]`.
+        Along::All if m.is_empty() => one_mat(Matrix::empty()),
+        Along::All => one_mat(reduce_all(&m, f)),
+        Along::Dim(d) => one_mat(extremum_along(&m, d, f)),
+    }
+}
+
+/// `max` or `min` along `d`, with MATLAB's rule for an empty: "If
+/// size(A,dim) is 0, then max(A,dim) returns an empty array with the same
+/// size as A." Otherwise the reduced dimension becomes 1, even when the other
+/// one is 0, so `max(zeros(3, 0))` is 1x0 and `max(zeros(0, 3), [], 2)` is
+/// 0x1. `max` has no identity element, which is why this is not `sum`'s rule.
+fn extremum_along(m: &Matrix, d: usize, f: impl Fn(&[f64]) -> f64) -> Matrix {
+    let len = match d {
+        1 => m.rows,
+        2 => m.cols,
+        _ => 1,
+    };
+    if len == 0 {
+        return m.clone();
+    }
+    reduce(m, Some(d), f)
+}
+
+// ---- round -----------------------------------------------------------
+
+/// `round(X)`, `round(X, n)`, `round(X, n, 'decimals')` and
+/// `round(X, n, 'significant')`, element-wise, ties away from zero.
+fn round(args: &[Value]) -> R<Vec<Value>> {
+    at_most(args, 3, "round")?;
+    let m = mat(args, 0, "round")?;
+    if args.len() == 1 {
+        return one_mat(m.map(f64::round));
+    }
+    let significant = match args.get(2) {
+        None => false,
+        Some(_) => match option(args, 2) {
+            Some(t) if t.eq_ignore_ascii_case("decimals") => false,
+            Some(t) if t.eq_ignore_ascii_case("significant") => true,
+            _ => return Err(error::round_type()),
+        },
+    };
+    let n = match (option(args, 1), mat(args, 1, "round")?.scalar_value()) {
+        (None, Some(n)) if n.fract() == 0.0 => n,
+        _ if significant => return Err(error::round_significant()),
+        _ => return Err(error::round_digits()),
+    };
+    if significant {
+        if n < 1.0 {
+            return Err(error::round_significant());
+        }
+        return one_mat(m.map(|x| round_significant(x, n)));
+    }
+    one_mat(m.map(|x| round_decimals(x, n)))
+}
+
+/// `10^k` correctly rounded, `Inf` past the top of the range and `0` past the
+/// bottom. The decimal parser is exact where `powi` accumulates error.
+fn pow10(k: f64) -> f64 {
+    format!("1e{}", k.clamp(-400.0, 400.0))
+        .parse()
+        .unwrap_or(f64::NAN)
+}
+
+/// `x` rounded to the nearest multiple of `10^-n`, for an integer `n`.
+///
+/// Two guards keep the scaling honest. For `n > 0`, when `10^n` or `x * 10^n`
+/// is not finite, or `x * 10^n` is at least 2^52 and so already an integer,
+/// `x` is its own answer: `round(pi, 20)` is `pi` and `round(1e307, 2)` is
+/// `1e307`. For `n < 0`, a `10^-n` past the range makes every finite `x` a
+/// tiny fraction of the step, so the answer is `0` (`round(5, -400)`), not
+/// the `NaN` that `0 * Inf` would give; and an `x / 10^-n` of at least 2^52
+/// is already a multiple of the step, so `x` is its own answer there too.
+pub fn round_decimals(x: f64, n: f64) -> f64 {
+    const INTEGRAL: f64 = 4_503_599_627_370_496.0; // 2^52
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    if n == 0.0 {
+        return x.round();
+    }
+    if n > 0.0 {
+        let p = pow10(n);
+        let y = x * p;
+        if !p.is_finite() || !y.is_finite() || y.abs() >= INTEGRAL {
+            return x;
+        }
+        y.round() / p
+    } else {
+        let p = pow10(-n);
+        if !p.is_finite() {
+            return 0.0;
+        }
+        let y = x / p;
+        if y.abs() >= INTEGRAL {
+            return x;
+        }
+        y.round() * p
+    }
+}
+
+/// `x` rounded to `n` significant digits, `n >= 1`: decimals
+/// `n - floor(log10(abs(x))) - 1`. `0`, `Inf` and `NaN` pass through.
+pub fn round_significant(x: f64, n: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 {
+        return x;
+    }
+    round_decimals(x, n - x.abs().log10().floor() - 1.0)
 }
 
 /// Reduce along a dimension. Without one, MATLAB picks the first dimension
@@ -338,9 +464,258 @@ mod tests {
             reduction(&three, "sum", Red::Sum).unwrap_err().msg,
             "Too many input arguments."
         );
+        let four = [
+            one[0].clone(),
+            one[0].clone(),
+            one[0].clone(),
+            one[0].clone(),
+        ];
+        assert_eq!(round(&four).unwrap_err().msg, "Too many input arguments.");
         assert!(binary(&one, "mod", f64::atan2).is_err());
         assert!(binary(&two, "mod", f64::atan2).is_ok());
         assert!(extremum(&three, "max", true).is_ok());
+    }
+
+    fn call(args: &[Value], name: &str, kind: Red) -> R<Matrix> {
+        Ok(reduction(args, name, kind)?[0].clone().into_mat())
+    }
+
+    fn val(m: Matrix) -> Value {
+        Value::Mat(m)
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Str(s.to_string())
+    }
+
+    #[test]
+    fn an_empty_sum_is_positive_zero() {
+        assert!(sum0(&[]).is_sign_positive());
+        assert_eq!(sum0(&[1.0, 2.0]), 3.0);
+        let s = call(&[val(Matrix::empty())], "sum", Red::Sum).unwrap();
+        assert_eq!(s.data, [0.0]);
+        assert!(s.data[0].is_sign_positive(), "sum([]) is -0");
+        let z = call(&[val(Matrix::filled(0, 3, 0.0))], "sum", Red::Sum).unwrap();
+        assert!(z.data.iter().all(|v| v.is_sign_positive()));
+        assert!(
+            call(&[val(Matrix::empty())], "mean", Red::Mean)
+                .unwrap()
+                .data[0]
+                .is_nan()
+        );
+    }
+
+    #[test]
+    fn any_ignores_nan_and_all_does_not() {
+        let any = |v: &[f64]| call(&[val(Matrix::row(v.to_vec()))], "any", Red::Any).unwrap();
+        let all = |v: &[f64]| call(&[val(Matrix::row(v.to_vec()))], "all", Red::All).unwrap();
+        assert_eq!(any(&[f64::NAN]).data, [0.0]);
+        assert_eq!(any(&[f64::NAN, 0.0]).data, [0.0]);
+        assert_eq!(any(&[f64::NAN, 1.0]).data, [1.0]);
+        assert_eq!(all(&[f64::NAN]).data, [1.0]);
+        let m = rmat(2, 2, &[f64::NAN, 0.0, 0.0, 2.0]);
+        let by_row = call(&[val(m), val(Matrix::scalar(2.0))], "any", Red::Any).unwrap();
+        assert_eq!(by_row, Matrix::col(vec![0.0, 1.0]));
+    }
+
+    #[test]
+    fn all_reduces_over_every_element() {
+        let a = val(rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]));
+        let all = text("all");
+        assert_eq!(
+            call(&[a.clone(), all.clone()], "sum", Red::Sum)
+                .unwrap()
+                .data,
+            [10.0]
+        );
+        assert_eq!(
+            call(&[a.clone(), all.clone()], "prod", Red::Prod)
+                .unwrap()
+                .data,
+            [24.0]
+        );
+        assert_eq!(
+            call(&[a.clone(), all.clone()], "mean", Red::Mean)
+                .unwrap()
+                .data,
+            [2.5]
+        );
+        assert_eq!(
+            call(&[a.clone(), all.clone()], "all", Red::All)
+                .unwrap()
+                .data,
+            [1.0]
+        );
+        let nan = val(rmat(2, 2, &[0.0, 0.0, 0.0, f64::NAN]));
+        assert_eq!(
+            call(&[nan, all.clone()], "any", Red::Any).unwrap().data,
+            [0.0]
+        );
+        // An empty reduces to the identity element, as a 1x1.
+        let e = call(
+            &[val(Matrix::filled(0, 3, 0.0)), all.clone()],
+            "sum",
+            Red::Sum,
+        )
+        .unwrap();
+        assert_eq!(e, Matrix::scalar(0.0));
+        let e = call(&[val(Matrix::empty()), all.clone()], "prod", Red::Prod).unwrap();
+        assert_eq!(e, Matrix::scalar(1.0));
+        let max = |a: &[Value]| extremum(a, "max", true).unwrap()[0].clone().into_mat();
+        let none = val(Matrix::empty());
+        assert_eq!(max(&[a.clone(), none.clone(), all.clone()]).data, [4.0]);
+        let min = extremum(&[a.clone(), none.clone(), all.clone()], "min", false).unwrap();
+        assert_eq!(min[0].clone().into_mat().data, [1.0]);
+        // max has no identity element, so an empty stays the empty.
+        let e = max(&[none.clone(), none.clone(), all]);
+        assert_eq!((e.rows, e.cols), (0, 0));
+        // Any other char is a bad dimension, never a character code.
+        let e = reduction(&[a.clone(), text("x")], "sum", Red::Sum)
+            .unwrap_err()
+            .msg;
+        assert_eq!(
+            e,
+            "Dimension argument to 'sum' must be a positive integer scalar."
+        );
+        assert!(extremum(&[a, none, text("x")], "max", true).is_err());
+    }
+
+    #[test]
+    fn max_and_min_of_an_empty_follow_the_empty_dimension_rule() {
+        let shape = |m: Matrix, d: Option<f64>, is_max: bool| {
+            let mut args = vec![val(m)];
+            if let Some(d) = d {
+                args.push(val(Matrix::empty()));
+                args.push(val(Matrix::scalar(d)));
+            }
+            let r = extremum(&args, "max", is_max).unwrap()[0]
+                .clone()
+                .into_mat();
+            (r.rows, r.cols)
+        };
+        let z = |r, c| Matrix::filled(r, c, 0.0);
+        assert_eq!(shape(z(3, 0), None, true), (1, 0));
+        assert_eq!(shape(z(0, 3), None, true), (0, 3));
+        assert_eq!(shape(z(0, 3), Some(2.0), true), (0, 1));
+        assert_eq!(shape(z(3, 0), Some(2.0), false), (3, 0));
+        assert_eq!(shape(z(0, 0), Some(1.0), true), (0, 0));
+        assert_eq!(shape(z(0, 0), None, true), (0, 0));
+        assert_eq!(shape(z(1, 0), None, false), (1, 0));
+        assert_eq!(shape(z(0, 3), Some(3.0), true), (0, 3));
+        // A non-empty input is unchanged by the rule.
+        assert_eq!(shape(z(2, 3), None, true), (1, 3));
+        assert_eq!(shape(z(2, 3), Some(2.0), true), (2, 1));
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn round_to_decimals_scales_by_a_power_of_ten() {
+        let pi = std::f64::consts::PI;
+        assert!(close(round_decimals(pi, 2.0), 314.0 / 100.0));
+        assert!(close(round_decimals(pi, 3.0), 3142.0 / 1000.0));
+        assert!(close(round_decimals(-pi, 1.0), -3.1));
+        assert_eq!(round_decimals(2.5, 0.0), 3.0);
+        assert_eq!(round_decimals(-2.5, 0.0), -3.0);
+        // Negative n rounds to tens, hundreds, ...
+        assert_eq!(round_decimals(863_178_137.0, -2.0), 863_178_100.0);
+        assert_eq!(round_decimals(1234.0, -1.0), 1230.0);
+        assert_eq!(round_decimals(-1250.1, -2.0), -1300.0);
+        // Ties go away from zero.
+        assert_eq!(round_decimals(150.0, -2.0), 200.0);
+        assert_eq!(round_decimals(-150.0, -2.0), -200.0);
+    }
+
+    #[test]
+    fn round_guards_against_scaling_out_of_range() {
+        let pi = std::f64::consts::PI;
+        // Already an integer at the scale: x itself, exactly.
+        assert_eq!(round_decimals(pi, 20.0), pi);
+        assert_eq!(round_decimals(pi, 16.0), pi);
+        // The scaled value overflows: x itself.
+        assert_eq!(round_decimals(1e307, 2.0), 1e307);
+        // 10^n itself overflows: x itself.
+        assert_eq!(round_decimals(pi, 400.0), pi);
+        assert_eq!(round_decimals(pi, 1e300), pi);
+        // 10^-n overflows: every finite x is a tiny part of the step.
+        assert_eq!(round_decimals(5.0, -400.0), 0.0);
+        assert_eq!(round_decimals(1e300, -1e300), 0.0);
+        // A huge x with a negative n is already a multiple.
+        assert_eq!(round_decimals(1e300, -2.0), 1e300);
+        // Non-finite values and zero pass through.
+        assert!(round_decimals(f64::NAN, 2.0).is_nan());
+        assert_eq!(round_decimals(f64::INFINITY, -2.0), f64::INFINITY);
+        assert_eq!(round_decimals(0.0, -400.0), 0.0);
+        // A tiny x underflows cleanly to zero.
+        assert_eq!(round_decimals(1e-300, 5.0), 0.0);
+    }
+
+    #[test]
+    fn round_to_significant_digits() {
+        assert_eq!(round_significant(1253.0, 2.0), 1300.0);
+        assert!(close(round_significant(1.345, 2.0), 1.3));
+        assert_eq!(round_significant(120.44, 2.0), 120.0);
+        assert!(close(round_significant(0.012345, 3.0), 0.0123));
+        assert_eq!(round_significant(-987.0, 1.0), -1000.0);
+        assert_eq!(round_significant(0.0, 3.0), 0.0);
+        assert!(round_significant(f64::NAN, 3.0).is_nan());
+        assert_eq!(round_significant(f64::NEG_INFINITY, 3.0), f64::NEG_INFINITY);
+        let pi = std::f64::consts::PI;
+        assert_eq!(round_significant(pi, 30.0), pi);
+    }
+
+    #[test]
+    fn round_checks_its_digit_count_and_type() {
+        let num = |v: f64| val(Matrix::scalar(v));
+        let pi = std::f64::consts::PI;
+        let r = |a: &[Value]| round(a).map(|v| v[0].clone().into_mat().data[0]);
+        assert!(close(r(&[num(pi), num(2.0)]).unwrap(), 314.0 / 100.0));
+        assert!(close(
+            r(&[num(pi), num(2.0), text("decimals")]).unwrap(),
+            314.0 / 100.0
+        ));
+        assert!(close(
+            r(&[num(pi), num(2.0), text("significant")]).unwrap(),
+            3.1
+        ));
+        assert_eq!(r(&[num(2.5)]).unwrap(), 3.0);
+        let digits = "Number of digits for 'round' must be an integer scalar.";
+        let sig = "Number of significant digits for 'round' must be a positive integer scalar.";
+        let kind = "Rounding type for 'round' must be 'decimals' or 'significant'.";
+        for bad in [1.5, f64::NAN, f64::INFINITY] {
+            assert_eq!(r(&[num(pi), num(bad)]).unwrap_err().msg, digits, "{bad}");
+        }
+        assert_eq!(r(&[num(pi), text("a")]).unwrap_err().msg, digits);
+        assert_eq!(
+            r(&[num(pi), num(0.0), text("significant")])
+                .unwrap_err()
+                .msg,
+            sig
+        );
+        assert_eq!(
+            r(&[num(pi), num(1.5), text("significant")])
+                .unwrap_err()
+                .msg,
+            sig
+        );
+        assert_eq!(
+            r(&[num(pi), num(2.0), text("banker")]).unwrap_err().msg,
+            kind
+        );
+        assert_eq!(r(&[num(pi), num(2.0), num(1.0)]).unwrap_err().msg, kind);
+        // Element-wise over an array, with the shape kept.
+        let v = round(&[
+            val(Matrix::row(vec![1253.0, 1.345, 120.44])),
+            num(2.0),
+            text("significant"),
+        ])
+        .unwrap()[0]
+            .clone()
+            .into_mat();
+        assert_eq!((v.rows, v.cols), (1, 3));
+        assert_eq!(v.data[0], 1300.0);
     }
 
     #[test]

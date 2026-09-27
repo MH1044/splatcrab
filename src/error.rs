@@ -299,13 +299,27 @@ pub fn bad_size_arg(name: &str) -> MError {
 }
 
 /// The one message for a shape that would not fit in memory. `range` in
-/// `interp.rs` reaches it through `args::check_size` rather than inventing a
+/// `interp.rs` reaches it through `args::check_shape` rather than inventing a
 /// second wording for the `:` operator.
-pub fn size_overflow(rows: usize, cols: usize) -> MError {
+///
+/// The two dimensions arrive already rendered, because a requested size can
+/// be past `usize` (`zeros(1e300)`) and `args::fmt_dim` decides how such a
+/// size is printed.
+pub fn size_overflow(rows: &str, cols: &str) -> MError {
     MError::new(format!(
         "Requested {}x{} array exceeds the maximum array size.",
         rows, cols
     ))
+}
+
+/// A third or later size other than `1`: `zeros(2, 3, 4)`.
+pub fn nd_unsupported() -> MError {
+    MError::new("N-D arrays are not supported.")
+}
+
+/// A single size argument that is a column or a matrix: `zeros([2; 3])`.
+pub fn size_vector_not_row(name: &str) -> MError {
+    MError::new(format!("Size vector for '{}' must be a row vector.", name))
 }
 
 // ---- builtins --------------------------------------------------------
@@ -344,8 +358,8 @@ pub fn sort_vectors_only() -> MError {
     MError::new("'sort' currently supports vectors only.")
 }
 
-pub fn dot_length_mismatch() -> MError {
-    MError::new("Vectors must be the same length for 'dot'.")
+pub fn dot_size_mismatch() -> MError {
+    MError::new("A and B must be the same size for 'dot'.")
 }
 
 pub fn reshape_numel(have: usize, rows: usize, cols: usize) -> MError {
@@ -353,6 +367,68 @@ pub fn reshape_numel(have: usize, rows: usize, cols: usize) -> MError {
         "To reshape the number of elements must not change ({} vs {}x{}).",
         have, rows, cols
     ))
+}
+
+/// MATLAB's wording. `known` is rendered by `args::fmt_dim`, since the
+/// product of the known sizes can be past `usize`.
+pub fn reshape_not_divisible(known: &str, total: usize) -> MError {
+    MError::new(format!(
+        "Product of known dimensions, {}, not divisible into total number of elements, {}.",
+        known, total
+    ))
+}
+
+/// MATLAB's wording.
+pub fn reshape_two_unknowns() -> MError {
+    MError::new("Size can only have one unknown dimension.")
+}
+
+pub fn sort_direction() -> MError {
+    MError::new("Sort direction for 'sort' must be 'ascend' or 'descend'.")
+}
+
+pub fn find_count() -> MError {
+    MError::new("Number of elements for 'find' must be a positive integer scalar.")
+}
+
+pub fn find_direction() -> MError {
+    MError::new("Search direction for 'find' must be 'first' or 'last'.")
+}
+
+pub fn norm_type() -> MError {
+    MError::new("Norm type for 'norm' must be a positive real scalar, Inf, -Inf or 'fro'.")
+}
+
+/// MATLAB's wording.
+pub fn diag_offset() -> MError {
+    MError::new("K-th diagonal input must be an integer scalar.")
+}
+
+pub fn num2str_precision() -> MError {
+    MError::new("Precision for 'num2str' must be a positive integer.")
+}
+
+pub fn round_digits() -> MError {
+    MError::new("Number of digits for 'round' must be an integer scalar.")
+}
+
+pub fn round_significant() -> MError {
+    MError::new("Number of significant digits for 'round' must be a positive integer scalar.")
+}
+
+pub fn round_type() -> MError {
+    MError::new("Rounding type for 'round' must be 'decimals' or 'significant'.")
+}
+
+/// MATLAB's wording: a bare `toc` with no earlier bare `tic`.
+pub fn toc_without_tic() -> MError {
+    MError::new(
+        "You must call TIC without an output argument before calling TOC without an input argument.",
+    )
+}
+
+pub fn eps_class() -> MError {
+    MError::new("Only 'double' is supported as a class name for 'eps'.")
 }
 
 #[cfg(test)]

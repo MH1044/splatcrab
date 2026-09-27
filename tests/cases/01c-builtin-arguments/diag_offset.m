@@ -1,0 +1,17 @@
+% covers: 7 - diag(v, k) places v on the k-th diagonal; diag(A, k) returns it as a column, 0x1 past the matrix
+disp(diag([1 2], 1))
+disp(diag([1 2], -1))
+A = [1 2 3; 4 5 6; 7 8 9];
+disp(diag(A, 1)')
+disp(diag(A, -2))
+disp(size(diag(A, 3)))
+disp(diag([1 2 3; 4 5 6], -1))
+disp(diag(5, 1))
+disp(diag(A, 0)')
+disp(diag(A, -1)')
+disp(size(diag(A, -3)))
+disp(diag([1 2 3; 4 5 6], 2))
+disp(diag([1 2 3; 4 5 6], 1)')
+disp(size(diag([1 2 3; 4 5 6], -2)))
+disp(diag([1; 2], 1))
+disp(diag(7, -2))
