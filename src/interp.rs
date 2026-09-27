@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use crate::bail;
+use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::scan;
@@ -160,6 +161,17 @@ impl Interp {
             }
             Stmt::For(name, e, body) => {
                 let m = self.eval_mat(e)?;
+                // A loop that does not run still assigns its variable, as
+                // MATLAB does: after `k = 7; for k = []; end`, `k` is the
+                // empty, not `7`, and a name that did not exist comes into
+                // existence. The value is the empty that the next column
+                // would have been, which gives `[]` a 0x0 and `1:0` a 1x0,
+                // the shapes Octave assigns. MATLAB's exact shape is
+                // unsettled, so no golden case asserts it.
+                if m.cols == 0 {
+                    let empty = Matrix::new(m.rows, 0, Vec::new());
+                    self.vars.insert(name.clone(), Value::Mat(empty));
+                }
                 for c in 0..m.cols {
                     let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
                     let v = if m.rows == 1 {
@@ -265,7 +277,7 @@ impl Interp {
             BinOp::EDiv => a.zip(&b, "./", |x, y| x / y)?,
             // `a.\b` divides the other way round, element by element.
             BinOp::ELDiv => a.zip(&b, ".\\", |x, y| y / x)?,
-            BinOp::EPow => a.zip(&b, ".^", f64::powf)?,
+            BinOp::EPow => a.try_zip(&b, ".^", powf_real)?,
             BinOp::Mul => {
                 if a.is_scalar() || b.is_scalar() {
                     a.zip(&b, "*", |x, y| x * y)?
@@ -290,7 +302,7 @@ impl Interp {
             }
             BinOp::Pow => {
                 if a.is_scalar() && b.is_scalar() {
-                    Matrix::scalar(a.data[0].powf(b.data[0]))
+                    Matrix::scalar(powf_real(a.data[0], b.data[0])?)
                 } else if let Some(p) = b.scalar_value() {
                     matrix_power(&a, p)?
                 } else {
@@ -512,16 +524,48 @@ impl Interp {
 /// without passing through a builtin. It uses `args::check_shape` rather than
 /// a second policy, so `x = 1:1e15` gets the same limit and the same message
 /// as `zeros(1e10)` instead of aborting in the allocator.
+///
+/// An infinite end point is no longer an early empty. `0:Inf` and `-Inf:1:0`
+/// both have the step count `Inf`, which is what `check_shape` already refuses
+/// for `zeros(1, Inf)`, so they report `1xInf` instead of quietly giving a
+/// `1x0` and exit 0; MATLAB and Octave both refuse them. A `NaN` still gives
+/// the empty: `1:NaN` stays as it was, and stays recorded in Known bugs,
+/// because Octave gives a `1x1` `NaN` there and MATLAB is unverified.
 fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
-    if s == 0.0 || (b - a) / s < 0.0 || !a.is_finite() || !b.is_finite() || !s.is_finite() {
+    // How many times the step fits between the end points; the vector has one
+    // more element than that. `1:NaN` and `Inf:Inf` both make it `NaN`, which
+    // is neither negative nor a count.
+    let steps = (b - a) / s;
+    if s == 0.0 || !s.is_finite() || steps.is_nan() || steps < 0.0 {
         return Ok(Matrix::new(1, 0, Vec::new()));
     }
     // The count stays in `f64` until `check_shape` has judged it, so a count
     // past `usize` is named as asked: `0:1e-300:1e300` overflows `f64` itself
     // and reports `1xInf`, where it used to report the `usize::MAX` clamp.
-    let count = ((b - a) / s + 1e-10).floor() + 1.0;
-    let (_, n) = crate::builtins::args::check_shape(1.0, count)?;
-    Ok(Matrix::row((0..n).map(|k| a + k as f64 * s).collect()))
+    let n = (steps + 1e-10).floor();
+    let (_, count) = crate::builtins::args::check_shape(1.0, n + 1.0)?;
+    // MATLAB computes the upper half of a colon from the right-hand end point
+    // rather than adding the step `n` times. That is what makes `0:0.1:0.3`
+    // end exactly on `0.3` and `-1:0.01:1` symmetric: element `k` is
+    // `a + k*s` and element `n - k` is `right - k*s`, so the pair sums to
+    // `a + right` exactly, whatever the roundoff in `k*s`.
+    //
+    // The right-hand end point is `b` itself only when the range lands on it.
+    // `n >= steps` says the floor above discarded no partial step (the `1e-10`
+    // fuzz counts as landing), so `0:0.1:0.35` keeps `a + 3s` as its last
+    // element rather than jumping to `0.35`.
+    let right = if n >= steps { b } else { a + n * s };
+    let n = n as usize;
+    let data = (0..count)
+        .map(|k| {
+            if 2 * k <= n {
+                a + k as f64 * s
+            } else {
+                right - (n - k) as f64 * s
+            }
+        })
+        .collect();
+    Ok(Matrix::row(data))
 }
 
 fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
@@ -587,6 +631,12 @@ fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
         if cols.iter().any(|c| *c >= m.cols) {
             bail!(error::index_exceeds_bound(2, m.cols));
         }
+        // A two-subscript read sizes its result from the subscripts, not from
+        // the array: `A(ones(1, 1e5), ones(1, 1e5))` asks for 1e10 elements
+        // out of a 2x2 `A`, and used to abort in the allocator on the
+        // `with_capacity` below. The bounds tests come first, so an
+        // out-of-range subscript is still reported as one.
+        crate::builtins::args::check_shape(rows.len() as f64, cols.len() as f64)?;
         let mut data = Vec::with_capacity(rows.len() * cols.len());
         for &c in &cols {
             for &r in &rows {
@@ -903,8 +953,27 @@ mod tests {
             ok_out("n = 0;\nfor k = []\nn = 1;\nend\ndisp(n)"),
             "     0\n"
         );
-        // The loop variable is never even created.
-        assert!(err_msg("for k = []\nend\nk").contains("Undefined function or variable 'k'"));
+        // ... but it still assigns its loop variable, as MATLAB does. The
+        // variable used to be left undefined, and a name that already held a
+        // value kept it.
+        assert_eq!(ok_out("for k = []\nend\ndisp(isempty(k))"), "     1\n");
+        assert_eq!(
+            ok_out("k = 7;\nfor k = []\nend\ndisp(isempty(k))"),
+            "     1\n"
+        );
+        // The empty assigned is the column the loop would have taken next,
+        // which is Octave's shape for both of these. MATLAB's own shape is
+        // unsettled, so no golden case asserts it.
+        assert_eq!(
+            ok_out("for k = []\nend\nfprintf('%d %d\\n', size(k))"),
+            "0 0\n"
+        );
+        assert_eq!(
+            ok_out("for k = 1:0\nend\nfprintf('%d %d\\n', size(k))"),
+            "1 0\n"
+        );
+        // A loop that does run still leaves the last column behind.
+        assert_eq!(ok_out("for k = [1 2 3]\nend\ndisp(k)"), "     3\n");
     }
 
     #[test]
@@ -1080,6 +1149,128 @@ mod tests {
         assert_eq!(range(3.0, -1.0, 1.0).unwrap().data, [3.0, 2.0, 1.0]);
         assert!(range(1.0, 0.0, 5.0).unwrap().is_empty());
         assert!(range(f64::NAN, 1.0, 5.0).unwrap().is_empty());
+    }
+
+    /// The colon lands exactly on its end point, and is symmetric about its
+    /// middle, because the upper half is computed from the right-hand end
+    /// point rather than by adding the step over and over.
+    #[test]
+    fn the_colon_hits_its_end_point_exactly() {
+        let x = range(0.0, 0.1, 0.3).unwrap();
+        assert_eq!(x.numel(), 4);
+        assert_eq!(x.data[0], 0.0);
+        assert_eq!(*x.data.last().unwrap(), 0.3);
+
+        let y = range(-1.0, 0.01, 1.0).unwrap();
+        assert_eq!(y.numel(), 201);
+        assert_eq!(*y.data.last().unwrap(), 1.0);
+        for k in 0..y.numel() {
+            assert_eq!(y.data[k] + y.data[y.numel() - 1 - k], 0.0, "element {k}");
+        }
+
+        // An end point the range does not land on is not jumped to: the last
+        // element of 0:0.1:0.35 is 0.3-ish, never 0.35.
+        let short = range(0.0, 0.1, 0.35).unwrap();
+        assert_eq!(short.numel(), 4);
+        assert!(*short.data.last().unwrap() < 0.35);
+        close(*short.data.last().unwrap(), 0.3);
+
+        // Integer ranges and descending ranges keep their exact values.
+        assert_eq!(
+            range(1.0, 1.0, 5.0).unwrap().data,
+            [1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            range(10.0, -2.0, 2.0).unwrap().data,
+            [10.0, 8.0, 6.0, 4.0, 2.0]
+        );
+        // A single-element range, where there is no upper half at all.
+        assert_eq!(range(5.0, 1.0, 5.0).unwrap().data, [5.0]);
+        assert_eq!(range(0.0, 0.1, 0.05).unwrap().data, [0.0]);
+    }
+
+    /// An infinite end point is refused rather than quietly giving a `1x0`;
+    /// a `NaN` one still gives the empty, and stays in Known bugs.
+    #[test]
+    fn a_non_finite_range_end_point_is_refused_but_nan_is_not() {
+        let msg = "Requested 1xInf array exceeds the maximum array size.";
+        assert_eq!(range(0.0, 1.0, f64::INFINITY).unwrap_err().msg, msg);
+        assert_eq!(range(f64::NEG_INFINITY, 1.0, 0.0).unwrap_err().msg, msg);
+        assert_eq!(range(0.0, -1.0, f64::NEG_INFINITY).unwrap_err().msg, msg);
+        assert_eq!(err_msg("x = 0:Inf;"), msg);
+        assert_eq!(err_msg("x = -Inf:1:0;"), msg);
+        // A range that runs the wrong way is empty whatever its end points,
+        // which is the answer it always gave.
+        assert!(range(f64::INFINITY, 1.0, 0.0).unwrap().is_empty());
+        // NaN anywhere is the empty, unchanged and still recorded.
+        assert!(range(1.0, 1.0, f64::NAN).unwrap().is_empty());
+        assert!(range(f64::NAN, 1.0, 1.0).unwrap().is_empty());
+        assert!(range(1.0, f64::NAN, 5.0).unwrap().is_empty());
+        // Inf:Inf has no count either: the difference is NaN.
+        assert!(range(f64::INFINITY, 1.0, f64::INFINITY).unwrap().is_empty());
+        // An infinite step is untouched by this cycle; see Known bugs.
+        assert!(range(1.0, f64::INFINITY, 5.0).unwrap().is_empty());
+    }
+
+    /// Acceptance test 17, the `index_read` half: a two-subscript read sizes
+    /// its result from the subscripts, so the guard belongs there and not on
+    /// the array being read.
+    #[test]
+    fn a_two_subscript_read_checks_its_result_size() {
+        let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        // 20000 squared is past the 2^28-element cap; every subscript is 1,
+        // so the 2x2 source is never the problem.
+        let big = || Sel::List(vec![0; 20_000], 1, 20_000);
+        let e = index_read(&a, &[big(), big()]).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 20000x20000 array exceeds the maximum array size."
+        );
+        // An out-of-range subscript is still reported as one: the bounds
+        // tests come before the size guard.
+        let out = Sel::List(vec![5; 20_000], 1, 20_000);
+        let e = index_read(&a, &[out, big()]).unwrap_err().msg;
+        assert!(e.contains("exceeds array bounds"), "{e}");
+        // A result that fits is unaffected.
+        let ok = index_read(&a, &[Sel::List(vec![0], 1, 1), Sel::All]).unwrap();
+        assert_eq!(ok.data, [1.0, 2.0]);
+    }
+
+    /// Acceptance test 14, through both spellings of the power operator.
+    #[test]
+    fn a_would_be_complex_result_is_an_error_not_a_nan() {
+        for src in [
+            "sqrt(-4)",
+            "log(-1)",
+            "log2(-8)",
+            "log10(-10)",
+            "asin(2)",
+            "acos(-2)",
+            "(-8)^(1/3)",
+            "(-8).^(1/3)",
+            "power(-2, 0.5)",
+            "x = [1 -4]; sqrt(x)",
+            "[-8 1].^(1/3)",
+        ] {
+            let e = err_msg(src);
+            assert!(
+                e.starts_with("Complex results are not supported."),
+                "{src}: {e}"
+            );
+        }
+        // The real neighbours of each of those still compute.
+        assert_eq!(ok_out("disp(sqrt(4))"), "     2\n");
+        assert_eq!(ok_out("disp(log(1))"), "     0\n");
+        assert_eq!(ok_out("disp(asin(0))"), "     0\n");
+        assert_eq!(ok_out("disp((-8)^2)"), "    64\n");
+        assert_eq!(ok_out("disp((-8)^(1/1))"), "    -8\n");
+        assert_eq!(ok_out("fprintf('%g\\n', (-2)^Inf)"), "Inf\n");
+        // A NaN argument is in the real domain of all of them.
+        assert_eq!(ok_out("fprintf('%g\\n', sqrt(NaN))"), "NaN\n");
+        assert_eq!(ok_out("fprintf('%g\\n', asin(NaN))"), "NaN\n");
+        assert_eq!(ok_out("fprintf('%g\\n', power(NaN, 0.5))"), "NaN\n");
+        // -0 is not negative, so it keeps IEEE's real answers.
+        assert_eq!(ok_out("fprintf('%g\\n', sqrt(-0))"), "0\n");
     }
 
     #[test]

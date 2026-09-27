@@ -19,12 +19,15 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Nested concatenation `[A; B]`, `[a' b']` | 00 | `builtins_sample` | |
 | Ranges `a:b` and `a:s:b` | 00 | `ranges` | Descending and fractional steps |
 | A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_size` |
+| A range lands exactly on its end point | 01d | `range_hits_end_point` | `x = 0:0.1:0.3; x(end) == 0.3` is `1`, and `-1:0.01:1` is symmetric: the upper half is computed from the right-hand end point, not by repeated addition |
+| An infinite range end point is refused | 01d | `err_range_end_inf`, `err_range_start_neg_inf` | `0:Inf` and `-Inf:1:0` report `1xInf` rather than quietly giving a 1x0. `1:NaN` is still an empty, and still in Known bugs |
 
 ## Operators
 
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
 | `+ - * /` and left division | 00 | `matrix_ops` | Backslash solves square systems only |
+| The singular test is relative to the matrix | 01d | `solve_relative_pivot` | The pivot tolerance scales with the largest finite magnitude in the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15] \ [1; 1]` is solved rather than refused. A fixed `1e-14` used to judge it, and `det` and `\` disagreed on what singular means; they now make the identical test |
 | `^` with an integer exponent | 00 | `demo_smoke` | Negative exponents invert |
 | `.* ./ .^` elementwise | 00 | `matrix_ops` | |
 | `.\` elementwise left divide | 01b | `eldiv_vector`, `eldiv_after_number` | `a.\b` is `b./a`; `2.\x` no longer means `2 \ x` |
@@ -33,6 +36,9 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | |
 | `~` negation | 00 | `logical_ops` | |
 | Scalar and row/column broadcasting | 00 | `builtins_sample` | |
+| A result too big to allocate is a clean error | 01d | `err_zip_result_size`, `err_matmul_result_size`, `err_matmul_size_wraps`, `err_index_result_size` | Broadcasting, `*`, a two-subscript read and a reduction all size their result from their operands, and all judge it before allocating. `ones(1e5,1) + ones(1,1e5)` used to abort the process, exit 134 |
+| `*` keeps `Inf` and `NaN` through a zero factor | 01d | `matmul_keeps_inf_and_nan` | `[Inf 0] * [0; 1]` is `NaN`, as in MATLAB. A sparsity shortcut used to skip the multiply and give `0` |
+| A result that would be complex is a clean error | 01d | `err_complex_sqrt`, `err_complex_log`, `err_complex_asin`, `err_complex_power_operator`, and five more | `sqrt(-4)`, `log(-1)`, `asin(2)`, `(-8)^(1/3)` and the rest used to return `NaN` and exit 0. Cycle 10 replaces the error with the value |
 
 ## Indexing
 
@@ -56,6 +62,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `for` over matrix columns | 00 | `control_flow` | |
 | `while` | 00 | `control_flow` | |
 | `break` and `continue` | 00 | `control_flow` | |
+| A `for` that does not run still assigns its variable | 01d | `for_zero_iterations_assigns_empty` | After `k = 7; for k = []; end`, `k` is the empty; a name that did not exist comes into existence. The exact empty shape MATLAB gives is unsettled, so no case asserts it |
 
 ## Builtins
 
@@ -120,6 +127,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_third_size`, `err_nd_zero_third_size`, `err_nd_fourth_size`, `err_nd_size_vector`, `err_nd_reshape` | `zeros(2, 3, 1)` is 2x3. Any other third size, `0` included, is "N-D arrays are not supported."; N-D arrays are not built yet. `eye` still takes two sizes |
 | A size past `usize` is named as asked | 01c | `err_size_overflow_named`, `err_size_overflow_g_form`, `err_size_overflow_range_inf` | `zeros(1e300)` reports `1e+300x1e+300`, and `0:1e-300:1e300` reports `1xInf`, not the `usize::MAX` clamp. Indexed growth still names the clamp (cycle 03) |
 | `linspace` floors its count | 01c | `linspace_floor_count` | `linspace(0, 1, 2.7)` is two points; a count below 1 is 1x0 |
+| `linspace` includes both end points exactly | 01d | `range_hits_end_point` | The last element is the end point itself, not `a + (b-a)*(n-1)/(n-1)` |
 | `sort(v, 'descend')`, `sort(v, dim)`, `sort(v, dim, direction)` | 01c | `sort_direction`, `sort_descend_stable`, `err_sort_direction` | Stable in both directions; `NaN` first when descending |
 | `find(X, n)`, `find(X, n, 'first')`, `find(X, n, 'last')` | 01c | `find_count`, `err_find_count_zero`, `err_find_count_fraction`, `err_find_direction` | The last `n` stay in ascending order; `n` must be a positive integer |
 | `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | Vectors only until cycle 08. `p = 0` and a negative finite `p` are refused |
@@ -146,6 +154,10 @@ implements the ones MATLAB code actually uses. Cases are in
 | The `+` and space flags, and precision on integers | 01 | `printf_plus_space_and_int_precision` | `%+d`, `% d`, `%.3d` |
 | `%d` of a non-integer switches to `%e` | 01 | `printf_d_nonintegral` | MATLAB's rule; it used to fall back to `%g` |
 | `%s` of a number is its character, and a char argument expands per character | 01 | `printf_string_and_char_args` | `%s` still takes a whole char argument |
+| `printf` bounds its width and its precision | 01d | `err_printf_precision_f`, `err_printf_precision_e`, `err_printf_width` | At most 8192, for every conversion and both fallbacks. `%.65536f` and `%.65535e` used to panic (exit 101) and `%2147483647d` to build a two-gigabyte pad (exit 134) |
+| `%d` prints an integer past 2^63 in full | 01d | `printf_d_past_64_bits` | `fprintf('%d', 1e30)` used to print the `i64` clamp `9223372036854775807` |
+| `%.Ns` truncates before it pads | 01d | `printf_s_precision_truncates` | `[%5.2s]` of `'abcdef'` is `[   ab]`, as in C and MATLAB |
+| An empty `trace` is `+0` | 01d | `trace_empty_is_positive_zero` | `fprintf('%.4f', trace([]))` printed `-0.0000`; `trace` now goes through `math::sum0` like the other reductions |
 | MATLAB-style error messages | 00 | the seven `err_*` cases | Every message text is defined in `src/error.rs` and nowhere else |
 | `Error: Line N: <msg>` in script mode | 01b | `err_line_runtime`, `err_line_parse` | Runtime, parse and lex errors alike; stdout is still flushed first |
 | An error in a block body names the body's line | 01b | `err_line_in_for_body` | `MError::at` keeps the innermost line |

@@ -113,17 +113,150 @@ the cycle is not worth starting if they are left to the end.
 
 ## Design notes
 
-Filled in during implementation. Record in particular:
+### The four result-size paths
 
-- Where `check_shape` is called from for each of the four result-size paths,
-  and whether any of them needed a different signature.
-- The exact pivot rule chosen for `solve`, and the norm it is relative to.
-- How the colon's end point is computed, and whether `linspace` needed the same
-  treatment or only its last element pinned.
-- The bound chosen for `printf` width and precision, and what an absurd value
-  now reports.
-- The error text for an unsupported complex result, which cycle 10 will later
-  replace with a value.
+All four call `args::check_shape(rows as f64, cols as f64)` immediately before
+the allocation, and after any check that would give a better message:
+
+| Path | Where | Judged before |
+|---|---|---|
+| broadcasting | `Matrix::try_zip`, `value.rs` | `Vec::with_capacity(rows * cols)` |
+| matrix product | `Matrix::matmul`, `value.rs` | `Matrix::filled(self.rows, o.cols, 0.0)` |
+| two-subscript read | `index_read`, `interp.rs` | `Vec::with_capacity(rows.len() * cols.len())` |
+| reduction | `math::reduce` | `Matrix::row` / `Matrix::col` |
+
+`check_shape` itself did not change, and neither did its signature. It already
+took `f64` sizes so that a size past `usize` could be named as asked, and
+every dimension arriving here is a `usize` below `2^53`, so the conversion is
+exact and the message reads the same as a constructor's.
+
+Two signatures did change. `Matrix::zip` became a thin wrapper over a new
+`Matrix::try_zip`, whose closure returns `R<f64>`: the size guard needed the
+function to be fallible before its loop, and `.^` needed it fallible inside
+the loop for the complex-result error below, so one change served both.
+`math::reduce` now returns `R<Matrix>`, which moved `extremum_along` and the
+two call sites in `reduction` and `dot` to `?`.
+
+`matmul` also returns early when the result has no elements. `check_shape`
+passes a legal 0-by-2^32 result, and the column loop would then spin four
+billion times over nothing. That is a hang rather than an abort, so it is not
+one of the three, but it is the same family and one line to close.
+
+### The pivot rule
+
+`Matrix::singular_tol` is `f64::EPSILON * n * max |A|`, where `n` is the row
+count and the maximum runs over the **finite** entries of the original matrix.
+`solve` and `det` both call it once, before elimination, and both test
+`pivot.abs() <= tol`.
+
+Three choices worth recording:
+
+- The norm is the largest magnitude, not a 1- or Frobenius norm. It is the
+  cheapest quantity that scales with the matrix, and the rule only has to
+  separate "small because the matrix is small" from "small because the matrix
+  is singular", which any norm does equally well.
+- `<=`, not `<`. The all-zero matrix has norm `0` and so tolerance `0`, and
+  `0 < 0` is false; it would have been declared non-singular and then divided
+  by. `<=` keeps it singular, as the old fixed threshold did.
+- Non-finite entries are excluded from the norm. Including them makes the
+  tolerance `Inf` or `NaN` for any matrix holding an `Inf`, and every finite
+  pivot is then at or below it, so `[Inf 0; 0 1] \ [1; 1]` would report a
+  singular matrix where it used to solve. A pivot that is itself `Inf` or
+  `NaN` fails the `<=` test and flows into the arithmetic exactly as before.
+
+`det` used to return `0` only for an exactly zero pivot, which is why it and
+`solve` disagreed. They now make the identical test and differ only in what
+they do about it: `det` reports `0`, `solve` refuses.
+
+### The colon's end point, and `linspace`
+
+`range` keeps the step count it always had, `floor((b - a) / s + 1e-10)`, and
+then decides what the right-hand end point is. If that floor discarded no
+partial step — `n >= (b - a) / s`, where the `1e-10` fuzz counts as landing —
+the end point is `b` itself; otherwise it is `a + n*s`, so `0:0.1:0.35` keeps
+`a + 3s` and does not jump to `0.35`.
+
+The vector is then built from both ends: element `k` is `a + k*s` while
+`2k <= n`, and `right - (n - k)*s` beyond that. Two properties fall out. The
+last element is `right - 0` exactly, so `x = 0:0.1:0.3; x(end) == 0.3` is `1`.
+And elements `k` and `n - k` sum to `a + right` exactly, because the same
+`k*s` is added to one and subtracted from the other, so `-1:0.01:1` is
+symmetric however `k*s` rounds.
+
+`linspace` needed only its last element pinned to `b`. Its interior points are
+already one multiply and one add away from `a` rather than a running sum, so
+there is no drift for a two-sided computation to cancel; only the final
+`(b - a) * (n-1) / (n-1)` was losing the end point.
+
+The non-finite end points needed no new error. `0:Inf` and `-Inf:1:0` both
+have the step count `Inf`, and `check_shape(1, Inf)` already reports
+`Requested 1xInf array exceeds the maximum array size.`, which is the wording
+`0:1e-300:1e300` has given since 01c. The early return that used to swallow
+them now fires only on a `NaN` step count, which keeps `1:NaN` the empty it
+was — deliberately, since Octave gives a `1x1` `NaN` there and MATLAB is
+unverified. `Inf:1:0` stays empty too: its count is negative, as it is for any
+range that runs the wrong way.
+
+### The `printf` bound
+
+`core::MAX_FIELD` is **8192**, and it bounds the width and the precision of
+every conversion. An absurd value reports
+`The width or precision in a format specifier must be at most 8192.`
+
+8192 sits far from both ends of the problem. A double's longest exact decimal
+expansion is 1074 fractional digits, so `%.8192f` still prints any value in
+full; the lowest limit above is Rust's `u16` precision at 65535, and `%e`
+fails one below that on its own `ndigits > 0` assertion. The bound is applied
+at parse time, in one helper, `core::field`, so the fallbacks are covered by
+construction: `%d` of a non-integer reaches `fmt_e` and `%s` of one reaches
+`fmt_g` with a precision that is already bounded. The same helper replaced the
+old `parse().unwrap_or(0)`, so a width too long even for a `usize` is now the
+same clean error rather than being silently dropped.
+
+One consequence worth naming: because the bound is applied while the specifier
+is being read, it fires before the "ran out of data" early return, so
+`fprintf('%d %.99999f', 1)` is now an error where it used to print `1 ` and
+stop. An absurd field is a defect in the format string whether or not the data
+reaches it, so that is the answer this cycle wants. No golden case covered the
+old behaviour.
+
+`%d` past `2^63` prints `format!("{:.0}", |v|)`, the exact decimal expansion
+of the double, and keeps the `i64` path below that so nothing that already
+printed correctly moved. `%.Ns` truncates in `core::truncate` before the width
+pads, which is C's order and MATLAB's.
+
+### The complex-result error
+
+Three constructors in `error.rs`, all opening with the same sentence so a
+golden case can match on it alone:
+
+- `Complex results are not supported. '<name>' of a negative number is complex.`
+  — `sqrt`, `log`, `log2`, `log10`.
+- `Complex results are not supported. '<name>' of a value outside [-1, 1] is complex.`
+  — `asin`, `acos`.
+- `Complex results are not supported. A negative number raised to a fractional power is complex.`
+  — `^`, `.^` and `power`.
+
+The domains live in `math::Real`, checked over the whole argument before any
+of it is mapped, and in `math::powf_real`, which `interp.rs` uses for both
+spellings of the power operator so that `(-8)^(1/3)`, `(-8).^(1/3)` and
+`power(-8, 1/3)` cannot drift apart. `NaN` is inside every one of these
+domains, because `sqrt(NaN)` is `NaN` in MATLAB too, and an infinite exponent
+is inside `powf_real`'s, because `(-2)^Inf` is a real `Inf`. Cycle 10 replaces
+each error with a value; until then the refusal is the honest answer.
+
+### What this cycle did not fix
+
+- Deep nesting (QA D4) still aborts with exit 134. It is the last member of
+  the process-killing family and it belongs to 01e. **Invariant 6 is not
+  restored.**
+- `1:Inf:5` is still a `1x0` where MATLAB gives a `1x1`. The D15 row was about
+  end points; an infinite *step* is a separate early return, and it is now a
+  Known bugs row of its own scheduled to 01e.
+- `1:NaN` is still an empty, and now has its own "verify first" row.
+- `mod` and `rem` with an infinite divisor were removed from Known bugs with
+  no code change and no golden case, per Out of scope.
+- `for` over a matrix with no rows (QA D35) is untouched and still open.
 
 ## Acceptance tests
 
@@ -164,4 +297,4 @@ checks the message would pass on either.
 
 ## Status
 
-Planned
+Done (2026-09-28)

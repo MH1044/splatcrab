@@ -2592,26 +2592,24 @@ The line and position are right, but the token is named by its internal
 | 0 | The script ran to the end |
 | 1 | A lex, parse or runtime error; the message is on stderr |
 | 101 | The interpreter panicked — always a bug, please report it |
+| 134 | The process was aborted: the allocator refused, or a stack overflowed |
 
 Exit 101 is reserved for panics so a crash can never be mistaken for a clean
-error. A handful of inputs still reach it, all of them pathological:
+error, and nothing you are likely to type reaches it. An absurd format field,
+a result too large to allocate, and a size that would overflow are all
+ordinary errors:
 
 ```matlab
 fprintf('%.65536f\n', 1);
 ```
 
 ```
-
-thread '<unnamed>' (27164) panicked at src\builtins\core.rs:601:25:
-Formatting argument out of range
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: Line 1: The width or precision in a format specifier must be at most 8192.
 ```
 
-(The process id in that message changes from run to run.)
-
-A few others abort with 134 instead: a result size that only broadcasting or
-`matmul` could produce (`ones(1e5,1) + ones(1,1e5)`), and about 96,000 levels
-of nesting. These are the cycle-01d and 01e work.
+One input still aborts with 134: around 96,000 levels of nesting exhausts the
+parser's stack. It is the last of its family and belongs to cycle 01e. Until
+it is closed, nothing here claims that no input can kill the process.
 
 ## Differences from MATLAB
 
@@ -2683,28 +2681,20 @@ where MATLAB keeps integer columns:
 ```matlab
 disp([1 2 NaN])
 disp(NaN)
-x = 0:0.1:0.3;
-a = x(end) == 0.3
-b = size(0:Inf)
 ```
 
 ```
     1.0000    2.0000       NaN
        NaN
-a =
-
-     0
-
-b =
-
-     1     0
-
 ```
 
-MATLAB gives `     1     2   NaN`, `   NaN`, `1` for `a`, and refuses `0:Inf`
-outright. The `a` line is the colon operator missing its end point: MATLAB
-computes the second half of the range from the right-hand end so it lands
-exactly on `b`. `linspace` has the same defect.
+MATLAB gives `     1     2   NaN` and `   NaN`: it keeps integer columns when
+the only non-integer entries are non-finite. Cycle 01e owns this.
+
+The colon operator used to miss its end point here, so `0:0.1:0.3` did not
+finish on `0.3`, and `0:Inf` gave an empty rather than being refused. Both are
+fixed: the range is computed from the right-hand end so it lands exactly, and
+an infinite end point is an error.
 
 ### Logical values
 
@@ -2763,41 +2753,34 @@ c =
 
 ### Numerics
 
-`matmul` skips a multiply when one factor is zero, so `Inf` and `NaN` are
-swallowed; and results that should be complex are a silent `NaN` rather than
-an error:
+`matmul` used to skip a multiply when one factor was zero, which swallowed
+`Inf` and `NaN`. It no longer does:
 
 ```matlab
 a = [Inf 0] * [0; 1]
-b = sqrt(-4)
-c = log(-1)
-d = (-8)^(1/3)
 ```
 
 ```
 a =
 
-     0
-
-b =
-
        NaN
-
-c =
-
-       NaN
-
-d =
-
-       NaN
-
 ```
 
-MATLAB gives `NaN`, `0 + 2.0000i`, `0 + 3.1416i` and `1.0000 + 1.7321i`.
-Until complex numbers arrive in cycle 10, a clean error would be the honest
-answer; these `NaN`s are not.
+A result that would be complex is refused rather than returned as a `NaN` that
+looks computed. MATLAB gives `0 + 2.0000i` for the first of these, and
+`0 + 3.1416i` and `1.0000 + 1.7321i` for `log(-1)` and `(-8)^(1/3)`. Until
+complex numbers arrive in cycle 10, the refusal is the honest answer:
 
-`trace([])` is `-0`, and `%d` saturates at 2^63:
+```matlab
+sqrt(-4)
+```
+
+```
+Error: Line 1: Complex results are not supported. 'sqrt' of a negative number is complex.
+```
+
+`trace([])` used to print `-0`, and `%d` used to saturate at 2^63. Both are
+fixed, and both now agree with MATLAB:
 
 ```matlab
 fprintf('%.4f\n', trace([]));
@@ -2805,8 +2788,8 @@ fprintf('%d\n', 1e30);
 ```
 
 ```
--0.0000
-9223372036854775807
+0.0000
+1000000000000000019884624838656
 ```
 
 ### Char class

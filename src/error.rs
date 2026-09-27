@@ -259,6 +259,36 @@ pub fn nonsquare_inverse() -> MError {
     MError::new("Matrix must be square to invert.")
 }
 
+// ---- results that would be complex -----------------------------------
+//
+// Cycle 01d turns each of these from a silent `NaN` into a refusal; cycle 10
+// replaces the refusal with the complex value itself. Every one of them opens
+// with the same sentence, so a golden case can match on it alone.
+
+/// `sqrt(-4)`, `log(-1)`, `log2(-8)`, `log10(-10)`.
+pub fn complex_negative(name: &str) -> MError {
+    MError::new(format!(
+        "Complex results are not supported. '{}' of a negative number is complex.",
+        name
+    ))
+}
+
+/// `asin(2)`, `acos(-2)`.
+pub fn complex_outside_unit(name: &str) -> MError {
+    MError::new(format!(
+        "Complex results are not supported. '{}' of a value outside [-1, 1] is complex.",
+        name
+    ))
+}
+
+/// `(-8)^(1/3)`, `(-8).^(1/3)`, `power(-2, 0.5)`.
+pub fn complex_power() -> MError {
+    MError::new(
+        "Complex results are not supported. \
+         A negative number raised to a fractional power is complex.",
+    )
+}
+
 pub fn nonsquare_determinant() -> MError {
     MError::new("Matrix must be square to compute a determinant.")
 }
@@ -344,6 +374,16 @@ pub fn invalid_format_spec() -> MError {
 
 pub fn unsupported_format_spec(c: char) -> MError {
     MError::new(format!("Unsupported format specifier '%{}'.", c))
+}
+
+/// A field that is absurd rather than merely large: `%.65536f` used to panic
+/// inside Rust's formatter and `%2147483647d` used to build a two-gigabyte
+/// pad. Both numbers are judged before anything is formatted or allocated.
+pub fn format_field_too_large(limit: usize) -> MError {
+    MError::new(format!(
+        "The width or precision in a format specifier must be at most {}.",
+        limit
+    ))
 }
 
 pub fn nonsquare_trace() -> MError {

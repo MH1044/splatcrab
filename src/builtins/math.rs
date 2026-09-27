@@ -1,6 +1,6 @@
 //! Reductions, element-wise math and the two-argument numeric functions.
 
-use super::args::{Along, at_most, dim, dim_or_all, mat, need, option};
+use super::args::{Along, at_most, check_shape, dim, dim_or_all, mat, need, option};
 use super::{Registry, add, one_mat};
 use crate::error;
 use crate::interp::R;
@@ -22,16 +22,16 @@ pub fn register(r: &mut Registry) {
 
     // ---- element-wise math -------------------------------------------
     add(r, "abs", |_, a, _| unary(a, "abs", f64::abs), "abs(X) - absolute value.");
-    add(r, "sqrt", |_, a, _| unary(a, "sqrt", f64::sqrt), "sqrt(X) - square root.");
+    add(r, "sqrt", |_, a, _| real_unary(a, "sqrt", f64::sqrt, Real::NonNegative), "sqrt(X) - square root.");
     add(r, "exp", |_, a, _| unary(a, "exp", f64::exp), "exp(X) - e raised to the power X.");
-    add(r, "log", |_, a, _| unary(a, "log", f64::ln), "log(X) - natural logarithm.");
-    add(r, "log2", |_, a, _| unary(a, "log2", f64::log2), "log2(X) - base 2 logarithm.");
-    add(r, "log10", |_, a, _| unary(a, "log10", f64::log10), "log10(X) - base 10 logarithm.");
+    add(r, "log", |_, a, _| real_unary(a, "log", f64::ln, Real::NonNegative), "log(X) - natural logarithm.");
+    add(r, "log2", |_, a, _| real_unary(a, "log2", f64::log2, Real::NonNegative), "log2(X) - base 2 logarithm.");
+    add(r, "log10", |_, a, _| real_unary(a, "log10", f64::log10, Real::NonNegative), "log10(X) - base 10 logarithm.");
     add(r, "sin", |_, a, _| unary(a, "sin", f64::sin), "sin(X) - sine of X in radians.");
     add(r, "cos", |_, a, _| unary(a, "cos", f64::cos), "cos(X) - cosine of X in radians.");
     add(r, "tan", |_, a, _| unary(a, "tan", f64::tan), "tan(X) - tangent of X in radians.");
-    add(r, "asin", |_, a, _| unary(a, "asin", f64::asin), "asin(X) - inverse sine, in radians.");
-    add(r, "acos", |_, a, _| unary(a, "acos", f64::acos), "acos(X) - inverse cosine, in radians.");
+    add(r, "asin", |_, a, _| real_unary(a, "asin", f64::asin, Real::UnitInterval), "asin(X) - inverse sine, in radians.");
+    add(r, "acos", |_, a, _| real_unary(a, "acos", f64::acos, Real::UnitInterval), "acos(X) - inverse cosine, in radians.");
     add(r, "atan", |_, a, _| unary(a, "atan", f64::atan), "atan(X) - inverse tangent, in radians.");
     add(r, "sinh", |_, a, _| unary(a, "sinh", f64::sinh), "sinh(X) - hyperbolic sine.");
     add(r, "cosh", |_, a, _| unary(a, "cosh", f64::cosh), "cosh(X) - hyperbolic cosine.");
@@ -52,7 +52,44 @@ pub fn register(r: &mut Registry) {
     add(r, "rem", |_, a, _| binary(a, "rem", remainder), "rem(X,Y) - remainder after division, signed like X.");
     add(r, "atan2", |_, a, _| binary(a, "atan2", f64::atan2), "atan2(Y,X) - four-quadrant inverse tangent.");
     add(r, "hypot", |_, a, _| binary(a, "hypot", f64::hypot), "hypot(X,Y) - sqrt(X^2 + Y^2) without overflow.");
-    add(r, "power", |_, a, _| binary(a, "power", f64::powf), "power(X,Y) - element-wise X raised to the power Y.");
+    add(r, "power", |_, a, _| real_binary(a, "power", powf_real), "power(X,Y) - element-wise X raised to the power Y.");
+}
+
+/// Where a real function stops being real. Until cycle 10 brings complex
+/// numbers, an argument outside the domain is a clean error rather than the
+/// `NaN` these used to hand back: `sqrt(-4)` is `2i` in MATLAB, and a `NaN`
+/// that looks like a computed answer is worse than a refusal.
+#[derive(Clone, Copy)]
+enum Real {
+    /// `sqrt`, `log`, `log2`, `log10`: a negative argument is complex.
+    NonNegative,
+    /// `asin`, `acos`: an argument outside [-1, 1] is complex.
+    UnitInterval,
+}
+
+impl Real {
+    /// `None` when `x` is in the real domain, and the error otherwise. `NaN`
+    /// is in the domain of both: `sqrt(NaN)` is `NaN` in MATLAB too.
+    fn check(self, name: &str, x: f64) -> Option<crate::error::MError> {
+        match self {
+            Real::NonNegative if x < 0.0 => Some(error::complex_negative(name)),
+            Real::UnitInterval if x.abs() > 1.0 => Some(error::complex_outside_unit(name)),
+            _ => None,
+        }
+    }
+}
+
+/// `x^y` where the result would be complex: a negative base raised to a
+/// power that is neither an integer nor infinite. `(-8)^(1/3)` is complex in
+/// MATLAB, while `(-2)^Inf` is a real `Inf` and `(-2)^3` a real `-8`.
+///
+/// `interp.rs` uses this for both `^` and `.^`, so the three spellings
+/// `(-8)^(1/3)`, `(-8).^(1/3)` and `power(-8, 1/3)` agree.
+pub fn powf_real(x: f64, y: f64) -> R<f64> {
+    if x < 0.0 && y.is_finite() && y.fract() != 0.0 {
+        return Err(error::complex_power());
+    }
+    Ok(x.powf(y))
 }
 
 /// MATLAB's `mod`: the result takes the sign of the divisor, and a zero
@@ -86,6 +123,20 @@ fn unary(args: &[Value], name: &str, f: fn(f64) -> f64) -> R<Vec<Value>> {
     one_mat(mat(args, 0, name)?.map(f))
 }
 
+/// [`unary`] for a function with a real domain smaller than the line. The
+/// whole argument is judged before any of it is mapped, so one complex
+/// element refuses the call rather than seeding the result with a `NaN`.
+fn real_unary(args: &[Value], name: &str, f: fn(f64) -> f64, domain: Real) -> R<Vec<Value>> {
+    at_most(args, 1, name)?;
+    let m = mat(args, 0, name)?;
+    for x in &m.data {
+        if let Some(e) = domain.check(name, *x) {
+            return Err(e);
+        }
+    }
+    one_mat(m.map(f))
+}
+
 /// Every two-argument element-wise function, with broadcasting.
 fn binary(args: &[Value], name: &str, f: fn(f64, f64) -> f64) -> R<Vec<Value>> {
     at_most(args, 2, name)?;
@@ -93,6 +144,16 @@ fn binary(args: &[Value], name: &str, f: fn(f64, f64) -> f64) -> R<Vec<Value>> {
     let a = mat(args, 0, name)?;
     let b = mat(args, 1, name)?;
     one_mat(a.zip(&b, name, f)?)
+}
+
+/// [`binary`] for a function that may refuse a pair of elements, which is
+/// `power` and its complex results.
+fn real_binary(args: &[Value], name: &str, f: fn(f64, f64) -> R<f64>) -> R<Vec<Value>> {
+    at_most(args, 2, name)?;
+    need(args, 2, name)?;
+    let a = mat(args, 0, name)?;
+    let b = mat(args, 1, name)?;
+    one_mat(a.try_zip(&b, name, f)?)
 }
 
 // ---- reductions ------------------------------------------------------
@@ -130,8 +191,8 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
         Red::All => |xs| xs.iter().all(|v| *v != 0.0) as u8 as f64,
     };
     one_mat(match along {
-        None => reduce(&m, None, f),
-        Some(Along::Dim(d)) => reduce(&m, Some(d), f),
+        None => reduce(&m, None, f)?,
+        Some(Along::Dim(d)) => reduce(&m, Some(d), f)?,
         Some(Along::All) => reduce_all(&m, f),
     })
 }
@@ -187,7 +248,7 @@ fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
         // is the 0x0 `[]`.
         Along::All if m.is_empty() => one_mat(Matrix::empty()),
         Along::All => one_mat(reduce_all(&m, f)),
-        Along::Dim(d) => one_mat(extremum_along(&m, d, f)),
+        Along::Dim(d) => one_mat(extremum_along(&m, d, f)?),
     }
 }
 
@@ -196,14 +257,14 @@ fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
 /// size as A." Otherwise the reduced dimension becomes 1, even when the other
 /// one is 0, so `max(zeros(3, 0))` is 1x0 and `max(zeros(0, 3), [], 2)` is
 /// 0x1. `max` has no identity element, which is why this is not `sum`'s rule.
-fn extremum_along(m: &Matrix, d: usize, f: impl Fn(&[f64]) -> f64) -> Matrix {
+fn extremum_along(m: &Matrix, d: usize, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
     let len = match d {
         1 => m.rows,
         2 => m.cols,
         _ => 1,
     };
     if len == 0 {
-        return m.clone();
+        return Ok(m.clone());
     }
     reduce(m, Some(d), f)
 }
@@ -300,36 +361,42 @@ pub fn round_significant(x: f64, n: f64) -> f64 {
 ///
 /// A dimension beyond the array's is a singleton, so the answer is the input
 /// unchanged; `0` never reaches here, because `args::dim` rejects it.
-pub fn reduce(m: &Matrix, dim: Option<usize>, f: impl Fn(&[f64]) -> f64) -> Matrix {
+/// The result shape comes from the operand, and one dimension of an operand
+/// can be enormous while the operand itself is empty: `sum(zeros(0, 1e15))`
+/// is a 1x1e15 row built from no elements at all, and used to abort in the
+/// allocator. Both shapes therefore go through `args::check_shape` first.
+pub fn reduce(m: &Matrix, dim: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
     let d = match dim {
         Some(d) => d,
         None => {
             // Only the no-dimension form of a 0x0 collapses to the identity:
             // sum([]) is 0, but sum([], 1) keeps MATLAB's 1x0 empty.
             if m.rows == 0 && m.cols == 0 {
-                return Matrix::scalar(f(&[]));
+                return Ok(Matrix::scalar(f(&[])));
             }
             if m.rows == 1 { 2 } else { 1 }
         }
     };
     if d >= 3 {
-        return m.clone();
+        return Ok(m.clone());
     }
     if d == 1 {
-        Matrix::row(
+        check_shape(1.0, m.cols as f64)?;
+        Ok(Matrix::row(
             (0..m.cols)
                 .map(|c| f(&m.data[c * m.rows..(c + 1) * m.rows]))
                 .collect(),
-        )
+        ))
     } else {
-        Matrix::col(
+        check_shape(m.rows as f64, 1.0)?;
+        Ok(Matrix::col(
             (0..m.rows)
                 .map(|r| {
                     let xs: Vec<f64> = (0..m.cols).map(|c| m.get(r, c)).collect();
                     f(&xs)
                 })
                 .collect(),
-        )
+        ))
     }
 }
 
@@ -389,7 +456,119 @@ mod tests {
     }
 
     fn sum_of(m: &Matrix, d: Option<usize>) -> Matrix {
-        reduce(m, d, |xs| xs.iter().sum())
+        reduce(m, d, |xs| xs.iter().sum()).expect("shape fits")
+    }
+
+    /// Acceptance test 17, the `reduce` half. The operand is empty and one of
+    /// its dimensions is enormous, so the result shape is the only thing that
+    /// can be judged; the allocation used to happen anyway.
+    #[test]
+    fn reduce_checks_the_result_size_before_allocating() {
+        let wide = Matrix::new(0, 1_000_000_000_000_000, Vec::new());
+        let e = reduce(&wide, Some(1), sum0).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 1x1000000000000000 array exceeds the maximum array size."
+        );
+        let tall = Matrix::new(1_000_000_000_000_000, 0, Vec::new());
+        let e = reduce(&tall, Some(2), sum0).unwrap_err().msg;
+        assert!(e.contains("1000000000000000x1"), "{e}");
+        // Through the builtin, which is how a script reaches it.
+        assert!(
+            call(
+                &[val(wide.clone()), val(Matrix::scalar(1.0))],
+                "sum",
+                Red::Sum
+            )
+            .is_err()
+        );
+        assert!(call(&[val(tall), val(Matrix::scalar(2.0))], "mean", Red::Mean).is_err());
+        // A dimension past the array's is a singleton and allocates nothing
+        // new, so it is still allowed.
+        assert!(reduce(&wide, Some(3), sum0).is_ok());
+        // And an ordinary reduction is untouched.
+        assert_eq!(
+            reduce(&rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]), Some(1), sum0).unwrap(),
+            Matrix::row(vec![4.0, 6.0])
+        );
+    }
+
+    /// Acceptance test 14 at the level of the helpers: the domain test runs
+    /// over the whole argument before any of it is mapped.
+    #[test]
+    fn a_real_function_refuses_a_complex_result() {
+        let neg = |name: &str, f: fn(f64) -> f64, x: f64| {
+            real_unary(&[val(Matrix::scalar(x))], name, f, Real::NonNegative)
+        };
+        for (name, f) in [
+            ("sqrt", f64::sqrt as fn(f64) -> f64),
+            ("log", f64::ln),
+            ("log2", f64::log2),
+            ("log10", f64::log10),
+        ] {
+            let e = neg(name, f, -1.0).unwrap_err().msg;
+            assert_eq!(
+                e,
+                format!(
+                    "Complex results are not supported. '{name}' of a negative number is complex."
+                )
+            );
+            // On the domain, and at its edge, the value comes through.
+            assert!(neg(name, f, 1.0).is_ok());
+            assert!(neg(name, f, 0.0).is_ok());
+            assert!(neg(name, f, -0.0).is_ok());
+            assert!(neg(name, f, f64::NAN).is_ok());
+            assert!(neg(name, f, f64::INFINITY).is_ok());
+            assert!(neg(name, f, f64::NEG_INFINITY).is_err());
+        }
+        let unit = |name: &str, f: fn(f64) -> f64, x: f64| {
+            real_unary(&[val(Matrix::scalar(x))], name, f, Real::UnitInterval)
+        };
+        for (name, f) in [("asin", f64::asin as fn(f64) -> f64), ("acos", f64::acos)] {
+            let e = unit(name, f, 2.0).unwrap_err().msg;
+            assert_eq!(
+                e,
+                format!(
+                    "Complex results are not supported. \
+                     '{name}' of a value outside [-1, 1] is complex."
+                )
+            );
+            assert!(unit(name, f, -2.0).is_err());
+            assert!(unit(name, f, f64::INFINITY).is_err());
+            assert!(unit(name, f, 1.0).is_ok());
+            assert!(unit(name, f, -1.0).is_ok());
+            assert!(unit(name, f, f64::NAN).is_ok());
+        }
+        // One bad element in a matrix refuses the whole call.
+        let m = val(Matrix::row(vec![1.0, -4.0, 9.0]));
+        assert!(real_unary(&[m], "sqrt", f64::sqrt, Real::NonNegative).is_err());
+    }
+
+    #[test]
+    fn a_negative_base_with_a_fractional_exponent_is_complex() {
+        let e = powf_real(-8.0, 1.0 / 3.0).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Complex results are not supported. \
+             A negative number raised to a fractional power is complex."
+        );
+        assert!(powf_real(-2.0, 0.5).is_err());
+        // An integer exponent is real, whatever its sign.
+        assert_eq!(powf_real(-8.0, 2.0).unwrap(), 64.0);
+        assert_eq!(powf_real(-2.0, -2.0).unwrap(), 0.25);
+        assert_eq!(powf_real(-8.0, 0.0).unwrap(), 1.0);
+        // So is an infinite one, which IEEE answers without going complex.
+        assert_eq!(powf_real(-2.0, f64::INFINITY).unwrap(), f64::INFINITY);
+        assert_eq!(powf_real(-2.0, f64::NEG_INFINITY).unwrap(), 0.0);
+        // A non-negative base takes any exponent, and so does a NaN one.
+        assert_eq!(powf_real(8.0, 1.0 / 3.0).unwrap(), 8.0f64.powf(1.0 / 3.0));
+        assert_eq!(powf_real(-0.0, 0.5).unwrap(), 0.0);
+        assert!(powf_real(f64::NAN, 0.5).unwrap().is_nan());
+        assert!(powf_real(-2.0, f64::NAN).unwrap().is_nan());
+        // The `power` builtin broadcasts through the same test.
+        let a = val(Matrix::row(vec![-8.0, 8.0]));
+        let b = val(Matrix::scalar(1.0 / 3.0));
+        assert!(real_binary(&[a, b], "power", powf_real).is_err());
     }
 
     #[test]

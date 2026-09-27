@@ -25,7 +25,11 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 
 - This module is OPTIONAL. Decide before starting cycle 09 whether to
   run it; if it is skipped, every builtin that would return a complex
-  result must raise a clear error instead.
+  result must raise a clear error instead. Cycle 01d already put that error
+  in place for the nine inputs QA D14 named, through `math::Real`,
+  `math::powf_real` and the three `error::complex_*` constructors, so the
+  skip case is covered. This cycle's job is to replace those refusals with
+  values, not to add any.
 
 ## Design notes
 

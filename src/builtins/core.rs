@@ -203,9 +203,15 @@ fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         100.0
     };
     let (_, n) = check_shape(1.0, n)?;
+    // "linspace always includes the endpoints", so the last element is `b`
+    // itself rather than `a + (b - a) * (n - 1) / (n - 1)`, which rounds off:
+    // `linspace(-2.9, 1.17, 7)` used to end a few ulps short of `1.17`. Only
+    // the end point needs pinning; the colon's two-sided computation buys
+    // nothing here, because every interior point is already one multiply and
+    // one add from `a` rather than a running sum.
     let data = (0..n)
         .map(|k| {
-            if n == 1 {
+            if k + 1 == n {
                 b
             } else {
                 a + (b - a) * k as f64 / (n - 1) as f64
@@ -462,7 +468,18 @@ fn char_of(v: f64) -> char {
     }
 }
 
+/// 2^63: the first magnitude an `i64` cannot hold.
+const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
 /// `%d`, `%i` and `%u`. Precision zero-pads the digits, as in C.
+///
+/// An integral value at or above `2^63` no longer prints the `i64` clamp:
+/// `fprintf('%d', 1e30)` printed `9223372036854775807` and now prints the
+/// value. Past that magnitude the digits come from `{:.0}`, the exact decimal
+/// expansion of the double, so `1e30` prints as
+/// `1000000000000000019884624838656`, which is what C's `%.0f` gives for the
+/// same bits. Below it the `i64` path stays, so nothing that already printed
+/// correctly moves.
 fn int_body(v: f64, prec: Option<usize>) -> String {
     if !v.is_finite() {
         return nonfinite(v);
@@ -472,13 +489,16 @@ fn int_body(v: f64, prec: Option<usize>) -> String {
         // that is not an integer.
         return fmt_e(v, prec.unwrap_or(6));
     }
-    // Known bug, scheduled to cycle 11: this saturates at 64 bits.
-    let n = v as i64;
-    let digits = format!("{}", n.unsigned_abs());
+    let magnitude = v.abs();
+    let digits = if magnitude < I64_LIMIT {
+        format!("{}", magnitude as u64)
+    } else {
+        format!("{:.0}", magnitude)
+    };
     let pad = prec.unwrap_or(0).saturating_sub(digits.len());
     format!(
         "{}{}{}",
-        if n < 0 { "-" } else { "" },
+        if v < 0.0 { "-" } else { "" },
         "0".repeat(pad),
         digits
     )
@@ -495,10 +515,57 @@ fn char_code(v: f64) -> Option<char> {
 
 /// `%s` given a number: MATLAB prints the character with that code, and falls
 /// back to the number itself when the value is not a character code.
+///
+/// Precision truncates the text, as it does for a char argument; on the `%g`
+/// fallback it is still the number of significant digits, which is where
+/// QA D16 leaves it for cycle 11.
 fn str_body(v: f64, prec: Option<usize>) -> String {
     match char_code(v) {
-        Some(c) => c.to_string(),
+        Some(c) => truncate(&c.to_string(), prec),
         None => fmt_g(v, prec.unwrap_or(6)),
+    }
+}
+
+/// `%.Ns`: C and MATLAB cut a string to `N` characters, and do it before the
+/// field width pads, so `sprintf('[%5.2s]', 'abcdef')` is `[   ab]`. Precision
+/// on a string used to be read and then ignored.
+fn truncate(s: &str, prec: Option<usize>) -> String {
+    match prec {
+        Some(n) => s.chars().take(n).collect(),
+        None => s.to_string(),
+    }
+}
+
+/// The largest width or precision any conversion will accept.
+///
+/// Both numbers reach an allocation or a Rust formatter, and both used to be
+/// unbounded. Rust holds a formatter's precision in a `u16`, so `%.65536f`
+/// panicked with "Formatting argument out of range" and `%.65535e` tripped its
+/// own `ndigits > 0` assertion one below that; `%2147483647d` built a
+/// two-gigabyte pad and aborted in the allocator. Every one of them is a
+/// single line of user input that killed the REPL.
+///
+/// 8192 is chosen to be far beyond any honest format and far below every
+/// limit above. A double's longest exact decimal expansion is 1074 fractional
+/// digits, so `%.8192f` still prints every value in full, and the widest
+/// field that could be meant for a terminal is two orders of magnitude
+/// narrower. It bounds `%f`, `%e`, `%g`, `%d` and `%s` alike, including the
+/// fallbacks `%d` and `%s` take to `fmt_e` and `fmt_g` for a value that is not
+/// an integer, which is how `%.65536d` reached the same panic.
+pub const MAX_FIELD: usize = 8192;
+
+/// One width or precision from a format specifier, bounded. An empty run of
+/// digits is `absent` (`%5d` has no precision and `%.f` means `%.0f`), and
+/// anything that does not fit is the same clean error as an absurd one: the
+/// old `parse().unwrap_or(0)` silently ignored the width of
+/// `sprintf('%99999999999999999999d', 1)`.
+fn field(digits: &str, absent: usize) -> R<usize> {
+    if digits.is_empty() {
+        return Ok(absent);
+    }
+    match digits.parse::<usize>() {
+        Ok(n) if n <= MAX_FIELD => Ok(n),
+        _ => Err(error::format_field_too_large(MAX_FIELD)),
     }
 }
 
@@ -561,6 +628,7 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                 width.push(chars[i]);
                 i += 1;
             }
+            let width = field(&width, 0)?;
             let mut prec: Option<usize> = None;
             if i < chars.len() && chars[i] == '.' {
                 i += 1;
@@ -569,7 +637,7 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                     p.push(chars[i]);
                     i += 1;
                 }
-                prec = Some(p.parse().unwrap_or(0));
+                prec = Some(field(&p, 0)?);
             }
             if i >= chars.len() {
                 return Err(error::invalid_format_spec());
@@ -620,7 +688,9 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                         s.push(char_of(next));
                         ai += 1;
                     }
-                    s
+                    // The whole argument is still consumed; only the text
+                    // printed is cut, and it is cut before the width pads.
+                    truncate(&s, prec)
                 }
                 ('s', Some(PArg::Num(v))) => {
                     numeric = false;
@@ -635,7 +705,6 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                     body.insert(0, ' ');
                 }
             }
-            let width: usize = width.parse().unwrap_or(0);
             let len = body.chars().count();
             if len >= width {
                 out.push_str(&body);
@@ -867,6 +936,30 @@ mod tests {
         assert_eq!(mat_of(linspace, &[num(0.0), num(1.0)]).numel(), 100);
     }
 
+    /// "linspace always includes the endpoints": the last element is the end
+    /// point itself, not `a + (b - a) * (n - 1) / (n - 1)`, which rounds off.
+    #[test]
+    fn linspace_lands_exactly_on_both_end_points() {
+        let lin = |a: f64, b: f64, n: f64| mat_of(linspace, &[num(a), num(b), num(n)]);
+        for (a, b, n) in [
+            (0.0, 1.0, 7.0),
+            (-2.9, 1.17, 7.0),
+            (1.0, 0.0, 5.0),
+            (-1.0, 1.0, 101.0),
+            (0.1, 0.3, 3.0),
+            (1e-15, 1e15, 9.0),
+        ] {
+            let m = lin(a, b, n);
+            assert_eq!(m.numel(), n as usize, "{a}:{b} in {n}");
+            assert_eq!(m.data[0], a, "start of {a}..{b}");
+            assert_eq!(*m.data.last().unwrap(), b, "end of {a}..{b}");
+        }
+        // A single point is the end point, as MATLAB documents.
+        assert_eq!(lin(0.0, 1.0, 1.0).data, [1.0]);
+        // The interior is unchanged.
+        assert_eq!(lin(0.0, 1.0, 5.0).data, [0.0, 0.25, 0.5, 0.75, 1.0]);
+    }
+
     #[test]
     fn isvector_counts_an_empty_row_or_column() {
         let isv = |m: Matrix| mat_of(isvector, &[Value::Mat(m)]).data[0];
@@ -1026,6 +1119,132 @@ mod tests {
         assert_eq!(pf("[%+06.1f]", &[1.5]), "[+001.5]");
         // A char conversion takes no sign.
         assert_eq!(pf("[%+c]", &[65.0]), "[A]");
+    }
+
+    /// Acceptance test 18: the bound holds at the boundary and one past it,
+    /// for every conversion, including the two fallbacks `%d` and `%s` take
+    /// for a value they cannot print as themselves. Each of these used to
+    /// panic (exit 101) or build a multi-gigabyte pad (exit 134).
+    #[test]
+    fn printf_bounds_its_width_and_precision_for_every_conversion() {
+        let too_large = format!(
+            "The width or precision in a format specifier must be at most {}.",
+            MAX_FIELD
+        );
+        let try_fmt = |fmt: &str, v: f64| {
+            format_printf(&[Value::Str(fmt.to_string()), Value::Mat(Matrix::scalar(v))])
+        };
+        // `%s` of pi falls back to `%g`, `%d` of pi to `%e`; both used to
+        // reach the same panic through the fallback rather than the
+        // conversion itself.
+        for (conv, v) in [
+            ('d', 1.0),
+            ('i', 1.0),
+            ('u', 1.0),
+            ('f', 1.0),
+            ('F', 1.0),
+            ('e', 1.0),
+            ('E', 1.0),
+            ('g', 1.0),
+            ('G', 1.0),
+            ('c', 65.0),
+            ('s', 65.0),
+            ('d', std::f64::consts::PI),
+            ('s', std::f64::consts::PI),
+        ] {
+            let at = format!("%.{MAX_FIELD}{conv}");
+            assert!(try_fmt(&at, v).is_ok(), "precision at the bound: {at}");
+            let past = format!("%.{}{}", MAX_FIELD + 1, conv);
+            assert_eq!(
+                try_fmt(&past, v).unwrap_err().msg,
+                too_large,
+                "precision past the bound: {past}"
+            );
+            let at = format!("%{MAX_FIELD}{conv}");
+            assert_eq!(
+                try_fmt(&at, v).unwrap().chars().count(),
+                MAX_FIELD,
+                "width at the bound: {at}"
+            );
+            let past = format!("%{}{}", MAX_FIELD + 1, conv);
+            assert_eq!(
+                try_fmt(&past, v).unwrap_err().msg,
+                too_large,
+                "width past the bound: {past}"
+            );
+        }
+        // The three inputs from the spec, by number rather than by boundary.
+        assert_eq!(try_fmt("%.65536f", 1.0).unwrap_err().msg, too_large);
+        assert_eq!(try_fmt("%.65535e", 1.0).unwrap_err().msg, too_large);
+        assert_eq!(try_fmt("%2147483647d", 1.0).unwrap_err().msg, too_large);
+        // A width too long even for a usize used to be read as `0` and the
+        // whole field silently dropped.
+        assert_eq!(
+            try_fmt("%99999999999999999999d", 1.0).unwrap_err().msg,
+            too_large
+        );
+        assert_eq!(
+            try_fmt("%.99999999999999999999f", 1.0).unwrap_err().msg,
+            too_large
+        );
+        // An absent field is still absent, and `%.f` still means `%.0f`.
+        assert_eq!(pf("[%d]", &[5.0]), "[5]");
+        assert_eq!(pf("[%.f]", &[1.5]), "[2]");
+        assert_eq!(field("", 6).unwrap(), 6);
+        assert_eq!(field("0", 6).unwrap(), 0);
+        assert_eq!(field(&MAX_FIELD.to_string(), 0).unwrap(), MAX_FIELD);
+        assert!(field(&(MAX_FIELD + 1).to_string(), 0).is_err());
+    }
+
+    /// `%d` of an integral value at or above 2^63 used to print the `i64`
+    /// clamp. The expected digits are the exact value of the double, which is
+    /// what C's `%.0f` prints for the same bits.
+    #[test]
+    fn printf_d_prints_an_integer_past_64_bits_in_full() {
+        assert_eq!(pf("%d", &[1e30]), "1000000000000000019884624838656");
+        assert_eq!(pf("%d", &[-1e30]), "-1000000000000000019884624838656");
+        assert_eq!(pf("%d", &[I64_LIMIT]), "9223372036854775808");
+        assert_eq!(pf("%d", &[-I64_LIMIT]), "-9223372036854775808");
+        // The largest double below the limit still takes the i64 path.
+        let below = 9_223_372_036_854_774_784.0;
+        assert!(below < I64_LIMIT);
+        assert_eq!(pf("%d", &[below]), "9223372036854774784");
+        // Everything that already printed correctly is untouched.
+        assert_eq!(pf("%d", &[0.0]), "0");
+        assert_eq!(pf("%d", &[-0.0]), "0");
+        assert_eq!(pf("%d", &[-7.0]), "-7");
+        assert_eq!(pf("%d", &[1e15]), "1000000000000000");
+        assert_eq!(pf("[%d][%d]", &[f64::INFINITY, f64::NAN]), "[Inf][NaN]");
+        // The flags and the padding still see the whole number.
+        assert_eq!(pf("%+d", &[1e30]), "+1000000000000000019884624838656");
+        assert_eq!(pf("%.33d", &[1e30]), "001000000000000000019884624838656");
+    }
+
+    /// C and MATLAB cut a string to the precision, and do it before the width
+    /// pads. The precision used to be parsed and then ignored.
+    #[test]
+    fn printf_truncates_a_string_to_its_precision() {
+        let s = |fmt: &str, text: &str| {
+            format_printf(&[Value::Str(fmt.to_string()), Value::Str(text.to_string())]).unwrap()
+        };
+        assert_eq!(s("[%5.2s]", "abcdef"), "[   ab]");
+        assert_eq!(s("[%-5.2s]", "abcdef"), "[ab   ]");
+        assert_eq!(s("[%.2s]", "abcdef"), "[ab]");
+        assert_eq!(s("[%.0s]", "abcdef"), "[]");
+        // A precision longer than the string leaves it whole.
+        assert_eq!(s("[%.9s]", "abc"), "[abc]");
+        // No precision, no truncation.
+        assert_eq!(s("[%5s]", "abcdef"), "[abcdef]");
+        assert_eq!(s("[%s]", "abcdef"), "[abcdef]");
+        // The whole char argument is still consumed, so the format cycles
+        // once rather than once per remaining character.
+        assert_eq!(s("[%.1s]", "abc"), "[a]");
+        // A number that is a character code truncates the same way.
+        assert_eq!(pf("[%.0s]", &[65.0]), "[]");
+        assert_eq!(pf("[%.1s]", &[65.0]), "[A]");
+        // On the `%g` fallback the precision is still significant digits.
+        assert_eq!(pf("[%.3s]", &[1.5]), "[1.5]");
+        assert_eq!(pf("[%.2s]", &[123.456]), "[1.2e+02]");
     }
 
     #[test]

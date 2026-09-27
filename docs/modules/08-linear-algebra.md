@@ -20,13 +20,14 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - Singular systems warn instead of erroring, and so do `inv` and `A^-1` of a
   singular matrix (QA D26), which return `Inf` matrices as MATLAB and Octave
   do: `inv([1 2; 2 4])` is `Inf Inf; Inf Inf`, and `inv(0)` is `Inf`
-- Fix `matmul` swallowing `Inf` and `NaN`: the `if b == 0.0 { continue }`
-  sparsity shortcut skips the multiply, so `[Inf 0] * [0; 1]` gives `0`
-  where MATLAB gives `NaN`. See "Known bugs" in `docs/ARCHITECTURE.md`
-- Fix the absolute pivot tolerance in `solve`: the fixed `1e-14` test
-  calls the perfectly conditioned `[1e-15 0; 0 1e-15]` singular. Make the
-  threshold relative to the matrix norm, and make `det` and `solve` agree
-  on what singular means. The LU rewrite in this cycle is the place
+
+Two bullets that stood here, `matmul` swallowing `Inf` and `NaN` through its
+sparsity shortcut and the absolute pivot tolerance in `solve`, were fixed by
+cycle 01d and removed from this Scope in the same commit. The LU rewrite
+inherits the rule rather than inventing a second one: `Matrix::singular_tol`
+is `eps * n * max |A|` over the finite entries, and `solve` and `det` both
+test a pivot against it with `<=`, which is what makes them agree on what
+singular means. Keeping them in agreement is part of this cycle's job.
 
 ## Out of scope
 

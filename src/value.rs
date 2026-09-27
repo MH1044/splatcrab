@@ -133,9 +133,22 @@ impl Matrix {
 
     /// Element-wise combination with scalar / row / column broadcasting.
     pub fn zip(&self, o: &Matrix, op: &str, f: impl Fn(f64, f64) -> f64) -> R<Matrix> {
+        self.try_zip(o, op, |a, b| Ok(f(a, b)))
+    }
+
+    /// [`zip`](Matrix::zip) for an operation that may refuse an element, which
+    /// is what `.^` needs now that a would-be-complex result is an error
+    /// rather than a `NaN`. `zip` is this function with an infallible closure.
+    ///
+    /// The broadcast shape goes through `args::check_shape` before a single
+    /// element is allocated. `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
+    /// elements from two 1e5-element operands, and used to abort in the
+    /// allocator with exit 134, taking the REPL with it.
+    pub fn try_zip(&self, o: &Matrix, op: &str, f: impl Fn(f64, f64) -> R<f64>) -> R<Matrix> {
         let dims_err = || error::operator_dims(op, self.rows, self.cols, o.rows, o.cols);
         let rows = broadcast_dim(self.rows, o.rows).ok_or_else(dims_err)?;
         let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
+        crate::builtins::args::check_shape(rows as f64, cols as f64)?;
         let mut data = Vec::with_capacity(rows * cols);
         for c in 0..cols {
             for r in 0..rows {
@@ -147,7 +160,7 @@ impl Matrix {
                     if o.rows == 1 { 0 } else { r },
                     if o.cols == 1 { 0 } else { c },
                 );
-                data.push(f(a, b));
+                data.push(f(a, b)?);
             }
         }
         Ok(Matrix::new(rows, cols, data))
@@ -163,23 +176,61 @@ impl Matrix {
         Matrix::new(self.cols, self.rows, data)
     }
 
+    /// Matrix product. The result shape comes from the operands, so it goes
+    /// through `args::check_shape` before `Matrix::filled` allocates: the
+    /// outer product `ones(1e5, 1) * ones(1, 1e5)` used to abort in the
+    /// allocator, and `zeros(2^32, 0) * zeros(0, 2^32)` used to wrap
+    /// `rows * cols` to zero, report a 4294967296-square result and then panic
+    /// on the next transpose.
+    ///
+    /// There is deliberately no `if b == 0.0 { continue }` shortcut. Skipping
+    /// the multiply meant `Inf * 0` and `NaN * 0` never happened, so
+    /// `[Inf 0] * [0; 1]` gave `0` where MATLAB gives `NaN`.
     pub fn matmul(&self, o: &Matrix) -> R<Matrix> {
         if self.cols != o.rows {
             bail!(error::matmul_dims(self.rows, self.cols, o.rows, o.cols));
         }
+        crate::builtins::args::check_shape(self.rows as f64, o.cols as f64)?;
         let mut out = Matrix::filled(self.rows, o.cols, 0.0);
+        if out.data.is_empty() {
+            // Nothing to accumulate into, and `o.cols` alone can be enormous:
+            // `zeros(0, 5) * zeros(5, 2^32)` is a legal 0x2^32 result, so the
+            // column loop below would spin four billion times for nothing.
+            return Ok(out);
+        }
         for j in 0..o.cols {
             for k in 0..self.cols {
                 let b = o.get(k, j);
-                if b == 0.0 {
-                    continue;
-                }
                 for i in 0..self.rows {
                     out.data[j * self.rows + i] += self.get(i, k) * b;
                 }
             }
         }
         Ok(out)
+    }
+
+    /// The pivot magnitude at or below which this matrix counts as singular.
+    ///
+    /// It is relative to the matrix, not absolute: the old fixed `1e-14`
+    /// called the diagonal `[1e-15 0; 0 1e-15]` singular although it is
+    /// perfectly conditioned, and only its scale was small. `eps * n * ||A||`
+    /// is the usual rule, with `||A||` the largest magnitude in `A`.
+    ///
+    /// `solve` and `det` both use it, which is what makes them agree on what
+    /// singular means. Non-finite entries are left out of the norm, so an
+    /// `Inf` in the matrix cannot make every pivot look negligible; a pivot
+    /// that is itself `Inf` or `NaN` fails the `<=` test and flows through to
+    /// the arithmetic, exactly as it did under the fixed threshold.
+    ///
+    /// The test is `<=` rather than `<` so that the all-zero matrix, whose
+    /// norm and tolerance are both `0`, is still singular.
+    fn singular_tol(&self) -> f64 {
+        let norm = self
+            .data
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        f64::EPSILON * self.rows.max(1) as f64 * norm
     }
 
     /// Solve A * X = B for square A (Gaussian elimination with partial pivoting).
@@ -194,6 +245,7 @@ impl Matrix {
         if b.rows != n {
             bail!(error::solve_dims(self.rows, self.cols, b.rows, b.cols));
         }
+        let tol = self.singular_tol();
         let m = b.cols;
         let mut a: Vec<Vec<f64>> = (0..n)
             .map(|i| (0..n).map(|j| self.get(i, j)).collect())
@@ -210,7 +262,7 @@ impl Matrix {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
-            if a[p][k].abs() < 1e-14 {
+            if a[p][k].abs() <= tol {
                 bail!(error::singular());
             }
             a.swap(k, p);
@@ -261,6 +313,7 @@ impl Matrix {
             bail!(error::nonsquare_determinant());
         }
         let n = self.rows;
+        let tol = self.singular_tol();
         let mut a: Vec<Vec<f64>> = (0..n)
             .map(|i| (0..n).map(|j| self.get(i, j)).collect())
             .collect();
@@ -274,7 +327,9 @@ impl Matrix {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
-            if a[p][k] == 0.0 {
+            // The same test `solve` makes, so the two agree on what singular
+            // means: `det` reports `0` where `solve` refuses to divide.
+            if a[p][k].abs() <= tol {
                 return Ok(0.0);
             }
             if p != k {
@@ -502,6 +557,39 @@ mod tests {
         );
     }
 
+    /// Acceptance test 17, the `zip` half: the broadcast result shape goes
+    /// through `check_shape`, so `ones(1e5, 1) + ones(1, 1e5)` is an error
+    /// rather than an allocator abort. Asserted here directly, not only
+    /// through a script, because the script form used to kill the process.
+    #[test]
+    fn zip_checks_the_broadcast_result_size_before_allocating() {
+        // 20000 squared is 4e8, past the 2^28-element cap, while the two
+        // operands together are 40000 elements.
+        let col = Matrix::col(vec![1.0; 20_000]);
+        let row = Matrix::row(vec![1.0; 20_000]);
+        let e = col.zip(&row, "+", |x, y| x + y).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 20000x20000 array exceeds the maximum array size."
+        );
+        // The same guard on the fallible form.
+        assert!(col.try_zip(&row, "+", |x, y| Ok(x + y)).is_err());
+        // A shape that fits is untouched, and `zip` is `try_zip` with an
+        // infallible closure.
+        let small = Matrix::col(vec![1.0, 2.0])
+            .try_zip(&Matrix::row(vec![10.0, 20.0]), "*", |x, y| Ok(x * y))
+            .unwrap();
+        assert_eq!(small.data, [10.0, 20.0, 20.0, 40.0]);
+        // A refusal from the closure comes out as the error.
+        let e = Matrix::scalar(1.0)
+            .try_zip(&Matrix::scalar(2.0), "+", |_, _| {
+                Err(crate::error::too_many_outputs())
+            })
+            .unwrap_err()
+            .msg;
+        assert_eq!(e, "Too many output arguments.");
+    }
+
     #[test]
     fn zip_rejects_incompatible_sizes() {
         let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -528,6 +616,45 @@ mod tests {
         // Multiplying by the identity is a no-op.
         assert_eq!(a.matmul(&Matrix::identity(3, 3)).unwrap(), a);
         assert_eq!(Matrix::identity(2, 2).matmul(&a).unwrap(), a);
+    }
+
+    /// Acceptance test 17, the `matmul` half, and acceptance test 4.
+    #[test]
+    fn matmul_checks_the_result_size_before_allocating() {
+        // Both operands are empty, so the old code allocated nothing and
+        // reached `Matrix::filled` with a wrapped `rows * cols`.
+        let tall = Matrix::new(100_000, 0, Vec::new());
+        let wide = Matrix::new(0, 100_000, Vec::new());
+        assert_eq!(
+            tall.matmul(&wide).unwrap_err().msg,
+            "Requested 100000x100000 array exceeds the maximum array size."
+        );
+        // The size that used to wrap to zero: 2^32 squared is exactly 2^64.
+        let a = Matrix::new(1 << 32, 0, Vec::new());
+        let b = Matrix::new(0, 1 << 32, Vec::new());
+        assert_eq!(
+            a.matmul(&b).unwrap_err().msg,
+            "Requested 4294967296x4294967296 array exceeds the maximum array size."
+        );
+        // A legal empty result is still produced, and promptly.
+        let wide_ok = Matrix::new(0, 1 << 20, Vec::new());
+        let empty = Matrix::new(0, 0, Vec::new()).matmul(&wide_ok).unwrap();
+        assert_eq!((empty.rows, empty.cols), (0, 1 << 20));
+    }
+
+    /// The `if b == 0.0 { continue }` shortcut is gone, so a zero factor is
+    /// multiplied like any other and `Inf * 0` and `NaN * 0` happen.
+    #[test]
+    fn matmul_keeps_inf_and_nan_through_a_zero_factor() {
+        let inf = Matrix::row(vec![f64::INFINITY, 0.0]);
+        let nan = Matrix::row(vec![f64::NAN, 0.0]);
+        let pick = Matrix::col(vec![0.0, 1.0]);
+        assert!(inf.matmul(&pick).unwrap().data[0].is_nan());
+        assert!(nan.matmul(&pick).unwrap().data[0].is_nan());
+        // A finite matrix with zeros is unaffected: the shortcut only ever
+        // mattered for a non-finite partner.
+        let a = rmat(2, 2, &[1.0, 0.0, 0.0, 2.0]);
+        assert_eq!(a.matmul(&a).unwrap(), rmat(2, 2, &[1.0, 0.0, 0.0, 4.0]));
     }
 
     #[test]
@@ -597,6 +724,82 @@ mod tests {
         for v in &x.data {
             close_tol(*v, 1.0, 1e-8);
         }
+    }
+
+    /// The pivot threshold is relative to the matrix, so a well-conditioned
+    /// system is solved whatever its scale. The old fixed `1e-14` called the
+    /// first of these singular.
+    #[test]
+    fn solve_scales_its_pivot_tolerance_with_the_matrix() {
+        let tiny = rmat(2, 2, &[1e-15, 0.0, 0.0, 1e-15]);
+        let x = tiny.solve(&Matrix::col(vec![1.0, 1.0])).unwrap();
+        close_tol(x.get(0, 0), 1e15, 1e-12);
+        close_tol(x.get(1, 0), 1e15, 1e-12);
+        // The same system scaled up and down is solved just as well.
+        for scale in [1e-300, 1e-30, 1.0, 1e30, 1e150] {
+            let a = rmat(2, 2, &[scale, 0.0, 0.0, scale]);
+            let x = a.solve(&Matrix::col(vec![scale, 2.0 * scale])).unwrap();
+            close(x.get(0, 0), 1.0);
+            close(x.get(1, 0), 2.0);
+        }
+        // Scale alone never decides: a matrix that is singular stays singular
+        // however small its entries are.
+        let singular = rmat(2, 2, &[1e-15, 2e-15, 2e-15, 4e-15]);
+        assert!(
+            singular
+                .solve(&Matrix::col(vec![1.0, 2.0]))
+                .unwrap_err()
+                .msg
+                .contains("singular")
+        );
+        // An all-zero matrix has a zero norm and so a zero tolerance, which
+        // is why the test is `<=` and not `<`.
+        let zeros = Matrix::filled(2, 2, 0.0);
+        assert!(zeros.solve(&Matrix::col(vec![1.0, 1.0])).is_err());
+    }
+
+    /// `det` and `solve` make the same test, which is what "agree on what
+    /// singular means" is: `det` reports `0` exactly where `solve` refuses.
+    #[test]
+    fn det_and_solve_agree_on_singular() {
+        let cases = [
+            rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]),
+            rmat(2, 2, &[1e-15, 2e-15, 2e-15, 4e-15]),
+            Matrix::filled(2, 2, 0.0),
+            rmat(2, 2, &[1e-15, 0.0, 0.0, 1e-15]),
+            rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]),
+        ];
+        for a in cases {
+            let rhs = Matrix::col(vec![1.0, 1.0]);
+            let singular_to_det = a.det().unwrap() == 0.0;
+            let singular_to_solve = a.solve(&rhs).is_err();
+            assert_eq!(singular_to_det, singular_to_solve, "{:?}", a.data);
+        }
+        // The scaled diagonal has a real determinant now, rather than being
+        // written off: 1e-15 * 1e-15.
+        close_tol(
+            rmat(2, 2, &[1e-15, 0.0, 0.0, 1e-15]).det().unwrap(),
+            1e-30,
+            1e-12,
+        );
+    }
+
+    /// A non-finite entry must not drag the norm, and with it the tolerance,
+    /// to infinity: every pivot would then be at or below it and every such
+    /// matrix would be called singular, which the fixed threshold never did.
+    #[test]
+    fn a_non_finite_entry_does_not_make_everything_singular() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let a = rmat(2, 2, &[bad, 0.0, 0.0, 1.0]);
+            assert!(a.singular_tol().is_finite(), "{bad}");
+            assert_eq!(a.singular_tol(), f64::EPSILON * 2.0);
+        }
+        // And the system is still solved: the `Inf` pivot is far above the
+        // tolerance, so the second row is eliminated and back-substituted as
+        // it always was.
+        let a = rmat(2, 2, &[f64::INFINITY, 0.0, 0.0, 1.0]);
+        let x = a.solve(&Matrix::col(vec![1.0, 1.0])).unwrap();
+        assert_eq!(x.get(1, 0), 1.0);
     }
 
     #[test]

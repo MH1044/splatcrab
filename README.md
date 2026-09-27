@@ -116,14 +116,23 @@ z
   separates elements inside brackets just as a space does, so `[1 ...` newline
   `-2]` is two elements
 - Matrix literals, ranges `a:b` and `a:s:b`, capped so `1:1e15` is a clean
-  error rather than an allocator abort
+  error rather than an allocator abort. A range lands exactly on its end point
+  and is symmetric about its middle, so `x = 0:0.1:0.3; x(end) == 0.3` is `1`;
+  an infinite end point such as `0:Inf` is refused
 - Operators `+ - * / \ ^`, elementwise `.* ./ .\ .^`, transpose, comparisons,
-  `& | ~` and short-circuit `&& ||`, with broadcasting
+  `& | ~` and short-circuit `&& ||`, with broadcasting. A result too big to
+  allocate is a clean error wherever its shape comes from the operands, so
+  `ones(1e5,1) + ones(1,1e5)` names the size it was asked for instead of
+  aborting the process
 - Indexing `A(i)`, `A(i,j)`, `v(2:4)`, `A(:,1)`, `A(end)`, and growth on
   indexed assignment such as `z(end+1) = x`
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
-  `break`, `continue`
-- Square `A\b`, `inv`, `det`, integer matrix powers
+  `break`, `continue`. A `for` that runs zero times still assigns the empty to
+  its loop variable, as MATLAB does
+- Square `A\b`, `inv`, `det`, integer matrix powers. The singular test is
+  relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
+  solved rather than written off, and `det` and `\` agree on what singular
+  means
 - 80 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`
@@ -134,6 +143,12 @@ z
   `sum(A, 'all')` and `max(A, [], 'all')`, and `dot` of two matrices. A char
   option is never read as a dimension, and a third size other than `1` is the
   clear error "N-D arrays are not supported."
+- `fprintf` and `sprintf` with a bounded width and precision, so no format
+  specifier can panic or build a pad it cannot afford; `%d` prints an integer
+  past `2^63` in full, and `%.Ns` truncates a string before padding it
+- A result that would be complex, such as `sqrt(-4)` or `(-8)^(1/3)`, is a
+  clean error naming complex numbers rather than a silent `NaN`. Cycle 10
+  replaces the error with the value
 - A builtin that produces no value, such as `disp`, is legal as a statement
   and is "Too many output arguments." in an expression; every builtin rejects
   extra arguments with "Too many input arguments."

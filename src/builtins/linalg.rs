@@ -57,7 +57,11 @@ fn trace(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     if m.rows != m.cols {
         return Err(error::nonsquare_trace());
     }
-    one_mat(Matrix::scalar((0..m.rows).map(|i| m.get(i, i)).sum()))
+    // Through `math::sum0`, not Rust's `.sum()`, whose empty sum is `-0.0`:
+    // `fprintf('%.4f', trace([]))` used to print `-0.0000`. Cycle 01c routed
+    // `sum`, `mean`, `norm` and `dot` this way and missed `trace`.
+    let diagonal: Vec<f64> = (0..m.rows).map(|i| m.get(i, i)).collect();
+    one_mat(Matrix::scalar(sum0(&diagonal)))
 }
 
 /// `diag(v, k)` places `v` on the k-th diagonal of a square matrix of order
@@ -218,7 +222,7 @@ fn dot(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         return Err(error::dot_size_mismatch());
     }
     let products = x.zip(&y, "dot", |p, q| p * q)?;
-    one_mat(reduce(&products, d, sum0))
+    one_mat(reduce(&products, d, sum0)?)
 }
 
 // ---- rearrangement ---------------------------------------------------
@@ -419,6 +423,28 @@ mod tests {
 
     fn num(v: f64) -> Value {
         Value::Mat(Matrix::scalar(v))
+    }
+
+    /// `trace` goes through `math::sum0`, whose empty sum is `+0`. Rust's own
+    /// `.sum()` starts from `-0.0`, so `fprintf('%.4f', trace([]))` printed
+    /// `-0.0000` where MATLAB gives `0`. Cycle 01c fixed `sum`, `mean`,
+    /// `norm` and `dot` this way and missed this one.
+    #[test]
+    fn trace_of_an_empty_is_positive_zero() {
+        let t = call(trace, &[Value::Mat(Matrix::empty())]).unwrap();
+        assert_eq!(t.data, [0.0]);
+        assert!(t.data[0].is_sign_positive(), "trace([]) is -0");
+        // The ordinary answers are unchanged.
+        let a = Value::Mat(Matrix::new(2, 2, vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(call(trace, &[a]).unwrap().data, [5.0]);
+        assert_eq!(
+            call(trace, &[Value::Mat(Matrix::identity(3, 3))])
+                .unwrap()
+                .data,
+            [3.0]
+        );
+        // A non-square matrix is still refused.
+        assert!(call(trace, &[row(&[1.0, 2.0])]).is_err());
     }
 
     #[test]

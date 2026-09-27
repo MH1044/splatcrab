@@ -29,11 +29,20 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - A char element is a UTF-16 code unit, as in MATLAB (QA D37):
   `length('😀')` is `2`
 - `save` and `load` for uncompressed MAT version 5, plus `-ascii`
-- Fix `%d` saturating at 64 bits: `fprintf('%d', 1e30)` prints the `i64`
-  clamp `9223372036854775807` instead of the full value. See "Known bugs"
-  in `docs/ARCHITECTURE.md`
-- Fix precision being ignored for string conversions: `%5.2s` of
-  `'abcdef'` must truncate to two characters before padding to five
+- `printf` conversions and flags (QA D16), which cycle 01d's Out of scope
+  moved here rather than leave half a `printf` rewrite in a bug-fix cycle:
+  `%E` and `%G` printing a lower-case `e`; `%s` of a non-integer using `%g`
+  where the MATLAB page's own example gives `%e`; the ignored `#` flag; the
+  `0` flag padding a non-finite value; the unprocessed escapes `\xN`, `\N`
+  (octal), `\a`, `\b`, `\f` and `\v`; `%x`, `%X`, `%o` and a `*` width or
+  precision; and MATLAB printing the text up to an invalid conversion rather
+  than erroring. See "Known bugs" in `docs/ARCHITECTURE.md` for each
+
+Two bullets that stood here, `%d` saturating at 64 bits and precision being
+ignored for string conversions, were fixed by cycle 01d and removed from this
+Scope in the same commit. That cycle also bounded `printf`'s width and
+precision at `core::MAX_FIELD`; the rewrite here needs a bound of its own,
+because the panics it prevents are in Rust's formatter and do not go away.
 
 ## Out of scope
 
