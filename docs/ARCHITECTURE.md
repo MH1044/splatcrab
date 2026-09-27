@@ -128,8 +128,9 @@ builtin.
    lexes as a `Token` rather than an `Ident`.
 2. `parser.rs`: add the `Stmt` variant and a branch in `parse_stmt`.
 3. `interp.rs`: add the arm in `exec`, returning the right `Flow`.
-4. `main.rs`: if the statement opens a block, teach `needs_more` to count it so
-   the REPL keeps reading lines.
+4. `syntax.rs`: if the statement opens a block, teach `completeness` to count
+   it, so both the REPL and the interface keep reading lines. This lived in
+   `main.rs` until cycle U0 moved it out; look there, not in the binary.
 
 ### Add a value type
 

@@ -28,6 +28,8 @@ and the table names the cycle that owns it.
 | 01 | [registry-and-builtins](modules/01-registry-and-builtins.md) | The 79 builtins moved out of one 409-line match into a registry that knows `nargout`, plus `tic`/`toc` for 81; arity checks; interpreter on a 256 MB stack | Done (2026-09-27) |
 | 01b | [error-reporting](modules/01b-error-reporting.md) | `MError` carrying a line number and every message text, `Error: Line N` in script mode, the three lexer defects found in cycle 0, elementwise `.\`, and a capped range | Done (2026-09-27) |
 | 01c | [builtin-arguments](modules/01c-builtin-arguments.md) | The argument forms that cycle 01's arity checks turned into errors (`sort` direction, `find` count, `norm` order, `diag` offset, `num2str` precision, `round` digits), size vectors such as `zeros(size(A))`, `true(n)`, `eps(x)`, `'all'`, and the QA pass's argument defects in the same builtins | Done (2026-09-27) |
+| 01d | [numerics-and-printf](modules/01d-numerics-and-printf.md) | The numeric and `printf` defects: `matmul` with `Inf`/`NaN`, a pivot tolerance relative to the norm, unchecked result sizes, `printf` width and precision, colon and `linspace` end points, and the last three inputs that kill the process | Planned |
+| 01e | [display-and-parser](modules/01e-display-and-parser.md) | The display and parser defects: column wrapping, non-finite rows, empty shapes, chained ranges, readable token names, REPL errors to stderr, a parser depth limit, and `break` outside a loop | Planned |
 | 02 | [classes-and-display](modules/02-classes-and-display.md) | Logical and char classes as a tag on `Matrix`; class propagation; MATLAB display fidelity | Planned |
 | 03 | [indexing-forms](modules/03-indexing-forms.md) | Logical indexing, element deletion, in-place assignment, access-chain AST, multiple return values | Planned |
 | 04 | [switch-try-commands](modules/04-switch-try-commands.md) | `switch`, `try`/`catch` with an error struct, `warning`, `assert`, command syntax, block comments | Planned |
@@ -41,10 +43,56 @@ and the table names the cycle that owns it.
 | 12 | [plotting](modules/12-plotting.md) | `plot`, `scatter`, `bar`, `histogram`, `subplot`, labels and legends, SVG and PNG output | Planned |
 | 13 | [environment](modules/13-environment.md) | REPL line editing and history, tab completion, `help`, `which`, `eval`, `format` | Planned |
 
+## The U series: the interface
+
+A second axis, not a continuation of the first. The `NN` numbers above encode
+the order the *language* has to be built in, and that order has a written
+rationale. The interface is orthogonal to it: it needs no language feature that
+does not already exist, and the language needs nothing from it. Numbering it
+into the same series would force renumbering around 12 and 13 and would imply a
+dependency that is not there.
+
+`GOLDEN_FILTER` is a substring match, so `tests/cases/U0-ui-foundations/` and
+friends work with no change to the harness.
+
+The interface is a browser page served by the binary itself over loopback,
+using the standard library alone. It is deliberately MATLAB-shaped, and
+deliberately better in the places people dislike MATLAB: it starts instantly,
+its dark mode is defined once rather than retrofitted, an error takes you to
+the line that raised it, plots appear inline rather than in floating windows
+that get lost, and the transcript is ordinary selectable text.
+
+| U | Module | Goal | Status |
+|---|---|---|---|
+| U0 | ui-foundations | The evaluation protocol as a stdin/stdout program, covered by the existing golden harness, with no network code at all | Planned |
+| U1 | ui-server | `splatcrab --ui` serves a loopback page that runs a line and shows its exact output; the HTTP bytes are pinned by golden cases | Planned |
+| U2 | ui-desktop | Four resizable panes: command window, workspace and file browser, with the palette defined exactly once | Planned |
+| U3 | ui-editor | An editor with tabs and line numbers, Run and Run Selection, and an error that jumps to its line | Planned |
+| U4 | ui-figures | Gated on 12 and 13: plots inline, path completion, and `cd` shared between the command window and the file pane | Planned |
+
+Built between 01e and 02, except U4, which waits for the modules it depends on.
+U0 comes first for a reason: it puts the whole protocol behind a stdio program
+before any socket exists, so the hard half is covered by ordinary golden cases
+and U1 is left as a thin shell over something already proven.
+
 ## Dependency policy
 
-No crates and no dev-dependencies until the plotting module. Even there, prefer
-a hand-written SVG writer and a store-only PNG encoder over pulling in a
-dependency. The point is a self-contained binary that builds in seconds; a
-linear algebra crate would be the first thing to weigh, and only once the API
-surface has settled.
+**No crate is ever added, for any reason.** Nothing in `[dependencies]`, nothing
+in `[dev-dependencies]`, in any module, plotting and the interface included.
+The standard library only.
+
+This used to read "no crates until the plotting module", which contradicted
+the project's Definition of Done, which
+said never. The absolute reading wins and the carve-out is gone.
+
+What that buys, and what it costs. A self-contained binary that builds in
+seconds and has no supply chain. In exchange, several things are hand-written
+that would otherwise be a line in a manifest: an SVG writer and a store-only
+PNG encoder (12), a regular-expression engine and an inflate (11), an HTTP
+server and a JSON writer (U1), and raw FFI rather than a crate wherever the
+operating system has to be asked something (02, 13).
+
+The cost is unevenly distributed, and the interface pays the most. That is
+understood and accepted. If a cycle ever concludes the rule cannot be held, it
+stops and asks rather than deciding for itself: adding a dependency is an
+escalation, never a cycle decision.

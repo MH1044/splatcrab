@@ -14,7 +14,13 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
   `scatter`, `bar`, `histogram`, `xlabel`, `ylabel`, `title`, `legend`,
   `grid`, `axis`, `xlim`, `ylim`, `hold`, `saveas` and `print`
 - An SVG writer first; PNG through a store-only zlib encoder
-- The REPL hands a saved SVG to the operating system viewer
+- The command-line runner hands a saved SVG to the operating system viewer
+- A figure's rendered SVG is retrievable in memory, not only through a file:
+  `Interp` keeps the SVG of each open figure addressable by number, through
+  `figure_svg(n)` and `figure_numbers()`, so a front end can render it inline
+  rather than writing a temporary file and reading it back. The writer already
+  builds the whole SVG as a `String` before `saveas` writes it, so this keeps
+  what exists rather than producing anything new
 - Golden cases read the saved SVG back with `fileread` and `strfind`, so
   no image comparison is needed
 
@@ -23,8 +29,14 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - Anything not listed in Scope. Features named in a later module's Goal belong
   to that module; if this cycle needs one of them, shrink this spec instead of
   borrowing from the next.
-- An interactive figure window. Output is SVG and PNG files; the REPL only
-  hands the file to the operating system viewer.
+- **Interaction with a figure**: no zoom, no pan, no data cursor, no click
+  handling, in the terminal or in the interface. A figure is a rendered image.
+  The command-line runner hands the file to the operating system viewer; the U
+  series renders the same SVG inline in a figure pane. Neither is interactive.
+  (This bullet used to forbid "an interactive figure window" and then define
+  the output as files only, which read as a ban on showing a plot anywhere but
+  an external viewer. The intent was always to rule out interaction, not
+  display.)
 - 3-D plots, surfaces and animation.
 
 ## Design notes
