@@ -49,7 +49,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Colon `A(:,1)`, `A(2,:)`, `A(:)` | 00 | `indexing` | |
 | `end` anywhere in an index | 00 | `indexing` | Including arithmetic such as `end-1` |
 | Indexed assignment with growth | 00 | `growth` | Vector and two-dimensional |
-| String indexing | 00 | `strings` | Returns a string |
+| String indexing | 00 | `strings` | Returns a string. A char **variable** only: `'abc'(2)` is a parse error, as indexing any literal is |
 | Logical indexing | 03 | | Planned |
 | Deletion `x(i) = []` | 03 | `err_delete_unsupported` | Currently an error |
 
