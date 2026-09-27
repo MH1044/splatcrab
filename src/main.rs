@@ -3,14 +3,10 @@
 //!   splatcrab            start the REPL
 //!   splatcrab script.m   run a script file
 
-mod interp;
-mod lexer;
-mod parser;
-mod value;
-
 use std::io::{self, BufRead, Write};
 
-use lexer::Token;
+use splatcrab::interp;
+use splatcrab::lexer::{self, Token};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

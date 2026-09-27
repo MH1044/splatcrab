@@ -5,7 +5,7 @@
 
 use crate::lexer::Token;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Num(f64),
     Str(String),
@@ -49,7 +49,7 @@ pub enum BinOp {
     OrOr,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     /// Expression statement; bool = display result (no trailing `;`).
     Expr(Expr, bool),
@@ -470,5 +470,424 @@ impl Parser {
                 _ => row.push(self.parse_expr()?),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::lex;
+
+    fn parse_expr(src: &str) -> Expr {
+        let toks = lex(src).expect("lex should succeed");
+        let mut p = Parser::new(toks);
+        p.parse_expr().expect("expression should parse")
+    }
+
+    fn parse(src: &str) -> Vec<Stmt> {
+        let toks = lex(src).expect("lex should succeed");
+        let mut p = Parser::new(toks);
+        p.parse_program().expect("program should parse")
+    }
+
+    fn parse_result(src: &str) -> Result<Vec<Stmt>, String> {
+        let toks = lex(src).expect("lex should succeed");
+        let mut p = Parser::new(toks);
+        p.parse_program()
+    }
+
+    fn num(v: f64) -> Expr {
+        Expr::Num(v)
+    }
+
+    fn ident(s: &str) -> Expr {
+        Expr::Ident(s.to_string())
+    }
+
+    fn bin(op: BinOp, l: Expr, r: Expr) -> Expr {
+        Expr::Binary(op, Box::new(l), Box::new(r))
+    }
+
+    fn neg(e: Expr) -> Expr {
+        Expr::Neg(Box::new(e))
+    }
+
+    fn not(e: Expr) -> Expr {
+        Expr::Not(Box::new(e))
+    }
+
+    fn tr(e: Expr) -> Expr {
+        Expr::Transpose(Box::new(e))
+    }
+
+    fn range(a: Expr, step: Option<Expr>, b: Expr) -> Expr {
+        Expr::Range(Box::new(a), step.map(Box::new), Box::new(b))
+    }
+
+    // ---- precedence and associativity ---------------------------------
+
+    #[test]
+    fn unary_minus_binds_looser_than_power() {
+        assert_eq!(parse_expr("-2^2"), neg(bin(BinOp::Pow, num(2.0), num(2.0))));
+    }
+
+    #[test]
+    fn unary_sign_is_allowed_in_the_exponent() {
+        assert_eq!(parse_expr("2^-1"), bin(BinOp::Pow, num(2.0), neg(num(1.0))));
+        assert_eq!(parse_expr("2^+1"), bin(BinOp::Pow, num(2.0), num(1.0)));
+    }
+
+    #[test]
+    fn power_is_left_associative() {
+        assert_eq!(
+            parse_expr("2^3^2"),
+            bin(BinOp::Pow, bin(BinOp::Pow, num(2.0), num(3.0)), num(2.0))
+        );
+    }
+
+    #[test]
+    fn transpose_binds_tighter_than_multiplication() {
+        assert_eq!(
+            parse_expr("a'*b"),
+            bin(BinOp::Mul, tr(ident("a")), ident("b"))
+        );
+    }
+
+    #[test]
+    fn transpose_binds_tighter_than_unary_minus() {
+        assert_eq!(parse_expr("-a'"), neg(tr(ident("a"))));
+    }
+
+    #[test]
+    fn repeated_transpose_nests() {
+        assert_eq!(parse_expr("a''"), tr(tr(ident("a"))));
+    }
+
+    #[test]
+    fn not_binds_tighter_than_comparison() {
+        assert_eq!(
+            parse_expr("~a == b"),
+            bin(BinOp::Eq, not(ident("a")), ident("b"))
+        );
+    }
+
+    #[test]
+    fn comparisons_are_left_associative() {
+        assert_eq!(
+            parse_expr("a == b < c"),
+            bin(
+                BinOp::Lt,
+                bin(BinOp::Eq, ident("a"), ident("b")),
+                ident("c")
+            )
+        );
+    }
+
+    #[test]
+    fn oror_is_looser_than_andand() {
+        assert_eq!(
+            parse_expr("a || b && c"),
+            bin(
+                BinOp::OrOr,
+                ident("a"),
+                bin(BinOp::AndAnd, ident("b"), ident("c"))
+            )
+        );
+    }
+
+    #[test]
+    fn or_is_looser_than_and() {
+        assert_eq!(
+            parse_expr("a | b & c"),
+            bin(
+                BinOp::Or,
+                ident("a"),
+                bin(BinOp::And, ident("b"), ident("c"))
+            )
+        );
+    }
+
+    #[test]
+    fn addition_is_left_associative() {
+        assert_eq!(
+            parse_expr("a - b - c"),
+            bin(
+                BinOp::Sub,
+                bin(BinOp::Sub, ident("a"), ident("b")),
+                ident("c")
+            )
+        );
+    }
+
+    #[test]
+    fn multiplication_is_left_associative() {
+        assert_eq!(
+            parse_expr("a/b*c"),
+            bin(
+                BinOp::Mul,
+                bin(BinOp::Div, ident("a"), ident("b")),
+                ident("c")
+            )
+        );
+    }
+
+    #[test]
+    fn elementwise_power_binds_tighter_than_elementwise_product() {
+        assert_eq!(
+            parse_expr("a.*b./c.^d"),
+            bin(
+                BinOp::EDiv,
+                bin(BinOp::EMul, ident("a"), ident("b")),
+                bin(BinOp::EPow, ident("c"), ident("d"))
+            )
+        );
+    }
+
+    #[test]
+    fn range_endpoint_absorbs_addition() {
+        assert_eq!(
+            parse_expr("1:3+1"),
+            range(num(1.0), None, bin(BinOp::Add, num(3.0), num(1.0)))
+        );
+    }
+
+    #[test]
+    fn range_with_step() {
+        assert_eq!(
+            parse_expr("1:2:9"),
+            range(num(1.0), Some(num(2.0)), num(9.0))
+        );
+    }
+
+    #[test]
+    fn comparison_is_looser_than_range() {
+        assert_eq!(
+            parse_expr("1:3 == x"),
+            bin(BinOp::Eq, range(num(1.0), None, num(3.0)), ident("x"))
+        );
+    }
+
+    #[test]
+    fn parentheses_override_precedence() {
+        assert_eq!(
+            parse_expr("(1+2)*3"),
+            bin(BinOp::Mul, bin(BinOp::Add, num(1.0), num(2.0)), num(3.0))
+        );
+    }
+
+    // ---- matrix literals ------------------------------------------------
+
+    #[test]
+    fn matrix_rows_split_on_semicolon() {
+        assert_eq!(
+            parse_expr("[1 2; 3 4]"),
+            Expr::Matrix(vec![vec![num(1.0), num(2.0)], vec![num(3.0), num(4.0)],])
+        );
+    }
+
+    #[test]
+    fn matrix_whitespace_rule_reaches_the_parser() {
+        assert_eq!(
+            parse_expr("[1 -2]"),
+            Expr::Matrix(vec![vec![num(1.0), neg(num(2.0))]])
+        );
+        assert_eq!(
+            parse_expr("[1 - 2]"),
+            Expr::Matrix(vec![vec![bin(BinOp::Sub, num(1.0), num(2.0))]])
+        );
+    }
+
+    #[test]
+    fn empty_matrix_has_no_rows() {
+        assert_eq!(parse_expr("[]"), Expr::Matrix(vec![]));
+    }
+
+    // ---- statements -----------------------------------------------------
+
+    #[test]
+    fn semicolon_suppresses_display() {
+        assert_eq!(
+            parse("x = 3;"),
+            vec![Stmt::Assign("x".to_string(), num(3.0), false)]
+        );
+    }
+
+    #[test]
+    fn missing_semicolon_shows_result() {
+        assert_eq!(
+            parse("x = 3"),
+            vec![Stmt::Assign("x".to_string(), num(3.0), true)]
+        );
+    }
+
+    #[test]
+    fn indexed_assignment_uses_index_assign() {
+        assert_eq!(
+            parse("x(end+1) = 3"),
+            vec![Stmt::IndexAssign(
+                "x".to_string(),
+                vec![bin(BinOp::Add, Expr::End, num(1.0))],
+                num(3.0),
+                true,
+            )]
+        );
+    }
+
+    #[test]
+    fn bare_colon_in_an_index_is_expr_colon() {
+        assert_eq!(
+            parse("A(:, 1)"),
+            vec![Stmt::Expr(
+                Expr::Index("A".to_string(), vec![Expr::Colon, num(1.0)]),
+                true
+            )]
+        );
+    }
+
+    #[test]
+    fn end_inside_an_index_is_expr_end() {
+        assert_eq!(
+            parse_expr("a(end)"),
+            Expr::Index("a".to_string(), vec![Expr::End])
+        );
+    }
+
+    #[test]
+    fn expression_statement() {
+        assert_eq!(
+            parse("1 + 2"),
+            vec![Stmt::Expr(bin(BinOp::Add, num(1.0), num(2.0)), true)]
+        );
+    }
+
+    #[test]
+    fn statements_separated_by_newlines_and_semicolons() {
+        assert_eq!(
+            parse("x = 1;\ny = 2\n"),
+            vec![
+                Stmt::Assign("x".to_string(), num(1.0), false),
+                Stmt::Assign("y".to_string(), num(2.0), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn call_with_several_arguments() {
+        assert_eq!(
+            parse("disp(1, x);"),
+            vec![Stmt::Expr(
+                Expr::Index("disp".to_string(), vec![num(1.0), ident("x")]),
+                false
+            )]
+        );
+    }
+
+    // ---- blocks ----------------------------------------------------------
+
+    #[test]
+    fn if_elseif_else_block() {
+        assert_eq!(
+            parse("if a\n  1;\nelseif b\n  2;\nelse\n  3;\nend\n"),
+            vec![Stmt::If(
+                vec![
+                    (ident("a"), vec![Stmt::Expr(num(1.0), false)]),
+                    (ident("b"), vec![Stmt::Expr(num(2.0), false)]),
+                ],
+                Some(vec![Stmt::Expr(num(3.0), false)]),
+            )]
+        );
+    }
+
+    #[test]
+    fn if_without_else_has_no_tail() {
+        assert_eq!(
+            parse("if a\n  1;\nend"),
+            vec![Stmt::If(
+                vec![(ident("a"), vec![Stmt::Expr(num(1.0), false)])],
+                None
+            )]
+        );
+    }
+
+    #[test]
+    fn for_loop_with_comma_separators() {
+        assert_eq!(
+            parse("for k = 1:3, disp(k); end"),
+            vec![Stmt::For(
+                "k".to_string(),
+                range(num(1.0), None, num(3.0)),
+                vec![Stmt::Expr(
+                    Expr::Index("disp".to_string(), vec![ident("k")]),
+                    false
+                )],
+            )]
+        );
+    }
+
+    #[test]
+    fn while_loop_with_break() {
+        assert_eq!(
+            parse("while a\nbreak\nend"),
+            vec![Stmt::While(ident("a"), vec![Stmt::Break])]
+        );
+    }
+
+    #[test]
+    fn while_loop_with_continue() {
+        assert_eq!(
+            parse("while a\ncontinue;\nend"),
+            vec![Stmt::While(ident("a"), vec![Stmt::Continue])]
+        );
+    }
+
+    #[test]
+    fn nested_blocks() {
+        assert_eq!(
+            parse("for i = 1:2\n  if i > 1\n    break\n  end\nend"),
+            vec![Stmt::For(
+                "i".to_string(),
+                range(num(1.0), None, num(2.0)),
+                vec![Stmt::If(
+                    vec![(bin(BinOp::Gt, ident("i"), num(1.0)), vec![Stmt::Break],)],
+                    None
+                )],
+            )]
+        );
+    }
+
+    // ---- errors ------------------------------------------------------------
+
+    #[test]
+    fn end_outside_an_index_is_an_error() {
+        assert!(parse_result("end").is_err());
+        assert!(parse_result("x = end").is_err());
+    }
+
+    #[test]
+    fn unterminated_matrix_literal_is_an_error() {
+        assert!(parse_result("[1 2").is_err());
+        assert!(parse_result("[1 2; 3").is_err());
+    }
+
+    #[test]
+    fn indexing_a_matrix_literal_is_an_error() {
+        assert!(parse_result("[1 2](1)").is_err());
+    }
+
+    #[test]
+    fn invalid_assignment_target_is_an_error() {
+        assert!(parse_result("1 = 2").is_err());
+        assert!(parse_result("a + b = 2").is_err());
+    }
+
+    #[test]
+    fn unclosed_block_is_an_error() {
+        assert!(parse_result("if a\n1;").is_err());
+        assert!(parse_result("for k = 1:3\ndisp(k);").is_err());
+    }
+
+    #[test]
+    fn unmatched_paren_is_an_error() {
+        assert!(parse_result("(1 + 2").is_err());
     }
 }

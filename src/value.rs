@@ -359,3 +359,368 @@ pub fn nonfinite(v: f64) -> String {
         "-Inf".to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close_tol(a: f64, b: f64, tol: f64) {
+        assert!(
+            (a - b).abs() <= tol * b.abs().max(1.0),
+            "{a} vs {b} (tolerance {tol})"
+        );
+    }
+
+    fn close(a: f64, b: f64) {
+        close_tol(a, b, 1e-12);
+    }
+
+    /// Builds a matrix from elements given in reading (row-major) order.
+    fn rmat(rows: usize, cols: usize, row_major: &[f64]) -> Matrix {
+        assert_eq!(rows * cols, row_major.len());
+        let mut m = Matrix::filled(rows, cols, 0.0);
+        for (i, v) in row_major.iter().enumerate() {
+            m.set(i / cols, i % cols, *v);
+        }
+        m
+    }
+
+    fn close_all(got: &Matrix, want: &Matrix) {
+        assert_eq!((got.rows, got.cols), (want.rows, want.cols));
+        for (g, w) in got.data.iter().zip(&want.data) {
+            close(*g, *w);
+        }
+    }
+
+    // ---- layout ------------------------------------------------------
+
+    #[test]
+    fn column_major_layout() {
+        let m = Matrix::new(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // Element (r, c) lives at data[c * rows + r].
+        assert_eq!(m.get(0, 0), m.data[0]);
+        assert_eq!(m.get(1, 0), m.data[1]);
+        assert_eq!(m.get(0, 1), m.data[2]);
+        assert_eq!(m.get(1, 1), m.data[3]);
+        assert_eq!(m.get(0, 2), m.data[4]);
+        assert_eq!(m.get(1, 2), m.data[5]);
+        // So the matrix above reads [1 3 5; 2 4 6].
+        assert_eq!(m, rmat(2, 3, &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0]));
+
+        let mut z = Matrix::filled(2, 2, 0.0);
+        z.set(1, 0, 7.0);
+        z.set(0, 1, 9.0);
+        assert_eq!(z.data, [0.0, 7.0, 9.0, 0.0]);
+    }
+
+    #[test]
+    fn transpose_round_trips() {
+        let m = Matrix::new(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let t = m.transpose();
+        assert_eq!((t.rows, t.cols), (3, 2));
+        assert_eq!(t.get(0, 0), m.get(0, 0));
+        assert_eq!(t.get(1, 0), m.get(0, 1));
+        assert_eq!(t.get(2, 0), m.get(0, 2));
+        assert_eq!(t.get(0, 1), m.get(1, 0));
+        assert_eq!(t.get(2, 1), m.get(1, 2));
+        assert_eq!(t.transpose(), m);
+        assert_eq!(Matrix::empty().transpose(), Matrix::empty());
+    }
+
+    #[test]
+    fn shape_predicates() {
+        assert!(Matrix::empty().is_empty());
+        assert!(Matrix::scalar(1.0).is_scalar());
+        assert!(Matrix::row(vec![1.0, 2.0]).is_vector());
+        assert!(Matrix::col(vec![1.0, 2.0]).is_vector());
+        assert!(!rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).is_vector());
+        assert!(!Matrix::empty().is_vector());
+        assert_eq!(Matrix::identity(2, 3).data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // MATLAB truthiness: non-empty and every element non-zero.
+        assert!(Matrix::row(vec![1.0, 2.0]).is_true());
+        assert!(!Matrix::row(vec![1.0, 0.0]).is_true());
+        assert!(!Matrix::empty().is_true());
+    }
+
+    #[test]
+    fn value_conversions() {
+        let m = Value::Str("AB".to_string()).into_mat();
+        assert_eq!((m.rows, m.cols), (1, 2));
+        assert_eq!(m.data, [65.0, 66.0]);
+        assert_eq!(
+            Value::Str("hi".to_string()).display("s"),
+            "s =\n\n    'hi'\n\n"
+        );
+        assert_eq!(
+            Value::Mat(Matrix::scalar(3.0)).display("x"),
+            "x =\n\n     3\n\n"
+        );
+    }
+
+    // ---- zip / broadcasting ------------------------------------------
+
+    #[test]
+    fn zip_broadcasts_a_row() {
+        let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let r = rmat(1, 3, &[10.0, 20.0, 30.0]);
+        let s = a.zip(&r, "+", |x, y| x + y).unwrap();
+        assert_eq!((s.rows, s.cols), (2, 3));
+        assert_eq!(s, rmat(2, 3, &[11.0, 22.0, 33.0, 14.0, 25.0, 36.0]));
+        // Broadcasting is symmetric in shape.
+        let s2 = r.zip(&a, "+", |x, y| x + y).unwrap();
+        assert_eq!(s2, s);
+    }
+
+    #[test]
+    fn zip_broadcasts_a_column() {
+        let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let c = rmat(2, 1, &[10.0, 20.0]);
+        let s = a.zip(&c, "+", |x, y| x + y).unwrap();
+        assert_eq!((s.rows, s.cols), (2, 3));
+        assert_eq!(s, rmat(2, 3, &[11.0, 12.0, 13.0, 24.0, 25.0, 26.0]));
+    }
+
+    #[test]
+    fn zip_broadcasts_scalars_on_either_side() {
+        let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let s = Matrix::scalar(2.0);
+        let l = a.zip(&s, "*", |x, y| x * y).unwrap();
+        assert_eq!(l, rmat(2, 3, &[2.0, 4.0, 6.0, 8.0, 10.0, 12.0]));
+        let r = s.zip(&a, "-", |x, y| x - y).unwrap();
+        assert_eq!((r.rows, r.cols), (2, 3));
+        assert_eq!(r, rmat(2, 3, &[1.0, 0.0, -1.0, -2.0, -3.0, -4.0]));
+    }
+
+    #[test]
+    fn zip_column_by_row_is_an_outer_product() {
+        let c = Matrix::col(vec![1.0, 2.0, 3.0]);
+        let r = Matrix::row(vec![10.0, 20.0, 30.0]);
+        let o = c.zip(&r, "*", |x, y| x * y).unwrap();
+        assert_eq!((o.rows, o.cols), (3, 3));
+        assert_eq!(
+            o,
+            rmat(
+                3,
+                3,
+                &[10.0, 20.0, 30.0, 20.0, 40.0, 60.0, 30.0, 60.0, 90.0]
+            )
+        );
+    }
+
+    #[test]
+    fn zip_rejects_incompatible_sizes() {
+        let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = rmat(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let e = a.zip(&b, "+", |x, y| x + y).unwrap_err();
+        assert!(e.contains("incompatible sizes"), "{e}");
+        assert!(e.contains("2x3 vs 3x2"), "{e}");
+        assert!(e.contains("'+'"), "{e}");
+    }
+
+    // ---- matmul ------------------------------------------------------
+
+    #[test]
+    fn matmul_values_and_shape() {
+        let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let b = rmat(3, 2, &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
+        let p = a.matmul(&b).unwrap();
+        assert_eq!((p.rows, p.cols), (2, 2));
+        assert_eq!(p, rmat(2, 2, &[58.0, 64.0, 139.0, 154.0]));
+        // The other order gives the 3x3 product.
+        let q = b.matmul(&a).unwrap();
+        assert_eq!((q.rows, q.cols), (3, 3));
+        assert_eq!(q.get(0, 0), 7.0 * 1.0 + 8.0 * 4.0);
+        // Multiplying by the identity is a no-op.
+        assert_eq!(a.matmul(&Matrix::identity(3, 3)).unwrap(), a);
+        assert_eq!(Matrix::identity(2, 2).matmul(&a).unwrap(), a);
+    }
+
+    #[test]
+    fn matmul_rejects_bad_dimensions() {
+        let a = Matrix::row(vec![1.0, 2.0]);
+        let b = Matrix::row(vec![3.0, 4.0]);
+        let e = a.matmul(&b).unwrap_err();
+        assert!(e.contains("Incorrect dimensions"), "{e}");
+        assert!(e.contains("1x2 * 1x2"), "{e}");
+        // Transposing the right side makes it legal again.
+        assert_eq!(a.matmul(&b.transpose()).unwrap(), Matrix::scalar(11.0));
+    }
+
+    // ---- solve -------------------------------------------------------
+
+    #[test]
+    fn solve_two_by_two() {
+        let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+        let b = Matrix::col(vec![3.0, 5.0]);
+        let x = a.solve(&b).unwrap();
+        assert_eq!((x.rows, x.cols), (2, 1));
+        close(x.get(0, 0), 0.8);
+        close(x.get(1, 0), 1.4);
+    }
+
+    #[test]
+    fn solve_multiple_right_hand_sides() {
+        let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+        let b = rmat(2, 2, &[3.0, 1.0, 5.0, 0.0]);
+        let x = a.solve(&b).unwrap();
+        assert_eq!((x.rows, x.cols), (2, 2));
+        close(x.get(0, 0), 0.8);
+        close(x.get(1, 0), 1.4);
+        close(x.get(0, 1), 0.6);
+        close(x.get(1, 1), -0.2);
+        // A * X reproduces B.
+        close_all(&a.matmul(&x).unwrap(), &b);
+    }
+
+    #[test]
+    fn solve_uses_partial_pivoting() {
+        // A zero in the leading pivot position needs a row swap.
+        let a = rmat(2, 2, &[0.0, 1.0, 1.0, 0.0]);
+        let x = a.solve(&Matrix::col(vec![1.0, 2.0])).unwrap();
+        close(x.get(0, 0), 2.0);
+        close(x.get(1, 0), 1.0);
+
+        let a3 = rmat(3, 3, &[0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
+        let x3 = a3.solve(&Matrix::col(vec![1.0, 2.0, 3.0])).unwrap();
+        close(x3.get(0, 0), 1.0);
+        close(x3.get(1, 0), 1.0);
+        close(x3.get(2, 0), 1.0);
+    }
+
+    #[test]
+    fn solve_moderately_ill_conditioned_system() {
+        // 4x4 Hilbert matrix, H(i, j) = 1 / (i + j - 1) with 1-based indices.
+        let mut h = Matrix::filled(4, 4, 0.0);
+        for (i, v) in h.data.iter_mut().enumerate() {
+            let (r, c) = (i % 4, i / 4);
+            *v = 1.0 / (r + c + 1) as f64;
+        }
+        let want = Matrix::filled(4, 1, 1.0);
+        let b = h.matmul(&want).unwrap();
+        let x = h.solve(&b).unwrap();
+        assert_eq!((x.rows, x.cols), (4, 1));
+        for v in &x.data {
+            close_tol(*v, 1.0, 1e-8);
+        }
+    }
+
+    #[test]
+    fn solve_rejects_singular_and_non_square() {
+        let s = rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]);
+        let e = s.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err();
+        assert!(e.contains("singular"), "{e}");
+
+        let ns = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let e = ns.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err();
+        assert!(e.contains("square"), "{e}");
+
+        // Square, but the right-hand side has the wrong number of rows.
+        let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+        assert!(a.solve(&Matrix::col(vec![1.0, 2.0, 3.0])).is_err());
+    }
+
+    // ---- inv / det ---------------------------------------------------
+
+    #[test]
+    fn inv_times_original_is_the_identity() {
+        let a = rmat(3, 3, &[4.0, 7.0, 2.0, 3.0, 6.0, 1.0, 2.0, 5.0, 3.0]);
+        let ai = a.inv().unwrap();
+        let id = Matrix::identity(3, 3);
+        close_all(&ai.matmul(&a).unwrap(), &id);
+        close_all(&a.matmul(&ai).unwrap(), &id);
+
+        // A 2x2 case with an inverse that is easy to state exactly.
+        let b = rmat(2, 2, &[4.0, 7.0, 2.0, 6.0]);
+        close_all(&b.inv().unwrap(), &rmat(2, 2, &[0.6, -0.7, -0.2, 0.4]));
+
+        assert!(rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).inv().is_err());
+        assert!(rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]).inv().is_err());
+    }
+
+    #[test]
+    fn det_known_values() {
+        close(rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).det().unwrap(), -2.0);
+        assert_eq!(rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]).det().unwrap(), 0.0);
+        close(Matrix::identity(1, 1).det().unwrap(), 1.0);
+        close(Matrix::identity(4, 4).det().unwrap(), 1.0);
+        close(
+            rmat(3, 3, &[4.0, 7.0, 2.0, 3.0, 6.0, 1.0, 2.0, 5.0, 3.0])
+                .det()
+                .unwrap(),
+            9.0,
+        );
+        let e = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .det()
+            .unwrap_err();
+        assert!(e.contains("square"), "{e}");
+    }
+
+    #[test]
+    fn det_sign_flips_when_rows_are_swapped() {
+        let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let swapped = rmat(2, 2, &[3.0, 4.0, 1.0, 2.0]);
+        let da = a.det().unwrap();
+        let ds = swapped.det().unwrap();
+        close(ds, -da);
+
+        let b = rmat(3, 3, &[4.0, 7.0, 2.0, 3.0, 6.0, 1.0, 2.0, 5.0, 3.0]);
+        let b_swapped = rmat(3, 3, &[3.0, 6.0, 1.0, 4.0, 7.0, 2.0, 2.0, 5.0, 3.0]);
+        close(b_swapped.det().unwrap(), -b.det().unwrap());
+    }
+
+    // ---- format ------------------------------------------------------
+
+    #[test]
+    fn format_integer_path() {
+        assert_eq!(
+            Matrix::row(vec![1.0, 10.0, 100.0]).format(),
+            "     1    10   100\n"
+        );
+        assert_eq!(Matrix::scalar(0.0).format(), "     0\n");
+        assert_eq!(Matrix::row(vec![-1.0, 2.0]).format(), "    -1     2\n");
+        assert_eq!(
+            Matrix::row(vec![-123456.0, 1.0]).format(),
+            "   -123456         1\n"
+        );
+        assert_eq!(
+            rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).format(),
+            "     1     2\n     3     4\n"
+        );
+    }
+
+    #[test]
+    fn format_four_decimal_path() {
+        assert_eq!(
+            Matrix::row(vec![1.5, 2.25]).format(),
+            "    1.5000    2.2500\n"
+        );
+        assert_eq!(Matrix::scalar(-0.5).format(), "   -0.5000\n");
+        // 1e-3 itself is on the fixed side of the scientific threshold.
+        assert_eq!(Matrix::scalar(0.001).format(), "    0.0010\n");
+    }
+
+    #[test]
+    fn format_scientific_thresholds() {
+        // max |x| >= 1e5 switches the whole matrix to scientific.
+        assert_eq!(Matrix::scalar(123456.7).format(), "   1.2346e+05\n");
+        assert_eq!(
+            Matrix::row(vec![1e5, 0.5]).format(),
+            "   1.0000e+05   5.0000e-01\n"
+        );
+        // ... and so does max |x| < 1e-3.
+        assert_eq!(Matrix::scalar(0.00012).format(), "   1.2000e-04\n");
+    }
+
+    #[test]
+    fn format_nonfinite_and_empty() {
+        assert_eq!(
+            Matrix::row(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).format(),
+            "       NaN       Inf      -Inf\n"
+        );
+        assert_eq!(Matrix::empty().format(), "     []\n");
+        assert_eq!(Matrix::new(1, 0, Vec::new()).format(), "     []\n");
+        assert_eq!(nonfinite(f64::NAN), "NaN");
+        assert_eq!(nonfinite(f64::INFINITY), "Inf");
+        assert_eq!(nonfinite(f64::NEG_INFINITY), "-Inf");
+    }
+}

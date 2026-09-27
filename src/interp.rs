@@ -1,6 +1,7 @@
 //! Tree-walking interpreter.
 
 use std::collections::HashMap;
+use std::io::{self, Write};
 
 use crate::lexer::lex;
 use crate::parser::{BinOp, Expr, Parser, Stmt};
@@ -13,6 +14,9 @@ pub struct Interp {
     /// Value of `end` for the index argument currently being evaluated.
     end_stack: Vec<usize>,
     rng: u64,
+    /// Everything the interpreter prints goes here. Nothing in this crate
+    /// outside `main.rs` may use `print!`, so tests can capture output.
+    pub out: Box<dyn Write>,
 }
 
 enum Flow {
@@ -36,11 +40,22 @@ impl Default for Interp {
 
 impl Interp {
     pub fn new() -> Self {
+        Self::with_output(Box::new(io::stdout()))
+    }
+
+    /// Builds an interpreter that writes everything to `out`.
+    pub fn with_output(out: Box<dyn Write>) -> Self {
         Interp {
             vars: HashMap::new(),
             end_stack: Vec::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
+            out,
         }
+    }
+
+    /// The single place interpreter output leaves the evaluator.
+    fn emit(&mut self, s: &str) -> R<()> {
+        self.out.write_all(s.as_bytes()).map_err(|e| e.to_string())
     }
 
     pub fn run(&mut self, src: &str) -> R<()> {
@@ -83,7 +98,7 @@ impl Interp {
                         self.vars.insert(name.clone(), v.clone());
                     }
                     if *show {
-                        print!("{}", v.display(&name));
+                        self.emit(&v.display(&name))?;
                     }
                 }
                 Ok(Flow::Normal)
@@ -91,7 +106,7 @@ impl Interp {
             Stmt::Assign(name, e, show) => {
                 let v = self.eval(e)?;
                 if *show {
-                    print!("{}", v.display(name));
+                    self.emit(&v.display(name))?;
                 }
                 self.vars.insert(name.clone(), v);
                 Ok(Flow::Normal)
@@ -100,7 +115,8 @@ impl Interp {
                 let rhs = self.eval(e)?;
                 self.assign_index(name, args, rhs)?;
                 if *show {
-                    print!("{}", self.vars[name].display(name));
+                    let shown = self.vars[name].display(name);
+                    self.emit(&shown)?;
                 }
                 Ok(Flow::Normal)
             }
@@ -786,15 +802,17 @@ impl Interp {
 
             // output
             "disp" => {
-                match args.first() {
-                    Some(Value::Str(s)) => println!("{}", s),
-                    Some(Value::Mat(m)) => print!("{}", m.format()),
+                let text = match args.first() {
+                    Some(Value::Str(s)) => format!("{s}\n"),
+                    Some(Value::Mat(m)) => m.format(),
                     None => return Err("Not enough input arguments for 'disp'.".to_string()),
-                }
+                };
+                self.emit(&text)?;
                 Ok(None)
             }
             "fprintf" => {
-                print!("{}", format_printf(&args)?);
+                let text = format_printf(&args)?;
+                self.emit(&text)?;
                 Ok(None)
             }
             "sprintf" => Ok(Some(Value::Str(format_printf(&args)?))),
@@ -825,23 +843,29 @@ impl Interp {
                 Ok(None)
             }
             "clc" => {
-                print!("\x1B[2J\x1B[H");
+                self.emit("\x1B[2J\x1B[H")?;
                 Ok(None)
             }
             "who" | "whos" => {
-                let mut names: Vec<&String> = self.vars.keys().collect();
+                let mut names: Vec<String> = self.vars.keys().cloned().collect();
                 names.sort();
                 if names.is_empty() {
                     return Ok(None);
                 }
-                println!("Your variables are:\n");
-                for n in names {
-                    match &self.vars[n] {
-                        Value::Mat(m) => println!("  {:<12} {}x{} double", n, m.rows, m.cols),
-                        Value::Str(s) => println!("  {:<12} 1x{} char", n, s.chars().count()),
-                    }
+                let mut text = String::from("Your variables are:\n\n");
+                for n in &names {
+                    let row = match &self.vars[n] {
+                        Value::Mat(m) => {
+                            format!("  {:<12} {}x{} double\n", n, m.rows, m.cols)
+                        }
+                        Value::Str(s) => {
+                            format!("  {:<12} 1x{} char\n", n, s.chars().count())
+                        }
+                    };
+                    text.push_str(&row);
                 }
-                println!();
+                text.push('\n');
+                self.emit(&text)?;
                 Ok(None)
             }
 
@@ -1230,4 +1254,335 @@ fn format_printf(args: &[Value]) -> R<String> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Shared(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `src` in a fresh interpreter; returns (result, captured stdout).
+    fn run(src: &str) -> (R<()>, String) {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut it = Interp::with_output(Box::new(Shared(buf.clone())));
+        let r = it.run(src);
+        let s = String::from_utf8(buf.borrow().clone()).unwrap();
+        (r, s)
+    }
+
+    /// Runs `src`, requiring success, and returns what it printed.
+    fn ok_out(src: &str) -> String {
+        let (r, s) = run(src);
+        match r {
+            Ok(()) => s,
+            Err(e) => panic!("{src:?} failed: {e}"),
+        }
+    }
+
+    /// Runs `src`, requiring failure, and returns the error message.
+    fn err_msg(src: &str) -> String {
+        let (r, s) = run(src);
+        match r {
+            Ok(()) => panic!("{src:?} unexpectedly succeeded, printing {s:?}"),
+            Err(e) => e,
+        }
+    }
+
+    fn close(a: f64, b: f64) {
+        assert!((a - b).abs() <= 1e-12 * b.abs().max(1.0), "{a} vs {b}");
+    }
+
+    /// Builds a matrix from elements given in reading (row-major) order.
+    fn rmat(rows: usize, cols: usize, row_major: &[f64]) -> Matrix {
+        assert_eq!(rows * cols, row_major.len());
+        let mut m = Matrix::filled(rows, cols, 0.0);
+        for (i, v) in row_major.iter().enumerate() {
+            m.set(i / cols, i % cols, *v);
+        }
+        m
+    }
+
+    // ---- display and `ans` -------------------------------------------
+
+    #[test]
+    fn assignment_echoes_unless_suppressed() {
+        assert_eq!(ok_out("x = 3"), "x =\n\n     3\n\n");
+        assert_eq!(ok_out("x = 3;"), "");
+        assert_eq!(ok_out("s = 'hi'"), "s =\n\n    'hi'\n\n");
+        assert_eq!(ok_out("x = 3;\ny = x + 1"), "y =\n\n     4\n\n");
+    }
+
+    #[test]
+    fn ans_is_set_by_expressions_but_not_by_assignments() {
+        assert_eq!(ok_out("1 + 1;\nans"), "ans =\n\n     2\n\n");
+        assert_eq!(ok_out("2 * 3"), "ans =\n\n     6\n\n");
+        // An assignment leaves `ans` untouched, so it is still undefined here.
+        let e = err_msg("x = 5;\nans");
+        assert!(e.contains("Undefined function or variable 'ans'"), "{e}");
+        // Naming an existing variable echoes under its own name, not `ans`.
+        assert_eq!(ok_out("x = 5;\nx"), "x =\n\n     5\n\n");
+    }
+
+    #[test]
+    fn a_variable_shadows_a_builtin() {
+        // `sum(1)` indexes the variable instead of calling the builtin,
+        // which would have returned 1 rather than 3.
+        assert_eq!(ok_out("sum = 3;\nsum(1)"), "ans =\n\n     3\n\n");
+        assert_eq!(ok_out("sum = [4 5 6];\ndisp(sum(2))"), "     5\n");
+        // Without the variable the builtin is reachable as usual.
+        assert_eq!(ok_out("disp(sum([1 2 3]))"), "     6\n");
+    }
+
+    // ---- indexed assignment ------------------------------------------
+
+    #[test]
+    fn indexed_assignment_grows_a_row() {
+        assert_eq!(ok_out("z = [];\nz(3) = 1"), "z =\n\n     0     0     1\n\n");
+        assert_eq!(
+            ok_out("z = [1 2];\nz(4) = 9"),
+            "z =\n\n     1     2     0     9\n\n"
+        );
+    }
+
+    #[test]
+    fn indexed_assignment_grows_a_column() {
+        assert_eq!(
+            ok_out("z = [1;2];\nz(4) = 9"),
+            "z =\n\n     1\n     2\n     0\n     9\n\n"
+        );
+    }
+
+    #[test]
+    fn indexed_assignment_grows_in_two_dimensions() {
+        assert_eq!(
+            ok_out("A = [1 2; 3 4];\nA(3,3) = 1"),
+            "A =\n\n     1     2     0\n     3     4     0\n     0     0     1\n\n"
+        );
+        assert_eq!(
+            ok_out("B = [];\nB(2,2) = 7"),
+            "B =\n\n     0     0\n     0     7\n\n"
+        );
+    }
+
+    #[test]
+    fn indexed_assignment_errors() {
+        // A 2-D array cannot grow through a single linear index.
+        let e = err_msg("A = [1 2; 3 4];\nA(5) = 1");
+        assert!(
+            e.contains("Attempt to grow array along ambiguous dimension"),
+            "{e}"
+        );
+        // Right-hand side of the wrong size.
+        let e = err_msg("A = [1 2 3];\nA(1:2) = [1 2 3]");
+        assert!(
+            e.contains("left side has 2 elements and the right side has 3"),
+            "{e}"
+        );
+        let e = err_msg("A = [1 2; 3 4];\nA(1,:) = [1 2 3]");
+        assert!(
+            e.contains("left side has 2 elements and the right side has 3"),
+            "{e}"
+        );
+        // Indices must be positive integers.
+        assert!(err_msg("A = [1 2 3];\nA(0) = 1").contains("positive integers"));
+    }
+
+    // ---- control flow ------------------------------------------------
+
+    #[test]
+    fn for_iterates_over_columns() {
+        assert_eq!(
+            ok_out("A = [1 2; 3 4];\nfor c = A\ndisp(c)\nend"),
+            "     1\n     3\n     2\n     4\n"
+        );
+        // A row vector therefore yields scalars.
+        assert_eq!(ok_out("for k = [7 8]\ndisp(k)\nend"), "     7\n     8\n");
+        // A column vector is a single 1-column iteration.
+        assert_eq!(ok_out("for k = [7; 8]\ndisp(k)\nend"), "     7\n     8\n");
+    }
+
+    #[test]
+    fn for_over_an_empty_matrix_runs_zero_times() {
+        assert_eq!(
+            ok_out("n = 0;\nfor k = []\nn = 1;\nend\ndisp(n)"),
+            "     0\n"
+        );
+        // The loop variable is never even created.
+        assert!(err_msg("for k = []\nend\nk").contains("Undefined function or variable 'k'"));
+    }
+
+    #[test]
+    fn while_with_break_and_continue() {
+        let src = "i = 0;\ns = 0;\n\
+                   while 1\n\
+                   i = i + 1;\n\
+                   if i > 5\n\
+                   break\n\
+                   end\n\
+                   if mod(i, 2) == 0\n\
+                   continue\n\
+                   end\n\
+                   s = s + i;\n\
+                   end\n\
+                   disp(s)\n\
+                   disp(i)";
+        // 1 + 3 + 5 = 9, and the loop leaves i at 6.
+        assert_eq!(ok_out(src), "     9\n     6\n");
+        // A while whose condition is false from the start runs zero times.
+        assert_eq!(ok_out("n = 0;\nwhile 0\nn = 1;\nend\ndisp(n)"), "     0\n");
+    }
+
+    #[test]
+    fn logical_operators_short_circuit() {
+        // The right-hand side must not be evaluated at all.
+        assert_eq!(ok_out("x = 0 && undefined_fn();\ndisp(x)"), "     0\n");
+        assert_eq!(ok_out("y = 1 || undefined_fn();\ndisp(y)"), "     1\n");
+        // ... and it really would have failed.
+        assert!(err_msg("disp(undefined_fn())").contains("Undefined function or variable"));
+        assert_eq!(ok_out("disp(1 && 1)"), "     1\n");
+        assert_eq!(ok_out("disp(0 || 0)"), "     0\n");
+        assert_eq!(ok_out("disp(1 && 0)"), "     0\n");
+    }
+
+    // ---- pure helpers ------------------------------------------------
+
+    #[test]
+    fn fmt_e_uses_a_signed_two_digit_exponent() {
+        assert_eq!(fmt_e(12345.678, 4), "1.2346e+04");
+        assert_eq!(fmt_e(0.0, 4), "0.0000e+00");
+        assert_eq!(fmt_e(-0.5, 2), "-5.00e-01");
+        assert_eq!(fmt_e(1.0, 0), "1e+00");
+        assert_eq!(fmt_e(f64::NAN, 4), "NaN");
+        assert_eq!(fmt_e(f64::INFINITY, 4), "Inf");
+        assert_eq!(fmt_e(f64::NEG_INFINITY, 4), "-Inf");
+    }
+
+    #[test]
+    fn fmt_g_switches_between_fixed_and_scientific() {
+        assert_eq!(fmt_g(0.0001, 6), "0.0001");
+        assert_eq!(fmt_g(0.00001, 6), "1e-05");
+        assert_eq!(fmt_g(1e6, 6), "1e+06");
+        assert_eq!(fmt_g(123456.0, 6), "123456");
+        // Trailing zeros are trimmed in both branches.
+        assert_eq!(fmt_g(1.5, 6), "1.5");
+        assert_eq!(fmt_g(100.0, 6), "100");
+        assert_eq!(fmt_g(1.25e-7, 6), "1.25e-07");
+        assert_eq!(fmt_g(0.0, 6), "0");
+        assert_eq!(fmt_g(-2.5, 6), "-2.5");
+        assert_eq!(fmt_g(f64::NEG_INFINITY, 6), "-Inf");
+    }
+
+    fn pf(fmt: &str, nums: &[f64]) -> String {
+        let mut args = vec![Value::Str(fmt.to_string())];
+        if !nums.is_empty() {
+            args.push(Value::Mat(Matrix::row(nums.to_vec())));
+        }
+        format_printf(&args).unwrap()
+    }
+
+    #[test]
+    fn printf_conversions() {
+        assert_eq!(pf("%d", &[42.0]), "42");
+        // %d with a non-integer falls back to %g.
+        assert_eq!(pf("%d", &[1.5]), "1.5");
+        assert_eq!(pf("%f", &[1.5]), "1.500000");
+        assert_eq!(pf("%e", &[1.5]), "1.500000e+00");
+        assert_eq!(pf("%g", &[1.5]), "1.5");
+        assert_eq!(pf("%c", &[65.0]), "A");
+        // %s given a number formats it like %g.
+        assert_eq!(pf("%s", &[3.5]), "3.5");
+        assert_eq!(pf("%s", &[42.0]), "42");
+        assert_eq!(
+            format_printf(&[Value::Str("[%s]".to_string()), Value::Str("hi".to_string())]).unwrap(),
+            "[hi]"
+        );
+        assert!(format_printf(&[Value::Mat(Matrix::scalar(1.0))]).is_err());
+    }
+
+    #[test]
+    fn printf_width_precision_and_flags() {
+        assert_eq!(pf("%6.3f", &[1.5]), " 1.500");
+        assert_eq!(pf("%-5d|", &[42.0]), "42   |");
+        assert_eq!(pf("%05.1f", &[3.5]), "003.5");
+        assert_eq!(pf("%05d", &[-42.0]), "-0042");
+        assert_eq!(pf("%8s|", &[42.0]), "      42|");
+        // A body at least as wide as the field is left alone.
+        assert_eq!(pf("%2d", &[12345.0]), "12345");
+    }
+
+    #[test]
+    fn printf_escapes_and_percent() {
+        assert_eq!(pf("100%%", &[]), "100%");
+        assert_eq!(pf("a\\tb\\nc", &[]), "a\tb\nc");
+        assert_eq!(pf("%d\\r\\\\", &[7.0]), "7\r\\");
+        // An unknown escape is passed through untouched.
+        assert_eq!(pf("\\q", &[]), "\\q");
+        // With no data at all, conversions expand to nothing.
+        assert_eq!(pf("[%d]", &[]), "[]");
+    }
+
+    #[test]
+    fn printf_cycles_the_format_over_the_data() {
+        assert_eq!(pf("%d %d\\n", &[1.0, 2.0, 3.0, 4.0]), "1 2\n3 4\n");
+        assert_eq!(ok_out("fprintf('%d %d\\n', 1:4)"), "1 2\n3 4\n");
+        // Running out of data mid-format stops right there.
+        assert_eq!(pf("%d %d %d\\n", &[1.0, 2.0]), "1 2 ");
+        assert_eq!(pf("%d-", &[1.0, 2.0, 3.0]), "1-2-3-");
+        // A literal-only format is emitted once even with data present.
+        assert_eq!(pf("hi", &[1.0, 2.0]), "hi");
+    }
+
+    #[test]
+    fn range_endpoints_and_emptiness() {
+        let r = range(1.0, 0.1, 2.0);
+        assert_eq!((r.rows, r.cols), (1, 11));
+        assert_eq!(r.numel(), 11);
+        assert_eq!(r.data[0], 1.0);
+        assert_eq!(r.data[10], 2.0);
+        close(r.data[5], 1.5);
+
+        let e = range(3.0, 1.0, 1.0);
+        assert!(e.is_empty());
+        assert_eq!((e.rows, e.cols), (1, 0));
+
+        assert_eq!(range(1.0, 1.0, 5.0).data, [1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(range(3.0, -1.0, 1.0).data, [3.0, 2.0, 1.0]);
+        assert!(range(1.0, 0.0, 5.0).is_empty());
+        assert!(range(f64::NAN, 1.0, 5.0).is_empty());
+    }
+
+    #[test]
+    fn matrix_power_cases() {
+        let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(matrix_power(&a, 0.0).unwrap(), Matrix::identity(2, 2));
+
+        let inv = a.inv().unwrap();
+        let p = matrix_power(&a, -1.0).unwrap();
+        assert_eq!((p.rows, p.cols), (2, 2));
+        for (g, w) in p.data.iter().zip(&inv.data) {
+            close(*g, *w);
+        }
+
+        assert_eq!(
+            matrix_power(&a, 3.0).unwrap(),
+            rmat(2, 2, &[37.0, 54.0, 81.0, 118.0])
+        );
+        assert_eq!(matrix_power(&a, 1.0).unwrap(), a);
+
+        assert!(matrix_power(&rmat(1, 2, &[1.0, 2.0]), 2.0).is_err());
+        assert!(matrix_power(&a, 0.5).is_err());
+    }
 }

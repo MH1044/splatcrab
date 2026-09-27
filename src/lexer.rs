@@ -301,3 +301,416 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
     toks.push(Token::Eof);
     Ok(toks)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lx(src: &str) -> Vec<Token> {
+        lex(src).expect("lex should succeed")
+    }
+
+    fn id(s: &str) -> Token {
+        Token::Ident(s.to_string())
+    }
+
+    fn st(s: &str) -> Token {
+        Token::Str(s.to_string())
+    }
+
+    // ---- whitespace inside brackets ----------------------------------
+
+    #[test]
+    fn space_before_signed_number_separates_elements() {
+        assert_eq!(
+            lx("[1 -2]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Minus,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn spaces_on_both_sides_of_minus_stay_binary() {
+        let expected = vec![
+            Token::LBracket,
+            Token::Num(1.0),
+            Token::Minus,
+            Token::Num(2.0),
+            Token::RBracket,
+            Token::Eof,
+        ];
+        assert_eq!(lx("[1 - 2]"), expected);
+        assert_eq!(lx("[1-2]"), expected);
+    }
+
+    #[test]
+    fn space_separated_transposes_are_two_elements() {
+        assert_eq!(
+            lx("[a' b']"),
+            vec![
+                Token::LBracket,
+                id("a"),
+                Token::Transpose,
+                Token::Comma,
+                id("b"),
+                Token::Transpose,
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn signed_identifier_separates_but_spaced_minus_does_not() {
+        assert_eq!(
+            lx("[x -y]"),
+            vec![
+                Token::LBracket,
+                id("x"),
+                Token::Comma,
+                Token::Minus,
+                id("y"),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("[x - y]"),
+            vec![
+                Token::LBracket,
+                id("x"),
+                Token::Minus,
+                id("y"),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn space_before_paren_separates_elements() {
+        assert_eq!(
+            lx("[1 (2)]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::LParen,
+                Token::Num(2.0),
+                Token::RParen,
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_outside_brackets_never_separates() {
+        assert_eq!(
+            lx("1 -2"),
+            vec![Token::Num(1.0), Token::Minus, Token::Num(2.0), Token::Eof]
+        );
+    }
+
+    // ---- quote disambiguation ----------------------------------------
+
+    #[test]
+    fn quote_after_identifier_is_transpose() {
+        assert_eq!(lx("a'"), vec![id("a"), Token::Transpose, Token::Eof]);
+    }
+
+    #[test]
+    fn leading_quote_is_a_string() {
+        assert_eq!(lx("'abc'"), vec![st("abc"), Token::Eof]);
+    }
+
+    #[test]
+    fn doubled_single_quote_is_an_escape() {
+        assert_eq!(lx("'it''s'"), vec![st("it's"), Token::Eof]);
+    }
+
+    #[test]
+    fn doubled_double_quote_is_an_escape() {
+        assert_eq!(lx("\"dq\"\"x\""), vec![st("dq\"x"), Token::Eof]);
+    }
+
+    #[test]
+    fn quote_after_rparen_is_transpose() {
+        assert_eq!(
+            lx("A(1)'"),
+            vec![
+                id("A"),
+                Token::LParen,
+                Token::Num(1.0),
+                Token::RParen,
+                Token::Transpose,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn quote_after_assign_is_a_string() {
+        assert_eq!(
+            lx("x = 'a'"),
+            vec![id("x"), Token::Assign, st("a"), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn quote_after_rbracket_is_transpose() {
+        assert_eq!(
+            lx("[1 2]'"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Transpose,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn dot_quote_is_transpose() {
+        assert_eq!(lx(".'"), vec![Token::Transpose, Token::Eof]);
+        assert_eq!(lx("a.'"), vec![id("a"), Token::Transpose, Token::Eof]);
+    }
+
+    // ---- numbers ------------------------------------------------------
+
+    #[test]
+    fn number_literal_forms() {
+        assert_eq!(lx("12"), vec![Token::Num(12.0), Token::Eof]);
+        assert_eq!(lx("1.5"), vec![Token::Num(1.5), Token::Eof]);
+        assert_eq!(lx(".5"), vec![Token::Num(0.5), Token::Eof]);
+        assert_eq!(lx("1e-3"), vec![Token::Num(0.001), Token::Eof]);
+        assert_eq!(lx("2.5E+2"), vec![Token::Num(250.0), Token::Eof]);
+    }
+
+    #[test]
+    fn number_does_not_swallow_dot_of_dot_star() {
+        assert_eq!(
+            lx("2.*x"),
+            vec![Token::Num(2.0), Token::DotStar, id("x"), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn number_does_not_swallow_dot_of_dot_caret() {
+        assert_eq!(
+            lx("1.^2"),
+            vec![
+                Token::Num(1.0),
+                Token::DotCaret,
+                Token::Num(2.0),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn number_does_not_swallow_dot_of_dot_slash() {
+        assert_eq!(
+            lx("4./2"),
+            vec![
+                Token::Num(4.0),
+                Token::DotSlash,
+                Token::Num(2.0),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn number_followed_by_dot_transpose() {
+        assert_eq!(
+            lx("3.'"),
+            vec![Token::Num(3.0), Token::Transpose, Token::Eof]
+        );
+    }
+
+    // ---- newlines -----------------------------------------------------
+
+    #[test]
+    fn newline_inside_brackets_is_a_row_separator() {
+        assert_eq!(
+            lx("[1\n2]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Semi,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_outside_brackets_is_a_statement_separator() {
+        assert_eq!(
+            lx("1\n2"),
+            vec![Token::Num(1.0), Token::Newline, Token::Num(2.0), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn crlf_lexes_the_same_as_lf() {
+        assert_eq!(lx("x = 1\r\ny = 2"), lx("x = 1\ny = 2"));
+        assert_eq!(
+            lx("[1 2\r\n3 4]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Num(2.0),
+                Token::Semi,
+                Token::Num(3.0),
+                Token::Comma,
+                Token::Num(4.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(lx("[1 2\r\n3 4]"), lx("[1 2\n3 4]"));
+    }
+
+    // ---- comments and continuations -----------------------------------
+
+    #[test]
+    fn comment_runs_to_end_of_line_only() {
+        assert_eq!(
+            lx("x = 1 % set x\ny = 2"),
+            vec![
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Newline,
+                id("y"),
+                Token::Assign,
+                Token::Num(2.0),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn comment_at_end_of_input_is_dropped() {
+        assert_eq!(
+            lx("a = 1 % trailing"),
+            vec![id("a"), Token::Assign, Token::Num(1.0), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn line_continuation_joins_lines() {
+        assert_eq!(
+            lx("1 + ...\n2"),
+            vec![Token::Num(1.0), Token::Plus, Token::Num(2.0), Token::Eof]
+        );
+    }
+
+    // ---- keywords and operators ----------------------------------------
+
+    #[test]
+    fn keywords_are_their_own_tokens() {
+        assert_eq!(
+            lx("if elseif else end for while break continue"),
+            vec![
+                Token::If,
+                Token::ElseIf,
+                Token::Else,
+                Token::End,
+                Token::For,
+                Token::While,
+                Token::Break,
+                Token::Continue,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyword_prefix_is_an_identifier() {
+        assert_eq!(lx("endx"), vec![id("endx"), Token::Eof]);
+        assert_eq!(lx("iffy"), vec![id("iffy"), Token::Eof]);
+        assert_eq!(lx("_x1"), vec![id("_x1"), Token::Eof]);
+    }
+
+    #[test]
+    fn not_versus_not_equal() {
+        assert_eq!(lx("a~=b"), vec![id("a"), Token::Ne, id("b"), Token::Eof]);
+        assert_eq!(lx("~a"), vec![Token::Not, id("a"), Token::Eof]);
+    }
+
+    #[test]
+    fn two_character_operators() {
+        assert_eq!(
+            lx("== ~= <= >= && || .* ./ .^"),
+            vec![
+                Token::Eq,
+                Token::Ne,
+                Token::Le,
+                Token::Ge,
+                Token::AndAnd,
+                Token::OrOr,
+                Token::DotStar,
+                Token::DotSlash,
+                Token::DotCaret,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn single_character_operators() {
+        assert_eq!(
+            lx("+ - * / \\ ^ = < > & | ~ ( ) , ; :"),
+            vec![
+                Token::Plus,
+                Token::Minus,
+                Token::Star,
+                Token::Slash,
+                Token::Backslash,
+                Token::Caret,
+                Token::Assign,
+                Token::Lt,
+                Token::Gt,
+                Token::And,
+                Token::Or,
+                Token::Not,
+                Token::LParen,
+                Token::RParen,
+                Token::Comma,
+                Token::Semi,
+                Token::Colon,
+                Token::Eof,
+            ]
+        );
+    }
+
+    // ---- errors --------------------------------------------------------
+
+    #[test]
+    fn unterminated_string_is_an_error() {
+        assert!(lex("'abc").is_err());
+        assert!(lex("x = 'abc\ny = 1").is_err());
+        assert!(lex("\"abc").is_err());
+    }
+
+    #[test]
+    fn unexpected_character_is_an_error() {
+        assert!(lex("a @ b").is_err());
+        assert!(lex("#").is_err());
+    }
+}
