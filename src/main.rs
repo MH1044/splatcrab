@@ -1,7 +1,7 @@
-//! MatLabTwo: a small MATLAB-compatible interpreter.
+//! SplatCrab: a small MATLAB-compatible interpreter.
 //!
-//!   matlabtwo            start the REPL
-//!   matlabtwo script.m   run a script file
+//!   splatcrab            start the REPL
+//!   splatcrab script.m   run a script file
 
 mod interp;
 mod lexer;
@@ -32,7 +32,7 @@ fn main() {
         return;
     }
 
-    println!("MatLabTwo 0.1.0  (type 'exit' to quit)\n");
+    println!("SplatCrab 0.1.0  (type 'exit' to quit)\n");
     let stdin = io::stdin();
     let mut buf = String::new();
     loop {

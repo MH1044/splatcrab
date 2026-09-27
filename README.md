@@ -1,4 +1,4 @@
-# MatLabTwo
+# SplatCrab
 
 A lightweight, open-source MATLAB-compatible numerical language, written in Rust
 with no external dependencies.
@@ -17,8 +17,8 @@ ans =
 
 ```
 cargo build --release
-./target/release/matlabtwo                # REPL
-./target/release/matlabtwo examples/demo.m  # run a script
+./target/release/splatcrab                # REPL
+./target/release/splatcrab examples/demo.m  # run a script
 ```
 
 ## Architecture
