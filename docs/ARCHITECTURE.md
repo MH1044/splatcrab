@@ -131,7 +131,7 @@ compiling untouched. Only the constructors of results decide the class.
 ## Key designs to preserve
 
 These are decided and should not be re-litigated inside a cycle. The full
-rationale is in the plan that produced this repo.
+rationale is in the module specs under `docs/modules/`.
 
 **Errors (cycle 01b, in place).** `MError { msg, line }` in `error.rs`, with
 every message text defined there and nowhere else. Script mode prints
