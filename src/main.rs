@@ -43,6 +43,8 @@ fn run() -> i32 {
         // longer returns normally, so nothing else will.
         let _ = it.out.flush();
         if let Err(e) = result {
+            // `MError`'s Display supplies the `Line N: ` part when a line is
+            // known, so the prefix is spelled in exactly one place.
             eprintln!("Error: {}", e);
             return 1;
         }
@@ -69,7 +71,9 @@ fn run() -> i32 {
             continue;
         }
         if let Err(e) = it.run(&buf) {
-            println!("Error: {}", e);
+            // No line number here: a REPL entry is one line, so "Line 1:"
+            // would be noise rather than information.
+            println!("Error: {}", e.msg);
         }
         buf.clear();
     }

@@ -19,7 +19,7 @@ environment last.
 |---|---|---|---|
 | 00 | [baseline](modules/00-baseline.md) | The stage-0 interpreter: expressions, matrices, indexing, control flow, 79 builtins | Done (2026-09-27) |
 | 01 | [registry-and-builtins](modules/01-registry-and-builtins.md) | The 79 builtins moved out of one 409-line match into a registry that knows `nargout`, plus `tic`/`toc` for 81; arity checks; interpreter on a 256 MB stack | Done (2026-09-27) |
-| 01b | [error-reporting](modules/01b-error-reporting.md) | An error type carrying a line number, `Error: Line N` in script mode, and the two lexer defects found in cycle 0 | Planned |
+| 01b | [error-reporting](modules/01b-error-reporting.md) | `MError` carrying a line number and every message text, `Error: Line N` in script mode, the three lexer defects found in cycle 0, elementwise `.\`, and a capped range | Done (2026-09-27) |
 | 02 | [classes-and-display](modules/02-classes-and-display.md) | Logical and char classes as a tag on `Matrix`; class propagation; MATLAB display fidelity | Planned |
 | 03 | [indexing-forms](modules/03-indexing-forms.md) | Logical indexing, element deletion, in-place assignment, access-chain AST, multiple return values | Planned |
 | 04 | [switch-try-commands](modules/04-switch-try-commands.md) | `switch`, `try`/`catch` with an error struct, `warning`, `assert`, command syntax, block comments | Planned |

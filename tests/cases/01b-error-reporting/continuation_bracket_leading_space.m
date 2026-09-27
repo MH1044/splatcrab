@@ -1,0 +1,3 @@
+% covers: 7 - regression guard: the leading-space continuation form is still two elements
+x = [1 ...
+ -2]; disp(numel(x))

@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 
 use super::args::{at_most, check_size, mat, need, size_arg};
 use super::{Registry, add, one_mat};
+use crate::error;
 use crate::interp::{Interp, R};
 use crate::value::{Matrix, Value};
 
@@ -51,7 +52,7 @@ fn trace(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "trace")?;
     let m = mat(a, 0, "trace")?;
     if m.rows != m.cols {
-        return Err("Matrix must be square for 'trace'.".to_string());
+        return Err(error::nonsquare_trace());
     }
     one_mat(Matrix::scalar((0..m.rows).map(|i| m.get(i, i)).sum()))
 }
@@ -78,7 +79,7 @@ fn norm(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "norm")?;
     let m = mat(a, 0, "norm")?;
     if !m.is_vector() && !m.is_empty() {
-        return Err("'norm' currently supports vectors only.".to_string());
+        return Err(error::norm_vectors_only());
     }
     one_mat(Matrix::scalar(
         m.data.iter().map(|v| v * v).sum::<f64>().sqrt(),
@@ -91,7 +92,7 @@ fn dot(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     let x = mat(a, 0, "dot")?;
     let y = mat(a, 1, "dot")?;
     if x.numel() != y.numel() {
-        return Err("Vectors must be the same length for 'dot'.".to_string());
+        return Err(error::dot_length_mismatch());
     }
     one_mat(Matrix::scalar(
         x.data.iter().zip(&y.data).map(|(p, q)| p * q).sum(),
@@ -107,12 +108,7 @@ fn reshape(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     let r = size_arg(a, 1, "reshape")?;
     let c = size_arg(a, 2, "reshape")?;
     if check_size(r, c)? != m.numel() {
-        return Err(format!(
-            "To reshape the number of elements must not change ({} vs {}x{}).",
-            m.numel(),
-            r,
-            c
-        ));
+        return Err(error::reshape_numel(m.numel(), r, c));
     }
     one_mat(Matrix::new(r, c, m.data))
 }
@@ -203,7 +199,7 @@ fn sort(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "sort")?;
     let m = mat(a, 0, "sort")?;
     if !m.is_vector() && !m.is_empty() {
-        return Err("'sort' currently supports vectors only.".to_string());
+        return Err(error::sort_vectors_only());
     }
     let mut out = m.clone();
     out.data.sort_by(sort_cmp);
@@ -275,11 +271,15 @@ mod tests {
 
     #[test]
     fn a_size_that_would_overflow_is_an_error_not_a_panic() {
-        let e = call(reshape, &[num(1.0), num(1e10), num(1e10)]).unwrap_err();
+        let e = call(reshape, &[num(1.0), num(1e10), num(1e10)])
+            .unwrap_err()
+            .msg;
         assert!(e.contains("10000000000x10000000000"), "{e}");
         // repmat names the array it was asked for, not an intermediate: a
         // 1x2 tiled 1e10 by 1e10 is 10000000000x20000000000.
-        let e = call(repmat, &[row(&[1.0, 2.0]), num(1e10), num(1e10)]).unwrap_err();
+        let e = call(repmat, &[row(&[1.0, 2.0]), num(1e10), num(1e10)])
+            .unwrap_err()
+            .msg;
         assert!(e.contains("10000000000x20000000000"), "{e}");
         // A huge count with an empty source is still an empty array, as in
         // MATLAB, because the product is zero.
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn arity_is_checked_at_both_ends() {
         assert_eq!(
-            call(inv, &[num(1.0), num(2.0)]).unwrap_err(),
+            call(inv, &[num(1.0), num(2.0)]).unwrap_err().msg,
             "Too many input arguments."
         );
         assert!(call(dot, &[row(&[1.0, 2.0])]).is_err());

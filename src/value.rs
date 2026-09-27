@@ -2,6 +2,9 @@
 
 use std::fmt::Write as _;
 
+use crate::bail;
+use crate::error::{self, R};
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
@@ -127,13 +130,8 @@ impl Matrix {
     }
 
     /// Element-wise combination with scalar / row / column broadcasting.
-    pub fn zip(&self, o: &Matrix, op: &str, f: impl Fn(f64, f64) -> f64) -> Result<Matrix, String> {
-        let dims_err = || {
-            format!(
-                "Arrays have incompatible sizes for operator '{}' ({}x{} vs {}x{}).",
-                op, self.rows, self.cols, o.rows, o.cols
-            )
-        };
+    pub fn zip(&self, o: &Matrix, op: &str, f: impl Fn(f64, f64) -> f64) -> R<Matrix> {
+        let dims_err = || error::operator_dims(op, self.rows, self.cols, o.rows, o.cols);
         let rows = broadcast_dim(self.rows, o.rows).ok_or_else(dims_err)?;
         let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
         let mut data = Vec::with_capacity(rows * cols);
@@ -163,13 +161,9 @@ impl Matrix {
         Matrix::new(self.cols, self.rows, data)
     }
 
-    pub fn matmul(&self, o: &Matrix) -> Result<Matrix, String> {
+    pub fn matmul(&self, o: &Matrix) -> R<Matrix> {
         if self.cols != o.rows {
-            return Err(format!(
-                "Incorrect dimensions for matrix multiplication ({}x{} * {}x{}). \
-                 Use '.*' for element-wise multiplication.",
-                self.rows, self.cols, o.rows, o.cols
-            ));
+            bail!(error::matmul_dims(self.rows, self.cols, o.rows, o.cols));
         }
         let mut out = Matrix::filled(self.rows, o.cols, 0.0);
         for j in 0..o.cols {
@@ -190,19 +184,13 @@ impl Matrix {
     // Elimination is written with explicit indices on purpose; cycle 08 replaces
     // solve and det with a shared LU factorisation.
     #[allow(clippy::needless_range_loop)]
-    pub fn solve(&self, b: &Matrix) -> Result<Matrix, String> {
+    pub fn solve(&self, b: &Matrix) -> R<Matrix> {
         let n = self.rows;
         if self.rows != self.cols {
-            return Err(
-                "Only square systems are supported by '\\' and '/' for now (no least squares yet)."
-                    .to_string(),
-            );
+            bail!(error::nonsquare_system());
         }
         if b.rows != n {
-            return Err(format!(
-                "Matrix dimensions must agree for '\\' ({}x{} \\ {}x{}).",
-                self.rows, self.cols, b.rows, b.cols
-            ));
+            bail!(error::solve_dims(self.rows, self.cols, b.rows, b.cols));
         }
         let m = b.cols;
         let mut a: Vec<Vec<f64>> = (0..n)
@@ -221,7 +209,7 @@ impl Matrix {
                 })
                 .unwrap();
             if a[p][k].abs() < 1e-14 {
-                return Err("Matrix is singular to working precision.".to_string());
+                bail!(error::singular());
             }
             a.swap(k, p);
             x.swap(k, p);
@@ -256,9 +244,9 @@ impl Matrix {
         Ok(out)
     }
 
-    pub fn inv(&self) -> Result<Matrix, String> {
+    pub fn inv(&self) -> R<Matrix> {
         if self.rows != self.cols {
-            return Err("Matrix must be square to invert.".to_string());
+            bail!(error::nonsquare_inverse());
         }
         self.solve(&Matrix::identity(self.rows, self.rows))
     }
@@ -266,9 +254,9 @@ impl Matrix {
     // Elimination is written with explicit indices on purpose; cycle 08 replaces
     // solve and det with a shared LU factorisation.
     #[allow(clippy::needless_range_loop)]
-    pub fn det(&self) -> Result<f64, String> {
+    pub fn det(&self) -> R<f64> {
         if self.rows != self.cols {
-            return Err("Matrix must be square to compute a determinant.".to_string());
+            bail!(error::nonsquare_determinant());
         }
         let n = self.rows;
         let mut a: Vec<Vec<f64>> = (0..n)
@@ -511,7 +499,7 @@ mod tests {
     fn zip_rejects_incompatible_sizes() {
         let a = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let b = rmat(3, 2, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let e = a.zip(&b, "+", |x, y| x + y).unwrap_err();
+        let e = a.zip(&b, "+", |x, y| x + y).unwrap_err().msg;
         assert!(e.contains("incompatible sizes"), "{e}");
         assert!(e.contains("2x3 vs 3x2"), "{e}");
         assert!(e.contains("'+'"), "{e}");
@@ -539,7 +527,7 @@ mod tests {
     fn matmul_rejects_bad_dimensions() {
         let a = Matrix::row(vec![1.0, 2.0]);
         let b = Matrix::row(vec![3.0, 4.0]);
-        let e = a.matmul(&b).unwrap_err();
+        let e = a.matmul(&b).unwrap_err().msg;
         assert!(e.contains("Incorrect dimensions"), "{e}");
         assert!(e.contains("1x2 * 1x2"), "{e}");
         // Transposing the right side makes it legal again.
@@ -607,11 +595,11 @@ mod tests {
     #[test]
     fn solve_rejects_singular_and_non_square() {
         let s = rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]);
-        let e = s.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err();
+        let e = s.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err().msg;
         assert!(e.contains("singular"), "{e}");
 
         let ns = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let e = ns.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err();
+        let e = ns.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err().msg;
         assert!(e.contains("square"), "{e}");
 
         // Square, but the right-hand side has the wrong number of rows.
@@ -651,7 +639,8 @@ mod tests {
         );
         let e = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
             .det()
-            .unwrap_err();
+            .unwrap_err()
+            .msg;
         assert!(e.contains("square"), "{e}");
     }
 

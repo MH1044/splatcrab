@@ -331,11 +331,11 @@ mod tests {
         let two = [one[0].clone(), one[0].clone()];
         let three = [one[0].clone(), one[0].clone(), one[0].clone()];
         assert_eq!(
-            unary(&two, "abs", f64::abs).unwrap_err(),
+            unary(&two, "abs", f64::abs).unwrap_err().msg,
             "Too many input arguments."
         );
         assert_eq!(
-            reduction(&three, "sum", Red::Sum).unwrap_err(),
+            reduction(&three, "sum", Red::Sum).unwrap_err().msg,
             "Too many input arguments."
         );
         assert!(binary(&one, "mod", f64::atan2).is_err());
@@ -349,9 +349,9 @@ mod tests {
             Value::Mat(Matrix::row(vec![1.0, 2.0])),
             Value::Mat(Matrix::scalar(0.0)),
         ];
-        let e = reduction(&args, "sum", Red::Sum).unwrap_err();
+        let e = reduction(&args, "sum", Red::Sum).unwrap_err().msg;
         assert!(e.contains("positive integer"), "{e}");
-        let e = cumulative(&args, "cumsum", true).unwrap_err();
+        let e = cumulative(&args, "cumsum", true).unwrap_err().msg;
         assert!(e.contains("positive integer"), "{e}");
     }
 }

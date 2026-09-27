@@ -5,6 +5,11 @@
 //! case calls by name). Each case runs with the built `splatcrab` binary, with
 //! the working directory set to the case's own directory so helpers resolve.
 //!
+//! A `<name>.repl` file is a case too, and the one thing a `.m` cannot test:
+//! it is spawned with no script argument, so the binary enters the REPL, and
+//! the file is typed at the prompt through stdin. Everything else -- `.out`,
+//! `.err`, the exit-code rule -- is identical.
+//!
 //!   cargo test --test golden
 //!   GOLDEN_FILTER=00-baseline cargo test --test golden    # path substring
 //!   UPDATE_GOLDEN=1 cargo test --test golden              # rewrite .out
@@ -42,7 +47,26 @@ fn declares_itself_a_case(p: &Path) -> bool {
     }
 }
 
-/// Collects `.m` files that are cases, in a deterministic order. A `.m` is a
+/// True when this case drives the REPL rather than running a script: the
+/// binary is spawned with no argument and the file is typed at the prompt.
+fn is_repl_case(p: &Path) -> bool {
+    p.extension().is_some_and(|x| x == "repl")
+}
+
+/// The lines a `.repl` case types at the prompt: the whole file except its
+/// `% covers:` marker, which documents the case rather than being typed.
+fn repl_session(path: &Path) -> Vec<u8> {
+    let text = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => panic!("cannot read {}: {e}", path.display()),
+    };
+    match text.split_once('\n') {
+        Some((first, rest)) if first.trim_start().starts_with("% covers:") => rest.into(),
+        _ => text.into_bytes(),
+    }
+}
+
+/// Collects case files, in a deterministic order. A `.m` or `.repl` file is a
 /// case when it has a sibling `.out`, or when it opens with `% covers:`.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
@@ -53,7 +77,7 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     for p in entries {
         if p.is_dir() {
             collect_cases(&p, out);
-        } else if p.extension().is_some_and(|x| x == "m")
+        } else if p.extension().is_some_and(|x| x == "m" || x == "repl")
             && (p.with_extension("out").exists() || declares_itself_a_case(&p))
         {
             out.push(p);
@@ -83,12 +107,19 @@ struct Outcome {
 /// output cannot fill the pipe and deadlock while we poll for exit.
 fn run_case(path: &Path) -> Outcome {
     let dir = path.parent().expect("case has a parent directory");
-    let stdin_path = path.with_extension("stdin");
-    let stdin_data = fs::read(&stdin_path).ok();
+    let stdin_data = if is_repl_case(path) {
+        Some(repl_session(path))
+    } else {
+        fs::read(path.with_extension("stdin")).ok()
+    };
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_splatcrab"));
-    cmd.arg(path)
-        .current_dir(dir)
+    // A REPL case takes no script argument: that argument is what makes the
+    // binary run a file instead of reading the prompt.
+    if !is_repl_case(path) {
+        cmd.arg(path);
+    }
+    cmd.current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin_data.is_some() {

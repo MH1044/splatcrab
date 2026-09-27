@@ -82,6 +82,99 @@ error from a `String` literal and now want a line attached.
 A statement's line is enough to locate a runtime error, and it keeps the AST
 small. The parser knows the line of the token that started each statement.
 
+### Decisions taken while building it
+
+**The lexer returns `Lexed { tokens: Vec<Token>, lines: Vec<u32> }`**, with
+`lex(src) -> R<Vec<Token>>` kept as a one-line wrapper over
+`scan(src) -> R<Lexed>`. A parallel vector rather than a `Vec<(Token, u32)>`,
+for the reason the note above gives: the 43 token-stream assertions still
+compare against a plain `Vec<Token>` and not one of them changed. `Token`
+itself is untouched, so it stays comparable on its own — which matters for
+`crlf_lexes_the_same_as_lf`, where two inputs must produce equal token
+streams from different byte offsets. The lines are asserted separately, by
+five new tests that read `scan(...).lines` directly, so the information is
+genuinely tested rather than merely carried. Pushing to the two vectors goes
+through one private `Out::push`, so they cannot drift.
+
+**The line sits on a `Located { stmt, line }` wrapper**, not as a field on each
+`Stmt` variant. A block body is `Vec<Located>`, so `Stmt` keeps comparing over
+shape alone and a `u32` does not have to be threaded through every tuple
+variant, including `Break` and `Continue`. The parser's statement tests now
+build their expectations through an `at(line, stmt)` helper and assert the
+line as well as the tree: `nested_blocks`, for instance, pins the `for` to
+line 1, the `if` to line 2 and the `break` to line 3. That is a strengthening,
+not a rewrite — every tree shape those tests asserted is still asserted.
+`Parser::new(tokens)` still exists with an empty line table and reports line 1,
+which is what the expression tests and the REPL's `needs_more` want.
+
+**`MError::at` records a line only if none is known yet.** `exec_block` calls
+it on everything a statement returns, so the innermost block that sees the
+error wins and acceptance test 4 falls out for free: an error in a `for` body
+reports the body's line while the `for` unwinds around it. An error in the
+loop's own range expression still reports the `for`'s line, because that is the
+statement that raised it.
+
+**`Display for MError` supplies the `Line N: ` prefix**, so script mode is
+still `eprintln!("Error: {}", e)` and the prefix is spelled in exactly one
+place. The REPL prints `e.msg`, since a REPL entry is one line and a number
+there would be noise.
+
+**Every message text moved to `error.rs`, including the builtins'.** The spec
+says "or is constructed through one place", and `args.rs` already was one for
+argument messages, but leaving two homes would have left the duplication the
+bullet is aimed at: `Dimensions of arrays being concatenated are not
+consistent.` was formatted in two spots in `interp.rs` and
+`Not enough input arguments for '{}'.` in three in `args.rs`. Each is now one
+function. Acceptance test 15 is a unit test in `error.rs` that `include_str!`s
+the other eight source files, cuts each at its `#[cfg(test)]`, and fails if an
+`Err(`, `bail!(`, `ok_or(`, `ok_or_else(||` or `map_err(|e|` is handed a string
+literal or a `format!`. That is a tighter net than grepping for `.to_string()`,
+which has legitimate uses on the same lines; it was checked against three
+planted violations, one of each shape, and caught all three.
+
+**`bail!(e)` is `return Err(e.into())`.** It takes a constructor rather than a
+format string on purpose, which is what stops it becoming a second place to
+write messages.
+
+**A `...` continuation is a gap between tokens exactly as whitespace is.** Both
+now run the same loop and reach the same bracket-separator check, which is the
+smallest fix for the reported defect and makes `[1 ...` newline `2]` two
+elements as well. Adding `.` to the number lexer's exclusion list fixes
+`a = 1...` in the same line of code as the backslash that `.\` needed.
+
+**The range cap counts in `f64` before it casts.** `((b - a) / s).floor()` cast
+straight to `usize` saturates, and the `+ 1` would then overflow in a debug
+build, so the count is completed as a float and only then clamped. `1:1e15`
+reports `Requested 1x1000000000000000 array exceeds the maximum array size.`,
+`check_size`'s own wording, and exits 1 rather than aborting.
+
+**Acceptance test 5 needed a new kind of golden case.** The runner always
+spawned the binary with the case path as `argv[1]`, and `main` enters the REPL
+only when there is no argument, so a piped session could not be expressed: the
+`.stdin` file was delivered to a process that never reads stdin. `tests/golden.rs`
+now also collects `<name>.repl` files, spawns those with no argument and pipes
+the file (minus its `% covers:` marker) to the prompt. Everything else about a
+case — discovery by marker, `.out`, `.err`, the exit-code rule — is unchanged,
+and the 60 older cases are untouched by the change. The one `.repl` case pins
+the whole session, banner and prompts included, which is what makes
+`>> Error: Undefined function or variable 'bad_name'.` followed by `ans = 2` a
+single assertion. It was verified against a planted regression: printing the
+REPL error as `e` rather than `e.msg` makes it fail with
+`+ >> Error: Line 1: Undefined function or variable 'bad_name'.`.
+
+**Pretty token names in parse errors are not part of this cycle.** The example
+at the top of this spec renders the parse error as `unexpected ';' in
+expression`; the parser actually says `unexpected Semi in expression`, the
+`Debug` name of the token. The Scope never promised the rendering, so
+`err_line_parse.err` asserts the `Line 3:` prefix alone rather than pinning a
+message the spec did not commit to. The gap between the example and the
+message is recorded in "Known bugs" instead of being closed here.
+
+**Invariant 6 is still not restored.** The `:` operator no longer aborts the
+allocator, but `fprintf('%.65536f', 1)` still panics and
+`fprintf('%2147483647d', 1)` still hangs. Those two rows stay open in
+"Known bugs" until cycle 11.
+
 ## Acceptance tests
 
 Each becomes at least one golden case in `tests/cases/01b-error-reporting/`.
@@ -117,4 +210,7 @@ Each becomes at least one golden case in `tests/cases/01b-error-reporting/`.
 
 ## Status
 
-Planned
+Done (2026-09-27). All fifteen acceptance tests are covered: twelve script
+cases and one `.repl` session under `tests/cases/01b-error-reporting/`, and
+unit tests in `src/lexer.rs` and `src/error.rs` for tests 14 and 15.
+Invariant 6 remains open on the two `printf` rows, which cycle 11 owns.

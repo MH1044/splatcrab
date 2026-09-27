@@ -26,11 +26,28 @@ A case is a `.m` file with a sibling `.out`:
 | `<name>.out` | exact expected stdout. May be empty |
 | `<name>.err` | optional. A substring that must appear in stderr; the process must exit 1 |
 | `<name>.stdin` | optional. Piped to the script's stdin |
+| `<name>.repl` | a REPL session instead of a script. Line 1 is the marker; the rest is typed at the prompt |
 
 A `.m` file is a case when it has a sibling `.out`, **or** when its first line
 is the `% covers:` marker. The marker is what makes a brand new case
 discoverable before its `.out` exists, so `UPDATE_GOLDEN=1` can create one; a
 case with neither fails loudly rather than being skipped in silence.
+
+### REPL cases
+
+A `.repl` file is a case in its own right, discovered by the same two rules and
+taking the same `.out` and `.err` siblings. The difference is how it runs: the
+binary is spawned with **no script argument**, so it enters the REPL, and the
+file is piped to its stdin, which the REPL reads line by line as if typed. The
+`% covers:` marker on line 1 is stripped first, so it is not typed at the
+prompt.
+
+The expected output therefore contains the banner and the `>> ` prompts, which
+are part of what the case pins down. Use a `.repl` case only for behaviour that
+belongs to the prompt itself — that errors carry no line number there, that a
+session survives one — since a script case is cheaper to read. End the session
+with `exit`, as a user would. EOF ends it too, and leaves the same trailing
+prompt, but then the case never says where it meant to stop.
 
 A `.m` with no marker and no `.out` is a helper: a function or script file that
 a case next to it calls by name. Each case runs with its own directory as the

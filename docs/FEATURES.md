@@ -12,11 +12,13 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Single-quoted strings, `''` escape | 00 | `strings` | Displays with quotes; MATLAB shows char bare |
 | Double-quoted strings | 00 | `strings` | Treated as char; MATLAB has a separate string class |
 | `%` comments | 00 | every case | |
-| `...` line continuation | 00 | `demo_smoke` | |
+| `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
+| `...` separates elements inside brackets | 01b | `continuation_bracket_element` | `[1 ...` newline `-2]` is two elements, like `[1 -2]` |
 | `;` suppresses display, `,` and newline show | 00 | `indexing` | |
 | Matrix literals, space/comma/newline separators | 00 | `matrix_ops` | `[1 -2]` is two elements, `[1 - 2]` is one |
 | Nested concatenation `[A; B]`, `[a' b']` | 00 | `builtins_sample` | |
 | Ranges `a:b` and `a:s:b` | 00 | `ranges` | Descending and fractional steps |
+| A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_size` |
 
 ## Operators
 
@@ -25,6 +27,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `+ - * /` and left division | 00 | `matrix_ops` | Backslash solves square systems only |
 | `^` with an integer exponent | 00 | `demo_smoke` | Negative exponents invert |
 | `.* ./ .^` elementwise | 00 | `matrix_ops` | |
+| `.\` elementwise left divide | 01b | `eldiv_vector`, `eldiv_after_number` | `a.\b` is `b./a`; `2.\x` no longer means `2 \ x` |
 | Transpose `'` and `.'` | 00 | `matrix_ops` | |
 | `== ~= < <= > >=` | 00 | `logical_ops` | Results are 0/1 doubles until cycle 02 |
 | `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | |
@@ -109,7 +112,10 @@ until cycles 08 and 09. `sort` puts `NaN` last.
 | The `+` and space flags, and precision on integers | 01 | `printf_plus_space_and_int_precision` | `%+d`, `% d`, `%.3d` |
 | `%d` of a non-integer switches to `%e` | 01 | `printf_d_nonintegral` | MATLAB's rule; it used to fall back to `%g` |
 | `%s` of a number is its character, and a char argument expands per character | 01 | `printf_string_and_char_args` | `%s` still takes a whole char argument |
-| MATLAB-style error messages | 00 | the seven `err_*` cases | |
+| MATLAB-style error messages | 00 | the seven `err_*` cases | Every message text is defined in `src/error.rs` and nowhere else |
+| `Error: Line N: <msg>` in script mode | 01b | `err_line_runtime`, `err_line_parse` | Runtime, parse and lex errors alike; stdout is still flushed first |
+| An error in a block body names the body's line | 01b | `err_line_in_for_body` | `MError::at` keeps the innermost line |
+| The REPL reports errors without a line, and survives them | 01b | `repl_error_has_no_line` | One line per entry, so a number would be noise. The only `.repl` case: it drives the prompt, not a script |
 
 ## Tooling
 

@@ -5,6 +5,9 @@
 //!    `[1 - 2]` is one) and a newline acts like `;`.
 //!  * `'` is a transpose after a value and a string delimiter otherwise.
 
+use crate::bail;
+use crate::error::{self, R};
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
     Num(f64),
@@ -19,6 +22,7 @@ pub enum Token {
     Caret,
     DotStar,
     DotSlash,
+    DotBackslash,
     DotCaret,
     Transpose,
 
@@ -72,11 +76,59 @@ fn ends_value(t: &Token) -> bool {
     )
 }
 
-pub fn lex(src: &str) -> Result<Vec<Token>, String> {
+/// True when a `...` line continuation starts at `i`.
+fn is_continuation(chars: &[char], i: usize) -> bool {
+    chars.get(i) == Some(&'.') && chars.get(i + 1) == Some(&'.') && chars.get(i + 2) == Some(&'.')
+}
+
+/// The lexer's full result: the token stream, and the source line each token
+/// came from.
+///
+/// The lines live beside the tokens rather than inside them. Pairing each
+/// token with its line would have changed what a `Token` is, and with it all
+/// 43 token-stream assertions in this file's tests; a parallel vector leaves
+/// both them and `lex` below untouched, and the parser reads `lines[pos]`
+/// exactly where it already reads `toks[pos]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lexed {
+    pub tokens: Vec<Token>,
+    /// `lines[k]` is the 1-based source line `tokens[k]` starts on. Always the
+    /// same length as `tokens`.
+    pub lines: Vec<u32>,
+}
+
+/// Tokens and their lines, pushed together so the two can never drift.
+struct Out {
+    tokens: Vec<Token>,
+    lines: Vec<u32>,
+}
+
+impl Out {
+    fn push(&mut self, t: Token, line: u32) {
+        self.tokens.push(t);
+        self.lines.push(line);
+    }
+
+    fn last(&self) -> Option<&Token> {
+        self.tokens.last()
+    }
+}
+
+/// The token stream alone, for callers that have no use for the lines: the
+/// parser's own tests, and the REPL's `needs_more`.
+pub fn lex(src: &str) -> R<Vec<Token>> {
+    Ok(scan(src)?.tokens)
+}
+
+pub fn scan(src: &str) -> R<Lexed> {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut i = 0;
-    let mut toks: Vec<Token> = Vec::new();
+    let mut line: u32 = 1;
+    let mut toks = Out {
+        tokens: Vec::new(),
+        lines: Vec::new(),
+    };
     // Stack of open delimiters so we know whether the innermost one is `[`.
     let mut open: Vec<char> = Vec::new();
 
@@ -92,19 +144,29 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             continue;
         }
 
-        // Line continuation `...`: skip the rest of the line including the newline.
-        if c == '.' && i + 2 < n && chars[i + 1] == '.' && chars[i + 2] == '.' {
-            while i < n && chars[i] != '\n' {
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-
-        // Whitespace: inside brackets it may separate elements.
-        if c == ' ' || c == '\t' || c == '\r' {
-            while i < n && matches!(chars[i], ' ' | '\t' | '\r') {
-                i += 1;
+        // Whitespace and `...` continuations are both gaps between tokens, and
+        // inside brackets a gap may separate two elements. They are handled
+        // together so both kinds reach the separator check below: a `...` that
+        // skipped straight past its newline used to leave the cursor on the
+        // next character, so `[1 ...` newline `-2]` came out as one element
+        // worth `-1` instead of two.
+        if matches!(c, ' ' | '\t' | '\r') || is_continuation(&chars, i) {
+            while i < n {
+                if matches!(chars[i], ' ' | '\t' | '\r') {
+                    i += 1;
+                } else if is_continuation(&chars, i) {
+                    while i < n && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    // Step over the newline the continuation hides. It is
+                    // still a line of the file, so it still counts.
+                    if i < n {
+                        line += 1;
+                    }
+                    i += 1;
+                } else {
+                    break;
+                }
             }
             if in_bracket && i < n {
                 let prev_ends = toks.last().is_some_and(ends_value);
@@ -121,7 +183,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 let signed_value =
                     (next == '+' || next == '-') && !matches!(next1, ' ' | '\t' | '\r' | '\n');
                 if prev_ends && (starts_value || signed_value) {
-                    toks.push(Token::Comma);
+                    toks.push(Token::Comma, line);
                 }
             }
             continue;
@@ -129,11 +191,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 
         if c == '\n' {
             i += 1;
-            toks.push(if in_bracket {
-                Token::Semi
-            } else {
-                Token::Newline
-            });
+            toks.push(
+                if in_bracket {
+                    Token::Semi
+                } else {
+                    Token::Newline
+                },
+                line,
+            );
+            line += 1;
             continue;
         }
 
@@ -143,10 +209,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             while i < n && chars[i].is_ascii_digit() {
                 i += 1;
             }
-            // `2.*x` must not swallow the dot of `.*`
+            // `2.*x` must not swallow the dot of `.*`. The list covers every
+            // character that can follow the dot of a dotted operator: the
+            // backslash of `.\`, which would otherwise leave `2.\x` silently
+            // meaning `2 \ x`, and the dot of `...`, which would otherwise
+            // make `a = 1...` lex as `1.` followed by a stray `..`.
             if i < n
                 && chars[i] == '.'
-                && !(i + 1 < n && matches!(chars[i + 1], '*' | '/' | '^' | '\''))
+                && !(i + 1 < n && matches!(chars[i + 1], '*' | '/' | '\\' | '^' | '\'' | '.'))
             {
                 i += 1;
                 while i < n && chars[i].is_ascii_digit() {
@@ -166,10 +236,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 }
             }
             let text: String = chars[start..i].iter().collect();
-            let v: f64 = text
-                .parse()
-                .map_err(|_| format!("invalid number '{}'", text))?;
-            toks.push(Token::Num(v));
+            let v: f64 = match text.parse() {
+                Ok(v) => v,
+                Err(_) => bail!(error::invalid_number(&text).at(line)),
+            };
+            toks.push(Token::Num(v), line);
             continue;
         }
 
@@ -191,7 +262,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 "continue" => Token::Continue,
                 _ => Token::Ident(word),
             };
-            toks.push(tok);
+            toks.push(tok, line);
             continue;
         }
 
@@ -199,14 +270,14 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
         if c == '\'' {
             if toks.last().is_some_and(ends_value) {
                 i += 1;
-                toks.push(Token::Transpose);
+                toks.push(Token::Transpose, line);
                 continue;
             }
             i += 1;
             let mut s = String::new();
             loop {
                 if i >= n || chars[i] == '\n' {
-                    return Err("unterminated string".to_string());
+                    bail!(error::unterminated_string().at(line));
                 }
                 if chars[i] == '\'' {
                     if i + 1 < n && chars[i + 1] == '\'' {
@@ -220,7 +291,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            toks.push(Token::Str(s));
+            toks.push(Token::Str(s), line);
             continue;
         }
 
@@ -230,7 +301,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             let mut s = String::new();
             loop {
                 if i >= n || chars[i] == '\n' {
-                    return Err("unterminated string".to_string());
+                    bail!(error::unterminated_string().at(line));
                 }
                 if chars[i] == '"' {
                     if i + 1 < n && chars[i + 1] == '"' {
@@ -244,7 +315,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 s.push(chars[i]);
                 i += 1;
             }
-            toks.push(Token::Str(s));
+            toks.push(Token::Str(s), line);
             continue;
         }
 
@@ -259,6 +330,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             ('|', Some('|')) => (Token::OrOr, 2),
             ('.', Some('*')) => (Token::DotStar, 2),
             ('.', Some('/')) => (Token::DotSlash, 2),
+            ('.', Some('\\')) => (Token::DotBackslash, 2),
             ('.', Some('^')) => (Token::DotCaret, 2),
             ('.', Some('\'')) => (Token::Transpose, 2),
             ('+', _) => (Token::Plus, 1),
@@ -292,14 +364,17 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
             (',', _) => (Token::Comma, 1),
             (';', _) => (Token::Semi, 1),
             (':', _) => (Token::Colon, 1),
-            _ => return Err(format!("unexpected character '{}'", c)),
+            _ => bail!(error::unexpected_char(c).at(line)),
         };
-        toks.push(tok);
+        toks.push(tok, line);
         i += len;
     }
 
-    toks.push(Token::Eof);
-    Ok(toks)
+    toks.push(Token::Eof, line);
+    Ok(Lexed {
+        tokens: toks.tokens,
+        lines: toks.lines,
+    })
 }
 
 #[cfg(test)]
@@ -532,6 +607,38 @@ mod tests {
     }
 
     #[test]
+    fn number_does_not_swallow_dot_of_dot_backslash() {
+        // Without the backslash in the exclusion list this was `Num(2.0)`
+        // followed by `Backslash`, so `2.\x` silently meant `2 \ x`.
+        assert_eq!(
+            lx("2.\\x"),
+            vec![Token::Num(2.0), Token::DotBackslash, id("x"), Token::Eof]
+        );
+        assert_eq!(
+            lx("2 .\\ 8"),
+            vec![
+                Token::Num(2.0),
+                Token::DotBackslash,
+                Token::Num(8.0),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn number_does_not_swallow_the_dot_of_a_continuation() {
+        // `1...` used to lex as `1.` plus a stray `..`.
+        assert_eq!(
+            lx("1...\n+ 2"),
+            vec![Token::Num(1.0), Token::Plus, Token::Num(2.0), Token::Eof]
+        );
+        assert_eq!(
+            lx("1.0...\n+ 2"),
+            vec![Token::Num(1.0), Token::Plus, Token::Num(2.0), Token::Eof]
+        );
+    }
+
+    #[test]
     fn number_followed_by_dot_transpose() {
         assert_eq!(
             lx("3.'"),
@@ -620,6 +727,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_continuation_may_follow_any_token() {
+        let joined = vec![Token::Num(1.0), Token::Plus, Token::Num(2.0), Token::Eof];
+        assert_eq!(lx("1 ...\n+ 2"), joined);
+        assert_eq!(lx("1...\n+ 2"), joined);
+        assert_eq!(
+            lx("x...\n+ 2"),
+            vec![id("x"), Token::Plus, Token::Num(2.0), Token::Eof]
+        );
+        assert_eq!(
+            lx("(1)...\n+ 2"),
+            vec![
+                Token::LParen,
+                Token::Num(1.0),
+                Token::RParen,
+                Token::Plus,
+                Token::Num(2.0),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("y = [1]...\n+ 2"),
+            vec![
+                id("y"),
+                Token::Assign,
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::RBracket,
+                Token::Plus,
+                Token::Num(2.0),
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_continuation_inside_brackets_still_separates_elements() {
+        // The `...` branch used to skip past the newline and leave the cursor
+        // on the minus, so no separating `Comma` was inserted and `[1 ...`
+        // newline `-2]` collapsed to the single element `-1`.
+        let two = vec![
+            Token::LBracket,
+            Token::Num(1.0),
+            Token::Comma,
+            Token::Minus,
+            Token::Num(2.0),
+            Token::RBracket,
+            Token::Eof,
+        ];
+        assert_eq!(lx("[1 ...\n-2]"), two);
+        // The leading-space form, which was correct by accident.
+        assert_eq!(lx("[1 ...\n -2]"), two);
+        // A continuation does not invent a separator where a space would not:
+        // spaces on both sides of the minus still make it binary.
+        assert_eq!(
+            lx("[1 ...\n- 2]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Minus,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_continuation_inside_brackets_separates_plain_elements() {
+        assert_eq!(
+            lx("[1 ...\n2]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
     // ---- keywords and operators ----------------------------------------
 
     #[test]
@@ -673,6 +862,23 @@ mod tests {
     }
 
     #[test]
+    fn dot_backslash_is_its_own_operator() {
+        assert_eq!(
+            lx("a.\\b"),
+            vec![id("a"), Token::DotBackslash, id("b"), Token::Eof]
+        );
+        assert_eq!(
+            lx("a .\\ b"),
+            vec![id("a"), Token::DotBackslash, id("b"), Token::Eof]
+        );
+        // A lone backslash is still matrix left division.
+        assert_eq!(
+            lx("a\\b"),
+            vec![id("a"), Token::Backslash, id("b"), Token::Eof]
+        );
+    }
+
+    #[test]
     fn single_character_operators() {
         assert_eq!(
             lx("+ - * / \\ ^ = < > & | ~ ( ) , ; :"),
@@ -712,5 +918,48 @@ mod tests {
     fn unexpected_character_is_an_error() {
         assert!(lex("a @ b").is_err());
         assert!(lex("#").is_err());
+    }
+
+    // ---- line numbers ---------------------------------------------------
+
+    #[test]
+    fn every_token_carries_its_source_line() {
+        let l = scan("x = 1\ny = 2").unwrap();
+        assert_eq!(l.tokens.len(), l.lines.len());
+        // Ident Assign Num Newline | Ident Assign Num Eof.
+        // The newline that ends line 1 belongs to line 1.
+        assert_eq!(l.lines, vec![1, 1, 1, 1, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn a_continuation_still_advances_the_line_count() {
+        // The `+` continues the statement on line 1 but sits on line 2, and
+        // that is the line an error in it has to name.
+        let l = scan("a = 1...\n+ 2\nb = 3").unwrap();
+        assert_eq!(l.lines, vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn a_newline_inside_brackets_counts_as_a_line() {
+        let l = scan("x = [1\n2]\ny = 3").unwrap();
+        // Ident Assign LBracket Num(1) Semi Num(2) RBracket Newline ...
+        assert_eq!(l.lines[..8], [1, 1, 1, 1, 1, 2, 2, 2]);
+        assert_eq!(*l.lines.last().unwrap(), 3);
+    }
+
+    #[test]
+    fn crlf_and_lf_number_the_lines_the_same() {
+        assert_eq!(
+            scan("x = 1\r\ny = 2\r\nz = 3").unwrap().lines,
+            scan("x = 1\ny = 2\nz = 3").unwrap().lines
+        );
+    }
+
+    #[test]
+    fn a_lexer_error_names_the_line_it_happened_on() {
+        assert_eq!(scan("x = 1\ny = @").unwrap_err().line, Some(2));
+        assert_eq!(scan("x = 1\n\ny = 'abc").unwrap_err().line, Some(3));
+        // A continuation before the bad character still moves the count on.
+        assert_eq!(scan("x = 1 ...\n@").unwrap_err().line, Some(2));
     }
 }

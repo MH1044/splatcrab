@@ -1,9 +1,11 @@
 //! Recursive-descent parser producing statements and expressions.
 //!
 //! Precedence (loosest to tightest), following MATLAB:
-//!   ||   &&   |   &   comparison   :   + -   * / \ .* ./   unary - ~   ^ .^   transpose
+//!   ||   &&   |   &   comparison   :   + -   * / \ .* ./ .\   unary - ~   ^ .^   transpose
 
-use crate::lexer::Token;
+use crate::bail;
+use crate::error::{self, R};
+use crate::lexer::{Lexed, Token};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -36,6 +38,8 @@ pub enum BinOp {
     Pow,
     EMul,
     EDiv,
+    /// Elementwise left divide `.\`: `a.\b` is `b ./ a`.
+    ELDiv,
     EPow,
     Eq,
     Ne,
@@ -55,26 +59,50 @@ pub enum Stmt {
     Expr(Expr, bool),
     Assign(String, Expr, bool),
     IndexAssign(String, Vec<Expr>, Expr, bool),
-    If(Vec<(Expr, Vec<Stmt>)>, Option<Vec<Stmt>>),
-    For(String, Expr, Vec<Stmt>),
-    While(Expr, Vec<Stmt>),
+    If(Vec<(Expr, Vec<Located>)>, Option<Vec<Located>>),
+    For(String, Expr, Vec<Located>),
+    While(Expr, Vec<Located>),
     Break,
     Continue,
 }
 
+/// A statement with the source line it starts on.
+///
+/// The line sits on a wrapper rather than inside every `Stmt` variant so that
+/// shape and position stay separable: `Stmt` and `Expr` still compare over
+/// structure alone, and a block body is a `Vec<Located>`, which is what lets a
+/// runtime error inside a `for` body report the body's line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Located {
+    pub stmt: Stmt,
+    pub line: u32,
+}
+
 pub struct Parser {
     toks: Vec<Token>,
+    /// `lines[k]` is the source line of `toks[k]`. Empty when the parser was
+    /// built from tokens alone, and then every statement reports line 1.
+    lines: Vec<u32>,
     pos: usize,
     /// Depth of `name( ... )` argument lists we are inside; enables `end` and bare `:`.
     in_index: usize,
 }
 
-type R<T> = Result<T, String>;
-
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
         Parser {
             toks,
+            lines: Vec::new(),
+            pos: 0,
+            in_index: 0,
+        }
+    }
+
+    /// The parser the interpreter uses: tokens with the lines they came from.
+    pub fn with_lines(lexed: Lexed) -> Self {
+        Parser {
+            toks: lexed.tokens,
+            lines: lexed.lines,
             pos: 0,
             in_index: 0,
         }
@@ -82,6 +110,11 @@ impl Parser {
 
     fn peek(&self) -> &Token {
         &self.toks[self.pos]
+    }
+
+    /// The source line of the token about to be read.
+    fn line(&self) -> u32 {
+        self.lines.get(self.pos).copied().unwrap_or(1)
     }
 
     fn peek_at(&self, k: usize) -> &Token {
@@ -110,7 +143,8 @@ impl Parser {
             self.next();
             Ok(())
         } else {
-            Err(format!("expected {:?} but found {:?}", t, self.peek()))
+            let line = self.line();
+            bail!(error::expected_token(&t, self.peek()).at(line))
         }
     }
 
@@ -120,15 +154,16 @@ impl Parser {
         }
     }
 
-    pub fn parse_program(&mut self) -> R<Vec<Stmt>> {
+    pub fn parse_program(&mut self) -> R<Vec<Located>> {
         let stmts = self.parse_block(&[])?;
         if self.peek() != &Token::Eof {
-            return Err(format!("unexpected {:?}", self.peek()));
+            let line = self.line();
+            bail!(error::unexpected_token(self.peek()).at(line));
         }
         Ok(stmts)
     }
 
-    fn parse_block(&mut self, stops: &[Token]) -> R<Vec<Stmt>> {
+    fn parse_block(&mut self, stops: &[Token]) -> R<Vec<Located>> {
         let mut out = Vec::new();
         loop {
             self.skip_terminators();
@@ -136,11 +171,16 @@ impl Parser {
             if *p == Token::Eof || stops.contains(p) {
                 return Ok(out);
             }
-            out.push(self.parse_stmt()?);
+            // The line of the token that opens the statement is the line a
+            // runtime error inside it reports.
+            let line = self.line();
+            let stmt = self.parse_stmt()?;
+            out.push(Located { stmt, line });
         }
     }
 
     fn parse_stmt(&mut self) -> R<Stmt> {
+        let line = self.line();
         match self.peek().clone() {
             Token::If => {
                 self.next();
@@ -162,7 +202,7 @@ impl Parser {
                             return Ok(Stmt::If(arms, Some(body)));
                         }
                         Token::End => return Ok(Stmt::If(arms, None)),
-                        t => return Err(format!("expected 'end' to close 'if', found {:?}", t)),
+                        t => bail!(error::expected_end_of_if(&t).at(line)),
                     }
                 }
             }
@@ -170,7 +210,7 @@ impl Parser {
                 self.next();
                 let name = match self.next() {
                     Token::Ident(n) => n,
-                    t => return Err(format!("expected loop variable after 'for', found {:?}", t)),
+                    t => bail!(error::expected_loop_variable(&t).at(line)),
                 };
                 self.expect(Token::Assign)?;
                 let range = self.parse_expr()?;
@@ -195,10 +235,9 @@ impl Parser {
                 self.end_stmt()?;
                 Ok(Stmt::Continue)
             }
-            Token::End | Token::Else | Token::ElseIf => Err(format!(
-                "unexpected {:?} with no matching block",
-                self.peek()
-            )),
+            Token::End | Token::Else | Token::ElseIf => {
+                bail!(error::block_with_no_opener(self.peek()).at(line))
+            }
             _ => {
                 let e = self.parse_expr()?;
                 if self.peek() == &Token::Assign {
@@ -208,7 +247,7 @@ impl Parser {
                     match e {
                         Expr::Ident(n) => Ok(Stmt::Assign(n, rhs, show)),
                         Expr::Index(n, args) => Ok(Stmt::IndexAssign(n, args, rhs, show)),
-                        _ => Err("invalid assignment target".to_string()),
+                        _ => bail!(error::invalid_assignment_target().at(line)),
                     }
                 } else {
                     let show = self.end_stmt()?;
@@ -230,7 +269,10 @@ impl Parser {
                 Ok(true)
             }
             Token::Eof | Token::End | Token::Else | Token::ElseIf => Ok(true),
-            t => Err(format!("unexpected {:?}", t)),
+            _ => {
+                let line = self.line();
+                bail!(error::unexpected_token(self.peek()).at(line))
+            }
         }
     }
 
@@ -343,6 +385,7 @@ impl Parser {
                 Token::Backslash => BinOp::LDiv,
                 Token::DotStar => BinOp::EMul,
                 Token::DotSlash => BinOp::EDiv,
+                Token::DotBackslash => BinOp::ELDiv,
                 _ => return Ok(left),
             };
             self.next();
@@ -411,6 +454,7 @@ impl Parser {
     }
 
     fn parse_primary(&mut self) -> R<Expr> {
+        let line = self.line();
         match self.next() {
             Token::Num(v) => Ok(Expr::Num(v)),
             Token::Str(s) => Ok(Expr::Str(s)),
@@ -441,7 +485,7 @@ impl Parser {
                     Ok(Expr::Ident(name))
                 }
             }
-            t => Err(format!("unexpected {:?} in expression", t)),
+            t => bail!(error::unexpected_in_expression(&t).at(line)),
         }
     }
 
@@ -466,7 +510,10 @@ impl Parser {
                 Token::Comma => {
                     self.next();
                 }
-                Token::Eof => return Err("unterminated matrix literal: missing ']'".to_string()),
+                Token::Eof => {
+                    let line = self.line();
+                    bail!(error::unterminated_matrix().at(line))
+                }
                 _ => row.push(self.parse_expr()?),
             }
         }
@@ -476,7 +523,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lexer::lex;
+    use crate::lexer::{lex, scan};
 
     fn parse_expr(src: &str) -> Expr {
         let toks = lex(src).expect("lex should succeed");
@@ -484,16 +531,19 @@ mod tests {
         p.parse_expr().expect("expression should parse")
     }
 
-    fn parse(src: &str) -> Vec<Stmt> {
-        let toks = lex(src).expect("lex should succeed");
-        let mut p = Parser::new(toks);
-        p.parse_program().expect("program should parse")
+    fn parse(src: &str) -> Vec<Located> {
+        parse_result(src).expect("program should parse")
     }
 
-    fn parse_result(src: &str) -> Result<Vec<Stmt>, String> {
-        let toks = lex(src).expect("lex should succeed");
-        let mut p = Parser::new(toks);
+    fn parse_result(src: &str) -> R<Vec<Located>> {
+        let lexed = scan(src).expect("lex should succeed");
+        let mut p = Parser::with_lines(lexed);
         p.parse_program()
+    }
+
+    /// A statement and the line it is expected to start on.
+    fn at(line: u32, stmt: Stmt) -> Located {
+        Located { stmt, line }
     }
 
     fn num(v: f64) -> Expr {
@@ -644,6 +694,32 @@ mod tests {
     }
 
     #[test]
+    fn elementwise_left_divide_sits_with_the_other_products() {
+        assert_eq!(
+            parse_expr("a.\\b"),
+            bin(BinOp::ELDiv, ident("a"), ident("b"))
+        );
+        // Same precedence level as `.*`, so it is left associative with it.
+        assert_eq!(
+            parse_expr("a.\\b.*c"),
+            bin(
+                BinOp::EMul,
+                bin(BinOp::ELDiv, ident("a"), ident("b")),
+                ident("c")
+            )
+        );
+        // `.\` binds looser than `.^`.
+        assert_eq!(
+            parse_expr("a.\\b.^c"),
+            bin(
+                BinOp::ELDiv,
+                ident("a"),
+                bin(BinOp::EPow, ident("b"), ident("c"))
+            )
+        );
+    }
+
+    #[test]
     fn range_endpoint_absorbs_addition() {
         assert_eq!(
             parse_expr("1:3+1"),
@@ -708,7 +784,7 @@ mod tests {
     fn semicolon_suppresses_display() {
         assert_eq!(
             parse("x = 3;"),
-            vec![Stmt::Assign("x".to_string(), num(3.0), false)]
+            vec![at(1, Stmt::Assign("x".to_string(), num(3.0), false))]
         );
     }
 
@@ -716,7 +792,7 @@ mod tests {
     fn missing_semicolon_shows_result() {
         assert_eq!(
             parse("x = 3"),
-            vec![Stmt::Assign("x".to_string(), num(3.0), true)]
+            vec![at(1, Stmt::Assign("x".to_string(), num(3.0), true))]
         );
     }
 
@@ -724,11 +800,14 @@ mod tests {
     fn indexed_assignment_uses_index_assign() {
         assert_eq!(
             parse("x(end+1) = 3"),
-            vec![Stmt::IndexAssign(
-                "x".to_string(),
-                vec![bin(BinOp::Add, Expr::End, num(1.0))],
-                num(3.0),
-                true,
+            vec![at(
+                1,
+                Stmt::IndexAssign(
+                    "x".to_string(),
+                    vec![bin(BinOp::Add, Expr::End, num(1.0))],
+                    num(3.0),
+                    true,
+                )
             )]
         );
     }
@@ -737,9 +816,12 @@ mod tests {
     fn bare_colon_in_an_index_is_expr_colon() {
         assert_eq!(
             parse("A(:, 1)"),
-            vec![Stmt::Expr(
-                Expr::Index("A".to_string(), vec![Expr::Colon, num(1.0)]),
-                true
+            vec![at(
+                1,
+                Stmt::Expr(
+                    Expr::Index("A".to_string(), vec![Expr::Colon, num(1.0)]),
+                    true
+                )
             )]
         );
     }
@@ -756,7 +838,7 @@ mod tests {
     fn expression_statement() {
         assert_eq!(
             parse("1 + 2"),
-            vec![Stmt::Expr(bin(BinOp::Add, num(1.0), num(2.0)), true)]
+            vec![at(1, Stmt::Expr(bin(BinOp::Add, num(1.0), num(2.0)), true))]
         );
     }
 
@@ -765,8 +847,8 @@ mod tests {
         assert_eq!(
             parse("x = 1;\ny = 2\n"),
             vec![
-                Stmt::Assign("x".to_string(), num(1.0), false),
-                Stmt::Assign("y".to_string(), num(2.0), true),
+                at(1, Stmt::Assign("x".to_string(), num(1.0), false)),
+                at(2, Stmt::Assign("y".to_string(), num(2.0), true)),
             ]
         );
     }
@@ -775,9 +857,12 @@ mod tests {
     fn call_with_several_arguments() {
         assert_eq!(
             parse("disp(1, x);"),
-            vec![Stmt::Expr(
-                Expr::Index("disp".to_string(), vec![num(1.0), ident("x")]),
-                false
+            vec![at(
+                1,
+                Stmt::Expr(
+                    Expr::Index("disp".to_string(), vec![num(1.0), ident("x")]),
+                    false
+                )
             )]
         );
     }
@@ -788,12 +873,15 @@ mod tests {
     fn if_elseif_else_block() {
         assert_eq!(
             parse("if a\n  1;\nelseif b\n  2;\nelse\n  3;\nend\n"),
-            vec![Stmt::If(
-                vec![
-                    (ident("a"), vec![Stmt::Expr(num(1.0), false)]),
-                    (ident("b"), vec![Stmt::Expr(num(2.0), false)]),
-                ],
-                Some(vec![Stmt::Expr(num(3.0), false)]),
+            vec![at(
+                1,
+                Stmt::If(
+                    vec![
+                        (ident("a"), vec![at(2, Stmt::Expr(num(1.0), false))]),
+                        (ident("b"), vec![at(4, Stmt::Expr(num(2.0), false))]),
+                    ],
+                    Some(vec![at(6, Stmt::Expr(num(3.0), false))]),
+                )
             )]
         );
     }
@@ -802,9 +890,12 @@ mod tests {
     fn if_without_else_has_no_tail() {
         assert_eq!(
             parse("if a\n  1;\nend"),
-            vec![Stmt::If(
-                vec![(ident("a"), vec![Stmt::Expr(num(1.0), false)])],
-                None
+            vec![at(
+                1,
+                Stmt::If(
+                    vec![(ident("a"), vec![at(2, Stmt::Expr(num(1.0), false))])],
+                    None
+                )
             )]
         );
     }
@@ -813,13 +904,16 @@ mod tests {
     fn for_loop_with_comma_separators() {
         assert_eq!(
             parse("for k = 1:3, disp(k); end"),
-            vec![Stmt::For(
-                "k".to_string(),
-                range(num(1.0), None, num(3.0)),
-                vec![Stmt::Expr(
-                    Expr::Index("disp".to_string(), vec![ident("k")]),
-                    false
-                )],
+            vec![at(
+                1,
+                Stmt::For(
+                    "k".to_string(),
+                    range(num(1.0), None, num(3.0)),
+                    vec![at(
+                        1,
+                        Stmt::Expr(Expr::Index("disp".to_string(), vec![ident("k")]), false)
+                    )],
+                )
             )]
         );
     }
@@ -828,7 +922,7 @@ mod tests {
     fn while_loop_with_break() {
         assert_eq!(
             parse("while a\nbreak\nend"),
-            vec![Stmt::While(ident("a"), vec![Stmt::Break])]
+            vec![at(1, Stmt::While(ident("a"), vec![at(2, Stmt::Break)]))]
         );
     }
 
@@ -836,7 +930,7 @@ mod tests {
     fn while_loop_with_continue() {
         assert_eq!(
             parse("while a\ncontinue;\nend"),
-            vec![Stmt::While(ident("a"), vec![Stmt::Continue])]
+            vec![at(1, Stmt::While(ident("a"), vec![at(2, Stmt::Continue)]))]
         );
     }
 
@@ -844,13 +938,22 @@ mod tests {
     fn nested_blocks() {
         assert_eq!(
             parse("for i = 1:2\n  if i > 1\n    break\n  end\nend"),
-            vec![Stmt::For(
-                "i".to_string(),
-                range(num(1.0), None, num(2.0)),
-                vec![Stmt::If(
-                    vec![(bin(BinOp::Gt, ident("i"), num(1.0)), vec![Stmt::Break],)],
-                    None
-                )],
+            vec![at(
+                1,
+                Stmt::For(
+                    "i".to_string(),
+                    range(num(1.0), None, num(2.0)),
+                    vec![at(
+                        2,
+                        Stmt::If(
+                            vec![(
+                                bin(BinOp::Gt, ident("i"), num(1.0)),
+                                vec![at(3, Stmt::Break)],
+                            )],
+                            None
+                        )
+                    )],
+                )
             )]
         );
     }
@@ -889,5 +992,49 @@ mod tests {
     #[test]
     fn unmatched_paren_is_an_error() {
         assert!(parse_result("(1 + 2").is_err());
+    }
+
+    // ---- line numbers ------------------------------------------------------
+
+    fn lines_of(src: &str) -> Vec<u32> {
+        parse(src).iter().map(|s| s.line).collect()
+    }
+
+    #[test]
+    fn a_statement_takes_the_line_of_the_token_that_opens_it() {
+        assert_eq!(lines_of("x = 1;\n\ny = 2;\nz = 3;"), vec![1, 3, 4]);
+        // A statement spread over several lines is located at its first.
+        assert_eq!(lines_of("x = 1 + ...\n2;\ny = 3;"), vec![1, 3]);
+        // Several statements on one line all share it.
+        assert_eq!(lines_of("a = 1; b = 2; c = 3;"), vec![1, 1, 1]);
+    }
+
+    #[test]
+    fn a_block_body_keeps_its_own_lines() {
+        let stmts = parse("for k = 1:2\n  disp(k);\n  disp(k);\nend");
+        assert_eq!(stmts[0].line, 1);
+        match &stmts[0].stmt {
+            Stmt::For(_, _, body) => {
+                assert_eq!(body.iter().map(|s| s.line).collect::<Vec<_>>(), vec![2, 3])
+            }
+            other => panic!("expected a for loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_parse_error_names_the_line_of_the_offending_token() {
+        assert_eq!(parse_result("x = 5;\ny = x + ;").unwrap_err().line, Some(2));
+        assert_eq!(parse_result("x = 1;\n\n1 = 2").unwrap_err().line, Some(3));
+        assert_eq!(parse_result("x = 1;\nend").unwrap_err().line, Some(2));
+        assert_eq!(parse_result("x = 1;\ny = [1 2").unwrap_err().line, Some(2));
+    }
+
+    #[test]
+    fn tokens_without_lines_still_parse_and_report_line_one() {
+        // `Parser::new` is what the expression tests and the REPL's
+        // `needs_more` use; with no line table every statement is line 1.
+        let toks = lex("x = 1;\ny = 2;").expect("lex should succeed");
+        let stmts = Parser::new(toks).parse_program().expect("should parse");
+        assert_eq!(stmts.iter().map(|s| s.line).collect::<Vec<_>>(), vec![1, 1]);
     }
 }

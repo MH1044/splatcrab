@@ -4,6 +4,7 @@ use std::f64::consts::{E, PI};
 
 use super::args::{at_most, check_size, dim, mat, need, scalar, size_arg, string};
 use super::{Registry, add, none, one, one_mat};
+use crate::error;
 use crate::interp::{Interp, R, fmt_e, fmt_g};
 use crate::value::{Matrix, Value, nonfinite};
 
@@ -275,11 +276,10 @@ fn num2str_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 }
 
 fn error(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    let msg = match args.first() {
-        Some(Value::Str(_)) => format_printf(args)?,
-        _ => "error".to_string(),
-    };
-    Err(msg)
+    match args.first() {
+        Some(Value::Str(_)) => Err(error::raised(format_printf(args)?)),
+        _ => Err(error::raised_default()),
+    }
 }
 
 // ---- workspace -------------------------------------------------------
@@ -447,7 +447,7 @@ fn str_body(v: f64, prec: Option<usize>) -> String {
 pub fn format_printf(args: &[Value]) -> R<String> {
     let fmt = match args.first() {
         Some(Value::Str(s)) => s.clone(),
-        _ => return Err("The first argument must be a format string.".to_string()),
+        _ => return Err(error::format_not_a_string()),
     };
     let mut flat: Vec<PArg> = Vec::new();
     for (group, a) in args[1..].iter().enumerate() {
@@ -512,7 +512,7 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                 prec = Some(p.parse().unwrap_or(0));
             }
             if i >= chars.len() {
-                return Err("Invalid format specifier.".to_string());
+                return Err(error::invalid_format_spec());
             }
             let conv = chars[i];
             i += 1;
@@ -566,7 +566,7 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                     numeric = false;
                     str_body(v, prec)
                 }
-                (other, _) => return Err(format!("Unsupported format specifier '%{}'.", other)),
+                (other, _) => return Err(error::unsupported_format_spec(other)),
             };
             if numeric && !body.starts_with('-') {
                 if flags.contains('+') {
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn a_size_that_would_overflow_is_an_error_not_a_panic() {
-        let e = call(zeros, &[num(1e10)], 1).unwrap_err();
+        let e = call(zeros, &[num(1e10)], 1).unwrap_err().msg;
         assert!(e.contains("10000000000x10000000000"), "{e}");
         assert!(call(ones, &[num(1e10)], 1).is_err());
         assert!(call(rand, &[num(1e10)], 1).is_err());
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn extra_arguments_are_rejected() {
         assert_eq!(
-            call(numel, &[num(1.0), num(2.0)], 1).unwrap_err(),
+            call(numel, &[num(1.0), num(2.0)], 1).unwrap_err().msg,
             "Too many input arguments."
         );
         assert!(call(disp, &[num(1.0), num(2.0)], 0).is_err());
@@ -684,7 +684,7 @@ mod tests {
     fn size_rejects_dimension_zero() {
         let a = [Value::Mat(Matrix::row(vec![1.0, 2.0, 3.0]))];
         let args = [a[0].clone(), num(0.0)];
-        let e = call(size, &args, 1).unwrap_err();
+        let e = call(size, &args, 1).unwrap_err().msg;
         assert!(e.contains("positive integer"), "{e}");
         // A dimension past the array's is a singleton.
         let args = [a[0].clone(), num(3.0)];

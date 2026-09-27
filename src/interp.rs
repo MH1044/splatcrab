@@ -4,14 +4,17 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
 
+use crate::bail;
 use crate::builtins::{self, Registry};
-use crate::lexer::lex;
-use crate::parser::{BinOp, Expr, Parser, Stmt};
+use crate::error;
+use crate::lexer::scan;
+use crate::parser::{BinOp, Expr, Located, Parser, Stmt};
 use crate::value::{Matrix, Value, nonfinite};
 
-/// Every fallible path in the interpreter returns this. Cycle 01b replaces the
-/// `String` with a structured error without touching a single signature.
-pub type R<T> = Result<T, String>;
+/// Every fallible path in the interpreter returns this. It lives in
+/// `error.rs`; the re-export is what let cycle 01b swap `String` for `MError`
+/// without touching a single `use crate::interp::R` in `builtins/`.
+pub use crate::error::R;
 
 pub struct Interp {
     pub vars: HashMap<String, Value>,
@@ -68,21 +71,27 @@ impl Interp {
 
     /// The single place interpreter output leaves the evaluator.
     pub(crate) fn emit(&mut self, s: &str) -> R<()> {
-        self.out.write_all(s.as_bytes()).map_err(|e| e.to_string())
+        self.out.write_all(s.as_bytes()).map_err(error::output)
     }
 
     pub fn run(&mut self, src: &str) -> R<()> {
-        let toks = lex(src)?;
-        let stmts = Parser::new(toks).parse_program()?;
+        let lexed = scan(src)?;
+        let stmts = Parser::with_lines(lexed).parse_program()?;
         self.exec_block(&stmts)?;
         Ok(())
     }
 
     // ---- statements --------------------------------------------------
 
-    fn exec_block(&mut self, stmts: &[Stmt]) -> R<Flow> {
+    /// Runs a block, tagging anything that fails with the line of the
+    /// statement it came out of.
+    ///
+    /// `MError::at` keeps the first line it is given, so the innermost block
+    /// wins: an error raised inside a `for` body reports the body's line,
+    /// not the line of the `for` that is unwinding around it.
+    fn exec_block(&mut self, stmts: &[Located]) -> R<Flow> {
         for s in stmts {
-            match self.exec(s)? {
+            match self.exec(&s.stmt).map_err(|e| e.at(s.line))? {
                 Flow::Normal => {}
                 f => return Ok(f),
             }
@@ -193,10 +202,8 @@ impl Interp {
                 .end_stack
                 .last()
                 .map(|n| Value::Mat(Matrix::scalar(*n as f64)))
-                .ok_or_else(|| "'end' is only valid inside an index expression.".to_string()),
-            Expr::Colon => {
-                Err("':' on its own is only valid inside an index expression.".to_string())
-            }
+                .ok_or_else(error::end_outside_index),
+            Expr::Colon => Err(error::colon_outside_index()),
             Expr::Index(n, args) => self.index(n, args),
             Expr::Matrix(rows) => self.build_matrix(rows),
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
@@ -211,7 +218,7 @@ impl Interp {
                     Some(s) => self.eval_scalar(s, "range step")?,
                     None => 1.0,
                 };
-                Ok(Value::Mat(range(a, s, b)))
+                Ok(Value::Mat(range(a, s, b)?))
             }
             Expr::Binary(op, a, b) => self.binary(*op, a, b),
         }
@@ -224,7 +231,7 @@ impl Interp {
     fn eval_scalar(&mut self, e: &Expr, what: &str) -> R<f64> {
         self.eval_mat(e)?
             .scalar_value()
-            .ok_or_else(|| format!("{} must be a scalar.", what))
+            .ok_or_else(|| error::not_a_scalar(what))
     }
 
     fn eval_args(&mut self, args: &[Expr]) -> R<Vec<Value>> {
@@ -255,6 +262,8 @@ impl Interp {
             BinOp::Sub => a.zip(&b, "-", |x, y| x - y)?,
             BinOp::EMul => a.zip(&b, ".*", |x, y| x * y)?,
             BinOp::EDiv => a.zip(&b, "./", |x, y| x / y)?,
+            // `a.\b` divides the other way round, element by element.
+            BinOp::ELDiv => a.zip(&b, ".\\", |x, y| y / x)?,
             BinOp::EPow => a.zip(&b, ".^", f64::powf)?,
             BinOp::Mul => {
                 if a.is_scalar() || b.is_scalar() {
@@ -284,10 +293,7 @@ impl Interp {
                 } else if let Some(p) = b.scalar_value() {
                     matrix_power(&a, p)?
                 } else {
-                    return Err(
-                        "Matrix exponent is not supported; use '.^' for element-wise power."
-                            .to_string(),
-                    );
+                    bail!(error::matrix_exponent());
                 }
             }
             BinOp::Eq => a.zip(&b, "==", bool_op(|x, y| x == y))?,
@@ -345,7 +351,7 @@ impl Interp {
 
     fn eval_index_args(&mut self, m: &Matrix, args: &[Expr]) -> R<Vec<Sel>> {
         if args.is_empty() || args.len() > 2 {
-            return Err("Only 1-D and 2-D indexing is supported.".to_string());
+            bail!(error::indexing_rank());
         }
         let mut out = Vec::with_capacity(args.len());
         for (k, a) in args.iter().enumerate() {
@@ -367,10 +373,7 @@ impl Interp {
             let mut idx = Vec::with_capacity(v.numel());
             for x in &v.data {
                 if x.fract() != 0.0 || *x < 1.0 {
-                    return Err(format!(
-                        "Index in position {} is invalid. Array indices must be positive integers.",
-                        k + 1
-                    ));
+                    bail!(error::index_not_positive_integer(k + 1));
                 }
                 idx.push(*x as usize - 1);
             }
@@ -382,19 +385,13 @@ impl Interp {
     fn assign_index(&mut self, name: &str, args: &[Expr], rhs: Value) -> R<()> {
         let rhs = rhs.into_mat();
         if rhs.is_empty() {
-            return Err("Deleting elements with '= []' is not supported yet.".to_string());
+            bail!(error::deletion_unsupported());
         }
         let mut m = match self.vars.get(name) {
             Some(v) => v.clone().into_mat(),
             None => Matrix::empty(),
         };
         let sel = self.eval_index_args(&m, args)?;
-        let size_err = |lhs: usize, r: usize| {
-            format!(
-                "Unable to perform assignment because the left side has {} elements and the right side has {}.",
-                lhs, r
-            )
-        };
         if sel.len() == 1 {
             let idx: Vec<usize> = match &sel[0] {
                 Sel::All => (0..m.numel()).collect(),
@@ -412,11 +409,11 @@ impl Interp {
                     m.data.resize(need, 0.0);
                     m.rows = need;
                 } else {
-                    return Err("Attempt to grow array along ambiguous dimension.".to_string());
+                    bail!(error::ambiguous_growth());
                 }
             }
             if !rhs.is_scalar() && rhs.numel() != idx.len() {
-                return Err(size_err(idx.len(), rhs.numel()));
+                bail!(error::assignment_size(idx.len(), rhs.numel()));
             }
             for (n, &k) in idx.iter().enumerate() {
                 m.data[k] = if rhs.is_scalar() {
@@ -448,7 +445,7 @@ impl Interp {
             }
             let count = rows.len() * cols.len();
             if !rhs.is_scalar() && rhs.numel() != count {
-                return Err(size_err(count, rhs.numel()));
+                bail!(error::assignment_size(count, rhs.numel()));
             }
             let mut n = 0;
             for &c in &cols {
@@ -494,7 +491,7 @@ impl Interp {
     fn call_builtin(&mut self, name: &str, args: Vec<Value>, nargout: usize) -> R<Vec<Value>> {
         match self.builtins.get(name).map(|e| e.f) {
             Some(f) => f(self, &args, nargout),
-            None => Err(format!("Undefined function or variable '{}'.", name)),
+            None => Err(error::undefined(name)),
         }
     }
 
@@ -503,26 +500,39 @@ impl Interp {
         self.call_builtin(name, args, 1)?
             .into_iter()
             .next()
-            .ok_or_else(|| "Too many output arguments.".to_string())
+            .ok_or_else(error::too_many_outputs)
     }
 }
 
 // ---- helpers ---------------------------------------------------------
 
-fn range(a: f64, s: f64, b: f64) -> Matrix {
+/// `a:b` and `a:s:b`. The `:` operator never reaches a builtin, so this is the
+/// one remaining place a user-supplied number becomes an allocation length
+/// without passing `args::check_size`. It uses that helper rather than a
+/// second policy, so `x = 1:1e15` gets the same limit and the same message as
+/// `zeros(1e10)` instead of aborting in the allocator.
+fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
     if s == 0.0 || (b - a) / s < 0.0 || !a.is_finite() || !b.is_finite() || !s.is_finite() {
-        return Matrix::new(1, 0, Vec::new());
+        return Ok(Matrix::new(1, 0, Vec::new()));
     }
-    let n = ((b - a) / s + 1e-10).floor() as usize + 1;
-    Matrix::row((0..n).map(|k| a + k as f64 * s).collect())
+    // The count stays in `f64` until it is known to fit: casting the floor
+    // straight to `usize` saturates, and the `+ 1` would then overflow.
+    let count = ((b - a) / s + 1e-10).floor() + 1.0;
+    let len = if count >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        count as usize
+    };
+    let n = crate::builtins::args::check_size(1, len)?;
+    Ok(Matrix::row((0..n).map(|k| a + k as f64 * s).collect()))
 }
 
 fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
     if a.rows != a.cols {
-        return Err("Matrix must be square for '^'. Use '.^' for element-wise power.".to_string());
+        bail!(error::nonsquare_power());
     }
     if p.fract() != 0.0 {
-        return Err("Only integer matrix powers are supported.".to_string());
+        bail!(error::fractional_matrix_power());
     }
     let base = if p < 0.0 { a.inv()? } else { a.clone() };
     let mut n = p.abs() as u64;
@@ -548,10 +558,7 @@ fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
                 let mut data = Vec::with_capacity(idx.len());
                 for &k in idx {
                     if k >= m.numel() {
-                        return Err(format!(
-                            "Index exceeds the number of array elements. Index must not exceed {}.",
-                            m.numel()
-                        ));
+                        bail!(error::index_exceeds_numel(m.numel()));
                     }
                     data.push(m.data[k]);
                 }
@@ -578,16 +585,10 @@ fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
             Sel::List(i, _, _) => i.clone(),
         };
         if rows.iter().any(|r| *r >= m.rows) {
-            return Err(format!(
-                "Index in position 1 exceeds array bounds. Index must not exceed {}.",
-                m.rows
-            ));
+            bail!(error::index_exceeds_bound(1, m.rows));
         }
         if cols.iter().any(|c| *c >= m.cols) {
-            return Err(format!(
-                "Index in position 2 exceeds array bounds. Index must not exceed {}.",
-                m.cols
-            ));
+            bail!(error::index_exceeds_bound(2, m.cols));
         }
         let mut data = Vec::with_capacity(rows.len() * cols.len());
         for &c in &cols {
@@ -622,7 +623,7 @@ fn hcat(vals: Vec<Value>) -> R<Value> {
     }
     let rows = mats[0].rows;
     if mats.iter().any(|m| m.rows != rows) {
-        return Err("Dimensions of arrays being concatenated are not consistent.".to_string());
+        bail!(error::concat_dims());
     }
     let mut data = Vec::new();
     let mut cols = 0;
@@ -647,7 +648,7 @@ fn vcat(vals: Vec<Value>) -> R<Value> {
     }
     let cols = mats[0].cols;
     if mats.iter().any(|m| m.cols != cols) {
-        return Err("Dimensions of arrays being concatenated are not consistent.".to_string());
+        bail!(error::concat_dims());
     }
     let rows: usize = mats.iter().map(|m| m.rows).sum();
     let mut out = Matrix::filled(rows, cols, 0.0);
@@ -747,6 +748,11 @@ mod tests {
 
     /// Runs `src`, requiring failure, and returns the error message.
     fn err_msg(src: &str) -> String {
+        err(src).msg
+    }
+
+    /// Runs `src`, requiring failure, and returns the error itself.
+    fn err(src: &str) -> crate::error::MError {
         let (r, s) = run(src);
         match r {
             Ok(()) => panic!("{src:?} unexpectedly succeeded, printing {s:?}"),
@@ -797,6 +803,33 @@ mod tests {
         assert_eq!(ok_out("sum = [4 5 6];\ndisp(sum(2))"), "     5\n");
         // Without the variable the builtin is reachable as usual.
         assert_eq!(ok_out("disp(sum([1 2 3]))"), "     6\n");
+    }
+
+    // ---- operators ---------------------------------------------------
+
+    #[test]
+    fn elementwise_left_divide_divides_the_other_way_round() {
+        assert_eq!(ok_out("disp(2.\\8)"), "     4\n");
+        assert_eq!(ok_out("disp(2 .\\ 8)"), "     4\n");
+        assert_eq!(ok_out("a = [4 8]; disp(a.\\[8 8])"), "     2     1\n");
+        assert_eq!(ok_out("disp([2 4].\\[8 8])"), "     4     2\n");
+        // It broadcasts like every other elementwise operator, and is the
+        // mirror of `./`.
+        assert_eq!(ok_out("disp([1 2].\\4)"), "     4     2\n");
+        assert_eq!(ok_out("disp(4./[1 2])"), "     4     2\n");
+        // A lone backslash still solves a system rather than dividing.
+        assert_eq!(ok_out("disp([2 0; 0 4]\\[2; 4])"), "     1\n     1\n");
+    }
+
+    #[test]
+    fn a_continuation_inside_brackets_separates_elements() {
+        assert_eq!(ok_out("x = [1 ...\n-2]; disp(numel(x))"), "     2\n");
+        assert_eq!(ok_out("x = [1 ...\n-2]; disp(x(2))"), "    -2\n");
+        assert_eq!(ok_out("x = [1 ...\n -2]; disp(numel(x))"), "     2\n");
+        // The other side of the whitespace rule is untouched.
+        assert_eq!(ok_out("x = [1 - 2]; disp(numel(x))"), "     1\n");
+        // A continuation straight after a digit now lexes.
+        assert_eq!(ok_out("a = 1...\n+ 2; disp(a)"), "     3\n");
     }
 
     // ---- indexed assignment ------------------------------------------
@@ -910,6 +943,41 @@ mod tests {
         assert_eq!(ok_out("disp(1 && 0)"), "     0\n");
     }
 
+    // ---- error line numbers ------------------------------------------
+
+    #[test]
+    fn a_runtime_error_reports_the_line_it_was_raised_on() {
+        assert_eq!(err("y + 1").line, Some(1));
+        assert_eq!(err("x = 1;\n[1 2] * [3 4]").line, Some(2));
+        assert_eq!(err("x = 1;\ny = 2;\n\nz = undefined_name").line, Some(4));
+        // Output before the error is still produced.
+        let (r, out) = run("disp(1)\ndisp(2)\ny + 1");
+        assert_eq!(out, "     1\n     2\n");
+        let e = r.unwrap_err();
+        assert_eq!(e.line, Some(3));
+        assert_eq!(e.msg, "Undefined function or variable 'y'.");
+        assert_eq!(e.to_string(), "Line 3: Undefined function or variable 'y'.");
+    }
+
+    #[test]
+    fn an_error_in_a_block_body_reports_the_body_line() {
+        // Not line 2, where the `for` is, and not line 1.
+        assert_eq!(
+            err("disp(1)\nfor k = 1:2\n[1 2] * [3 4];\nend").line,
+            Some(3)
+        );
+        assert_eq!(err("if 1\n\nundefined_name;\nend").line, Some(3));
+        assert_eq!(err("while 1\nundefined_name;\nend").line, Some(2));
+        // An error in the loop's own range expression belongs to the `for`.
+        assert_eq!(err("disp(1)\nfor k = undefined_name\nend").line, Some(2));
+    }
+
+    #[test]
+    fn a_parse_or_lex_error_reports_its_line_too() {
+        assert_eq!(err("x = 5;\ny = x + ;").line, Some(2));
+        assert_eq!(err("x = 5;\ny = 'abc").line, Some(2));
+    }
+
     // ---- pure helpers ------------------------------------------------
 
     #[test]
@@ -950,7 +1018,7 @@ mod tests {
         // In an expression the same call is an error, after the output.
         let (r, out) = run("x = disp(3)");
         assert_eq!(out, "     3\n");
-        assert_eq!(r.unwrap_err(), "Too many output arguments.");
+        assert_eq!(r.unwrap_err().msg, "Too many output arguments.");
         assert_eq!(err_msg("disp(1) + 1"), "Too many output arguments.");
         assert_eq!(err_msg("x = clc"), "Too many output arguments.");
     }
@@ -997,21 +1065,40 @@ mod tests {
 
     #[test]
     fn range_endpoints_and_emptiness() {
-        let r = range(1.0, 0.1, 2.0);
+        let r = range(1.0, 0.1, 2.0).unwrap();
         assert_eq!((r.rows, r.cols), (1, 11));
         assert_eq!(r.numel(), 11);
         assert_eq!(r.data[0], 1.0);
         assert_eq!(r.data[10], 2.0);
         close(r.data[5], 1.5);
 
-        let e = range(3.0, 1.0, 1.0);
+        let e = range(3.0, 1.0, 1.0).unwrap();
         assert!(e.is_empty());
         assert_eq!((e.rows, e.cols), (1, 0));
 
-        assert_eq!(range(1.0, 1.0, 5.0).data, [1.0, 2.0, 3.0, 4.0, 5.0]);
-        assert_eq!(range(3.0, -1.0, 1.0).data, [3.0, 2.0, 1.0]);
-        assert!(range(1.0, 0.0, 5.0).is_empty());
-        assert!(range(f64::NAN, 1.0, 5.0).is_empty());
+        assert_eq!(
+            range(1.0, 1.0, 5.0).unwrap().data,
+            [1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(range(3.0, -1.0, 1.0).unwrap().data, [3.0, 2.0, 1.0]);
+        assert!(range(1.0, 0.0, 5.0).unwrap().is_empty());
+        assert!(range(f64::NAN, 1.0, 5.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_long_range_is_a_clean_error_not_an_allocator_abort() {
+        // `1:1e15` used to ask the allocator for 8 PB and abort the process.
+        let e = err_msg("x = 1:1e15");
+        assert!(e.contains("1x1000000000000000"), "{e}");
+        assert!(e.contains("exceeds the maximum array size"), "{e}");
+        // The limit is `check_size`'s, not a second policy of its own: one
+        // element past the cap is refused. (The range at the cap is 2 GiB, so
+        // it is left to `check_size`'s own test rather than built here.)
+        let cap = crate::builtins::args::MAX_ELEMS as f64;
+        assert!(range(1.0, 1.0, cap + 1.0).is_err());
+        // A step that makes the count saturate a `usize` is refused too,
+        // rather than wrapping round to a small length.
+        assert!(range(0.0, 1e-300, 1e300).is_err());
     }
 
     #[test]
