@@ -34,7 +34,8 @@ end
   `while`, `break`, `continue`.
 - Column-major double matrices, matrix multiply, square `\` and `/` by
   Gaussian elimination with partial pivoting, `inv`, `det`, integer `A^n`.
-- 78 builtins; see `docs/FEATURES.md` for the list.
+- 79 builtins; see `docs/FEATURES.md` for the list. This said 78 until cycle
+  01 counted the names in the old `match` and found one more.
 - MATLAB-style display and error messages.
 - A REPL with block and bracket continuation, and a script runner that exits 1
   on error after flushing stdout.

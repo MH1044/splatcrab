@@ -28,6 +28,9 @@ There are no dependencies, so a clean build takes a few seconds.
  .m source ──► lexer.rs ──► parser.rs ──► interp.rs ──► value.rs
               tokens       Stmt / Expr   tree-walking   column-major
                                          evaluator      f64 matrices
+                                              │
+                                         builtins/    the 81 builtins,
+                                                      behind a registry
 ```
 
 Two MATLAB quirks live in the lexer because they need character-level context:
@@ -50,8 +53,12 @@ change has to preserve.
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`
 - Square `A\b`, `inv`, `det`, integer matrix powers
-- 78 builtins, from `zeros` and `linspace` through `sum` and `cumsum` to
-  `fprintf` and `sprintf`
+- 81 builtins in a registry, from `zeros` and `linspace` through `sum` and
+  `cumsum` to `fprintf`, `sprintf` and `tic`/`toc`. Each is an ordinary
+  function with `nargout` in its signature, in `src/builtins/`
+- A builtin that produces no value, such as `disp`, is legal as a statement
+  and is "Too many output arguments." in an expression; every builtin rejects
+  extra arguments with "Too many input arguments."
 - A REPL with multi-line continuation, and a script runner
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.

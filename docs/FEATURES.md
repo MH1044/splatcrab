@@ -56,25 +56,46 @@ What SplatCrab does today, with the golden case that proves each area works.
 
 ## Builtins
 
-78 names. Every one is exercised by `builtins_sample`, `reductions` or
-`demo_smoke`.
+81 names, each an ordinary function in `src/builtins/` registered by name in
+`Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
+`demo_smoke`; the shared-arm groups also by the `*_shared_arm` cases in
+`01-registry-and-builtins`. The count was 79 before this cycle, not the 78
+this table used to claim.
 
-| Group | Names | Since |
-|---|---|---|
-| Constants | `pi e Inf inf NaN nan eps true false` | 00 |
-| Constructors | `zeros ones eye rand linspace` | 00 |
-| Shape | `size numel length isempty isscalar isvector reshape repmat fliplr flipud` | 00 |
-| Reductions | `sum prod mean any all max min cumsum cumprod` | 00 |
-| Elementwise math | `abs sqrt exp log log2 log10 sin cos tan asin acos atan sinh cosh tanh floor ceil round fix sign` | 00 |
-| Predicates | `isnan isinf isfinite` | 00 |
-| Two-argument math | `mod rem atan2 hypot power` | 00 |
-| Linear algebra | `transpose inv det trace diag norm dot` | 00 |
-| Search and sort | `find sort` | 00 |
-| Output | `disp fprintf sprintf num2str error` | 00 |
-| Workspace | `clear clc who whos` | 00 |
+| Group | Names | Since | File |
+|---|---|---|---|
+| Constants | `pi e Inf inf NaN nan eps true false` | 00 | `core.rs` |
+| Constructors | `zeros ones eye rand linspace` | 00 | `core.rs` |
+| Shape queries | `size numel length isempty isscalar isvector` | 00 | `core.rs` |
+| Rearrangement | `reshape repmat fliplr flipud` | 00 | `linalg.rs` |
+| Reductions | `sum prod mean any all max min cumsum cumprod` | 00 | `math.rs` |
+| Elementwise math | `abs sqrt exp log log2 log10 sin cos tan asin acos atan sinh cosh tanh floor ceil round fix sign` | 00 | `math.rs` |
+| Predicates | `isnan isinf isfinite` | 00 | `math.rs` |
+| Two-argument math | `mod rem atan2 hypot power` | 00 | `math.rs` |
+| Linear algebra | `transpose inv det trace diag norm dot` | 00 | `linalg.rs` |
+| Search and sort | `find sort` | 00 | `linalg.rs` |
+| Output | `disp fprintf sprintf num2str error` | 00 | `core.rs` |
+| Workspace | `clear clc who whos` | 00 | `core.rs` |
+| Timing | `tic toc` | 01 | `core.rs` |
 
-Reductions take an optional dimension argument. `max` and `min` also take two
-arrays. `norm` and `sort` accept vectors only, until cycles 08 and 09.
+Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
+a dimension past the array's returns the input unchanged and `0` is an error.
+`max` and `min` also take two arrays. `norm` and `sort` accept vectors only,
+until cycles 08 and 09. `sort` puts `NaN` last.
+
+### Calling convention
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| A builtin that produces no value is legal as a statement | 01 | `disp_statement` | `disp`, `fprintf`, `clc`, `clear`, `who`, bare `tic` and `toc` |
+| ... and is an error in an expression | 01 | `err_disp_returns_no_value` | `Too many output arguments.`, replacing `'disp' does not return a value.` |
+| Too many input arguments is rejected | 01 | `err_too_many_inputs_*` | Previously extra arguments were ignored |
+| A dimension argument must be a positive integer | 01 | `err_reduction_dim_zero`, `err_size_dim_zero` | |
+| A negative size is an empty, not an error | 01 | `negative_size_is_empty` | `zeros(-1)` is `0x0` |
+| A size that would overflow is a clean error | 01 | `err_huge_size_*` | `zeros(1e10)` used to abort the process |
+| `NaN(n)` and `Inf(r,c)` fill a matrix | 01 | `nan_inf_constructors` | `true(n)` and `false(n)` wait for cycle 02 |
+| `tic`, `toc` and `toc(t)` | 01 | `tic_toc_value`, `tic_toc_handle` | `t = tic` returns a handle; bare `toc` prints the elapsed time |
+| A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread |
 
 ## Output and formatting
 
@@ -85,6 +106,9 @@ arrays. `norm` and `sort` accept vectors only, until cycles 08 and 09.
 | Empty display | 00 | `display_formats` | Prints `[]`; MATLAB prints a typed header |
 | `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %e %g %c %s`, flags, width, precision |
 | Format cycling over all elements | 00 | `fprintf_vector` | |
+| The `+` and space flags, and precision on integers | 01 | `printf_plus_space_and_int_precision` | `%+d`, `% d`, `%.3d` |
+| `%d` of a non-integer switches to `%e` | 01 | `printf_d_nonintegral` | MATLAB's rule; it used to fall back to `%g` |
+| `%s` of a number is its character, and a char argument expands per character | 01 | `printf_string_and_char_args` | `%s` still takes a whole char argument |
 | MATLAB-style error messages | 00 | the seven `err_*` cases | |
 
 ## Tooling

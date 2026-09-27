@@ -4,10 +4,15 @@
  .m source ──► lexer.rs ──► parser.rs ──► interp.rs ──► value.rs
               tokens       Stmt / Expr   tree-walking   column-major
                                          evaluator      f64 matrices
+                                              │
+                                         builtins/
+                                         the library, behind a registry
 ```
 
-`src/lib.rs` exposes the four modules. `src/main.rs` is the CLI and REPL and is
-the only file allowed to use `print!`.
+`src/lib.rs` exposes the five modules. `src/main.rs` is the CLI and REPL and is
+the only file allowed to use `print!`. It runs everything on a thread with a
+256 MB stack, because Windows gives the main thread 1 MB and the parser and
+the evaluator each recurse once per nesting level.
 
 ## The modules
 
@@ -33,8 +38,14 @@ implementation detail. It is what makes `A(:)`, `reshape`, and linear indexing
 produce MATLAB's answers, and every new operation must respect it.
 
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
-`name` is a variable and as a builtin call otherwise, grows arrays on indexed
-assignment, and holds the builtin library.
+`name` is a variable and as a builtin call otherwise, and grows arrays on
+indexed assignment. It no longer knows what any individual builtin does.
+
+**`builtins/`** is the library: `mod.rs` holds the registry, `args.rs` the
+argument helpers, and `core.rs`, `math.rs` and `linalg.rs` the builtins
+themselves. Every one has the same shape,
+`fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`, where the `usize` is
+`nargout` and an empty `Vec` means the builtin produced no value.
 
 ## Invariants
 
@@ -60,16 +71,24 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 
 ### Add a builtin
 
-Until cycle 01 lands the registry, builtins are match arms in `call_builtin`
-in `src/interp.rs`, returning `R<Option<Value>>` where `None` means the builtin
-produces no value. Add the arm, then:
+1. Write the function in the right file under `src/builtins/`: `core.rs` for
+   constants, constructors, shape queries, output, the workspace and timing;
+   `math.rs` for element-wise and reducing numerics; `linalg.rs` for linear
+   algebra, rearrangement, search and sort. The signature is
+   `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`; return `one_mat(m)`
+   for a value and `none()` for a builtin that produces none.
+2. Add one line to that file's `register`, with a one-line help string. The
+   table is `#[rustfmt::skip]`ed so it stays one line per name.
+3. Bump `EXPECTED` in the registry test in `src/builtins/mod.rs`.
+4. Add a golden case exercising it, and an `err_*` case for each new error.
+5. Add a row to `docs/FEATURES.md` and the name to `README.md`.
 
-1. Add a golden case exercising it, and an `err_*` case for each new error.
-2. Add a row to `docs/FEATURES.md`.
-3. Add the name to the builtin list in `README.md`.
-
-Use the `mat`, `scalar` and `dim` closures already defined in `call_builtin`
-for argument access; they produce the MATLAB-style error messages.
+Use the helpers in `src/builtins/args.rs` for argument access; they produce
+the MATLAB-style messages. `need` and `at_most` bound the argument count,
+`mat`, `scalar` and `string` fetch one, `dim` reads a dimension argument
+(a positive integer), `size_arg` reads a size (a negative size is `0`), and
+`check_size` is the only sanctioned way to turn a user-supplied shape into an
+allocation length.
 
 ### Add a statement
 
@@ -99,11 +118,12 @@ in one place. Script mode prints `Error: Line N: <msg>`. The `stack` field and
 the `  in <fn> (line N)` trace wait for cycle 05, since a stack only means
 something once user functions exist; design `MError` so adding it is additive.
 
-**Registry (cycle 01).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
+**Registry (cycle 01, in place).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
 value: legal at statement level, "Too many output arguments." in an expression.
 Copy the function pointer out of the map before calling it, or the borrow
-checker will object to `&self` and `&mut self` at once.
+checker will object to `&self` and `&mut self` at once. `Stmt::Expr` asks for
+0 values and `eval` asks for 1; cycle 03 adds the call sites that ask for more.
 
 **Classes (cycle 02).** `Class { Double, Logical, Char }` as a tag on `Matrix`.
 Arithmetic yields `Double`; comparisons and logical operators yield `Logical`;
@@ -141,9 +161,11 @@ cycle named:
 
 ## Known bugs
 
-Found while writing the cycle-0 unit tests and during the adversarial pass over
-the baseline, recorded rather than silently patched. Each is scheduled to a
-module; none is fixed in cycle 0, which changes no interpreter behaviour.
+Found while writing the cycle-0 unit tests, during the adversarial pass over
+the baseline, and while migrating the builtins in cycle 01; recorded rather
+than silently patched. Each is scheduled to a module. Cycle 01 fixed the
+sixteen rows scheduled to it, including the two process-killing panics, and
+those rows are gone from the table rather than being marked done.
 
 | Bug | Symptom | Fixed in |
 |---|---|---|
@@ -154,37 +176,47 @@ module; none is fixed in cycle 0, which changes no interpreter behaviour.
 | `solve` uses an absolute pivot tolerance | `[1e-15 0; 0 1e-15] \ [1; 1]` reports a singular matrix, but it is diagonal and perfectly conditioned; only its scale trips the fixed `1e-14` threshold. The threshold should be relative to the matrix norm. This also means `det` and `solve` disagree about what singular means | 08 |
 | `%d` saturates at 64 bits | `fprintf('%d', 1e30)` prints `9223372036854775807`. Any integral value at or above `2^63` prints the clamp. `Inf` and `NaN` are handled correctly | 11 |
 | `printf` ignores precision on strings | `fprintf('[%5.2s]', 'abcdef')` gives `[abcdef]`; C and MATLAB give `[   ab]`, truncating before padding | 11 |
-| **`num2str` of an infinity panics** | `num2str(Inf)` aborts the process with "attempt to add with overflow". `log10(Inf)` is `Inf`, the cast to `i32` saturates, and the `+ 5` overflows. A panic, not an error, so it kills the REPL. Violates invariant 6 | 01 |
-| **A huge size argument panics** | `zeros(1e10)` aborts with "attempt to multiply with overflow" when `rows * cols` is computed. Reachable through `ones`, `rand`, `eye`, `reshape`, `repmat` and index growth. MATLAB raises a catchable error. Violates invariant 6 | 01 |
-| `sort` scrambles finite values when any element is `NaN` | `sort([5 4 NaN 2 1])` gives `4 5 NaN 1 2`; MATLAB gives `1 2 4 5 NaN`. The comparator maps an incomparable pair to `Equal`, which is not a total order, so the sort misplaces the finite elements too | 01 |
-| `clear` with an argument wipes the whole workspace | `clear('a')` clears everything. The argument is never read. Silent data loss | 01 |
-| `cumsum` and `cumprod` ignore the dimension argument | `cumsum([1 2; 3 4], 2)` gives the dimension-1 answer. `docs/FEATURES.md` claims the dimension argument works, and the baseline case never passes one | 01 |
-| Reductions accept an out-of-range dimension | `sum(A, 3)` and `sum(A, 0)` both return the dimension-2 answer. MATLAB returns `A` unchanged for a singleton dimension and errors on `0`. `size(A, 0)` returns 1 where MATLAB errors | 01 |
-| `printf` ignores the `+`, space and `#` flags | `fprintf('[%+d]', 5)` gives `[5]`; C and MATLAB give `[+5]`. The flags are parsed and discarded | 01 |
-| `printf` ignores precision on integer conversions | `fprintf('[%.3d]', 5)` gives `[5]`; C gives `[005]` | 01 |
-| `%d` with a non-integer falls back to `%g` | `fprintf('%d', pi)` gives `3.14159`; MATLAB switches to `%e` and gives `3.141593e+00` | 01 |
-| `%s` with a number prints the number | `fprintf('%s', 65)` gives `65`; MATLAB gives `A` | 01 |
-| A char argument is not expanded per character | `fprintf('[%d %d]', 'AB')` gives truncated output; MATLAB expands the char array to one argument per character and gives `[65 66]` | 01 |
-| `sign(NaN)` is 0 | MATLAB gives `NaN`. The NaN case falls through to the zero branch | 01 |
-| Negative sizes are rejected instead of giving an empty | `zeros(-1)` errors; MATLAB treats a negative dimension as 0 and gives `0x0` | 01 |
-| Constructor arguments to constants are discarded | `NaN(2)` and `Inf(2,3)` return a scalar with the arguments silently ignored; MATLAB fills a matrix. `true(n)` and `false(n)` are cycle 02 | 01 |
-| Builtins never reject extra arguments | `abs(1, 2)` returns 1 and `disp('a','b')` prints `a`. Only lower bounds are checked, so a whole class of typos passes silently | 01 |
-| Reductions on an empty with an explicit dimension collapse to a scalar | `sum([], 1)` gives the scalar `0`; MATLAB gives a `1x0` empty. The no-dimension forms are all correct | 01 |
 | A continuation straight after a digit fails to lex | `a = 1...` newline `+ 2;` is "unexpected character '.'". The number lexer's exclusion list omits the dot itself, so `1...` lexes as `1` then a stray `..`. Distinct from the bracket-whitespace continuation bug, and in the same list as the `2.\x` trap | 01b |
 | Indexed assignment into a char silently makes it numeric | `s = 'abc'; s(1) = 'X'` yields `88 98 99` rather than `Xbc`. Indexed growth and string indexing are both claimed for the baseline; the class conversion is silent | 02 |
 | `&&` and `\|\|` accept non-scalar and empty operands | `[1 1] && 1` gives 1; MATLAB requires operands convertible to a logical scalar and errors. Short-circuiting itself is correct | 02 |
 | Wide matrices print on one unwrapped line | `linspace(1, 2)` prints roughly 1300 characters; MATLAB wraps into `Columns 1 through 13` blocks | 02 |
+| A non-finite element forces the whole row to four decimals | `disp([1 2 NaN])` gives `    1.0000    2.0000       NaN`; MATLAB gives `     1     2   NaN`, because a `NaN` or an `Inf` does not stop MATLAB using the integer column format. `disp(NaN)` is `       NaN` rather than `   NaN`. This is what makes the `disp` half of cycle-01 acceptance bullets 15, 23 and 25 unwritable: `sort_nan_last`, `sign_nan` and `nan_inf_constructors` assert those values through `fprintf('%g')` instead and carry a `% NOTE` saying so. When this is fixed, give those three cases back the `disp` lines the spec bullets name. Already visible in `00-baseline/display_formats` as `x6` | 02 |
 | Empty-result shapes differ in several builtins | `find([])` and `diag([])` give `0x1` where MATLAB gives `0x0`; `size('')` gives `1 0` where MATLAB gives `0 0`; `s(:)` on a char gives a row where MATLAB gives a column; `disp([])` prints `[]` where MATLAB prints nothing | 02 |
+| A long range allocates without a cap | `x = 1:1e15` aborts with "memory allocation of 8000000000000000 bytes failed" (verified), and `1:1e10` asks for 80 GB. `range` is the `:` operator in `interp.rs`, not a builtin, so it never reaches `args::check_size`, which is what now guards every builtin shape. Violates invariant 6 exactly as the two cycle-01 panics did | 01b |
+| Constants take no size argument | `pi(2)`, `e(2)` and `eps(2)` are now "Too many input arguments."; MATLAB fills a 2x2. Cycle 01 gave `NaN` and `Inf` their size arguments and added arity checks everywhere, which turned the old silent discard into an error. Belongs with `true(n)` and `false(n)` | 02 |
+| `sort` takes no direction | `sort(v, 'descend')` is now "Too many input arguments."; MATLAB sorts descending. The old code accepted the argument and ignored it, so it returned the ascending sort. Same family as the constants above: the cycle-01 arity checks turned a silently wrong answer into an honest error | 09 |
+| `find` takes no count | `find(x, k)` is now "Too many input arguments."; MATLAB returns the first `k` nonzero indices. The old code ignored `k` and returned every index | 03 |
+| `norm` takes no order | `norm(v, p)` is now "Too many input arguments."; MATLAB returns the p-norm. The old code ignored `p` and returned the 2-norm. Lands with matrix `norm` (1, 2, inf, fro) | 08 |
+| `diag` takes no offset | `diag(A, k)` and `diag(v, k)` are now "Too many input arguments."; MATLAB reads the k-th diagonal, or places the vector on it. The old code ignored `k` and used the main diagonal | 08 |
+| `num2str` takes no precision | `num2str(x, n)` is now "Too many input arguments."; MATLAB formats to `n` significant digits. The old code ignored `n`. Already named in cycle 11's Goal as `num2str(x,prec)` | 11 |
+| `round` takes no digit count | `round(x, n)` is now "Too many input arguments."; MATLAB rounds to `n` decimal places. The old code ignored `n` and rounded to an integer, like every other element-wise unary | 09 |
+| Constructors take two sizes only | `zeros(r, c, p)`, `ones(r, c, p)` and `rand(r, c, p)` are now "Too many input arguments."; MATLAB builds an r-by-c-by-p array. The old code built the 2-D array and dropped the third size. Needs N-D arrays, which no module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
+| `max` and `min` on an empty ignore the dimension | `max([], [], 1)` gives `0x0`; MATLAB gives `1x0`. The empty check comes before the dimension argument is read. Reductions were fixed in cycle 01; `max` and `min` return an empty either way, so this one is a shape difference rather than a wrong value | 02 |
 | `mod` and `rem` with an infinite divisor, unverified | `mod(5, Inf)` gives `NaN`; C `fmod` semantics suggest `5`. Not checked against a real MATLAB, so confirm before acting. Every other `mod` and `rem` edge tested is correct | verify first |
 | Loop variable after a zero-iteration `for`, unverified | After `for k = []; end` the variable keeps its previous value. MATLAB may assign the empty instead. Not checked against a real MATLAB | verify first |
+
+| `printf` checks neither width nor precision | `fprintf('%.65536f', 1)` panics with "Formatting argument out of range", because Rust's formatter holds precision in a `u16` and 65536 overflows it; 65535 is fine. `fprintf('%2147483647d', 1)` hangs instead, building a two-gigabyte pad. Both are reachable from one line of user input and kill the REPL. Pre-existing, not a cycle-01 regression | 11 |
 
 A trap to remember when adding `.\`: the number lexer's "do not swallow the
 dot" exclusion list covers `*`, `/`, `^` and the quote, but not the backslash,
 so `2.\x` already lexes as matrix left division. Adding `.\` without adding the
 backslash to that list would leave `2.\x` silently meaning `2 \ x`.
 
-The rows above in bold are process-killing panics. They break invariant 6,
-"errors are values, not panics", and are the first thing cycle 01 fixes.
+The two process-killing panics that used to head this list, `num2str(Inf)` and
+`zeros(1e10)`, were the first thing cycle 01 fixed, before a single builtin
+moved. **Three rows of that family are still open**, all pre-existing rather
+than regressions: a long range allocates without a cap because the `:` operator
+never reaches a builtin, and `printf` checks neither its width nor its
+precision. `args::check_size` closes the family only for a size that arrives at
+a builtin; it does not cover a digit count taken from a format string, nor the
+`:` operator. **Invariant 6 is therefore not yet restored**, and no document
+should claim it is until those three rows are gone.
+
+Because of this, `src/main.rs` joins the interpreter thread with
+`unwrap_or(101)`, not `unwrap_or(1)`. A panic must stay distinguishable from a
+clean error by exit code, since that is the golden harness's main tripwire: a
+case with an `.err` file expects exit 1, so a panic reported as 1 could pass a
+test that was meant to prove the opposite.
 
 Two entries are marked "verify first". They were found by reading the code and
 reasoning about MATLAB, not by running MATLAB, and the entries

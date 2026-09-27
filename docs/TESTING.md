@@ -104,8 +104,15 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   including pivoting and singular systems, `inv`, `det`, and the display
   format branches.
 - `interp.rs`: behaviour, through a capture helper that swaps `Interp.out` for
-  an in-memory buffer, plus the pure helpers `fmt_e`, `fmt_g`, `format_printf`,
-  `range` and `matrix_power`.
+  an in-memory buffer, plus the pure helpers `fmt_e`, `fmt_g`, `range` and
+  `matrix_power`. The builtin tests here cover the wiring only: name
+  resolution, `nargout`, and the empty return.
+- `builtins/`: the builtins themselves, called directly as functions.
+  `mod.rs` checks the registry holds every name exactly once and that every
+  entry is callable; `args.rs` the message text of each helper and the size
+  overflow guard; `core.rs` the constructors, `num2str` and `format_printf`;
+  `math.rs` the reduction and scan dimension rules; `linalg.rs` sorting and
+  rearrangement.
 
 ## The output rule
 
