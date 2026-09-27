@@ -73,7 +73,11 @@ type R<T> = Result<T, String>;
 
 impl Parser {
     pub fn new(toks: Vec<Token>) -> Self {
-        Parser { toks, pos: 0, in_index: 0 }
+        Parser {
+            toks,
+            pos: 0,
+            in_index: 0,
+        }
     }
 
     fn peek(&self) -> &Token {
@@ -191,9 +195,10 @@ impl Parser {
                 self.end_stmt()?;
                 Ok(Stmt::Continue)
             }
-            Token::End | Token::Else | Token::ElseIf => {
-                Err(format!("unexpected {:?} with no matching block", self.peek()))
-            }
+            Token::End | Token::Else | Token::ElseIf => Err(format!(
+                "unexpected {:?} with no matching block",
+                self.peek()
+            )),
             _ => {
                 let e = self.parse_expr()?;
                 if self.peek() == &Token::Assign {
@@ -305,7 +310,11 @@ impl Parser {
         let second = self.parse_add()?;
         if self.eat(&Token::Colon) {
             let third = self.parse_add()?;
-            Ok(Expr::Range(Box::new(first), Some(Box::new(second)), Box::new(third)))
+            Ok(Expr::Range(
+                Box::new(first),
+                Some(Box::new(second)),
+                Box::new(third),
+            ))
         } else {
             Ok(Expr::Range(Box::new(first), None, Box::new(second)))
         }

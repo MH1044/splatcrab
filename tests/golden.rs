@@ -177,7 +177,8 @@ fn check_case(m: &Path, update: bool) -> Result<(), String> {
         } else {
             format!("{actual}\n")
         };
-        fs::write(&out_path, text).map_err(|e| format!("cannot write {}: {e}", out_path.display()))?;
+        fs::write(&out_path, text)
+            .map_err(|e| format!("cannot write {}: {e}", out_path.display()))?;
     }
     let expected = match fs::read_to_string(&out_path) {
         Ok(s) => normalize(&s),

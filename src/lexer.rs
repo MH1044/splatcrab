@@ -107,7 +107,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
                 i += 1;
             }
             if in_bracket && i < n {
-                let prev_ends = toks.last().map_or(false, ends_value);
+                let prev_ends = toks.last().is_some_and(ends_value);
                 let next = chars[i];
                 let next1 = chars.get(i + 1).copied().unwrap_or(' ');
                 let starts_value = next.is_ascii_alphanumeric()
@@ -129,7 +129,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 
         if c == '\n' {
             i += 1;
-            toks.push(if in_bracket { Token::Semi } else { Token::Newline });
+            toks.push(if in_bracket {
+                Token::Semi
+            } else {
+                Token::Newline
+            });
             continue;
         }
 
@@ -193,7 +197,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, String> {
 
         // Transpose or single-quoted string.
         if c == '\'' {
-            if toks.last().map_or(false, ends_value) {
+            if toks.last().is_some_and(ends_value) {
                 i += 1;
                 toks.push(Token::Transpose);
                 continue;

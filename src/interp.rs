@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::lexer::lex;
 use crate::parser::{BinOp, Expr, Parser, Stmt};
-use crate::value::{nonfinite, Matrix, Value};
+use crate::value::{Matrix, Value, nonfinite};
 
 type R<T> = Result<T, String>;
 
@@ -162,7 +162,9 @@ impl Interp {
                 .last()
                 .map(|n| Value::Mat(Matrix::scalar(*n as f64)))
                 .ok_or_else(|| "'end' is only valid inside an index expression.".to_string()),
-            Expr::Colon => Err("':' on its own is only valid inside an index expression.".to_string()),
+            Expr::Colon => {
+                Err("':' on its own is only valid inside an index expression.".to_string())
+            }
             Expr::Index(n, args) => self.index(n, args),
             Expr::Matrix(rows) => self.build_matrix(rows),
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
@@ -214,9 +216,8 @@ impl Interp {
         }
         let a = self.eval_mat(a)?;
         let b = self.eval_mat(b)?;
-        let bool_op = |f: fn(f64, f64) -> bool| {
-            move |x: f64, y: f64| if f(x, y) { 1.0 } else { 0.0 }
-        };
+        let bool_op =
+            |f: fn(f64, f64) -> bool| move |x: f64, y: f64| if f(x, y) { 1.0 } else { 0.0 };
         let r = match op {
             BinOp::Add => a.zip(&b, "+", |x, y| x + y)?,
             BinOp::Sub => a.zip(&b, "-", |x, y| x - y)?,
@@ -387,7 +388,11 @@ impl Interp {
                 return Err(size_err(idx.len(), rhs.numel()));
             }
             for (n, &k) in idx.iter().enumerate() {
-                m.data[k] = if rhs.is_scalar() { rhs.data[0] } else { rhs.data[n] };
+                m.data[k] = if rhs.is_scalar() {
+                    rhs.data[0]
+                } else {
+                    rhs.data[n]
+                };
             }
         } else {
             let rows: Vec<usize> = match &sel[0] {
@@ -416,7 +421,11 @@ impl Interp {
             let mut n = 0;
             for &c in &cols {
                 for &r in &rows {
-                    let v = if rhs.is_scalar() { rhs.data[0] } else { rhs.data[n] };
+                    let v = if rhs.is_scalar() {
+                        rhs.data[0]
+                    } else {
+                        rhs.data[n]
+                    };
                     m.set(r, c, v);
                     n += 1;
                 }
@@ -457,7 +466,10 @@ impl Interp {
         let dim = |i: usize| -> R<usize> {
             let v = scalar(i)?;
             if v < 0.0 || v.fract() != 0.0 {
-                return Err(format!("Size arguments to '{}' must be non-negative integers.", name));
+                return Err(format!(
+                    "Size arguments to '{}' must be non-negative integers.",
+                    name
+                ));
             }
             Ok(v as usize)
         };
@@ -603,7 +615,11 @@ impl Interp {
                     for c in 0..m.cols {
                         let mut acc = if is_sum { 0.0 } else { 1.0 };
                         for r in 0..m.rows {
-                            acc = if is_sum { acc + m.get(r, c) } else { acc * m.get(r, c) };
+                            acc = if is_sum {
+                                acc + m.get(r, c)
+                            } else {
+                                acc * m.get(r, c)
+                            };
                             out.set(r, c, acc);
                         }
                     }
@@ -644,11 +660,7 @@ impl Interp {
             "isinf" => unary(|x| x.is_infinite() as u8 as f64),
             "isfinite" => unary(|x| x.is_finite() as u8 as f64),
             "mod" => ok(mat(0)?.zip(&mat(1)?, "mod", |x, y| {
-                if y == 0.0 {
-                    x
-                } else {
-                    x - (x / y).floor() * y
-                }
+                if y == 0.0 { x } else { x - (x / y).floor() * y }
             })?),
             "rem" => ok(mat(0)?.zip(&mat(1)?, "rem", |x, y| x - (x / y).trunc() * y)?),
             "atan2" => ok(mat(0)?.zip(&mat(1)?, "atan2", f64::atan2)?),
@@ -676,7 +688,9 @@ impl Interp {
                     }
                     ok(out)
                 } else {
-                    ok(Matrix::col((0..m.rows.min(m.cols)).map(|i| m.get(i, i)).collect()))
+                    ok(Matrix::col(
+                        (0..m.rows.min(m.cols)).map(|i| m.get(i, i)).collect(),
+                    ))
                 }
             }
             "norm" => {
@@ -684,7 +698,9 @@ impl Interp {
                 if !m.is_vector() && !m.is_empty() {
                     return Err("'norm' currently supports vectors only.".to_string());
                 }
-                ok(Matrix::scalar(m.data.iter().map(|v| v * v).sum::<f64>().sqrt()))
+                ok(Matrix::scalar(
+                    m.data.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                ))
             }
             "dot" => {
                 let a = mat(0)?;
@@ -751,7 +767,11 @@ impl Interp {
                     .filter(|(_, v)| **v != 0.0)
                     .map(|(i, _)| (i + 1) as f64)
                     .collect();
-                ok(if m.rows == 1 { Matrix::row(idx) } else { Matrix::col(idx) })
+                ok(if m.rows == 1 {
+                    Matrix::row(idx)
+                } else {
+                    Matrix::col(idx)
+                })
             }
             "sort" => {
                 let m = mat(0)?;
@@ -1191,17 +1211,17 @@ fn format_printf(args: &[Value]) -> R<String> {
                 out.push_str(&body);
             } else if flags.contains('-') {
                 out.push_str(&body);
-                out.extend(std::iter::repeat(' ').take(width - len));
+                out.extend(std::iter::repeat_n(' ', width - len));
             } else if flags.contains('0') && matches!(arg, Some(PArg::N(_))) {
                 let (sign, digits) = match body.strip_prefix('-') {
                     Some(d) => ("-", d.to_string()),
                     None => ("", body.clone()),
                 };
                 out.push_str(sign);
-                out.extend(std::iter::repeat('0').take(width - len));
+                out.extend(std::iter::repeat_n('0', width - len));
                 out.push_str(&digits);
             } else {
-                out.extend(std::iter::repeat(' ').take(width - len));
+                out.extend(std::iter::repeat_n(' ', width - len));
                 out.push_str(&body);
             }
         }

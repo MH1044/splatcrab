@@ -119,7 +119,11 @@ impl Matrix {
     }
 
     pub fn map(&self, f: impl Fn(f64) -> f64) -> Matrix {
-        Matrix::new(self.rows, self.cols, self.data.iter().map(|v| f(*v)).collect())
+        Matrix::new(
+            self.rows,
+            self.cols,
+            self.data.iter().map(|v| f(*v)).collect(),
+        )
     }
 
     /// Element-wise combination with scalar / row / column broadcasting.
@@ -139,7 +143,10 @@ impl Matrix {
                     if self.rows == 1 { 0 } else { r },
                     if self.cols == 1 { 0 } else { c },
                 );
-                let b = o.get(if o.rows == 1 { 0 } else { r }, if o.cols == 1 { 0 } else { c });
+                let b = o.get(
+                    if o.rows == 1 { 0 } else { r },
+                    if o.cols == 1 { 0 } else { c },
+                );
                 data.push(f(a, b));
             }
         }
@@ -180,6 +187,9 @@ impl Matrix {
     }
 
     /// Solve A * X = B for square A (Gaussian elimination with partial pivoting).
+    // Elimination is written with explicit indices on purpose; cycle 08 replaces
+    // solve and det with a shared LU factorisation.
+    #[allow(clippy::needless_range_loop)]
     pub fn solve(&self, b: &Matrix) -> Result<Matrix, String> {
         let n = self.rows;
         if self.rows != self.cols {
@@ -253,6 +263,9 @@ impl Matrix {
         self.solve(&Matrix::identity(self.rows, self.rows))
     }
 
+    // Elimination is written with explicit indices on purpose; cycle 08 replaces
+    // solve and det with a shared LU factorisation.
+    #[allow(clippy::needless_range_loop)]
     pub fn det(&self) -> Result<f64, String> {
         if self.rows != self.cols {
             return Err("Matrix must be square to compute a determinant.".to_string());
@@ -295,10 +308,7 @@ impl Matrix {
             return "     []\n".to_string();
         }
         let mut out = String::new();
-        let all_int = self
-            .data
-            .iter()
-            .all(|v| v.fract() == 0.0 && v.abs() < 1e15);
+        let all_int = self.data.iter().all(|v| v.fract() == 0.0 && v.abs() < 1e15);
         if all_int {
             let width = self
                 .data
