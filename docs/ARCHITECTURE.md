@@ -149,6 +149,10 @@ no interpreter behaviour.
 | Line continuation defeats the bracket whitespace rule | `[1 ...` newline `-2]` yields one element worth `-1` instead of two elements. The `...` branch in `lex` skips past the newline and leaves the cursor on the minus, so the branch that inserts the separating `Comma` never runs. Writing a leading space on the continued line is correct by accident | 01 |
 | No elementwise left divide | `a.\b` is `unexpected character '.'`. There is no `DotBackslash` token and no elementwise left-division operator | 01 |
 | Chained ranges are rejected | `1:2:3:4` is a parse error; MATLAB reads it as `(1:2:3):4`. `parse_range` handles at most two colons and does not loop | later, low impact |
+| `matmul` swallows `Inf` and `NaN` | `[Inf 0] * [0; 1]` gives `0`; MATLAB gives `NaN`. The `if b == 0.0 { continue }` sparsity shortcut skips the multiply, so `Inf * 0` and `NaN * 0` never happen | 08 |
+| `solve` uses an absolute pivot tolerance | `[1e-15 0; 0 1e-15] \ [1; 1]` reports a singular matrix, but it is diagonal and perfectly conditioned; only its scale trips the fixed `1e-14` threshold. The threshold should be relative to the matrix norm. This also means `det` and `solve` disagree about what singular means | 08 |
+| `%d` saturates at 64 bits | `fprintf('%d', 1e30)` prints `9223372036854775807`. Any integral value at or above `2^63` prints the clamp. `Inf` and `NaN` are handled correctly | 11 |
+| `printf` ignores precision on strings | `fprintf('[%5.2s]', 'abcdef')` gives `[abcdef]`; C and MATLAB give `[   ab]`, truncating before padding | 11 |
 
 A trap to remember when adding `.\`: the number lexer's "do not swallow the
 dot" exclusion list covers `*`, `/`, `^` and the quote, but not the backslash,

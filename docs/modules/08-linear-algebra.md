@@ -17,7 +17,14 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - one-sided Jacobi SVD
 - `rank pinv null orth kron cross triu tril magic cond`
 - matrix `norm` (1, 2, inf, fro)
-- singular warning instead of error
+- Singular systems warn instead of erroring
+- Fix `matmul` swallowing `Inf` and `NaN`: the `if b == 0.0 { continue }`
+  sparsity shortcut skips the multiply, so `[Inf 0] * [0; 1]` gives `0`
+  where MATLAB gives `NaN`. See "Known bugs" in `docs/ARCHITECTURE.md`
+- Fix the absolute pivot tolerance in `solve`: the fixed `1e-14` test
+  calls the perfectly conditioned `[1e-15 0; 0 1e-15]` singular. Make the
+  threshold relative to the matrix norm, and make `det` and `solve` agree
+  on what singular means. The LU rewrite in this cycle is the place
 
 ## Out of scope
 

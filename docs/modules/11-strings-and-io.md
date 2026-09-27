@@ -9,7 +9,20 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 
 ## Scope
 
-- `strcat strsplit strjoin strrep strtrim upper lower strcmp* strfind strtok num2str(x,prec) int2str str2double str2num mat2str isspace isletter blanks regexp regexprep(hand-rolled) input fopen fclose fgetl fgets fprintf(fid) fread fwrite feof fileread readmatrix writematrix csvread csvwrite save load(MAT v5 uncompressed + -ascii) delete`
+- String functions: `strcat`, `strsplit`, `strjoin`, `strrep`, `strtrim`,
+  `upper`, `lower`, the `strcmp` family, `strfind`, `strtok`,
+  `num2str(x, prec)`, `int2str`, `str2double`, `str2num`, `mat2str`,
+  `isspace`, `isletter`, `blanks`
+- A hand-rolled `regexp` and `regexprep`
+- File input and output: `input`, `fopen`, `fclose`, `fgetl`, `fgets`,
+  `fprintf(fid, ...)`, `fread`, `fwrite`, `feof`, `fileread`,
+  `readmatrix`, `writematrix`, `csvread`, `csvwrite`, `delete`
+- `save` and `load` for uncompressed MAT version 5, plus `-ascii`
+- Fix `%d` saturating at 64 bits: `fprintf('%d', 1e30)` prints the `i64`
+  clamp `9223372036854775807` instead of the full value. See "Known bugs"
+  in `docs/ARCHITECTURE.md`
+- Fix precision being ignored for string conversions: `%5.2s` of
+  `'abcdef'` must truncate to two characters before padding to five
 
 ## Out of scope
 
