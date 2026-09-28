@@ -1,0 +1,2 @@
+% covers: 8 - a character outside ASCII, the × of a class header, is written as raw UTF-8 in "out", not as a \u escape
+{"id":15,"op":"eval","code":"v = true(1, 2)"}

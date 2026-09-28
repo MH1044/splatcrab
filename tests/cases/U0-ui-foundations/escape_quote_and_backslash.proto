@@ -1,0 +1,2 @@
+% covers: 8 - a double quote and a backslash are decoded from the request and escaped in "out" as \" and \\
+{"id":13,"op":"eval","code":"disp('a\"b\\c')"}

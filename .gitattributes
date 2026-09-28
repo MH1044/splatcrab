@@ -5,6 +5,7 @@
 *.err  text eol=lf
 *.exit text eol=lf
 *.repl text eol=lf
+*.proto text eol=lf
 *.md   text eol=lf
 *.yml  text eol=lf
 *.toml text eol=lf

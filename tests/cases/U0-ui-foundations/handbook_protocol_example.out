@@ -1,0 +1,6 @@
+{"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
+{"id":2,"ok":false,"out":"     6\n","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":2}}
+{"id":3,"ok":true,"complete":false}
+{"id":4,"ok":true,"vars":[{"name":"x","size":[1,1],"class":"double"}]}
+{"id":5,"ok":true,"items":["diag","disp"]}
+{"id":6,"ok":false,"error":{"message":"Unknown operation 'fly'.","line":null}}

@@ -1,0 +1,5 @@
+{"id":13,"ok":false,"error":{"message":"Malformed request: 'op' must be a string.","line":null}}
+{"id":14,"ok":false,"error":{"message":"Malformed request: 'code' must be a string.","line":null}}
+{"id":15,"ok":false,"error":{"message":"Malformed request: 'code' must be a string.","line":null}}
+{"id":16,"ok":false,"error":{"message":"Malformed request: no 'prefix' field.","line":null}}
+{"id":100,"ok":true,"out":"     1\n"}

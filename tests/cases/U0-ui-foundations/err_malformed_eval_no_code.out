@@ -1,0 +1,2 @@
+{"id":12,"ok":false,"error":{"message":"Malformed request: no 'code' field.","line":null}}
+{"id":100,"ok":true,"out":"     1\n"}

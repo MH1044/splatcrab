@@ -1,0 +1,4 @@
+% covers: 9 - a string id is echoed as a string and as the first key, on workspace and on eval alike
+{"id":"abc","op":"workspace"}
+{"id":"def","op":"eval","code":"s = 'ab';"}
+{"id":"abc","op":"workspace"}

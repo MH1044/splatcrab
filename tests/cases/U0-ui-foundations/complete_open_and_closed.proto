@@ -1,0 +1,7 @@
+% covers: 4 - complete answers whether code is a finished entry: an open block or bracket is not, a closed block, c{end} and a plain statement are; it runs nothing, so the workspace stays empty
+{"id":2,"op":"complete","code":"for k = 1:3"}
+{"id":3,"op":"complete","code":"for k = 1:3\ndisp(k)\nend"}
+{"id":4,"op":"complete","code":"x = [1 2"}
+{"id":5,"op":"complete","code":"c{end}"}
+{"id":6,"op":"complete","code":"x = 1"}
+{"id":7,"op":"workspace"}

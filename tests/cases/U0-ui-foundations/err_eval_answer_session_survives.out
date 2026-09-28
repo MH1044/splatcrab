@@ -1,0 +1,2 @@
+{"id":3,"ok":false,"out":"     1\n","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":2}}
+{"id":4,"ok":true,"out":""}

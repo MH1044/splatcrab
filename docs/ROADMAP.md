@@ -64,7 +64,7 @@ that get lost, and the transcript is ordinary selectable text.
 
 | U | Module | Goal | Status |
 |---|---|---|---|
-| U0 | [ui-foundations](modules/U0-ui-foundations.md) | The evaluation protocol as a stdin/stdout program, covered by the existing golden harness, with no network code at all | Planned |
+| U0 | [ui-foundations](modules/U0-ui-foundations.md) | The evaluation protocol as a stdin/stdout program, covered by the existing golden harness, with no network code at all | Done (2026-09-28) |
 | U1 | ui-server | `splatcrab --ui` serves a loopback page that runs a line and shows its exact output; the HTTP bytes are pinned by golden cases | Planned |
 | U2 | ui-desktop | Four resizable panes: command window, workspace and file browser, with the palette defined exactly once | Planned |
 | U3 | ui-editor | An editor with tabs and line numbers, Run and Run Selection, and an error that jumps to its line | Planned |

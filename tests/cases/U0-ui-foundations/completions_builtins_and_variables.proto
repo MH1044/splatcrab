@@ -1,0 +1,5 @@
+% covers: 6 - completions lists every builtin and variable whose name starts with the prefix, sorted (the Scope's "di" example, then "dis" before and after a variable)
+{"id":4,"op":"completions","prefix":"di"}
+{"id":8,"op":"completions","prefix":"dis"}
+{"id":100,"op":"eval","code":"display_count = 1;"}
+{"id":8,"op":"completions","prefix":"dis"}

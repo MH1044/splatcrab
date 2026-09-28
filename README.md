@@ -93,6 +93,21 @@ Output goes to stdout. If a statement fails, the message goes to stderr as
 shell pipelines and CI. The bundled `examples/demo.m` walks through matrix
 arithmetic, indexing, growth on assignment, loops and formatted printing.
 
+**The evaluation protocol.** `splatcrab --protocol` is groundwork for a
+graphical interface rather than something to type at: it reads one JSON
+request per line on stdin and answers each with one JSON line on stdout,
+against one session that keeps its variables between requests. The operations
+are `eval`, `complete` (is this entry finished?), `workspace` and
+`completions`; a failed evaluation or a malformed line is an answer, and the
+process exits 0 at end of input. There is no network code: the interface to
+come is a thin transport over this. `docs/modules/U0-ui-foundations.md` is
+the full description.
+
+```
+$ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
+{"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
+```
+
 **A quick tour.** Paste this into the REPL, or save it as a script:
 
 ```matlab
@@ -203,6 +218,9 @@ z
   go to stderr like a script's, a block left open at end of input is reported
   rather than discarded, and a script file may start with a UTF-8 byte-order
   mark or hold bytes that are not valid UTF-8
+- `splatcrab --protocol`, a JSON Lines request loop over one session, with
+  `eval`, `complete`, `workspace` and `completions`: the groundwork for the
+  interface, with its JSON hand-written rather than taken from a crate
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.

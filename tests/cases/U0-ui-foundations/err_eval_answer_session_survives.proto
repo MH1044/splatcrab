@@ -1,0 +1,3 @@
+% covers: 2 - an eval error is an answer carrying the output before it and the one-based line within code, and the next request still runs; exit 0 (and nothing on stderr, which the harness asserts for every .proto case)
+{"id":3,"op":"eval","code":"disp(1)\ny = nosuchname"}
+{"id":4,"op":"eval","code":"z = 5;"}

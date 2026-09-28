@@ -81,6 +81,58 @@ noise, and the session survives them. Note that REPL diagnostics currently go
 to stderr, as in a script, but without a line number: a prompt entry is one
 line, so `Line 1:` would be noise.
 
+**The evaluation protocol.** `splatcrab --protocol` is for programs, not
+people: it is what the graphical interface will speak. It reads one JSON
+object per line on stdin and writes one JSON object per line on stdout, each
+answer flushed before the next line is read, all against one session, so a
+variable one request assigns is there for the next. Blank lines are skipped.
+It writes nothing to stderr and exits 0 at end of input, whatever the
+requests did: a failed evaluation and a line that is not a request are both
+answers, and the session goes on.
+
+There are four operations. `eval` runs `code` as a REPL entry, possibly
+several lines, and answers with the output it would have printed (`out`)
+and, if it failed, an `error` holding the REPL's message and the one-based
+line within `code`. `complete` answers whether `code` is a finished entry or
+still inside an open block or bracket, the same test the REPL uses to decide
+whether to keep reading. `workspace` lists each variable's name, size and
+class, sorted by name. `completions` lists every variable and builtin whose
+name starts with `prefix`. Every response starts with the request's `id` (a
+number or a string, or `null` when it sent none) and `ok`.
+
+This input, one request per line:
+
+```text
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+{"id":2,"op":"eval","code":"disp(x * 2)\ny = nosuchname"}
+{"id":3,"op":"complete","code":"for k = 1:3"}
+{"id":4,"op":"workspace"}
+{"id":5,"op":"completions","prefix":"di"}
+{"id":6,"op":"fly"}
+```
+
+gets exactly these bytes on stdout, and the exit code is 0:
+
+```text
+{"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
+{"id":2,"ok":false,"out":"     6\n","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":2}}
+{"id":3,"ok":true,"complete":false}
+{"id":4,"ok":true,"vars":[{"name":"x","size":[1,1],"class":"double"}]}
+{"id":5,"ok":true,"items":["diag","disp"]}
+{"id":6,"ok":false,"error":{"message":"Unknown operation 'fly'.","line":null}}
+```
+
+The `\n` inside a string is JSON's escape for a newline: a request or a
+response never spans two lines. An `eval` runs exactly the code it is sent,
+so an unclosed `for` is an error answer (`expected 'end' but found end of
+input`), not a wait for more; a client asks `complete` first. A line that is
+not a usable request is answered with `"ok":false` and a message beginning
+`Malformed request:`. The keys, their order and every message are specified
+in `docs/modules/U0-ui-foundations.md`. The handbook check runs only
+`matlab` examples, so this one is pinned instead by the golden case
+`tests/cases/U0-ui-foundations/handbook_protocol_example`, which sends these
+six requests and expects these six lines.
+
 ## The language
 
 ### Numbers

@@ -5,10 +5,19 @@
 //! it is the only place in the project allowed to use `print!`.
 //!
 //! `error` holds `MError` and every message text the other modules raise.
+//!
+//! Since cycle U0, `protocol` is the evaluation protocol behind
+//! `splatcrab --protocol`, built on `json` (a hand-written JSON value, parser
+//! and writer), `syntax` (whether an entry is complete, shared with the REPL)
+//! and `env` (name completions).
 
 pub mod builtins;
+pub mod env;
 pub mod error;
 pub mod interp;
+pub mod json;
 pub mod lexer;
 pub mod parser;
+pub mod protocol;
+pub mod syntax;
 pub mod value;

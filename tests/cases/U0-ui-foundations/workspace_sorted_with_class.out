@@ -1,0 +1,2 @@
+{"id":null,"ok":true,"out":""}
+{"id":7,"ok":true,"vars":[{"name":"s","size":[1,2],"class":"char"},{"name":"t","size":[1,1],"class":"logical"},{"name":"x","size":[1,3],"class":"double"}]}

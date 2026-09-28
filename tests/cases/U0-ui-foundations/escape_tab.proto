@@ -1,0 +1,2 @@
+% covers: 8 - a tab that fprintf writes is escaped in "out" as \t, and its newline as \n
+{"id":14,"op":"eval","code":"fprintf('x\\ty\\n')"}

@@ -1,0 +1,5 @@
+{"id":null,"ok":false,"error":{"message":"Malformed request: 'id' must be a number or a string.","line":null}}
+{"id":null,"ok":false,"error":{"message":"Malformed request: 'id' must be a number or a string.","line":null}}
+{"id":null,"ok":false,"error":{"message":"Malformed request: 'id' must be a number or a string.","line":null}}
+{"id":null,"ok":false,"error":{"message":"Malformed request: not valid JSON.","line":null}}
+{"id":100,"ok":true,"out":"     1\n"}

@@ -1,0 +1,6 @@
+% covers: 7 - an id that is neither a number nor a string is a malformed-request answer with "id":null, trailing text after the object is not valid JSON, and the next request still succeeds
+{"id":[1],"op":"workspace"}
+{"id":true,"op":"workspace"}
+{"id":{"n":1},"op":"workspace"}
+{"id":17,"op":"workspace"} trailing
+{"id":100,"op":"eval","code":"disp(1)"}

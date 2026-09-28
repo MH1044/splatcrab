@@ -10,10 +10,19 @@
                                          the library, behind a registry
 
                             error.rs: MError, and every message text
+
+ JSON line ──► protocol.rs ──► json.rs      parse the request, write the reply
+                   │
+                   ├──► interp.rs           eval, output captured
+                   ├──► syntax.rs           complete: is the entry finished?
+                   └──► env.rs              completions: variables + builtins
 ```
 
-`src/lib.rs` exposes the six modules. `src/main.rs` is the CLI and REPL and is
-the only file allowed to use `print!`. It runs everything on a thread with a
+`src/lib.rs` exposes the ten modules: the six of the language (`lexer`,
+`parser`, `interp`, `value`, `builtins`, `error`) and the four of the
+evaluation protocol that cycle U0 added (`json`, `syntax`, `env`,
+`protocol`). `src/main.rs` is the CLI and REPL and is the only file allowed to
+use `print!`. It runs everything, `--protocol` included, on a thread with a
 256 MB stack, because Windows gives the main thread 1 MB and the parser and
 the evaluator each recurse once per nesting level.
 
@@ -114,6 +123,34 @@ themselves. Every one has the same shape,
 `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`, where the `usize` is
 `nargout` and an empty `Vec` means the builtin produced no value.
 
+**`syntax.rs`** answers questions about source text short of parsing it.
+`is_complete` says whether an entry typed line by line has ended, by counting
+brackets and block openers against their closers over the token stream; the
+REPL asks it after every line and the protocol's `complete` asks it on
+request, so the two can never disagree. It was `needs_more` in `main.rs`
+until cycle U0.
+
+**`env.rs`** is the environment as seen from outside the evaluator.
+`completions(prefix, &vars, &registry)` lists every variable and builtin
+starting with `prefix`, sorted by byte order and deduplicated; cycle 13 adds
+path files to it and builds the terminal's tab completion on it.
+`Interp::builtins` hands out the registry read-only for it.
+
+**`json.rs`** is hand-written JSON: a `Json` value whose objects keep their
+keys in written order (a `Vec` of pairs, not a map), a parser and a writer.
+The parser counts array and object levels against `json::MAX_DEPTH`, 128, and
+refuses anything deeper, for invariant 6. The writer escapes exactly `"`,
+`\`, newline, carriage return and tab by name and other control characters as
+`\u00xx`, and writes everything else as raw UTF-8. Cycle U1 reuses it.
+
+**`protocol.rs`** is `splatcrab --protocol`: `serve(reader, writer)` reads
+one JSON request per line and writes one JSON response per line against one
+`Interp`, flushing after each. `eval` swaps `Interp.out` for a buffer for the
+length of the call and restores it, which is what the sink is for; the
+interpreter is built over a sink otherwise, so nothing but responses reaches
+the writer. A failed evaluation and a malformed request are both answers;
+the loop ends only at end of input. The message texts live in `error.rs`.
+
 **`main.rs`** is the CLI. On Windows it first switches the console's output
 code page to UTF-8 with `SetConsoleOutputCP(65001)`, declared as a raw
 `extern "system"` function under `#[cfg(windows)]`, because the crate takes no
@@ -144,7 +181,9 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    abort the process. Holding it is what the depth limit of
    `parser::MAX_DEPTH` is for: the parser and the evaluator both recurse once
    per nesting level, and recursion bounded only by the stack cannot return a
-   value when it runs out. Anything that computes a result shape from its
+   value when it runs out. The JSON parser of the protocol recurses on its
+   input too, and has its own, smaller bound, `json::MAX_DEPTH`. Anything
+   that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
    the recipe below.
 
@@ -202,9 +241,11 @@ true. A new operation of that kind belongs on the same list.
    lexes as a `Token` rather than an `Ident`.
 2. `parser.rs`: add the `Stmt` variant and a branch in `parse_stmt`.
 3. `interp.rs`: add the arm in `exec`, returning the right `Flow`.
-4. `syntax.rs`: if the statement opens a block, teach `completeness` to count
-   it, so both the REPL and the interface keep reading lines. This lived in
-   `main.rs` until cycle U0 moved it out; look there, not in the binary.
+4. `syntax.rs`: if the statement opens a block, teach `is_complete` to count
+   its keyword beside `if`, `for` and `while`, so that the REPL keeps
+   reading lines and the protocol's `complete` answers `false` until the
+   block is closed. This lived in `main.rs` as
+   `needs_more` until cycle U0 moved it out; look there, not in the binary.
 
 ### Add a value type
 
@@ -258,6 +299,15 @@ yield `Logical`; concatenation yields `Char` if any operand is `Char`, else
 Indexed assignment keeps the left-hand side's class. A char element is a
 UTF-16 code unit. The Design notes of `docs/modules/02-classes-and-display.md`
 have the full table and every display rule.
+
+**Protocol (cycle U0, in place).** JSON Lines over one persistent `Interp`,
+`protocol::serve(reader, writer)`, with `main.rs` only dispatching
+`--protocol` to it. Response keys come in a fixed order: `id`, `ok`, the
+operation's own keys, `error` last. Output is captured by swapping
+`Interp.out`, never by a second output path. Every failure a request can meet
+is an answer and the process exits 0 at end of input. Cycle U1 puts a socket
+in front of `serve` and reuses `json.rs`; the Design notes of
+`docs/modules/U0-ui-foundations.md` have the details.
 
 **Frames (cycle 05).** A stack of `Frame { vars, end_stack, unit, func_name }`
 with `frames[0]` as the base workspace, never popped. Moving `end_stack` into

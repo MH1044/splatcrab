@@ -1,0 +1,4 @@
+% covers: 1 - eval captures the display text in "out" and the session persists across requests; the blank line between them gets no response (Scope, first bullet)
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+
+{"id":2,"op":"eval","code":"disp(x * 2)"}

@@ -1,0 +1,2 @@
+{"id":null,"ok":false,"error":{"message":"Malformed request: not a JSON object.","line":null}}
+{"id":100,"ok":true,"out":"     1\n"}

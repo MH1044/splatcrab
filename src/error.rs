@@ -560,6 +560,52 @@ pub fn eps_class() -> MError {
     MError::new("Only 'double' is supported as a class name for 'eps'.")
 }
 
+// ---- protocol --------------------------------------------------------
+
+// A request the protocol cannot act on is answered, not fatal. Every text
+// but the unknown operation's is `Malformed request: <what is wrong>.`, the
+// form docs/modules/U0-ui-foundations.md fixes; what follows the colon is
+// SplatCrab's own wording.
+
+fn malformed(what: &str) -> MError {
+    MError::new(format!("Malformed request: {}.", what))
+}
+
+/// A line that is not one JSON value.
+pub fn request_not_json() -> MError {
+    malformed("not valid JSON")
+}
+
+/// A line nested past [`crate::json::MAX_DEPTH`] arrays or objects: refused
+/// by the depth limit before it could recurse far enough to overflow.
+pub fn request_too_deep() -> MError {
+    malformed("nested too deeply")
+}
+
+/// JSON, but not an object: `[1, 2]`, `"eval"`, `3`.
+pub fn request_not_object() -> MError {
+    malformed("not a JSON object")
+}
+
+/// An `id` that is neither a number nor a string.
+pub fn request_bad_id() -> MError {
+    malformed("'id' must be a number or a string")
+}
+
+/// A field the operation needs, `op` included, that is absent.
+pub fn request_missing(field: &str) -> MError {
+    malformed(&format!("no '{}' field", field))
+}
+
+/// A field present with a value that is not a string.
+pub fn request_not_string(field: &str) -> MError {
+    malformed(&format!("'{}' must be a string", field))
+}
+
+pub fn unknown_operation(op: &str) -> MError {
+    MError::new(format!("Unknown operation '{}'.", op))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,11 +659,15 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 8] = [
+        const FILES: [(&str, &str); 12] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
             ("value.rs", include_str!("value.rs")),
+            ("json.rs", include_str!("json.rs")),
+            ("syntax.rs", include_str!("syntax.rs")),
+            ("env.rs", include_str!("env.rs")),
+            ("protocol.rs", include_str!("protocol.rs")),
             ("builtins/args.rs", include_str!("builtins/args.rs")),
             ("builtins/core.rs", include_str!("builtins/core.rs")),
             ("builtins/math.rs", include_str!("builtins/math.rs")),

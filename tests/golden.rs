@@ -10,6 +10,12 @@
 //! the file is typed at the prompt through stdin. Everything else -- `.out`,
 //! `.err`, the exit-code rule -- is identical.
 //!
+//! A `<name>.proto` file is a case in the same way, for the evaluation
+//! protocol of cycle U0: the binary is spawned with `--protocol`, and the file
+//! less its `% covers:` line is typed on stdin, one JSON request per line.
+//! The `.out` holds one JSON response per line. A `.proto` case with no `.err`
+//! also asserts that stderr is empty, since the protocol writes nothing there.
+//!
 //! Every case asserts an exact exit code. `.err` holds a substring that must
 //! appear on stderr; `.exit` holds the expected code when it is not the one
 //! the other files imply (1 with an `.err`, 0 without).
@@ -57,9 +63,15 @@ fn is_repl_case(p: &Path) -> bool {
     p.extension().is_some_and(|x| x == "repl")
 }
 
-/// The lines a `.repl` case types at the prompt: the whole file except its
-/// `% covers:` marker, which documents the case rather than being typed.
-fn repl_session(path: &Path) -> Vec<u8> {
+/// True when this case drives the evaluation protocol: the binary is spawned
+/// with `--protocol` and the file is its stdin, one request per line.
+fn is_proto_case(p: &Path) -> bool {
+    p.extension().is_some_and(|x| x == "proto")
+}
+
+/// The lines a `.repl` or `.proto` case types on stdin: the whole file except
+/// its `% covers:` marker, which documents the case rather than being typed.
+fn session_input(path: &Path) -> Vec<u8> {
     let text = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => panic!("cannot read {}: {e}", path.display()),
@@ -70,8 +82,9 @@ fn repl_session(path: &Path) -> Vec<u8> {
     }
 }
 
-/// Collects case files, in a deterministic order. A `.m` or `.repl` file is a
-/// case when it has a sibling `.out`, or when it opens with `% covers:`.
+/// Collects case files, in a deterministic order. A `.m`, `.repl` or `.proto`
+/// file is a case when it has a sibling `.out`, or when it opens with
+/// `% covers:`.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
         Ok(rd) => rd.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
@@ -81,7 +94,9 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     for p in entries {
         if p.is_dir() {
             collect_cases(&p, out);
-        } else if p.extension().is_some_and(|x| x == "m" || x == "repl")
+        } else if p
+            .extension()
+            .is_some_and(|x| x == "m" || x == "repl" || x == "proto")
             && (p.with_extension("out").exists() || declares_itself_a_case(&p))
         {
             out.push(p);
@@ -111,16 +126,19 @@ struct Outcome {
 /// output cannot fill the pipe and deadlock while we poll for exit.
 fn run_case(path: &Path) -> Outcome {
     let dir = path.parent().expect("case has a parent directory");
-    let stdin_data = if is_repl_case(path) {
-        Some(repl_session(path))
+    let stdin_data = if is_repl_case(path) || is_proto_case(path) {
+        Some(session_input(path))
     } else {
         fs::read(path.with_extension("stdin")).ok()
     };
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_splatcrab"));
     // A REPL case takes no script argument: that argument is what makes the
-    // binary run a file instead of reading the prompt.
-    if !is_repl_case(path) {
+    // binary run a file instead of reading the prompt. A protocol case takes
+    // the flag that selects the protocol instead of the file.
+    if is_proto_case(path) {
+        cmd.arg("--protocol");
+    } else if !is_repl_case(path) {
         cmd.arg(path);
     }
     cmd.current_dir(dir)
@@ -285,6 +303,14 @@ fn check_case(m: &Path, update: bool) -> Result<(), String> {
                 r.stderr.trim_end()
             ));
         }
+    } else if is_proto_case(m) && !r.stderr.is_empty() {
+        // The protocol answers every failure on stdout and writes nothing
+        // at all to stderr (the U0 spec), so a protocol case with no `.err`
+        // asserts silence there, not merely "whatever stderr held".
+        problems.push(format!(
+            "a protocol case must write nothing to stderr; stderr was:\n{}",
+            r.stderr.trim_end()
+        ));
     }
     if expected != actual {
         problems.push(format!(

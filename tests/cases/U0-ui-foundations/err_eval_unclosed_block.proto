@@ -1,0 +1,3 @@
+% covers: 11 - an eval whose code leaves a block open is an error answer, not a wait for more input: the next line is answered as a request of its own
+{"id":16,"op":"eval","code":"for k = 1:3"}
+{"id":100,"op":"eval","code":"disp(2)"}

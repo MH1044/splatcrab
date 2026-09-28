@@ -1,0 +1,4 @@
+% covers: 6 - a variable that shadows a builtin is listed once, without a duplicate
+{"id":9,"op":"completions","prefix":"disp"}
+{"id":100,"op":"eval","code":"disp = 3;"}
+{"id":9,"op":"completions","prefix":"disp"}

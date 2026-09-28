@@ -220,11 +220,29 @@ implements the ones MATLAB code actually uses. Cases are in
 | REPL diagnostics go to stderr | 01e | `repl_error_to_stderr` | Script mode already did, so a piped session can now separate diagnostics from output too |
 | An unterminated block at end of input is reported | 01e | `err_repl_unterminated_block` | Piping `for k = 1:3` and `disp(k)` with no `end` printed nothing and exited 0 (QA D36); it now exits 1 and says why |
 
+## Evaluation protocol
+
+`splatcrab --protocol`, the groundwork for the interface (cycle U0). Cases in
+`tests/cases/U0-ui-foundations/`, each a `.proto` session.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `splatcrab --protocol`, JSON Lines over one session | U0 | `eval_display_and_session`, `err_eval_answer_session_survives`, `handbook_protocol_example` | One JSON request per line on stdin, one JSON response per line on stdout, flushed after each. Blank lines and a trailing `\r` are skipped. Exits 0 at end of input whatever the requests did, and writes nothing to stderr |
+| Request ids | U0 | `string_id_echoed`, `workspace_sorted_with_class` | A number or a string `id` is echoed as the response's first key; none, or `null`, is answered `"id":null` |
+| `eval` | U0 | `eval_display_and_session`, `err_eval_answer_session_survives`, `err_eval_keeps_earlier_assignments`, `err_eval_unclosed_block` | Runs `code` as a REPL entry, output captured into `out`. An error adds `error: {message, line}`: the message as the REPL prints it, the line one-based within `code`. Variables assigned before an error survive it. Code with an open block is run as sent and fails, rather than waiting for more |
+| `complete` | U0 | `complete_open_and_closed` | Whether `code` is a finished entry: `syntax::is_complete`, the same function the REPL asks |
+| `workspace` | U0 | `workspace_sorted_with_class` | `{name, size, class}` per variable, sorted by name |
+| `completions` | U0 | `completions_builtins_and_variables`, `completions_shadow_listed_once` | Every variable and builtin starting with `prefix`, sorted by byte order, a shadowed builtin listed once: `env::completions` |
+| Malformed requests are answers | U0 | `err_malformed_not_json`, `err_malformed_not_object`, `err_malformed_no_op`, `err_malformed_eval_no_code`, `err_malformed_field_not_string`, `err_malformed_bad_id`, `err_unknown_operation` | `"ok":false` with `Malformed request: <what>.` or `Unknown operation '<op>'.` and `"line":null`, then the next line is read |
+| JSON escaping | U0 | `escape_quote_and_backslash`, `escape_tab`, `raw_utf8_times` | `\"`, `\\`, `\n`, `\r`, `\t`, `\u00xx` for any other control character, raw UTF-8 for everything else, `×` included |
+| Nesting is bounded | U0 | `err_deep_nesting` | `src/json.rs` refuses arrays or objects nested past 128 levels, so 100,000 `[` are a malformed request, not a stack overflow |
+
 ## Tooling
 
 | Feature | Since | Notes |
 |---|---|---|
-| REPL with block and bracket continuation | 00 | `exit` and `quit` leave |
+| REPL with block and bracket continuation | 00 | `exit` and `quit` leave. Since U0 the continuation test is `syntax::is_complete`, shared with the protocol's `complete` |
+| `.proto` golden cases | U0 | `tests/golden.rs` spawns the binary with `--protocol` and types the case on stdin |
 | Script runner, exit code 1 on error | 00 | stdout is flushed before the error |
 | The Windows console reads output as UTF-8 | 02 | `SetConsoleOutputCP(65001)`, a raw `extern "system"` declaration in `src/main.rs` rather than a crate, so `×` and non-ASCII text render. A pipe or a file is unaffected |
 | Golden-file test harness | 00 | `tests/golden.rs`, no dependencies |

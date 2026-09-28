@@ -185,6 +185,11 @@ impl Interp {
         }
     }
 
+    /// The builtin library, read-only: what `env::completions` lists.
+    pub fn builtins(&self) -> &Registry {
+        &self.builtins
+    }
+
     /// Counts one more level of evaluation, refusing anything past the
     /// parser's [`MAX_DEPTH`]. The mirror of `Parser::deepen`: the two
     /// recursions run to the same depth on the same tree, so they share the

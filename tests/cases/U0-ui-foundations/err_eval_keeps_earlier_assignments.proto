@@ -1,0 +1,4 @@
+% covers: 3 - a variable assigned before an eval error survives it, and the failed assignment creates nothing; the message follows the out-of-bounds text docs/HANDBOOK.md pins for v(7), with a 1x1 array's limit of 1
+{"id":5,"op":"eval","code":"a = 7; b = a(3)"}
+{"id":6,"op":"eval","code":"disp(a)"}
+{"id":100,"op":"workspace"}

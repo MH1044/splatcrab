@@ -1,0 +1,3 @@
+{"id":"abc","ok":true,"vars":[]}
+{"id":"def","ok":true,"out":""}
+{"id":"abc","ok":true,"vars":[{"name":"s","size":[1,2],"class":"char"}]}

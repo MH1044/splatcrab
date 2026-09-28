@@ -1,12 +1,14 @@
 //! SplatCrab: a small MATLAB-compatible interpreter.
 //!
-//!   splatcrab            start the REPL
-//!   splatcrab script.m   run a script file
+//!   splatcrab              start the REPL
+//!   splatcrab script.m     run a script file
+//!   splatcrab --protocol   serve the evaluation protocol on stdin/stdout:
+//!                          one JSON request per line, one JSON response
+//!                          per line, one session (docs/modules/U0-ui-foundations.md)
 
 use std::io::{self, BufRead, Write};
 
-use splatcrab::interp;
-use splatcrab::lexer::{self, Token};
+use splatcrab::{interp, protocol, syntax};
 
 /// The interpreter recurses through the precedence chain once per nesting
 /// level, in the parser and again in the evaluator, so a deeply nested
@@ -50,6 +52,19 @@ fn console_utf8() {
 fn run() -> i32 {
     console_utf8();
     let args: Vec<String> = std::env::args().collect();
+
+    if args.get(1).is_some_and(|a| a == "--protocol") {
+        // Exits 0 at end of input whatever the requests did, and writes
+        // nothing to stderr: every failure a request can meet is an answer
+        // on stdout. Only the transport failing, a read or a write to the
+        // pipe itself, exits 1, and silently, since there is nobody left to
+        // tell on the stream that broke.
+        return match protocol::serve(io::stdin().lock(), io::stdout().lock()) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        };
+    }
+
     let mut it = interp::Interp::new();
 
     if args.len() > 1 {
@@ -98,7 +113,7 @@ fn run() -> i32 {
             break;
         }
         buf.push_str(&line);
-        if needs_more(&buf) {
+        if !syntax::is_complete(&buf) {
             continue;
         }
         if let Err(e) = it.run(&buf) {
@@ -108,7 +123,7 @@ fn run() -> i32 {
     }
     // The input ran out inside an unfinished block. Piping `for k = 1:3` and
     // `disp(k)` with no `end` used to discard the buffer in silence and exit
-    // 0 (QA D36). Nothing in the buffer is run: `needs_more` said an opener
+    // 0 (QA D36). Nothing in the buffer is run: `is_complete` said an opener
     // was still waiting, so the statements inside it were never complete.
     let mut code = 0;
     if !buf.trim().is_empty() {
@@ -133,29 +148,4 @@ fn report(it: &mut interp::Interp, e: &splatcrab::error::MError) {
     let _ = it.out.flush();
     io::stdout().flush().ok();
     eprintln!("Error: {}", e.msg);
-}
-
-/// True while the buffered input has an unclosed bracket or block, so the
-/// REPL keeps reading lines (like MATLAB's continuation for `for ... end`).
-fn needs_more(src: &str) -> bool {
-    let toks = match lexer::lex(src) {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    let mut brackets: i32 = 0;
-    let mut parens: i32 = 0;
-    let mut blocks: i32 = 0;
-    for t in &toks {
-        match t {
-            Token::LBracket => brackets += 1,
-            Token::RBracket => brackets -= 1,
-            // An `end` inside `(...)` or `{...}` is an index's, not a block's.
-            Token::LParen | Token::LBrace => parens += 1,
-            Token::RParen | Token::RBrace => parens -= 1,
-            Token::If | Token::For | Token::While => blocks += 1,
-            Token::End if parens == 0 => blocks -= 1,
-            _ => {}
-        }
-    }
-    brackets > 0 || blocks > 0
 }

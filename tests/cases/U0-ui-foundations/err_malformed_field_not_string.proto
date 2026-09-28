@@ -1,0 +1,6 @@
+% covers: 7 - a field that is present but not a string (op, code) and a missing prefix are malformed-request answers that echo the id, and the next request still succeeds
+{"id":13,"op":7}
+{"id":14,"op":"eval","code":[]}
+{"id":15,"op":"complete","code":null}
+{"id":16,"op":"completions"}
+{"id":100,"op":"eval","code":"disp(1)"}
