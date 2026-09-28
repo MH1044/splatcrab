@@ -1,0 +1,17 @@
+% covers: 5 - Origin: http://127.0.0.1:8123, and then Origin: http://localhost:8123 with Host: localhost:8123, are both accepted with 200 OK
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Origin: http://127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: localhost:8123
+Origin: http://localhost:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 41
+
+{"id":2,"op":"eval","code":"disp(x * 2)"}

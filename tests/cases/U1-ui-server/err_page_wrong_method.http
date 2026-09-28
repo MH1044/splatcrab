@@ -1,0 +1,5 @@
+% covers: 6 - POST / is 405 Method Not Allowed with Allow: GET, and no Content-Security-Policy, which only GET / carries
+POST / HTTP/1.1
+Host: 127.0.0.1:8123
+Content-Length: 0
+

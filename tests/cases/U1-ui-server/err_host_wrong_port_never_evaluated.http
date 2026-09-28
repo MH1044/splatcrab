@@ -1,0 +1,15 @@
+% covers: 4 - Host: 127.0.0.1:9999 with the right token is 403 Forbidden: the port must be the server's own, and a following valid disp(x) finds x unassigned
+POST /api HTTP/1.1
+Host: 127.0.0.1:9999
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 37
+
+{"id":2,"op":"eval","code":"disp(x)"}

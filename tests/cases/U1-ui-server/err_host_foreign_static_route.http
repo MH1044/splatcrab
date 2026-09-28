@@ -1,0 +1,4 @@
+% covers: 4 - the Host check covers every request: GET /app.js needs no token, but with Host: evil.example:8123 it is 403 Forbidden
+GET /app.js HTTP/1.1
+Host: evil.example:8123
+

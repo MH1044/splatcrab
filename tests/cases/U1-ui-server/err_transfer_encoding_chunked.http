@@ -1,0 +1,7 @@
+% covers: 8 - Transfer-Encoding: chunked on an otherwise valid POST /api is 501 Not Implemented; the head is the last thing sent, since no chunk is read
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Transfer-Encoding: chunked
+

@@ -99,14 +99,34 @@ request per line on stdin and answers each with one JSON line on stdout,
 against one session that keeps its variables between requests. The operations
 are `eval`, `complete` (is this entry finished?), `workspace` and
 `completions`; a failed evaluation or a malformed line is an answer, and the
-process exits 0 at end of input. There is no network code: the interface to
-come is a thin transport over this. `docs/modules/U0-ui-foundations.md` is
+process exits 0 at end of input. `docs/modules/U0-ui-foundations.md` is
 the full description.
 
 ```
 $ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
 {"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
 ```
+
+**The command window.** `splatcrab --ui` serves a command window in your
+browser: type an entry, press Enter, and its output appears exactly as the
+terminal would print it. Enter inserts a newline instead while a `for`, an
+`if` or a bracket is still open, Shift+Enter always does, and Up and Down
+walk the entries you have run. It prints the address it serves and opens it:
+
+```
+$ splatcrab --ui
+SplatCrab UI: http://127.0.0.1:53817/#3f9c0a5e71d24b88a06e4c19d2f7b350
+```
+
+Options: `--port N` serves on port N instead of one the system picks,
+`--no-browser` only prints the address, and `--token T` fixes the session
+token, for tests. The server listens on `127.0.0.1` alone, never on the
+network, and it runs code only for a request that carries the address's
+token (the part after `#`, which a browser never sends anywhere by itself)
+and names this server in `Host` and `Origin`, so another web page you visit
+cannot use it. Stop it with Ctrl+C. `docs/modules/U1-ui-server.md` is the
+full description; `splatcrab --http-stdio --port N --token T` answers HTTP
+requests from stdin the same way, which is how the tests pin every byte.
 
 **A quick tour.** Paste this into the REPL, or save it as a script:
 
@@ -221,6 +241,10 @@ z
 - `splatcrab --protocol`, a JSON Lines request loop over one session, with
   `eval`, `complete`, `workspace` and `completions`: the groundwork for the
   interface, with its JSON hand-written rather than taken from a crate
+- `splatcrab --ui`, a command window in the browser, served on the loopback
+  interface only behind a session token and `Host` and `Origin` checks, over
+  HTTP written from the standard library with its size limits enforced
+  before anything is buffered
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
@@ -273,7 +297,8 @@ cargo test
 All three must be green before a commit, and CI runs them on Ubuntu and
 Windows. Tests are golden files under `tests/cases/`: a `.m` script beside the
 exact output it must produce, or a `.repl` session beside the transcript the
-prompt must produce. `docs/TESTING.md` explains the format. Two rules worth
+prompt must produce, or a `.proto` or `.http` session beside the responses
+the protocol or the UI server must give. `docs/TESTING.md` explains the format. Two rules worth
 knowing up front: every feature starts as a spec in `docs/modules/`, and the
 crate takes no dependencies.
 

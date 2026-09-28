@@ -1,0 +1,4 @@
+% covers: 6 - GET /nope is 404 Not Found
+GET /nope HTTP/1.1
+Host: 127.0.0.1:8123
+

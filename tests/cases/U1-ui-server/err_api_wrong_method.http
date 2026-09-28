@@ -1,0 +1,5 @@
+% covers: 6 - GET /api, with the right token, is 405 Method Not Allowed with Allow: POST after Referrer-Policy
+GET /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+

@@ -16,6 +16,16 @@
 //! The `.out` holds one JSON response per line. A `.proto` case with no `.err`
 //! also asserts that stderr is empty, since the protocol writes nothing there.
 //!
+//! A `<name>.http` file is a case of the same kind for the UI server of cycle
+//! U1: the binary is spawned with `--http-stdio --port 8123 --token
+//! test-token`, and the file less its `% covers:` line is its stdin, HTTP
+//! requests one after another, each ending where its `Content-Length` says.
+//! Empty lines before a request line are skipped, so the LF that ends a
+//! hand-written body separates it from the next request. The `.out` holds
+//! the responses, each followed by one newline; its CRLF line ends are
+//! normalised to LF like any other output. An `.http` case with no `.err`
+//! asserts an empty stderr, as a `.proto` case does.
+//!
 //! Every case asserts an exact exit code. `.err` holds a substring that must
 //! appear on stderr; `.exit` holds the expected code when it is not the one
 //! the other files imply (1 with an `.err`, 0 without).
@@ -69,21 +79,39 @@ fn is_proto_case(p: &Path) -> bool {
     p.extension().is_some_and(|x| x == "proto")
 }
 
-/// The lines a `.repl` or `.proto` case types on stdin: the whole file except
-/// its `% covers:` marker, which documents the case rather than being typed.
+/// True when this case drives the UI server's HTTP layer: the binary is
+/// spawned with `--http-stdio` and the file is its stdin, one request after
+/// another.
+fn is_http_case(p: &Path) -> bool {
+    p.extension().is_some_and(|x| x == "http")
+}
+
+/// The port and token every `.http` case runs with, which its `Host`,
+/// `Origin` and `X-SplatCrab-Token` headers name.
+const HTTP_ARGS: [&str; 5] = ["--http-stdio", "--port", "8123", "--token", "test-token"];
+
+/// What a `.repl`, `.proto` or `.http` case types on stdin: the whole file
+/// except its `% covers:` marker, which documents the case rather than being
+/// typed. Read as bytes, so that an `.http` case can hold any.
 fn session_input(path: &Path) -> Vec<u8> {
-    let text = match fs::read_to_string(path) {
-        Ok(s) => s,
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
         Err(e) => panic!("cannot read {}: {e}", path.display()),
     };
-    match text.split_once('\n') {
-        Some((first, rest)) if first.trim_start().starts_with("% covers:") => rest.into(),
-        _ => text.into_bytes(),
+    match bytes.iter().position(|&b| b == b'\n') {
+        Some(k)
+            if String::from_utf8_lossy(&bytes[..k])
+                .trim_start()
+                .starts_with("% covers:") =>
+        {
+            bytes[k + 1..].to_vec()
+        }
+        _ => bytes,
     }
 }
 
-/// Collects case files, in a deterministic order. A `.m`, `.repl` or `.proto`
-/// file is a case when it has a sibling `.out`, or when it opens with
+/// Collects case files, in a deterministic order. A `.m`, `.repl`, `.proto`
+/// or `.http` file is a case when it has a sibling `.out`, or when it opens with
 /// `% covers:`.
 fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
     let mut entries: Vec<PathBuf> = match fs::read_dir(dir) {
@@ -96,7 +124,7 @@ fn collect_cases(dir: &Path, out: &mut Vec<PathBuf>) {
             collect_cases(&p, out);
         } else if p
             .extension()
-            .is_some_and(|x| x == "m" || x == "repl" || x == "proto")
+            .is_some_and(|x| x == "m" || x == "repl" || x == "proto" || x == "http")
             && (p.with_extension("out").exists() || declares_itself_a_case(&p))
         {
             out.push(p);
@@ -126,7 +154,7 @@ struct Outcome {
 /// output cannot fill the pipe and deadlock while we poll for exit.
 fn run_case(path: &Path) -> Outcome {
     let dir = path.parent().expect("case has a parent directory");
-    let stdin_data = if is_repl_case(path) || is_proto_case(path) {
+    let stdin_data = if is_repl_case(path) || is_proto_case(path) || is_http_case(path) {
         Some(session_input(path))
     } else {
         fs::read(path.with_extension("stdin")).ok()
@@ -135,9 +163,12 @@ fn run_case(path: &Path) -> Outcome {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_splatcrab"));
     // A REPL case takes no script argument: that argument is what makes the
     // binary run a file instead of reading the prompt. A protocol case takes
-    // the flag that selects the protocol instead of the file.
+    // the flag that selects the protocol instead of the file, and an HTTP
+    // case the stdio mode of the UI server with its fixed port and token.
     if is_proto_case(path) {
         cmd.arg("--protocol");
+    } else if is_http_case(path) {
+        cmd.args(HTTP_ARGS);
     } else if !is_repl_case(path) {
         cmd.arg(path);
     }
@@ -303,10 +334,11 @@ fn check_case(m: &Path, update: bool) -> Result<(), String> {
                 r.stderr.trim_end()
             ));
         }
-    } else if is_proto_case(m) && !r.stderr.is_empty() {
+    } else if (is_proto_case(m) || is_http_case(m)) && !r.stderr.is_empty() {
         // The protocol answers every failure on stdout and writes nothing
-        // at all to stderr (the U0 spec), so a protocol case with no `.err`
-        // asserts silence there, not merely "whatever stderr held".
+        // at all to stderr (the U0 spec), and so does its HTTP transport
+        // (U1), so such a case with no `.err` asserts silence there, not
+        // merely "whatever stderr held".
         problems.push(format!(
             "a protocol case must write nothing to stderr; stderr was:\n{}",
             r.stderr.trim_end()

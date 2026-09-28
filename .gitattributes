@@ -6,6 +6,8 @@
 *.exit text eol=lf
 *.repl text eol=lf
 *.proto text eol=lf
+*.http text eol=lf
 *.md   text eol=lf
 *.yml  text eol=lf
 *.toml text eol=lf
+src/ui/* text eol=lf

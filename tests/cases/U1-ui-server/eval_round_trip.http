@@ -1,0 +1,8 @@
+% covers: 1 - POST /api runs one U0 eval and answers 200 OK with the U0 response line, less its newline, as an application/json body, and every header in the spec's order
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}

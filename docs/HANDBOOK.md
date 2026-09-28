@@ -133,6 +133,82 @@ in `docs/modules/U0-ui-foundations.md`. The handbook check runs only
 `tests/cases/U0-ui-foundations/handbook_protocol_example`, which sends these
 six requests and expects these six lines.
 
+**The command window in a browser.** `splatcrab --ui` serves a command
+window on your own machine and prints the one line you need:
+
+```text
+SplatCrab UI: http://127.0.0.1:52817/#3f9c0a71d2e84b6c95a0f1e7c4d8b263
+```
+
+It also opens that address in your default browser, unless you pass
+`--no-browser`; `--port N` picks the port instead of letting the system
+choose one. The page is an input with a transcript above it: Enter runs the
+entry when it is complete and adds a line when it is not, Up and Down walk
+the page's history, and each entry's output is shown exactly as the terminal
+would print it. The server runs until you stop it with Ctrl+C.
+
+The part after `#` is the session token, fresh on every run. The page reads
+it from the address and sends it back with every request; nothing without it
+is ever run. The server listens on the loopback address `127.0.0.1` only,
+so no other machine can reach it, and because any web page you visit could
+still send requests to a local port, every request must name this server in
+its `Host` header and, when it sends an `Origin`, there too; a request to run
+code must also carry the token. Anything else is refused `403 Forbidden`
+before the interpreter sees it. The page, its script and its stylesheet need
+no token: they hold nothing secret.
+
+Under the page, the server speaks the evaluation protocol over HTTP: each
+request is one `POST /api` whose body is one protocol request and whose
+answer is the protocol's response line. These two requests, to a server
+started on port 8123 with the token `test-token` (the first carries it, the
+second does not):
+
+```text
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Content-Type: application/json
+Content-Length: 35
+
+{"id":2,"op":"eval","code":"y = 4"}
+```
+
+get these two responses, whose lines end in CRLF on the wire:
+
+```text
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 44
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
+HTTP/1.1 403 Forbidden
+Content-Type: text/plain; charset=utf-8
+Content-Length: 13
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+403 Forbidden
+```
+
+The routes, statuses, headers and limits are specified in
+`docs/modules/U1-ui-server.md`. `splatcrab --http-stdio --port N --token T`
+answers requests read from stdin the same way, with no socket, so this
+example is pinned by the golden case
+`tests/cases/U1-ui-server/handbook_http_example`, which sends these bytes and
+expects these.
+
 ## The language
 
 ### Numbers

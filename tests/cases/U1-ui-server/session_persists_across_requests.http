@@ -1,0 +1,15 @@
+% covers: 2 - two POST /api requests share one session: the second prints the x the first assigned
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 41
+
+{"id":2,"op":"eval","code":"disp(x * 2)"}

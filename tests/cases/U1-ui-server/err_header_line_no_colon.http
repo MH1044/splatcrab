@@ -1,0 +1,5 @@
+% covers: 8 - a header line with no colon is a malformed request, 400 Bad Request
+GET / HTTP/1.1
+Host: 127.0.0.1:8123
+NoColonHere
+

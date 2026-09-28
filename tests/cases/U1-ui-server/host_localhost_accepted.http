@@ -1,0 +1,8 @@
+% covers: 4 - Host: localhost:8123 is accepted as 127.0.0.1:8123 is, and the eval answers 200 OK
+POST /api HTTP/1.1
+Host: localhost:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}

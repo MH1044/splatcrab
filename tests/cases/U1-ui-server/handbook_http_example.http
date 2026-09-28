@@ -1,0 +1,14 @@
+% covers: Scope: splatcrab --http-stdio - the HTTP example in docs/HANDBOOK.md, byte for byte: an eval through POST /api answered 200 OK with the U0 response as its body, then the same kind of request without the token refused 403 Forbidden
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Content-Type: application/json
+Content-Length: 35
+
+{"id":2,"op":"eval","code":"y = 4"}

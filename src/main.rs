@@ -5,10 +5,21 @@
 //!   splatcrab --protocol   serve the evaluation protocol on stdin/stdout:
 //!                          one JSON request per line, one JSON response
 //!                          per line, one session (docs/modules/U0-ui-foundations.md)
+//!   splatcrab --ui [--port N] [--no-browser] [--token T]
+//!                          serve the command window on 127.0.0.1 only, on
+//!                          port N or one the system picks, print its URL
+//!                          and open it in the browser unless --no-browser;
+//!                          --token fixes the session token, for tests
+//!   splatcrab --http-stdio --port N --token T
+//!                          answer HTTP requests read from stdin as --ui
+//!                          answers them on port N with token T, one after
+//!                          another, each response followed by a newline
+//!                          (docs/modules/U1-ui-server.md)
 
 use std::io::{self, BufRead, Write};
 
-use splatcrab::{interp, protocol, syntax};
+use splatcrab::error::{self, MError};
+use splatcrab::{http, interp, protocol, server, syntax};
 
 /// The interpreter recurses through the precedence chain once per nesting
 /// level, in the parser and again in the evaluator, so a deeply nested
@@ -62,6 +73,16 @@ fn run() -> i32 {
         return match protocol::serve(io::stdin().lock(), io::stdout().lock()) {
             Ok(()) => 0,
             Err(_) => 1,
+        };
+    }
+    if let Some(mode) = args.get(1).filter(|a| *a == "--ui" || *a == "--http-stdio") {
+        return match ui_options(mode, &args[2..]) {
+            Ok(opts) if mode == "--ui" => ui(opts),
+            Ok(opts) => http_stdio(opts),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                1
+            }
         };
     }
 
@@ -132,6 +153,102 @@ fn run() -> i32 {
     }
     let _ = it.out.flush();
     code
+}
+
+/// The options of `--ui` and `--http-stdio`.
+struct UiOptions {
+    port: Option<u16>,
+    token: Option<String>,
+    browser: bool,
+}
+
+/// Parses the arguments after `--ui` or `--http-stdio`. `--http-stdio`
+/// needs both `--port` and `--token`, since there is no socket to pick a
+/// port and nobody to read a generated token; `--no-browser` is `--ui`'s.
+fn ui_options(mode: &str, rest: &[String]) -> Result<UiOptions, MError> {
+    let mut opts = UiOptions {
+        port: None,
+        token: None,
+        browser: true,
+    };
+    let mut rest = rest.iter();
+    while let Some(opt) = rest.next() {
+        match opt.as_str() {
+            "--port" => {
+                let text = rest.next().ok_or_else(|| error::option_needs_value(opt))?;
+                opts.port = Some(text.parse().map_err(|_| error::bad_port(text))?);
+            }
+            "--token" => {
+                let text = rest.next().ok_or_else(|| error::option_needs_value(opt))?;
+                // It travels in a URL fragment and a header, and on
+                // Windows through `cmd /C start`, which would read `&`,
+                // `|`, `^`, `<`, `>` and `%` as its own syntax: so only
+                // characters that mean nothing to any of the three.
+                if text.is_empty()
+                    || !text
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._~-".contains(&b))
+                {
+                    return Err(error::bad_token());
+                }
+                opts.token = Some(text.clone());
+            }
+            "--no-browser" if mode == "--ui" => opts.browser = false,
+            _ => return Err(error::unknown_option(mode, opt)),
+        }
+    }
+    if mode == "--http-stdio" {
+        if opts.port.is_none() {
+            return Err(error::missing_option(mode, "--port"));
+        }
+        if opts.token.is_none() {
+            return Err(error::missing_option(mode, "--token"));
+        }
+    }
+    Ok(opts)
+}
+
+/// `splatcrab --ui`: binds, prints the URL, opens it, and serves until
+/// killed. It returns only when binding fails.
+fn ui(opts: UiOptions) -> i32 {
+    let wanted = opts.port.unwrap_or(0);
+    let listener = match server::bind(wanted) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Error: {}", error::cannot_listen(wanted, &e));
+            return 1;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            eprintln!("Error: {}", error::cannot_listen(wanted, &e));
+            return 1;
+        }
+    };
+    let token = opts.token.unwrap_or_else(server::new_token);
+    let url = server::url(port, &token);
+    println!("SplatCrab UI: {}", url);
+    io::stdout().flush().ok();
+    if opts.browser {
+        server::open_browser(&url);
+    }
+    let cfg = http::Config { port, token };
+    let mut it = interp::Interp::with_output(Box::new(io::sink()));
+    server::serve(&listener, &mut it, &cfg)
+}
+
+/// `splatcrab --http-stdio`: exits 0 at end of input whatever the requests
+/// were, and 1, silently as `--protocol` does, only if stdin or stdout fails.
+fn http_stdio(opts: UiOptions) -> i32 {
+    let cfg = http::Config {
+        port: opts.port.unwrap_or_default(),
+        token: opts.token.unwrap_or_default(),
+    };
+    match http::serve_stdio(io::stdin().lock(), io::stdout().lock(), &cfg) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 /// Prints a REPL diagnostic.

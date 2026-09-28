@@ -1,0 +1,3 @@
+% covers: 8 - a request line that is not HTTP, hello, is 400 Bad Request
+hello
+

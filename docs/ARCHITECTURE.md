@@ -16,15 +16,24 @@
                    ├──► interp.rs           eval, output captured
                    ├──► syntax.rs           complete: is the entry finished?
                    └──► env.rs              completions: variables + builtins
+
+ browser ──► server.rs ──► http.rs ──► protocol::respond
+ 127.0.0.1   accept, read   limits, Host, Origin, token, routes
+ only        one request,   │
+             write, close   └──► src/ui/    index.html, app.js, app.css,
+                                            embedded with include_str!
+ stdin ────► http::serve_stdio (--http-stdio): the same http::handle, no socket
 ```
 
-`src/lib.rs` exposes the ten modules: the six of the language (`lexer`,
-`parser`, `interp`, `value`, `builtins`, `error`) and the four of the
+`src/lib.rs` exposes the twelve modules: the six of the language (`lexer`,
+`parser`, `interp`, `value`, `builtins`, `error`), the four of the
 evaluation protocol that cycle U0 added (`json`, `syntax`, `env`,
-`protocol`). `src/main.rs` is the CLI and REPL and is the only file allowed to
-use `print!`. It runs everything, `--protocol` included, on a thread with a
-256 MB stack, because Windows gives the main thread 1 MB and the parser and
-the evaluator each recurse once per nesting level.
+`protocol`) and the two of the UI server that cycle U1 added (`http`,
+`server`). `src/ui/` holds the page's three files, which `http.rs` embeds.
+`src/main.rs` is the CLI and REPL and is the only file allowed to use
+`print!`. It runs everything, `--protocol` and `--ui` included, on a thread
+with a 256 MB stack, because Windows gives the main thread 1 MB and the
+parser and the evaluator each recurse once per nesting level.
 
 ## The modules
 
@@ -151,6 +160,29 @@ interpreter is built over a sink otherwise, so nothing but responses reaches
 the writer. A failed evaluation and a malformed request are both answers;
 the loop ends only at end of input. The message texts live in `error.rs`.
 
+**`http.rs`** is the UI server's HTTP, as a pure function:
+`handle(request_bytes, &mut Interp, &Config) -> Vec<u8>`, with `Config`
+holding the port and the token. It parses the head (request line, headers
+with case-insensitive names, CRLF or bare LF), refuses what it must with
+`400`, `403`, `404`, `405`, `413`, `415`, `431` or `501`, serves the three
+embedded files, and hands the body of a `POST /api` that passed every check
+to `protocol::respond`. Responses are built in one place, so the header
+order and a `Content-Length` equal to the body's length hold for all of
+them; the status texts are a table in `error.rs`. `read_request` frames one
+request off any `BufRead` under the head and body caps, shared by the socket
+and by `serve_stdio`, the `--http-stdio` loop the golden cases drive.
+
+**`server.rs`** is the socket around it: `bind` to `127.0.0.1`, the session
+token, the browser launch, and `serve`, which accepts one connection at a
+time on the interpreter thread, reads one request under a 10-second deadline
+for the whole of it, so a client trickling a byte at a time cannot hold the
+server, writes the answer and closes. It holds no policy: every check is in
+`http.rs`, where a unit test can reach it.
+
+**`src/ui/`** is the page: `index.html`, `app.js` and `app.css`, a command
+window with no framework and no external resource, embedded with
+`include_str!` so the binary is the whole program.
+
 **`main.rs`** is the CLI. On Windows it first switches the console's output
 code page to UTF-8 with `SetConsoleOutputCP(65001)`, declared as a raw
 `extern "system"` function under `#[cfg(windows)]`, because the crate takes no
@@ -182,7 +214,10 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    `parser::MAX_DEPTH` is for: the parser and the evaluator both recurse once
    per nesting level, and recursion bounded only by the stack cannot return a
    value when it runs out. The JSON parser of the protocol recurses on its
-   input too, and has its own, smaller bound, `json::MAX_DEPTH`. Anything
+   input too, and has its own, smaller bound, `json::MAX_DEPTH`. The UI
+   server reads a request under two caps, `http::MAX_HEAD` (16 KiB) and
+   `http::MAX_BODY` (8 MiB), judged before the bytes are buffered, so no
+   client can make it allocate without bound. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
    the recipe below.
@@ -308,6 +343,32 @@ operation's own keys, `error` last. Output is captured by swapping
 is an answer and the process exits 0 at end of input. Cycle U1 puts a socket
 in front of `serve` and reuses `json.rs`; the Design notes of
 `docs/modules/U0-ui-foundations.md` have the details.
+
+**UI server (cycle U1, in place).** An endpoint that runs code on a loopback
+port can be reached by any web page the user visits, so the security model
+is the design, and every part of it is in `http.rs` except the binding:
+
+- `server::bind` binds `127.0.0.1` only, never a wildcard address.
+- A fresh 128-bit token per run travels in the URL's fragment, which a
+  browser never sends to a server or puts in a `Referer`, and comes back in
+  the `X-SplatCrab-Token` header on every `/api` call, compared in constant
+  time. A custom header makes a cross-origin request need a CORS preflight,
+  which this server never approves, and the token makes a guess useless.
+- Every request's `Host` must be `127.0.0.1:<port>` or `localhost:<port>`,
+  which defeats DNS rebinding, and an `Origin`, when present, must be this
+  server's own. A refusal is `403`.
+- The head is capped at 16 KiB and the body at 8 MiB, both judged before
+  buffering.
+- A refused request never reaches the interpreter: only the last arm of
+  `handle` calls `protocol::respond`, after every check has passed.
+- The page's `Content-Security-Policy: default-src 'self'; frame-ancestors
+  'none'` forbids inline script, anything from another origin, and framing.
+
+HTTP stays minimal: `Connection: close` on every response, no keep-alive, no
+chunked bodies, no `Expect: 100-continue`. The same `handle` is driven from
+stdin by `--http-stdio`, so the golden cases pin every byte without a socket,
+and `tests/ui_server.rs` covers the socket itself. The Design notes of
+`docs/modules/U1-ui-server.md` have the details.
 
 **Frames (cycle 05).** A stack of `Frame { vars, end_stack, unit, func_name }`
 with `frames[0]` as the base workspace, never popped. Moving `end_stack` into

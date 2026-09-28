@@ -1,0 +1,18 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 44
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 35
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":2,"ok":true,"out":"     6\n"}

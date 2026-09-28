@@ -237,12 +237,37 @@ implements the ones MATLAB code actually uses. Cases are in
 | JSON escaping | U0 | `escape_quote_and_backslash`, `escape_tab`, `raw_utf8_times` | `\"`, `\\`, `\n`, `\r`, `\t`, `\u00xx` for any other control character, raw UTF-8 for everything else, `×` included |
 | Nesting is bounded | U0 | `err_deep_nesting` | `src/json.rs` refuses arrays or objects nested past 128 levels, so 100,000 `[` are a malformed request, not a stack overflow |
 
+## UI server
+
+`splatcrab --ui`, the command window in the browser (cycle U1). Cases in
+`tests/cases/U1-ui-server/`, each an `.http` session run with port 8123 and
+token `test-token`; the real socket is `tests/ui_server.rs`, and every
+status, header and limit is also a unit test in `src/http.rs`.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `splatcrab --ui` | U1 | `tests/ui_server.rs` | Binds `127.0.0.1` only, on `--port N` or a port the system picks; prints `SplatCrab UI: http://127.0.0.1:<port>/#<token>`, flushes it, and opens it with `cmd /c start`, `open` or `xdg-open` unless `--no-browser`, ignoring a failure. One connection at a time on the interpreter thread; a request not received within 10 seconds of the connection, or a response not taken within 10 seconds, closes the connection, however slowly the bytes trickle, and no client can end the server |
+| The session token | U1 | `err_token_missing_never_evaluated`, `err_token_wrong_never_evaluated` | 128 bits, 32 lower-case hex digits, from `RandomState` mixed with the time and the process id; `--token T` fixes it. It rides in the URL fragment and comes back in `X-SplatCrab-Token`, compared in constant time; without it `/api` is `403` |
+| `Host` must name this server | U1 | `err_host_foreign_never_evaluated`, `err_host_wrong_port_never_evaluated`, `host_localhost_accepted`, `err_host_foreign_static_route` | `127.0.0.1:<port>` or `localhost:<port>` on every request, static routes included, against DNS rebinding; anything else, or none, is `403` |
+| `Origin`, when sent, must be this server | U1 | `err_origin_foreign_never_evaluated`, `err_origin_wrong_port_never_evaluated`, `err_origin_null_never_evaluated`, `origin_loopback_accepted` | `http://127.0.0.1:<port>` or `http://localhost:<port>`; `null` and every other origin are `403` |
+| A refused request never reaches the interpreter | U1 | the `*_never_evaluated` cases | Each follows a refusal with a valid request showing the refused code never ran |
+| `POST /api` | U1 | `eval_round_trip`, `session_persists_across_requests`, `malformed_protocol_body_answered` | The body is one U0 request and the answer is `protocol::respond`'s JSON less its newline, as `application/json`; the session persists across requests, and a malformed body is a `200` carrying the protocol's own refusal |
+| Routes and methods | U1 | `err_not_found`, `err_api_wrong_method`, `err_page_wrong_method`, `err_api_wrong_content_type_never_evaluated` | `GET /`, `/app.js`, `/app.css` and `POST /api`; anything else `404`, the wrong method `405` with `Allow`, `/api` without `application/json` `415` |
+| Malformed HTTP | U1 | `err_request_line_not_http`, `err_header_line_no_colon`, `err_content_length_not_a_number`, `err_transfer_encoding_chunked` | `400` for a bad request line, header or `Content-Length`; `501` for any `Transfer-Encoding` |
+| Size limits before buffering | U1 | `err_body_too_large`, `err_headers_too_large`, `err_header_line_too_large`, `err_request_line_too_large` | A head past 16 KiB is `431` after reading one byte more than the cap; a `Content-Length` past 8 MiB is `413` without reading the body |
+| Header names in any case, CRLF or LF | U1 | `header_names_any_case` | Values are trimmed of spaces and tabs |
+| Deterministic responses | U1 | every `U1-ui-server` case | Status line, `Content-Type`, `Content-Length`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, the CSP on `GET /` only, `Allow` on a `405` only, `Connection: close`; no `Date`, no `Server`. An error's body is its status text, such as `403 Forbidden` |
+| `splatcrab --http-stdio --port N --token T` | U1 | every `U1-ui-server` case | Requests from stdin one after another, empty lines before a request line skipped, each response followed by one `\n`; exits 0 at end of input and writes nothing to stderr |
+| The command window | U1 | checked by hand; `src/http.rs` unit tests | A transcript of entries, each its input then its exact output in a monospaced block, an error set apart; Enter runs an entry when `complete` says it is finished and inserts a newline otherwise; Up and Down walk the history; light and dark follow the system. No inline script or style, under `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` |
+
 ## Tooling
 
 | Feature | Since | Notes |
 |---|---|---|
 | REPL with block and bracket continuation | 00 | `exit` and `quit` leave. Since U0 the continuation test is `syntax::is_complete`, shared with the protocol's `complete` |
 | `.proto` golden cases | U0 | `tests/golden.rs` spawns the binary with `--protocol` and types the case on stdin |
+| `.http` golden cases | U1 | `tests/golden.rs` spawns the binary with `--http-stdio --port 8123 --token test-token` and pipes the case on stdin; an `.http` case with no `.err` asserts an empty stderr |
+| The UI server over a real socket | U1 | `tests/ui_server.rs` spawns `--ui --port 0 --no-browser --token itest` and talks to it over `TcpStream`, killing it in a `Drop` guard; it also checks the refusals of bad `--ui` and `--http-stdio` options |
 | Script runner, exit code 1 on error | 00 | stdout is flushed before the error |
 | The Windows console reads output as UTF-8 | 02 | `SetConsoleOutputCP(65001)`, a raw `extern "system"` declaration in `src/main.rs` rather than a crate, so `×` and non-ASCII text render. A pipe or a file is unaffected |
 | Golden-file test harness | 00 | `tests/golden.rs`, no dependencies |

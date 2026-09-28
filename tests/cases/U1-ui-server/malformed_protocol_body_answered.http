@@ -1,0 +1,8 @@
+% covers: 10 - a well-formed POST /api whose body is not json is 200 OK carrying U0's malformed-request answer: HTTP succeeded, and the protocol answered
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 8
+
+not json

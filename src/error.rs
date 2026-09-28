@@ -606,6 +606,66 @@ pub fn unknown_operation(op: &str) -> MError {
     MError::new(format!("Unknown operation '{}'.", op))
 }
 
+// ---- UI server -------------------------------------------------------
+
+/// The status line text of every status `http.rs` can answer, which is also
+/// the whole body of an error response (docs/modules/U1-ui-server.md): the
+/// code, a space and the reason phrase of RFC 9110, `413 Content Too Large`
+/// included rather than the older `Payload Too Large`.
+pub const HTTP_STATUS: [(u16, &str); 9] = [
+    (200, "200 OK"),
+    (400, "400 Bad Request"),
+    (403, "403 Forbidden"),
+    (404, "404 Not Found"),
+    (405, "405 Method Not Allowed"),
+    (413, "413 Content Too Large"),
+    (415, "415 Unsupported Media Type"),
+    (431, "431 Request Header Fields Too Large"),
+    (501, "501 Not Implemented"),
+];
+
+/// `HTTP_STATUS`'s text for `code`. Every code `http.rs` uses is in the
+/// table, which a unit test there checks, so the fallback is never written.
+pub fn http_status(code: u16) -> &'static str {
+    HTTP_STATUS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map_or("500 Internal Server Error", |(_, text)| text)
+}
+
+// The command-line options of `--ui` and `--http-stdio`, which `main.rs`
+// reports as `Error: <msg>` on stderr before exiting 1.
+
+/// `--port` or `--token` as the last argument, with nothing after it.
+pub fn option_needs_value(opt: &str) -> MError {
+    MError::new(format!("Option '{}' needs a value.", opt))
+}
+
+pub fn bad_port(text: &str) -> MError {
+    MError::new(format!(
+        "Option '--port' needs a port number from 0 to 65535, not '{}'.",
+        text
+    ))
+}
+
+/// A token that could not travel in a URL fragment and a header unchanged.
+pub fn bad_token() -> MError {
+    MError::new("Option '--token' needs letters, digits, '.', '_', '~' or '-' only.")
+}
+
+pub fn unknown_option(mode: &str, opt: &str) -> MError {
+    MError::new(format!("Unknown option '{}' for {}.", opt, mode))
+}
+
+pub fn missing_option(mode: &str, opt: &str) -> MError {
+    MError::new(format!("{} needs the option '{}'.", mode, opt))
+}
+
+/// Binding the loopback port failed, most often because it is in use.
+pub fn cannot_listen(port: u16, e: &std::io::Error) -> MError {
+    MError::new(format!("Cannot listen on 127.0.0.1:{}: {}", port, e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,7 +719,7 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 12] = [
+        const FILES: [(&str, &str); 14] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
@@ -668,6 +728,8 @@ mod tests {
             ("syntax.rs", include_str!("syntax.rs")),
             ("env.rs", include_str!("env.rs")),
             ("protocol.rs", include_str!("protocol.rs")),
+            ("http.rs", include_str!("http.rs")),
+            ("server.rs", include_str!("server.rs")),
             ("builtins/args.rs", include_str!("builtins/args.rs")),
             ("builtins/core.rs", include_str!("builtins/core.rs")),
             ("builtins/math.rs", include_str!("builtins/math.rs")),

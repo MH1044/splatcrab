@@ -1,0 +1,7 @@
+% covers: 9 - Content-Length: 9000000, past the 8 MiB limit, is 413 Content Too Large, answered from the head alone: no body bytes are sent
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 9000000
+
