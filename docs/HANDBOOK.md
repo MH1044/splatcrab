@@ -3236,9 +3236,8 @@ y = x + ;
 Error: Line 2: unexpected ';' in expression
 ```
 
-The line and position are right, but the token is named by its internal
-token's own spelling, `';'`, which is what it does now. It used to print the
-internal `Debug` name, `Semi`.
+The line is right, and the token is named as it is written, `';'`. It used to
+print the internal `Debug` name, `Semi`.
 
 ### Exit codes
 
