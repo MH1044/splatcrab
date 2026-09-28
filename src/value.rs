@@ -1031,7 +1031,7 @@ impl Matrix {
     ///
     /// The test is `<=` rather than `<` so that the all-zero matrix, whose
     /// norm and tolerance are both `0`, is still singular.
-    fn singular_tol(&self) -> f64 {
+    pub(crate) fn singular_tol(&self) -> f64 {
         let norm = self
             .data
             .iter()
@@ -1040,118 +1040,55 @@ impl Matrix {
         f64::EPSILON * self.rows.max(1) as f64 * norm
     }
 
-    /// Solve A * X = B for square A (Gaussian elimination with partial pivoting).
-    // Elimination is written with explicit indices on purpose; cycle 08 replaces
-    // solve and det with a shared LU factorisation.
-    #[allow(clippy::needless_range_loop)]
-    pub fn solve(&self, b: &Matrix) -> R<Matrix> {
-        let n = self.rows;
-        if self.rows != self.cols {
-            bail!(error::nonsquare_system());
-        }
-        if b.rows != n {
+    /// `A \ B`: the solution of `A * X = B`, and the warning to give with it.
+    ///
+    /// A square `A` goes through the shared LU (`builtins::factor::lu`),
+    /// which is the elimination `det` makes, so the two agree on what
+    /// singular means: when a pivot is at or below [`singular_tol`] the
+    /// answer comes with "Matrix is singular to working precision." and is
+    /// whatever the substitution gives, `Inf` or `NaN` for an exactly
+    /// singular matrix, as MATLAB's does (an error before cycle 08).
+    /// Any other `A` is solved in the least-squares sense by the
+    /// column-pivoted QR, with a rank-deficiency warning when its numerical
+    /// rank is below the smaller dimension.
+    ///
+    /// [`singular_tol`]: Matrix::singular_tol
+    pub fn solve(&self, b: &Matrix) -> R<(Matrix, Option<String>)> {
+        use crate::builtins::factor;
+        if b.rows != self.rows {
             bail!(error::solve_dims(self.rows, self.cols, b.rows, b.cols));
         }
-        let tol = self.singular_tol();
-        let m = b.cols;
-        let mut a: Vec<Vec<f64>> = (0..n)
-            .map(|i| (0..n).map(|j| self.get(i, j)).collect())
-            .collect();
-        let mut x: Vec<Vec<f64>> = (0..n)
-            .map(|i| (0..m).map(|j| b.get(i, j)).collect())
-            .collect();
-        for k in 0..n {
-            let p = (k..n)
-                .max_by(|&i, &j| {
-                    a[i][k]
-                        .abs()
-                        .partial_cmp(&a[j][k].abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
-            if a[p][k].abs() <= tol {
-                bail!(error::singular());
-            }
-            a.swap(k, p);
-            x.swap(k, p);
-            for i in k + 1..n {
-                let f = a[i][k] / a[k][k];
-                if f == 0.0 {
-                    continue;
-                }
-                for j in k..n {
-                    a[i][j] -= f * a[k][j];
-                }
-                for j in 0..m {
-                    x[i][j] -= f * x[k][j];
-                }
-            }
+        if self.rows == self.cols {
+            let f = factor::lu(self);
+            let x = f.solve(b)?;
+            Ok((x, f.singular.then(error::singular_warning)))
+        } else {
+            let (x, rank) = factor::lstsq(self, b)?;
+            let full = self.rows.min(self.cols);
+            Ok((
+                x,
+                (rank < full).then(|| error::rank_deficient_warning(rank)),
+            ))
         }
-        for k in (0..n).rev() {
-            for j in 0..m {
-                let mut s = x[k][j];
-                for i in k + 1..n {
-                    s -= a[k][i] * x[i][j];
-                }
-                x[k][j] = s / a[k][k];
-            }
-        }
-        let mut out = Matrix::filled(n, m, 0.0);
-        for i in 0..n {
-            for j in 0..m {
-                out.set(i, j, x[i][j]);
-            }
-        }
-        Ok(out)
     }
 
-    pub fn inv(&self) -> R<Matrix> {
+    /// `inv(A)` and the warning to give with it: `Inf` everywhere for an
+    /// exactly singular matrix, the computed inverse otherwise, and the
+    /// singular warning whenever `solve` would give it (QA D26).
+    pub fn inv(&self) -> R<(Matrix, Option<String>)> {
         if self.rows != self.cols {
             bail!(error::nonsquare_inverse());
         }
-        self.solve(&Matrix::identity(self.rows, self.rows))
+        let f = crate::builtins::factor::lu(self);
+        Ok((f.inverse()?, f.singular.then(error::singular_warning)))
     }
 
-    // Elimination is written with explicit indices on purpose; cycle 08 replaces
-    // solve and det with a shared LU factorisation.
-    #[allow(clippy::needless_range_loop)]
+    /// The determinant from the shared LU: exactly `0` where `solve` warns.
     pub fn det(&self) -> R<f64> {
         if self.rows != self.cols {
             bail!(error::nonsquare_determinant());
         }
-        let n = self.rows;
-        let tol = self.singular_tol();
-        let mut a: Vec<Vec<f64>> = (0..n)
-            .map(|i| (0..n).map(|j| self.get(i, j)).collect())
-            .collect();
-        let mut det = 1.0;
-        for k in 0..n {
-            let p = (k..n)
-                .max_by(|&i, &j| {
-                    a[i][k]
-                        .abs()
-                        .partial_cmp(&a[j][k].abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .unwrap();
-            // The same test `solve` makes, so the two agree on what singular
-            // means: `det` reports `0` where `solve` refuses to divide.
-            if a[p][k].abs() <= tol {
-                return Ok(0.0);
-            }
-            if p != k {
-                a.swap(k, p);
-                det = -det;
-            }
-            det *= a[k][k];
-            for i in k + 1..n {
-                let f = a[i][k] / a[k][k];
-                for j in k..n {
-                    a[i][j] -= f * a[k][j];
-                }
-            }
-        }
-        Ok(det)
+        Ok(crate::builtins::factor::lu(self).det())
     }
 
     /// One rendered cell per element, column-major like `data`, the column
@@ -1642,7 +1579,7 @@ mod tests {
     fn solve_two_by_two() {
         let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
         let b = Matrix::col(vec![3.0, 5.0]);
-        let x = a.solve(&b).unwrap();
+        let x = solved(&a, &b);
         assert_eq!((x.rows, x.cols), (2, 1));
         close(x.get(0, 0), 0.8);
         close(x.get(1, 0), 1.4);
@@ -1652,7 +1589,7 @@ mod tests {
     fn solve_multiple_right_hand_sides() {
         let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
         let b = rmat(2, 2, &[3.0, 1.0, 5.0, 0.0]);
-        let x = a.solve(&b).unwrap();
+        let x = solved(&a, &b);
         assert_eq!((x.rows, x.cols), (2, 2));
         close(x.get(0, 0), 0.8);
         close(x.get(1, 0), 1.4);
@@ -1666,12 +1603,12 @@ mod tests {
     fn solve_uses_partial_pivoting() {
         // A zero in the leading pivot position needs a row swap.
         let a = rmat(2, 2, &[0.0, 1.0, 1.0, 0.0]);
-        let x = a.solve(&Matrix::col(vec![1.0, 2.0])).unwrap();
+        let x = solved(&a, &Matrix::col(vec![1.0, 2.0]));
         close(x.get(0, 0), 2.0);
         close(x.get(1, 0), 1.0);
 
         let a3 = rmat(3, 3, &[0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 0.0]);
-        let x3 = a3.solve(&Matrix::col(vec![1.0, 2.0, 3.0])).unwrap();
+        let x3 = solved(&a3, &Matrix::col(vec![1.0, 2.0, 3.0]));
         close(x3.get(0, 0), 1.0);
         close(x3.get(1, 0), 1.0);
         close(x3.get(2, 0), 1.0);
@@ -1687,7 +1624,7 @@ mod tests {
         }
         let want = Matrix::filled(4, 1, 1.0);
         let b = h.matmul(&want).unwrap();
-        let x = h.solve(&b).unwrap();
+        let x = solved(&h, &b);
         assert_eq!((x.rows, x.cols), (4, 1));
         for v in &x.data {
             close_tol(*v, 1.0, 1e-8);
@@ -1700,34 +1637,37 @@ mod tests {
     #[test]
     fn solve_scales_its_pivot_tolerance_with_the_matrix() {
         let tiny = rmat(2, 2, &[1e-15, 0.0, 0.0, 1e-15]);
-        let x = tiny.solve(&Matrix::col(vec![1.0, 1.0])).unwrap();
+        let x = solved(&tiny, &Matrix::col(vec![1.0, 1.0]));
         close_tol(x.get(0, 0), 1e15, 1e-12);
         close_tol(x.get(1, 0), 1e15, 1e-12);
         // The same system scaled up and down is solved just as well.
         for scale in [1e-300, 1e-30, 1.0, 1e30, 1e150] {
             let a = rmat(2, 2, &[scale, 0.0, 0.0, scale]);
-            let x = a.solve(&Matrix::col(vec![scale, 2.0 * scale])).unwrap();
+            let x = solved(&a, &Matrix::col(vec![scale, 2.0 * scale]));
             close(x.get(0, 0), 1.0);
             close(x.get(1, 0), 2.0);
         }
         // Scale alone never decides: a matrix that is singular stays singular
-        // however small its entries are.
+        // however small its entries are. Since cycle 08 that is a warning
+        // with a result, not an error.
         let singular = rmat(2, 2, &[1e-15, 2e-15, 2e-15, 4e-15]);
-        assert!(
-            singular
-                .solve(&Matrix::col(vec![1.0, 2.0]))
-                .unwrap_err()
-                .msg
-                .contains("singular")
-        );
+        let (_, w) = singular.solve(&Matrix::col(vec![1.0, 2.0])).unwrap();
+        assert!(w.unwrap().contains("singular"));
         // An all-zero matrix has a zero norm and so a zero tolerance, which
         // is why the test is `<=` and not `<`.
         let zeros = Matrix::filled(2, 2, 0.0);
-        assert!(zeros.solve(&Matrix::col(vec![1.0, 1.0])).is_err());
+        assert!(
+            zeros
+                .solve(&Matrix::col(vec![1.0, 1.0]))
+                .unwrap()
+                .1
+                .is_some()
+        );
     }
 
     /// `det` and `solve` make the same test, which is what "agree on what
-    /// singular means" is: `det` reports `0` exactly where `solve` refuses.
+    /// singular means" is: `det` reports `0` exactly where `solve` warns
+    /// (where it refused before cycle 08), because both read the one LU.
     #[test]
     fn det_and_solve_agree_on_singular() {
         let cases = [
@@ -1740,7 +1680,7 @@ mod tests {
         for a in cases {
             let rhs = Matrix::col(vec![1.0, 1.0]);
             let singular_to_det = a.det().unwrap() == 0.0;
-            let singular_to_solve = a.solve(&rhs).is_err();
+            let singular_to_solve = a.solve(&rhs).unwrap().1.is_some();
             assert_eq!(singular_to_det, singular_to_solve, "{:?}", a.data);
         }
         // The scaled diagonal has a real determinant now, rather than being
@@ -1766,21 +1706,40 @@ mod tests {
         // tolerance, so the second row is eliminated and back-substituted as
         // it always was.
         let a = rmat(2, 2, &[f64::INFINITY, 0.0, 0.0, 1.0]);
-        let x = a.solve(&Matrix::col(vec![1.0, 1.0])).unwrap();
+        let x = solved(&a, &Matrix::col(vec![1.0, 1.0]));
         assert_eq!(x.get(1, 0), 1.0);
     }
 
+    /// A solve that must not warn, and its solution.
+    fn solved(a: &Matrix, b: &Matrix) -> Matrix {
+        let (x, w) = a.solve(b).unwrap();
+        assert!(w.is_none(), "{w:?}");
+        x
+    }
+
     #[test]
-    fn solve_rejects_singular_and_non_square() {
+    fn solve_warns_on_singular_and_solves_non_square_in_least_squares() {
+        // An exactly singular system: the warning and the substitution's NaN.
         let s = rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]);
-        let e = s.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err().msg;
-        assert!(e.contains("singular"), "{e}");
+        let (x, w) = s.solve(&Matrix::col(vec![1.0, 2.0])).unwrap();
+        assert_eq!(w.unwrap(), "Matrix is singular to working precision.");
+        assert!(x.data.iter().all(|v| v.is_nan()));
 
+        // A wide system has a basic least-squares solution, 2x1 for 2x3.
         let ns = rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let e = ns.solve(&Matrix::col(vec![1.0, 2.0])).unwrap_err().msg;
-        assert!(e.contains("square"), "{e}");
+        let x = solved(&ns, &Matrix::col(vec![1.0, 2.0]));
+        assert_eq!((x.rows, x.cols), (3, 1));
+        close_all(&ns.matmul(&x).unwrap(), &Matrix::col(vec![1.0, 2.0]));
 
-        // Square, but the right-hand side has the wrong number of rows.
+        // A rank-deficient one names its rank.
+        let rd = rmat(3, 2, &[1.0, 2.0, 2.0, 4.0, 3.0, 6.0]);
+        let (_, w) = rd.solve(&Matrix::col(vec![1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(
+            w.unwrap(),
+            "Matrix is rank deficient to working precision (rank 1)."
+        );
+
+        // The right-hand side has the wrong number of rows.
         let a = rmat(2, 2, &[2.0, 1.0, 1.0, 3.0]);
         assert!(a.solve(&Matrix::col(vec![1.0, 2.0, 3.0])).is_err());
     }
@@ -1790,22 +1749,28 @@ mod tests {
     #[test]
     fn inv_times_original_is_the_identity() {
         let a = rmat(3, 3, &[4.0, 7.0, 2.0, 3.0, 6.0, 1.0, 2.0, 5.0, 3.0]);
-        let ai = a.inv().unwrap();
+        let (ai, w) = a.inv().unwrap();
+        assert!(w.is_none());
         let id = Matrix::identity(3, 3);
         close_all(&ai.matmul(&a).unwrap(), &id);
         close_all(&a.matmul(&ai).unwrap(), &id);
 
         // A 2x2 case with an inverse that is easy to state exactly.
         let b = rmat(2, 2, &[4.0, 7.0, 2.0, 6.0]);
-        close_all(&b.inv().unwrap(), &rmat(2, 2, &[0.6, -0.7, -0.2, 0.4]));
+        close_all(&b.inv().unwrap().0, &rmat(2, 2, &[0.6, -0.7, -0.2, 0.4]));
 
         assert!(rmat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).inv().is_err());
-        assert!(rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]).inv().is_err());
+        // A singular matrix inverts to Inf, with the warning (QA D26).
+        let (s, w) = rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]).inv().unwrap();
+        assert!(s.data.iter().all(|&v| v == f64::INFINITY));
+        assert!(w.is_some());
     }
 
     #[test]
     fn det_known_values() {
-        close(rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).det().unwrap(), -2.0);
+        // Exactly -2, not a roundoff from it: the cycle-02 verify-first
+        // bullet, which cycle 08's LU keeps as it found it.
+        assert_eq!(rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).det().unwrap(), -2.0);
         assert_eq!(rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]).det().unwrap(), 0.0);
         close(Matrix::identity(1, 1).det().unwrap(), 1.0);
         close(Matrix::identity(4, 4).det().unwrap(), 1.0);

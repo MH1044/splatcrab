@@ -941,9 +941,10 @@ c =
 
 ```
 
-Backslash solves a linear system, and `/` is its right-hand twin. **Only
-square systems are supported**: a non-square `A\b` is an error, not a
-least-squares solution.
+Backslash solves a linear system, and `/` is its right-hand twin. A square
+system goes through an LU factorisation with partial pivoting; a non-square
+one is solved in the least-squares sense, since cycle 08 (see
+[Linear algebra](#linear-algebra)).
 
 ```matlab
 A = [4 -2; 1 1];
@@ -3007,9 +3008,11 @@ e =
 
 ### Linear algebra
 
-`transpose inv det trace diag norm dot`. `norm` takes **vectors only** until
-cycle 08 — `norm` of a matrix is an error, which is the easiest mistake to
-make in this section.
+`transpose inv det trace diag norm dot`, and since cycle 08 the
+factorisations `lu qr chol eig svd`, the builtins over them
+`rank pinv null orth cond`, and `kron cross triu tril magic`. `det`, `inv`,
+`\`, `/`, `A^-n` and `lu` share one LU factorisation with partial pivoting,
+which is what makes `det` and `\` agree on what singular means.
 
 ```matlab
 A = [4 -2; 1 1];
@@ -3063,23 +3066,169 @@ h =
 
 ```
 
+A non-square system has a least-squares solution: here the line through
+`(1, 1)`, `(2, 2)` and `(3, 2)`, intercept first.
+
 ```matlab
-n = norm([1 2; 3 4]);
+A = [1 1; 1 2; 1 3];
+b = [1; 2; 2];
+x = A \ b
+y = b' / A'
 ```
 
 ```
-Error: Line 1: 'norm' currently supports vectors only.
+x =
+
+    0.6667
+    0.5000
+
+y =
+
+    0.6667    0.5000
+
 ```
 
-A singular `inv` is an error rather than MATLAB's warning plus `Inf`:
+`norm` of a matrix takes `1`, `2`, `Inf` and `'fro'`; `cond` is the 2-norm
+condition number. The factorisations return as many outputs as asked for:
+
+```matlab
+A = [1 2; 3 4];
+n = [norm(A, 1), norm(A, Inf)]
+fprintf('%.4f %.4f %.4f\n', norm(A), norm(A, 'fro'), cond(A));
+[L, U, P] = lu(A)
+R = chol([4 2; 2 3])
+fprintf('%.4f %.4f\n', eig([2 1; 1 2]), svd([3 0; 0 4]));
+r = rank([1 2; 2 4])
+```
+
+```
+n =
+
+     6     7
+
+5.4650 5.4772 14.9330
+L =
+
+    1.0000         0
+    0.3333    1.0000
+
+U =
+
+    3.0000    4.0000
+         0    0.6667
+
+P =
+
+     0     1
+     1     0
+
+R =
+
+    2.0000    1.0000
+         0    1.4142
+
+1.0000 3.0000
+4.0000 3.0000
+r =
+
+     1
+
+```
+
+`eig` and `svd` are iterations, so their values can be a roundoff away from
+a whole number even when the exact answer is one: print them with `fprintf`,
+as here, or compare them with a tolerance, never with `==`. `eig` of a
+symmetric matrix is in ascending order and `svd` in descending order. The
+signs of `Q`, `R`, `U`, `V` and the eigenvectors are conventions, not unique,
+and so are the bases `null` and `orth` return: check a factorisation by its
+residual and a basis by its properties.
+
+```matlab
+[Q, R] = qr([1 2; 3 4]);
+disp(norm(Q * R - [1 2; 3 4]) < 1e-12)
+A = [2 1; 1 2];
+[V, D] = eig(A);
+disp(norm(A * V - V * D) < 1e-12)
+N = null([1 1]);
+O = orth([1 2; 2 4]);
+disp([size(N), size(O)])
+p = pinv([1 2; 2 4])
+k = kron([1 2], [1; 1])
+c = cross([1 0 0], [0 1 0])
+m = magic(4)
+t = triu(magic(3))
+l = tril(magic(3), -1)
+```
+
+```
+   1
+   1
+     2     1     2     1
+p =
+
+    0.0400    0.0800
+    0.0800    0.1600
+
+k =
+
+     1     2
+     1     2
+
+c =
+
+     0     0     1
+
+m =
+
+    16     2     3    13
+     5    11    10     8
+     9     7     6    12
+     4    14    15     1
+
+t =
+
+     8     1     6
+     0     5     7
+     0     0     2
+
+l =
+
+     0     0     0
+     3     0     0
+     4     9     0
+
+```
+
+A singular matrix is a warning, not an error, as in MATLAB: `inv` returns
+`Inf` everywhere, and `\` returns whatever the substitution gives. The
+warnings go to stderr, which is why they come after the output here:
 
 ```matlab
 A = [1 2; 2 4];
-b = inv(A);
+b = inv(A)
+x = A \ [1; 2];
 ```
 
 ```
-Error: Line 2: Matrix is singular to working precision.
+b =
+
+   Inf   Inf
+   Inf   Inf
+
+Warning: Matrix is singular to working precision.
+Warning: Matrix is singular to working precision.
+```
+
+An eigenvalue problem whose answer is complex is refused until complex numbers
+arrive in cycle 10, never answered with a wrong real value; so is a `NaN` or
+`Inf` handed to `eig` or `svd`:
+
+```matlab
+e = eig([0 -1; 1 0])
+```
+
+```
+Error: Line 1: Complex results are not supported. The eigenvalues of this matrix are complex.
 ```
 
 Integer matrix powers work, negative ones by inverting:
@@ -3109,7 +3258,7 @@ b =
 
 ### Search and sort
 
-`find sort`. Like `norm`, `sort` is vectors only until cycle 09.
+`find sort`. `sort` is vectors only until cycle 09.
 
 ```matlab
 x = [0 3 0 7 5];
@@ -4322,8 +4471,10 @@ h =
 ```
 
 MATLAB gives `-2.0000` for `e`: its determinant is a roundoff away from `-2`,
-and a value that is not a whole number prints with decimals here too. Cycle 08
-rewrites `det`.
+and a value that is not a whole number prints with decimals here too. Cycle
+08's shared LU kept the elimination order `det` had, rather than choosing one
+that would produce MATLAB's digits, so the difference stays until a source
+settles LAPACK's order.
 
 A `NaN` or `Inf` in a row keeps MATLAB's integer columns, which it did not
 before cycle 01e:
@@ -4511,10 +4662,12 @@ Error: Line 2: 'break' is only valid inside a loop.
 
 ### Builtin behaviour
 
-`norm` and `sort` take vectors only (cycles 08 and 09). Backslash solves
-square systems only and errors where MATLAB warns and returns a least-squares
-answer. `inv` of a singular matrix errors where MATLAB warns and returns
-`Inf`. `who` prints the typed table that is MATLAB's `whos`.
+`sort` takes vectors only (cycle 09). A system that is singular only to
+working precision warns with MATLAB's "singular" text, where MATLAB's is "close
+to singular or badly scaled" with an `RCOND`, and a rank-deficient
+least-squares system warns with SplatCrab's own text. `eig`, `svd` and the
+builtins over `svd` refuse `NaN` and `Inf`. `who` prints the typed table that
+is MATLAB's `whos`.
 
 A caught error is a minimal `MException`: `e.message`, `e.identifier`,
 `e.stack` and `class(e)`, with no `cause`, and a one-line display of
@@ -4598,7 +4751,6 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| Matrix `norm`, least squares, `\` of a non-square system | 08 |
 | Matrix `sort`, and `[s, i] = sort(...)` of a matrix | 09 |
 | Complex numbers, `1i`, `real`, `imag`, `abs` of a complex | 10 |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |

@@ -400,6 +400,16 @@ impl Interp {
         self.out.write_all(s.as_bytes()).map_err(error::output)
     }
 
+    /// Writes a warning a computation returned, if it returned one: the
+    /// singular-matrix warning of `\`, `/` and `A^-n` (cycle 08) goes this
+    /// way, and so lands in a protocol `eval`'s `out`.
+    pub(crate) fn warn(&mut self, w: Option<String>) -> R<()> {
+        match w {
+            Some(msg) => self.emit_err(&error::warning_line(&msg)),
+            None => Ok(()),
+        }
+    }
+
     /// The single place a warning leaves the evaluator. `out` is flushed
     /// first, so that when the two sinks are two streams that end up on one
     /// terminal, what was printed before the warning shows before it.
@@ -950,21 +960,27 @@ impl Interp {
                     a.zip(&b, "/", |x, y| x / y)?
                 } else {
                     // a / b  ==  (b' \ a')'
-                    b.transpose().solve(&a.transpose())?.transpose()
+                    let (x, w) = b.transpose().solve(&a.transpose())?;
+                    self.warn(w)?;
+                    x.transpose()
                 }
             }
             BinOp::LDiv => {
                 if a.is_scalar() {
                     a.zip(&b, "\\", |x, y| y / x)?
                 } else {
-                    a.solve(&b)?
+                    let (x, w) = a.solve(&b)?;
+                    self.warn(w)?;
+                    x
                 }
             }
             BinOp::Pow => {
                 if a.is_scalar() && b.is_scalar() {
                     Matrix::scalar(powf_real(a.data[0], b.data[0])?)
                 } else if let Some(p) = b.scalar_value() {
-                    matrix_power(&a, p)?
+                    let (x, w) = matrix_power(&a, p)?;
+                    self.warn(w)?;
+                    x
                 } else {
                     bail!(error::matrix_exponent());
                 }
@@ -2100,27 +2116,37 @@ fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
     Ok(Matrix::row(data))
 }
 
-fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
+/// `A^p` for an integer `p`, by repeated squaring, and the warning a
+/// negative power of a singular matrix gives with its `Inf` result, as
+/// `inv` gives it (QA D26).
+fn matrix_power(a: &Matrix, p: f64) -> R<(Matrix, Option<String>)> {
     if a.rows != a.cols {
         bail!(error::nonsquare_power());
     }
     if p.fract() != 0.0 {
         bail!(error::fractional_matrix_power());
     }
-    let base = if p < 0.0 { a.inv()? } else { a.clone() };
+    let (base, warning) = if p < 0.0 { a.inv()? } else { (a.clone(), None) };
+    // The first factor starts the product rather than multiplying an
+    // identity: `I * X` is `X` only when `X` is finite, since `0 * Inf` is
+    // `NaN`, and `[1 2; 2 4]^-1` must be `Inf` everywhere as `inv` is.
     let mut n = p.abs() as u64;
-    let mut result = Matrix::identity(a.rows, a.rows);
+    let mut result: Option<Matrix> = None;
     let mut sq = base;
     while n > 0 {
         if n & 1 == 1 {
-            result = result.matmul(&sq)?;
+            result = Some(match result {
+                None => sq.clone(),
+                Some(r) => r.matmul(&sq)?,
+            });
         }
         n >>= 1;
         if n > 0 {
             sq = sq.matmul(&sq)?;
         }
     }
-    Ok(result)
+    let result = result.unwrap_or_else(|| Matrix::identity(a.rows, a.rows));
+    Ok((result, warning))
 }
 
 // ---- index resolution ------------------------------------------------
@@ -4772,23 +4798,38 @@ mod tests {
     #[test]
     fn matrix_power_cases() {
         let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(matrix_power(&a, 0.0).unwrap(), Matrix::identity(2, 2));
+        let pow = |a: &Matrix, p: f64| {
+            let (m, w) = matrix_power(a, p).unwrap();
+            assert!(w.is_none(), "{w:?}");
+            m
+        };
+        assert_eq!(pow(&a, 0.0), Matrix::identity(2, 2));
 
-        let inv = a.inv().unwrap();
-        let p = matrix_power(&a, -1.0).unwrap();
+        let (inv, _) = a.inv().unwrap();
+        let p = pow(&a, -1.0);
         assert_eq!((p.rows, p.cols), (2, 2));
         for (g, w) in p.data.iter().zip(&inv.data) {
             close(*g, *w);
         }
 
-        assert_eq!(
-            matrix_power(&a, 3.0).unwrap(),
-            rmat(2, 2, &[37.0, 54.0, 81.0, 118.0])
-        );
-        assert_eq!(matrix_power(&a, 1.0).unwrap(), a);
+        assert_eq!(pow(&a, 3.0), rmat(2, 2, &[37.0, 54.0, 81.0, 118.0]));
+        assert_eq!(pow(&a, 1.0), a);
 
         assert!(matrix_power(&rmat(1, 2, &[1.0, 2.0]), 2.0).is_err());
         assert!(matrix_power(&a, 0.5).is_err());
+
+        // A negative power of a singular matrix is Inf, with the warning
+        // (QA D26), where it was an error before cycle 08.
+        let (s, w) = matrix_power(&rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]), -1.0).unwrap();
+        assert!(s.data.iter().all(|&v| v == f64::INFINITY));
+        assert_eq!(w.unwrap(), "Matrix is singular to working precision.");
+        // A positive power never warns.
+        assert!(
+            matrix_power(&rmat(2, 2, &[1.0, 2.0, 2.0, 4.0]), 2.0)
+                .unwrap()
+                .1
+                .is_none()
+        );
     }
 
     // ---- switch, try, warnings and commands (cycle 04) -----------------

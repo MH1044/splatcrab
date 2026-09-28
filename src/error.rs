@@ -630,10 +630,6 @@ pub fn matmul_dims(ar: usize, ac: usize, br: usize, bc: usize) -> MError {
     ))
 }
 
-pub fn nonsquare_system() -> MError {
-    MError::new("Only square systems are supported by '\\' and '/' for now (no least squares yet).")
-}
-
 pub fn solve_dims(ar: usize, ac: usize, br: usize, bc: usize) -> MError {
     MError::new(format!(
         "Matrix dimensions must agree for '\\' ({}x{} \\ {}x{}).",
@@ -641,8 +637,23 @@ pub fn solve_dims(ar: usize, ac: usize, br: usize, bc: usize) -> MError {
     ))
 }
 
-pub fn singular() -> MError {
-    MError::new("Matrix is singular to working precision.")
+/// The warning a square system, `inv` and `A^-1` give for a matrix with a
+/// pivot at or below `Matrix::singular_tol` (cycle 08; an error before it,
+/// QA D26). MATLAB's wording. The caller writes it through
+/// [`warning_line`] to `Interp.err` and goes on with the result.
+pub fn singular_warning() -> String {
+    "Matrix is singular to working precision.".to_string()
+}
+
+/// The warning a non-square `\` or `/` gives when the column-pivoted QR
+/// finds fewer independent columns than the smaller dimension (cycle 08).
+/// SplatCrab's own wording: MATLAB's is understood to name the tolerance as
+/// well, which no source at hand settles.
+pub fn rank_deficient_warning(rank: usize) -> String {
+    format!(
+        "Matrix is rank deficient to working precision (rank {}).",
+        rank
+    )
 }
 
 pub fn nonsquare_inverse() -> MError {
@@ -845,16 +856,79 @@ pub fn nonsquare_trace() -> MError {
     MError::new("Matrix must be square for 'trace'.")
 }
 
-pub fn norm_vectors_only() -> MError {
-    MError::new("'norm' currently supports vectors only.")
-}
-
 pub fn sort_vectors_only() -> MError {
     MError::new("'sort' currently supports vectors only.")
 }
 
 pub fn dot_size_mismatch() -> MError {
-    MError::new("A and B must be the same size for 'dot'.")
+    ab_size_mismatch("dot")
+}
+
+/// `dot` and `cross` with operands of different sizes.
+pub fn ab_size_mismatch(name: &str) -> MError {
+    MError::new(format!("A and B must be the same size for '{}'.", name))
+}
+
+// ---- linear algebra (cycle 08) -----------------------------------------
+//
+// SplatCrab's own wording throughout, except `not_positive_definite`,
+// which is the text the spec records for `chol`.
+
+/// `eig`, `chol` and `inv`'s neighbours: a matrix that must be square. The
+/// same form as [`nonsquare_trace`].
+pub fn nonsquare_for(name: &str) -> MError {
+    MError::new(format!("Matrix must be square for '{}'.", name))
+}
+
+/// `chol` of a matrix that is not symmetric positive definite, a `NaN` on
+/// the diagonal included.
+pub fn not_positive_definite() -> MError {
+    MError::new("Matrix must be positive definite.")
+}
+
+/// `eig`, `svd` and the builtins built on `svd` (`rank`, `pinv`, `null`,
+/// `orth`, `cond`, and the matrix 2-norm) refuse a `NaN` or an `Inf` rather
+/// than iterating on it.
+pub fn nonfinite_input(name: &str) -> MError {
+    MError::new(format!("Input to '{}' must not contain NaN or Inf.", name))
+}
+
+/// An iterative method that reached its cap (invariant 6: every iteration
+/// has one). `name` is the builtin the user called.
+pub fn no_convergence(name: &str) -> MError {
+    MError::new(format!(
+        "'{}' did not converge within its iteration limit.",
+        name
+    ))
+}
+
+/// `eig` of a real matrix with a complex pair, until cycle 10. Opens with
+/// the sentence every complex refusal shares.
+pub fn complex_eigenvalues() -> MError {
+    MError::new(
+        "Complex results are not supported. \
+         The eigenvalues of this matrix are complex.",
+    )
+}
+
+/// `norm(A, p)` of a matrix for a `p` other than 1, 2, `Inf` and `'fro'`.
+pub fn matrix_norm_type() -> MError {
+    MError::new("Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.")
+}
+
+/// `cross(a, b)` where no dimension has length 3.
+pub fn cross_length() -> MError {
+    MError::new("A and B must have a dimension of length 3 for 'cross'.")
+}
+
+/// `magic(n)` with an `n` that is not a real scalar.
+pub fn magic_order() -> MError {
+    MError::new("Order for 'magic' must be a real scalar.")
+}
+
+/// `rank(A, tol)` and `pinv(A, tol)` with a `tol` that is not a real scalar.
+pub fn tolerance_arg(name: &str) -> MError {
+    MError::new(format!("Tolerance for '{}' must be a real scalar.", name))
 }
 
 pub fn reshape_numel(have: usize, rows: usize, cols: usize) -> MError {

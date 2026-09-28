@@ -1,0 +1,2 @@
+% covers: 14 - under --protocol the singular-matrix warning lands in the eval's out and nothing reaches stderr
+{"id":1,"op":"eval","code":"x = inv([1 2; 2 4]);"}

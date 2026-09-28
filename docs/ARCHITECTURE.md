@@ -240,6 +240,21 @@ builtins themselves. Every one has the same shape,
 `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`, where the `usize` is
 `nargout` and an empty `Vec` means the builtin produced no value.
 
+Since cycle 08 `factor.rs` holds the numerics of linear algebra, with no
+`Interp` in them: `lu` (the one LU with partial pivoting that `det`, `inv`,
+`Matrix::solve`, `A^-n` and the `lu` builtin share, returning an `Lu` whose
+`singular` flag is the `Matrix::singular_tol` test with `<=`), Householder
+`qr` and the column-pivoted least-squares `lstsq`, `chol`, the cyclic Jacobi
+`eig_sym`, `eig_general` (EISPACK's `orthes` and `hqr2`, as JAMA transcribes
+them, refusing a complex pair) and the one-sided Jacobi `svd`, which returns
+no vectors, thin ones or full ones as `Vectors` asks. Every iteration there
+takes its cap as a parameter (`JACOBI_SWEEPS`, `SVD_SWEEPS`,
+`qr_iterations(n)`) so that a unit test can reach the `no_convergence` error.
+A computation that warns returns its warning text beside its result, as
+`Matrix::solve` and `Matrix::inv` return `(Matrix, Option<String>)`, and the
+caller writes it with `Interp::warn`, through `Interp.err`; `factor.rs` and
+`value.rs` never write anything themselves.
+
 **`syntax.rs`** answers questions about source text short of parsing it.
 `is_complete` says whether an entry typed line by line has ended, by counting
 brackets and block openers against their closers over the token stream; the
@@ -341,7 +356,11 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    client can make it allocate without bound. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
-   the recipe below.
+   the recipe below. An iteration that has no fixed trip count has a cap
+   too, and a clean error past it: since cycle 08 the Jacobi sweeps, the
+   one-sided Jacobi SVD and the shifted QR iteration of `factor.rs`, whose
+   callers refuse a `NaN` or `Inf` before the first sweep, so no input can
+   make one spin.
 
 ## Recipes
 
@@ -350,7 +369,9 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 1. Write the function in the right file under `src/builtins/`: `core.rs` for
    constants, constructors, shape queries, output, the workspace and timing;
    `math.rs` for element-wise and reducing numerics; `linalg.rs` for linear
-   algebra, rearrangement, search and sort. The signature is
+   algebra, rearrangement, search and sort, with the numerics of a
+   factorisation in `factor.rs` and only the argument handling in
+   `linalg.rs`. The signature is
    `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`; return `one_mat(m)`
    for a numeric value and `none()` for a builtin that produces none.
    `one_mat` makes its result a double whatever `m`'s class, which is MATLAB's
@@ -394,7 +415,11 @@ cycle 03, with the grown size kept as an `f64` until it is judged; the
 A shape the user never spells out goes through `check_shape` too. Since cycle
 01d, any operation whose result shape is computed from its operands' shapes
 calls it before allocating: `Matrix::try_zip` (and so `zip`), `Matrix::matmul`,
-the two-subscript branch of `resolve_read` and `math::reduce`. The operands can
+the two-subscript branch of `resolve_read` and `math::reduce`, and since cycle
+08 `kron` and every shape `factor.rs` computes (through `factor::zeros` and
+`factor::eye`: the `n`-by-`k` answer of a system with no rows, the `m`-by-`m`
+`Q` of `qr` and `U` of `svd`, `lu`'s `P`), which is why `svd` of a long
+column asks for its `U` only when the full decomposition was requested. The operands can
 be tiny and the result enormous — `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
 elements from 2e5 — so "the operands fit, therefore the result fits" is never
 true. A new operation of that kind belongs on the same list.
@@ -612,11 +637,11 @@ cycle named:
 
 | Deviation | Fixed in |
 |---|---|
-| `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here | 08, which replaces `det` with a shared LU factorisation (verify first) |
+| `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives | later (verify first) |
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | `who` and `whos` print the same typed table | Both produce byte-identical output. In MATLAB `who` is a bare list of names and `whos` is a table with size, bytes and class, so both deviate rather than only `who`, and neither has a bytes column | 13 |
-| `norm` and `sort` accept vectors only | 08, 09 |
-| Backslash solves square systems only, and errors instead of warning | 08 |
+| `sort` accepts vectors only | 09 |
+| Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where MATLAB is understood to say "close to singular or badly scaled" with an `RCOND`; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `eig([])` is 0x1. The Design notes of `docs/modules/08-linear-algebra.md` have each | later (verify first) |
 | A result that would be complex is a clean error; MATLAB returns the value | 10 |
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
@@ -687,7 +712,10 @@ Cycle 04 fixed the three rows scheduled to it: block comments that executed
 (QA D7), `error`'s argument rules (QA D9) and command syntax (QA D31).
 Cycle 07 fixed the row scheduled to it, the builtins that refused an
 `MException` and a handle, and narrowed it to `isequal` of handles, which
-its spec left out of scope.
+its spec left out of scope. Cycle 08 fixed the row scheduled to it, `inv`
+and `A^-1` of a singular matrix (QA D26), which now warn and return `Inf`,
+and with it the Known deviations rows for square-only backslash and
+vectors-only `norm`.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -702,7 +730,6 @@ spec also lists, it removes the row from that spec in the same commit.
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
 | A non-UTF-8 file is unread (was part of QA D29) | A UTF-16LE file is `Error: Line 2: unexpected character` on a NUL, the high byte of its first ASCII character (`err_utf16_file` pins that text and its exit code 1); MATLAB and Octave read it. Cycle 01e skipped the leading UTF-8 byte-order mark and swapped the strict read for a lossy one, which fixed the Windows-1252 half (a `% caf<E9>` comment now runs) and brought the failure inside the `Error:` format; a UTF-16 file still decodes to replacement characters rather than to its text, because that needs encoding detection and not a lossy decode | later |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
-| `inv` and `A^-1` of a singular matrix are errors (QA D26) | `inv([1 2; 2 4])` exits 1 with "Matrix is singular to working precision."; MATLAB prints that text as a warning and returns `Inf Inf; Inf Inf`, and `inv(0)` is `Inf` (Octave the same). It needs `warning`, which cycle 04 added, and goes with the backslash deviation | 08 |
 | `printf` conversions and flags differ from MATLAB (QA D16) | (a) `%E` and `%G` print a lower-case `e`. (b) `%s` of a non-integer uses `%g`: `sprintf('%s', pi)` is `3.14159` where the MATLAB `sprintf` page's own example gives `3.141593e+00`. (c) The `#` flag is ignored: `sprintf('%#.0f', 3)` is `3`, MATLAB `3.`. (d) The `0` flag pads a non-finite value: `sprintf('%05d', -Inf)` is `-0Inf`, MATLAB and C ` -Inf`. (e) The escapes `\xN`, `\N` (octal), `\a`, `\b`, `\f` and `\v` are not processed. (f) `%x`, `%X`, `%o` and a `*` width or precision are errors; MATLAB gives `ff` for `sprintf('%x', 255)` and `    3` for `sprintf('%*d', 5, 3)`. (g) An invalid conversion or a trailing `%` is an error; MATLAB "prints all text up to the invalid operator ... and discards the rest", so `sprintf('abc%q', 1)` is `abc`. Cycle 01d's Out of scope moved this row to 11: it is cosmetic, and cycle 11 rewrites `printf` for file output anyway. 01d kept the panics and the hang, which are not cosmetic | 11 |
 | `num2str` of a matrix gives one row in column-major order (QA D13) | `num2str([1 2; 3 4])` is the 1x10 `'1  3  2  4'`; MATLAB gives the 2x4 char `'1  2'` / `'3  4'`. `num2str([1 -2 300])` spaces its columns differently too. It needed a multi-row char, which cycle 02 provides | 11 |
 | `fprintf` rejects a file id and cannot return a byte count (QA D25) | `fprintf(1, 'hi\n')` is "The first argument must be a format string."; MATLAB writes `hi`, and `fprintf(2, ...)` writes to stderr. `n = fprintf('hi\n')` prints `hi` then "Too many output arguments."; MATLAB sets `n = 3`. Cycle 11 owns `fprintf(fid, ...)`; a file id of 2 writes to `Interp.err`, the second sink cycle 04 added for `warning` | 11 |

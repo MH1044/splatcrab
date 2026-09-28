@@ -5,6 +5,8 @@ use std::cmp::Ordering;
 use super::args::{
     at_most, check_shape, dim, fmt_dim, mat, need, option, shape, size_list, trailing_ones,
 };
+use super::core::eps_at;
+use super::factor::{self, JACOBI_SWEEPS, SVD_SWEEPS, Vectors, qr_iterations};
 use super::math::{reduce, sum0};
 use super::{Registry, add, one_as, one_mat};
 use crate::error;
@@ -20,8 +22,23 @@ pub fn register(r: &mut Registry) {
     add(r, "det", det, "det(A) - the determinant of a square matrix.");
     add(r, "trace", trace, "trace(A) - the sum of the diagonal of a square matrix.");
     add(r, "diag", diag, "diag(v,k) puts v on the k-th diagonal; diag(A,k) takes the k-th diagonal.");
-    add(r, "norm", norm, "norm(v), norm(v,p) - the p-norm of a vector: 1, 2, p > 0, Inf, -Inf or 'fro'.");
+    add(r, "norm", norm, "norm(v,p), norm(A,p) - a vector p-norm (1, 2, p > 0, Inf, -Inf, 'fro'), or a matrix norm (1, 2, Inf, 'fro').");
     add(r, "dot", dot, "dot(A,B), dot(A,B,dim) - scalar products of vectors, or of matching columns.");
+    add(r, "lu", lu, "[L,U,P] = lu(A), [L,U] = lu(A), Y = lu(A) - LU factorisation with partial pivoting, P*A = L*U.");
+    add(r, "qr", qr, "[Q,R] = qr(A), R = qr(A) - Householder QR factorisation, A = Q*R.");
+    add(r, "chol", chol, "R = chol(A), [R,p] = chol(A) - Cholesky factor, R'*R = A, of a positive definite matrix.");
+    add(r, "eig", eig, "e = eig(A), [V,D] = eig(A) - real eigenvalues and eigenvectors, A*V = V*D.");
+    add(r, "svd", svd, "s = svd(A), [U,S,V] = svd(A) - singular value decomposition, A = U*S*V'.");
+    add(r, "rank", rank, "rank(A), rank(A,tol) - the number of singular values above the tolerance.");
+    add(r, "pinv", pinv, "pinv(A), pinv(A,tol) - the Moore-Penrose pseudoinverse.");
+    add(r, "null", null, "null(A) - an orthonormal basis of the null space of A.");
+    add(r, "orth", orth, "orth(A) - an orthonormal basis of the range of A.");
+    add(r, "cond", cond, "cond(A) - the 2-norm condition number, the ratio of the largest singular value to the smallest.");
+    add(r, "kron", kron, "kron(A,B) - the Kronecker tensor product.");
+    add(r, "cross", cross, "cross(A,B) - the cross product of 3-element vectors, or along the first dimension of length 3.");
+    add(r, "triu", triu, "triu(A), triu(A,k) - the upper triangle of A, on and above the k-th diagonal.");
+    add(r, "tril", tril, "tril(A), tril(A,k) - the lower triangle of A, on and below the k-th diagonal.");
+    add(r, "magic", magic, "magic(n) - an n-by-n magic square, MATLAB's construction.");
 
     // ---- rearrangement -----------------------------------------------
     add(r, "reshape", reshape, "reshape(A,r,c), reshape(A,sz), reshape(A,r,[]) - the elements of A in a new shape.");
@@ -41,9 +58,13 @@ fn transpose(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     one_as(mat(a, 0, "transpose")?.transpose())
 }
 
-fn inv(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+/// `inv(A)`, with the singular warning and an `Inf` result for a singular
+/// matrix, as MATLAB gives them (QA D26; an error before cycle 08).
+fn inv(it: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "inv")?;
-    one_mat(mat(a, 0, "inv")?.inv()?)
+    let (x, w) = mat(a, 0, "inv")?.inv()?;
+    it.warn(w)?;
+    one_mat(x)
 }
 
 fn det(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -122,11 +143,14 @@ fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     }
 }
 
-/// The order of a vector norm.
+/// The order of a norm.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum NormType {
-    /// A positive, finite `p`; `2` is the default and `'fro'`.
+    /// A positive, finite `p`; `2` is the default.
     P(f64),
+    /// `'fro'`: the 2-norm of a vector, and the square root of the sum of
+    /// squares of a matrix, which is not its 2-norm.
+    Fro,
     Inf,
     NegInf,
 }
@@ -138,7 +162,7 @@ enum NormType {
 fn norm_type(a: &[Value]) -> R<NormType> {
     if let Some(s) = option(a, 1) {
         return if s.eq_ignore_ascii_case("fro") {
-            Ok(NormType::P(2.0))
+            Ok(NormType::Fro)
         } else if s.eq_ignore_ascii_case("inf") {
             Ok(NormType::Inf)
         } else {
@@ -156,15 +180,54 @@ fn norm_type(a: &[Value]) -> R<NormType> {
 fn norm(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 2, "norm")?;
     let m = mat(a, 0, "norm")?;
+    let is_matrix = !m.is_vector() && !m.is_empty();
+    // An order the vector rules refuse is refused for a matrix in the
+    // matrix's own words: the vector text offers `-Inf` and any positive
+    // real, which a matrix does not take (cycle 08's review).
     let p = if a.len() >= 2 {
-        norm_type(a)?
+        match norm_type(a) {
+            Ok(p) => p,
+            Err(_) if is_matrix => return Err(error::matrix_norm_type()),
+            Err(e) => return Err(e),
+        }
     } else {
         NormType::P(2.0)
     };
-    if !m.is_vector() && !m.is_empty() {
-        return Err(error::norm_vectors_only());
+    if is_matrix {
+        return one_mat(Matrix::scalar(matrix_norm(&m, p)?));
     }
     one_mat(Matrix::scalar(vector_norm(&m.data, p)))
+}
+
+/// `norm(A, p)` of a matrix (cycle 08; vectors only before it): the largest
+/// column sum of magnitudes for `1`, the largest row sum for `Inf`, the
+/// root of the sum of squares for `'fro'` and the largest singular value
+/// for `2`. Any other order is refused, as MATLAB offers no other matrix
+/// norm. A `NaN` anywhere makes every one of them `NaN`; an `Inf` makes the
+/// 2-norm `Inf` without an SVD, which would refuse it.
+fn matrix_norm(m: &Matrix, p: NormType) -> R<f64> {
+    let nan = m.data.iter().any(|x| x.is_nan());
+    let sums = |outer: usize, inner: usize, at: &dyn Fn(usize, usize) -> f64| {
+        (0..outer)
+            .map(|o| sum0(&(0..inner).map(|i| at(o, i).abs()).collect::<Vec<f64>>()))
+            .fold(0.0, f64::max)
+    };
+    let v = match p {
+        NormType::P(1.0) => sums(m.cols, m.rows, &|c, r| m.get(r, c)),
+        NormType::Inf => sums(m.rows, m.cols, &|r, c| m.get(r, c)),
+        NormType::Fro => vector_norm(&m.data, NormType::P(2.0)),
+        NormType::P(2.0) => {
+            if nan {
+                f64::NAN
+            } else if m.data.iter().any(|x| x.is_infinite()) {
+                f64::INFINITY
+            } else {
+                singular_values(m, "norm")?.first().copied().unwrap_or(0.0)
+            }
+        }
+        _ => return Err(error::matrix_norm_type()),
+    };
+    Ok(if nan { f64::NAN } else { v })
 }
 
 /// A vector norm that neither overflows nor underflows. With `s` the largest
@@ -188,7 +251,8 @@ fn vector_norm(v: &[f64], p: NormType) -> f64 {
             }
         }
         NormType::P(1.0) => abs.fold(0.0, |acc, x| acc + x),
-        NormType::P(p) => {
+        NormType::P(_) | NormType::Fro => {
+            let p = if let NormType::P(p) = p { p } else { 2.0 };
             let s = abs.clone().fold(0.0, f64::max);
             if s == 0.0 || !s.is_finite() {
                 return s;
@@ -230,6 +294,385 @@ fn dot(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     }
     let products = x.zip(&y, "dot", |p, q| p * q)?;
     one_mat(reduce(&products, d, sum0)?)
+}
+
+// ---- factorisations (cycle 08) --------------------------------------
+
+/// `Y = lu(A)`, `[L, U] = lu(A)` and `[L, U, P] = lu(A)`, for any
+/// `m`-by-`n` `A`: `P * A = L * U`. With two outputs `L` is `P' * L`, the
+/// permuted lower triangle, so that `A = L * U`; with one, `Y` is LAPACK's
+/// packed form, the multipliers below the diagonal and `U` on and above it.
+/// `lu` never warns; a singular `A` has a zero on `U`'s diagonal. A `NaN`
+/// spreads through the arithmetic, and there is no iteration to hang.
+fn lu(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "lu")?;
+    let f = factor::lu(&mat(a, 0, "lu")?);
+    if nargout < 2 {
+        return one_mat(f.lu);
+    }
+    let (l, u, p) = f.factors()?;
+    if nargout == 2 {
+        // Row i of L is row perm[i] of P' * L. Written out rather than
+        // multiplied, so that a NaN multiplier stays in its own row.
+        let mut pl = l.clone();
+        for (i, &r) in f.perm.iter().enumerate() {
+            for j in 0..l.cols {
+                pl.set(r, j, l.get(i, j));
+            }
+        }
+        return Ok(vec![Value::Mat(pl), Value::Mat(u)]);
+    }
+    Ok(vec![Value::Mat(l), Value::Mat(u), Value::Mat(p)])
+}
+
+/// `R = qr(A)` and `[Q, R] = qr(A)`, the full factorisation: `Q` is
+/// `m`-by-`m`. `R`'s diagonal may be negative, as LAPACK's is. A `NaN` or
+/// `Inf` spreads to a `NaN` result.
+fn qr(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "qr")?;
+    let (q, r) = factor::qr(&mat(a, 0, "qr")?, nargout >= 2)?;
+    match q {
+        Some(q) => Ok(vec![Value::Mat(q), Value::Mat(r)]),
+        None => one_mat(r),
+    }
+}
+
+/// `R = chol(A)` and `[R, p] = chol(A)`. The first form refuses a matrix
+/// that is not positive definite, a `NaN` on the diagonal included; the
+/// second returns the one-based column `p` that failed, with `R` the
+/// leading `(p-1)`-by-`(p-1)` factor, and `p = 0` on success.
+fn chol(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "chol")?;
+    let m = mat(a, 0, "chol")?;
+    if m.rows != m.cols {
+        return Err(error::nonsquare_for("chol"));
+    }
+    let (r, fail) = factor::chol(&m)?;
+    if nargout >= 2 {
+        let p = fail.map_or(0.0, |j| (j + 1) as f64);
+        return Ok(vec![Value::Mat(r), Value::Mat(Matrix::scalar(p))]);
+    }
+    match fail {
+        None => one_mat(r),
+        Some(_) => Err(error::not_positive_definite()),
+    }
+}
+
+/// `e = eig(A)` and `[V, D] = eig(A)`. An exactly symmetric `A` goes to the
+/// Jacobi method and its eigenvalues are ascending; any other to the
+/// Hessenberg QR iteration, in the order it finds them. Complex eigenvalues
+/// are the complex refusal until cycle 10, and a `NaN` or `Inf` is refused
+/// before any iteration starts.
+fn eig(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "eig")?;
+    let m = mat(a, 0, "eig")?;
+    if m.rows != m.cols {
+        return Err(error::nonsquare_for("eig"));
+    }
+    if !factor::all_finite(&m) {
+        return Err(error::nonfinite_input("eig"));
+    }
+    let (vals, vecs) = if factor::is_symmetric(&m) {
+        factor::eig_sym(&m, JACOBI_SWEEPS)?
+    } else {
+        factor::eig_general(&m, qr_iterations(m.rows))?
+    };
+    if nargout < 2 {
+        return one_mat(Matrix::col(vals));
+    }
+    Ok(vec![
+        Value::Mat(vecs),
+        Value::Mat(diagonal(&vals, m.rows, m.rows)?),
+    ])
+}
+
+/// An `rows`-by-`cols` matrix with `v` down its diagonal.
+fn diagonal(v: &[f64], rows: usize, cols: usize) -> R<Matrix> {
+    let mut d = factor::zeros(rows, cols)?;
+    for (i, x) in v.iter().enumerate() {
+        d.set(i, i, *x);
+    }
+    Ok(d)
+}
+
+/// The SVD every builtin that needs one shares: a `NaN` or `Inf` is refused
+/// in the name of the builtin the user called, before any sweep starts.
+fn checked_svd(m: &Matrix, want: Vectors, name: &str) -> R<factor::Svd> {
+    if !factor::all_finite(m) {
+        return Err(error::nonfinite_input(name));
+    }
+    factor::svd(m, want, SVD_SWEEPS)
+}
+
+fn singular_values(m: &Matrix, name: &str) -> R<Vec<f64>> {
+    Ok(checked_svd(m, Vectors::None, name)?.s)
+}
+
+/// `s = svd(A)`, a column of the `min(m, n)` singular values in descending
+/// order, and `[U, S, V] = svd(A)`, the full decomposition.
+fn svd(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "svd")?;
+    let m = mat(a, 0, "svd")?;
+    if nargout < 2 {
+        return one_mat(Matrix::col(singular_values(&m, "svd")?));
+    }
+    let f = checked_svd(&m, Vectors::Full, "svd")?;
+    let s = diagonal(&f.s, m.rows, m.cols)?;
+    let (u, v) = (f.u.expect("full vectors"), f.v.expect("full vectors"));
+    Ok(vec![Value::Mat(u), Value::Mat(s), Value::Mat(v)])
+}
+
+/// The optional tolerance argument of `rank` and `pinv`.
+fn tolerance(a: &[Value], i: usize, name: &str) -> R<Option<f64>> {
+    if a.len() <= i {
+        return Ok(None);
+    }
+    match (option(a, i), mat(a, i, name)?.scalar_value()) {
+        (None, Some(t)) => Ok(Some(t)),
+        _ => Err(error::tolerance_arg(name)),
+    }
+}
+
+/// The tolerance `rank`, `null` and `orth` share, `max(m, n) * eps(s(1))`,
+/// the default the MATLAB `rank` page gives. Sharing it is what makes
+/// `rank(A) + size(null(A), 2)` equal `size(A, 2)`.
+fn rank_tol(m: &Matrix, s: &[f64]) -> f64 {
+    m.rows.max(m.cols) as f64 * eps_at(s.first().copied().unwrap_or(0.0))
+}
+
+fn rank(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 2, "rank")?;
+    let m = mat(a, 0, "rank")?;
+    let tol = tolerance(a, 1, "rank")?;
+    let s = singular_values(&m, "rank")?;
+    let tol = tol.unwrap_or_else(|| rank_tol(&m, &s));
+    one_mat(Matrix::scalar(s.iter().filter(|&&x| x > tol).count() as f64))
+}
+
+/// `pinv(A)` and `pinv(A, tol)`: `V * diag(1 ./ s) * U'` over the singular
+/// values above `tol`, by default `max(m, n) * s(1) * eps`, the MATLAB
+/// `pinv` page's default. The result is `n`-by-`m`.
+fn pinv(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 2, "pinv")?;
+    let m = mat(a, 0, "pinv")?;
+    let tol = tolerance(a, 1, "pinv")?;
+    let f = checked_svd(&m, Vectors::Thin, "pinv")?;
+    let smax = f.s.first().copied().unwrap_or(0.0);
+    let tol = tol.unwrap_or(m.rows.max(m.cols) as f64 * smax * f64::EPSILON);
+    let (u, v) = (f.u.expect("thin vectors"), f.v.expect("thin vectors"));
+    let mut x = factor::zeros(m.cols, m.rows)?;
+    for (k, &sk) in f.s.iter().enumerate().filter(|(_, s)| **s > tol) {
+        for j in 0..m.rows {
+            let ujk = u.get(j, k) / sk;
+            for i in 0..m.cols {
+                let e = x.get(i, j) + v.get(i, k) * ujk;
+                x.set(i, j, e);
+            }
+        }
+    }
+    one_mat(x)
+}
+
+/// `null(A)`: the columns of the full `V` past the rank, an orthonormal
+/// basis of the null space, `n`-by-`(n - r)`.
+fn null(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "null")?;
+    let m = mat(a, 0, "null")?;
+    let f = checked_svd(&m, Vectors::Full, "null")?;
+    let tol = rank_tol(&m, &f.s);
+    let r = f.s.iter().filter(|&&x| x > tol).count();
+    let v = f.v.expect("full vectors");
+    one_mat(factor::cols_range(&v, r, v.cols))
+}
+
+/// `orth(A)`: the columns of `U` that belong to the singular values above
+/// the rank tolerance, an orthonormal basis of the range, `m`-by-`r`.
+fn orth(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "orth")?;
+    let m = mat(a, 0, "orth")?;
+    let f = checked_svd(&m, Vectors::Thin, "orth")?;
+    let tol = rank_tol(&m, &f.s);
+    let r = f.s.iter().filter(|&&x| x > tol).count();
+    one_mat(factor::cols_range(&f.u.expect("thin vectors"), 0, r))
+}
+
+/// `cond(A)`, the 2-norm condition number: `s(1) / s(end)`, `Inf` for a
+/// singular matrix (a zero singular value, the zero matrix included) and
+/// `0` for an empty one.
+fn cond(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "cond")?;
+    let m = mat(a, 0, "cond")?;
+    let s = singular_values(&m, "cond")?;
+    let c = match (s.first(), s.last()) {
+        (Some(_), Some(&0.0)) => f64::INFINITY,
+        (Some(&hi), Some(&lo)) => hi / lo,
+        _ => 0.0,
+    };
+    one_mat(Matrix::scalar(c))
+}
+
+// ---- constructions (cycle 08) ----------------------------------------
+
+/// `kron(A, B)`: the block matrix of `A(i, j) * B`, `(ma*mb)`-by-`(na*nb)`,
+/// its shape judged before it is allocated.
+fn kron(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 2, "kron")?;
+    need(a, 2, "kron")?;
+    let (x, y) = (mat(a, 0, "kron")?, mat(a, 1, "kron")?);
+    let (rows, cols) = check_shape(x.rows as f64 * y.rows as f64, x.cols as f64 * y.cols as f64)?;
+    let mut out = Matrix::filled(rows, cols, 0.0);
+    for j in 0..x.cols {
+        for i in 0..x.rows {
+            let v = x.get(i, j);
+            for l in 0..y.cols {
+                for k in 0..y.rows {
+                    out.set(i * y.rows + k, j * y.cols + l, v * y.get(k, l));
+                }
+            }
+        }
+    }
+    one_mat(out)
+}
+
+/// `cross(A, B)` of two arrays of one size: along the first dimension of
+/// length 3, so a 3-element row or column gives the same shape back, and a
+/// 3-by-n matrix is taken column by column.
+fn cross(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 2, "cross")?;
+    need(a, 2, "cross")?;
+    let (x, y) = (mat(a, 0, "cross")?, mat(a, 1, "cross")?);
+    if (x.rows, x.cols) != (y.rows, y.cols) {
+        return Err(error::ab_size_mismatch("cross"));
+    }
+    // The linear indices of each triple.
+    let r = x.rows;
+    let triples: Vec<[usize; 3]> = if r == 3 {
+        (0..x.cols).map(|j| [3 * j, 3 * j + 1, 3 * j + 2]).collect()
+    } else if x.cols == 3 {
+        (0..r).map(|i| [i, i + r, i + 2 * r]).collect()
+    } else {
+        return Err(error::cross_length());
+    };
+    let mut out = Matrix::filled(x.rows, x.cols, 0.0);
+    for [i, j, k] in triples {
+        let (p, q) = (&x.data, &y.data);
+        out.data[i] = p[j] * q[k] - p[k] * q[j];
+        out.data[j] = p[k] * q[i] - p[i] * q[k];
+        out.data[k] = p[i] * q[j] - p[j] * q[i];
+    }
+    one_mat(out)
+}
+
+/// The `k` of `triu(A, k)` and `tril(A, k)`: an integer scalar, `0` when
+/// absent, refused as `diag` refuses its offset.
+fn tri_offset(a: &[Value], name: &str) -> R<f64> {
+    if a.len() < 2 {
+        return Ok(0.0);
+    }
+    match (option(a, 1), mat(a, 1, name)?.scalar_value()) {
+        (None, Some(k)) if k.fract() == 0.0 => Ok(k),
+        _ => Err(error::diag_offset()),
+    }
+}
+
+/// `triu` and `tril`: `A` with the elements on the wrong side of the k-th
+/// diagonal zeroed, its class kept, as a rearrangement keeps it.
+fn triangle(a: &[Value], name: &str, keep: fn(f64, f64) -> bool) -> R<Vec<Value>> {
+    at_most(a, 2, name)?;
+    let mut m = mat(a, 0, name)?;
+    let k = tri_offset(a, name)?;
+    for j in 0..m.cols {
+        for i in 0..m.rows {
+            if !keep(j as f64 - i as f64, k) {
+                m.set(i, j, 0.0);
+            }
+        }
+    }
+    one_as(m)
+}
+
+fn triu(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    triangle(a, "triu", |d, k| d >= k)
+}
+
+fn tril(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    triangle(a, "tril", |d, k| d <= k)
+}
+
+/// `magic(n)`: MATLAB's construction, the siamese method for odd `n`, the
+/// complement pattern for a multiple of 4, and the LUX-style quadrant swap
+/// for the rest. `n` is floored, and below 1 the answer is `[]`.
+fn magic(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "magic")?;
+    need(a, 1, "magic")?;
+    let n = match (option(a, 0), mat(a, 0, "magic")?.scalar_value()) {
+        (None, Some(n)) if !n.is_nan() => n.floor(),
+        _ => return Err(error::magic_order()),
+    };
+    if n < 1.0 {
+        return one_mat(Matrix::empty());
+    }
+    let (n, _) = check_shape(n, n)?;
+    one_mat(magic_square(n))
+}
+
+fn magic_square(n: usize) -> Matrix {
+    let mut m = Matrix::filled(n, n, 0.0);
+    if n % 2 == 1 {
+        // M = n * mod(I + J - (n + 3) / 2, n) + mod(I + 2J - 2, n) + 1, with
+        // one-based I and J; n is added before subtracting so nothing wraps.
+        for i in 1..=n {
+            for j in 1..=n {
+                let a = (i + j + n - (n + 3) / 2) % n;
+                let b = (i + 2 * j - 2) % n;
+                m.set(i - 1, j - 1, (n * a + b + 1) as f64);
+            }
+        }
+    } else if n % 4 == 0 {
+        // 1:n^2 row by row, complemented where fix(mod(I, 4) / 2) equals
+        // fix(mod(J, 4) / 2).
+        for i in 1..=n {
+            for j in 1..=n {
+                let v = ((i - 1) * n + j) as f64;
+                let flip = (i % 4) / 2 == (j % 4) / 2;
+                m.set(i - 1, j - 1, if flip { (n * n + 1) as f64 - v } else { v });
+            }
+        }
+    } else {
+        let p = n / 2;
+        let q = magic_square(p);
+        let pp = (p * p) as f64;
+        for j in 0..p {
+            for i in 0..p {
+                let v = q.get(i, j);
+                m.set(i, j, v);
+                m.set(i, j + p, v + 2.0 * pp);
+                m.set(i + p, j, v + 3.0 * pp);
+                m.set(i + p, j + p, v + pp);
+            }
+        }
+        if n == 2 {
+            return m;
+        }
+        let swap = |m: &mut Matrix, i: usize, j: usize| {
+            let t = m.get(i, j);
+            m.set(i, j, m.get(i + p, j));
+            m.set(i + p, j, t);
+        };
+        // Columns 1..k and n-k+2..n (one-based) swap their halves ...
+        let k = (n - 2) / 4;
+        let cols: Vec<usize> = (0..k).chain(n - k + 1..n).collect();
+        for &j in &cols {
+            for i in 0..p {
+                swap(&mut m, i, j);
+            }
+        }
+        // ... and row k+1 swaps with row k+1+p in columns 1 and k+1.
+        for j in [0, k] {
+            swap(&mut m, k, j);
+        }
+    }
+    m
 }
 
 // ---- rearrangement ---------------------------------------------------
@@ -758,8 +1201,10 @@ mod tests {
         ] {
             assert_eq!(call(norm, &[v.clone(), p]).unwrap_err().msg, bad);
         }
-        let e = call(norm, &[mat(2, 2, &[1.0, 2.0, 3.0, 4.0]), num(1.0)]).unwrap_err();
-        assert_eq!(e.msg, "'norm' currently supports vectors only.");
+        // A matrix has its own norms since cycle 08: [1 2; 3 4] has column
+        // sums 4 and 6.
+        let a = mat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(call(norm, &[a.clone(), num(1.0)]).unwrap().data, [6.0]);
     }
 
     #[test]
@@ -1073,5 +1518,318 @@ mod tests {
         assert_eq!(outputs(find, &[t], 3)[2].class, Class::Logical);
         let e = outputs(find, &[Value::Mat(Matrix::empty())], 3);
         assert!(e.iter().all(|m| (m.rows, m.cols) == (0, 0)));
+    }
+
+    // ---- cycle 08: factorisations and constructions ------------------
+
+    fn err(f: crate::builtins::BuiltinFn, args: &[Value], nargout: usize) -> String {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        f(&mut it, args, nargout).unwrap_err().msg
+    }
+
+    fn near(a: &Matrix, b: &Matrix, tol: f64) -> bool {
+        (a.rows, a.cols) == (b.rows, b.cols)
+            && a.data
+                .iter()
+                .zip(&b.data)
+                .all(|(x, y)| (x - y).abs() <= tol)
+    }
+
+    #[test]
+    fn magic_squares_have_equal_sums_and_matlabs_layout() {
+        let m3 = call(magic, &[num(3.0)]).unwrap();
+        assert_eq!(
+            m3,
+            Matrix::new(3, 3, vec![8.0, 3.0, 4.0, 1.0, 5.0, 9.0, 6.0, 7.0, 2.0])
+        );
+        let m4 = call(magic, &[num(4.0)]).unwrap();
+        assert_eq!(m4.data[..4], [16.0, 5.0, 9.0, 4.0]);
+        for n in 1..=12usize {
+            let m = magic_square(n);
+            let want = (n * (n * n + 1) / 2) as f64;
+            let mut seen: Vec<f64> = m.data.clone();
+            seen.sort_by(f64::total_cmp);
+            let all: Vec<f64> = (1..=n * n).map(|k| k as f64).collect();
+            assert_eq!(seen, all, "magic({n}) holds 1..n^2");
+            if n == 2 {
+                continue; // no 2x2 magic square exists
+            }
+            for i in 0..n {
+                let r: f64 = (0..n).map(|j| m.get(i, j)).sum();
+                let c: f64 = (0..n).map(|j| m.get(j, i)).sum();
+                assert_eq!((r, c), (want, want), "row and column {i} of {n}");
+            }
+            assert_eq!((0..n).map(|i| m.get(i, i)).sum::<f64>(), want);
+            assert_eq!((0..n).map(|i| m.get(i, n - 1 - i)).sum::<f64>(), want);
+        }
+        assert!(call(magic, &[num(0.0)]).unwrap().is_empty());
+        assert_eq!(call(magic, &[num(3.7)]).unwrap(), m3);
+        let bad = "Order for 'magic' must be a real scalar.";
+        assert_eq!(err(magic, &[num(f64::NAN)], 1), bad);
+        assert_eq!(err(magic, &[text("a")], 1), bad);
+        assert!(err(magic, &[num(1e10)], 1).contains("10000000000x10000000000"));
+    }
+
+    #[test]
+    fn kron_cross_triu_and_tril() {
+        let k = call(kron, &[row(&[1.0, 2.0]), col(&[1.0, 1.0])]).unwrap();
+        assert_eq!(k, Matrix::new(2, 2, vec![1.0, 1.0, 2.0, 2.0]));
+        let a = mat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let k = call(kron, &[a, Value::Mat(Matrix::identity(2, 2))]).unwrap();
+        assert_eq!((k.rows, k.cols), (4, 4));
+        assert_eq!((k.get(0, 2), k.get(3, 1), k.get(1, 0)), (2.0, 3.0, 0.0));
+        // Two 1e5-element vectors ask for 1e10 elements: judged first.
+        let tall = Value::Mat(Matrix::filled(100_000, 1, 1.0));
+        let wide = Value::Mat(Matrix::filled(1, 100_000, 1.0));
+        assert!(err(kron, &[tall, wide], 1).contains("100000x100000"));
+
+        let c = call(cross, &[row(&[1.0, 0.0, 0.0]), row(&[0.0, 1.0, 0.0])]).unwrap();
+        assert_eq!(c, Matrix::row(vec![0.0, 0.0, 1.0]));
+        let c = call(cross, &[col(&[1.0, 2.0, 3.0]), col(&[4.0, 5.0, 6.0])]).unwrap();
+        assert_eq!(c, Matrix::col(vec![-3.0, 6.0, -3.0]));
+        // A 3-by-2 is taken column by column.
+        let a = mat(3, 2, &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let b = mat(3, 2, &[0.0, 0.0, 1.0, 0.0, 0.0, 1.0]);
+        let c = call(cross, &[a, b]).unwrap();
+        assert_eq!(c.data, [0.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            err(cross, &[row(&[1.0, 2.0, 3.0]), col(&[1.0, 2.0, 3.0])], 1),
+            "A and B must be the same size for 'cross'."
+        );
+        assert_eq!(
+            err(cross, &[row(&[1.0, 2.0]), row(&[1.0, 2.0])], 1),
+            "A and B must have a dimension of length 3 for 'cross'."
+        );
+
+        let a = mat(3, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let one = std::slice::from_ref(&a);
+        assert_eq!(
+            call(triu, one).unwrap().data,
+            [1.0, 0.0, 0.0, 2.0, 5.0, 0.0, 3.0, 6.0, 9.0]
+        );
+        assert_eq!(
+            call(tril, one).unwrap().data,
+            [1.0, 4.0, 7.0, 0.0, 5.0, 8.0, 0.0, 0.0, 9.0]
+        );
+        assert_eq!(
+            call(triu, &[a.clone(), num(1.0)]).unwrap().data,
+            [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 6.0, 0.0]
+        );
+        assert_eq!(
+            call(tril, &[a.clone(), num(-1.0)]).unwrap().data,
+            [0.0, 4.0, 7.0, 0.0, 0.0, 8.0, 0.0, 0.0, 0.0]
+        );
+        let all = call(triu, &[a.clone(), num(-1e300)]).unwrap();
+        assert_eq!(all, call(tril, &[a.clone(), num(1e300)]).unwrap());
+        // The class is kept, as a rearrangement keeps it.
+        let t = Value::Mat(Matrix::filled(2, 2, 1.0).with_class(Class::Logical));
+        assert_eq!(call(triu, &[t]).unwrap().class, Class::Logical);
+        assert_eq!(
+            err(triu, &[a, num(0.5)], 1),
+            "K-th diagonal input must be an integer scalar."
+        );
+    }
+
+    #[test]
+    fn matrix_norms() {
+        let a = mat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let n = |p: Option<Value>| {
+            let mut args = vec![a.clone()];
+            args.extend(p);
+            call(norm, &args).unwrap().data[0]
+        };
+        assert!((n(None) - 5.464985704219043).abs() < 1e-12);
+        assert!((n(Some(num(2.0))) - n(None)).abs() < 1e-15);
+        assert!((n(Some(text("fro"))) - 30f64.sqrt()).abs() < 1e-12);
+        assert_eq!(n(Some(num(1.0))), 6.0);
+        assert_eq!(n(Some(num(f64::INFINITY))), 7.0);
+        assert_eq!(n(Some(text("inf"))), 7.0);
+        let bad = "Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.";
+        for p in [num(3.0), num(f64::NEG_INFINITY), num(0.5)] {
+            assert_eq!(err(norm, &[a.clone(), p], 1), bad);
+        }
+        // NaN makes every matrix norm NaN; Inf makes the 2-norm Inf.
+        let nan = mat(2, 2, &[f64::NAN, 1.0, 1.0, 1.0]);
+        for p in [num(1.0), num(2.0), num(f64::INFINITY), text("fro")] {
+            assert!(call(norm, &[nan.clone(), p]).unwrap().data[0].is_nan());
+        }
+        let inf = mat(2, 2, &[f64::INFINITY, 1.0, 1.0, 1.0]);
+        assert_eq!(call(norm, &[inf]).unwrap().data[0], f64::INFINITY);
+        // A vector's 'fro' is still its 2-norm.
+        let v = call(norm, &[row(&[3.0, 4.0]), text("fro")]).unwrap();
+        assert_eq!(v.data[0], 5.0);
+    }
+
+    #[test]
+    fn rank_pinv_null_orth_and_cond() {
+        let s = mat(2, 2, &[1.0, 2.0, 2.0, 4.0]);
+        let one = std::slice::from_ref(&s);
+        assert_eq!(call(rank, one).unwrap().data, [1.0]);
+        let eye3 = Value::Mat(Matrix::identity(3, 3));
+        assert_eq!(call(rank, std::slice::from_ref(&eye3)).unwrap().data, [3.0]);
+        assert_eq!(
+            call(rank, &[Value::Mat(Matrix::empty())]).unwrap().data,
+            [0.0]
+        );
+        let z2 = Value::Mat(Matrix::filled(2, 2, 0.0));
+        assert_eq!(call(rank, std::slice::from_ref(&z2)).unwrap().data, [0.0]);
+        assert_eq!(call(rank, &[s.clone(), num(10.0)]).unwrap().data, [0.0]);
+        let p = call(pinv, one).unwrap();
+        let want = Matrix::new(2, 2, vec![0.04, 0.08, 0.08, 0.16]);
+        assert!(near(&p, &want, 1e-14), "{p:?}");
+        // pinv of a full-rank tall matrix is a left inverse.
+        let t = mat(3, 2, &[1.0, 1.0, 1.0, 2.0, 1.0, 3.0]);
+        let pt = call(pinv, std::slice::from_ref(&t)).unwrap();
+        assert_eq!((pt.rows, pt.cols), (2, 3));
+        let tm = t.into_mat().unwrap();
+        let left = pt.matmul(&tm).unwrap();
+        assert!(near(&left, &Matrix::identity(2, 2), 1e-13));
+        // A long column needs no 100000x100000 U.
+        let long = Value::Mat(Matrix::filled(100_000, 1, 1.0));
+        let pl = call(pinv, &[long]).unwrap();
+        assert_eq!((pl.rows, pl.cols), (1, 100_000));
+        assert!((pl.data[0] - 1e-5).abs() < 1e-18);
+
+        let z = call(null, one).unwrap();
+        assert_eq!((z.rows, z.cols), (2, 1));
+        let sm = s.clone().into_mat().unwrap();
+        assert!(sm.matmul(&z).unwrap().data.iter().all(|v| v.abs() < 1e-14));
+        assert!((z.data[0].hypot(z.data[1]) - 1.0).abs() < 1e-14);
+        let z = call(null, &[Value::Mat(Matrix::identity(2, 2))]).unwrap();
+        assert_eq!((z.rows, z.cols), (2, 0));
+        let o = call(orth, one).unwrap();
+        assert_eq!((o.rows, o.cols), (2, 1));
+        assert!((o.data[0] / o.data[1] - 0.5).abs() < 1e-14, "{o:?}");
+
+        let c = call(cond, &[mat(2, 2, &[1.0, 2.0, 3.0, 4.0])])
+            .unwrap()
+            .data[0];
+        assert!((c - 14.933034373659268).abs() < 1e-10);
+        assert_eq!(call(cond, &[z2]).unwrap().data, [f64::INFINITY]);
+        assert_eq!(
+            call(cond, &[Value::Mat(Matrix::empty())]).unwrap().data,
+            [0.0]
+        );
+        assert_eq!(call(cond, &[eye3]).unwrap().data, [1.0]);
+
+        let named: [(crate::builtins::BuiltinFn, &str); 6] = [
+            (rank, "rank"),
+            (pinv, "pinv"),
+            (null, "null"),
+            (orth, "orth"),
+            (cond, "cond"),
+            (svd, "svd"),
+        ];
+        for (f, name) in named {
+            let e = err(f, &[mat(2, 2, &[f64::NAN, 0.0, 0.0, 1.0])], 1);
+            assert_eq!(e, format!("Input to '{name}' must not contain NaN or Inf."));
+            let e = err(f, &[mat(2, 2, &[f64::INFINITY, 0.0, 0.0, 1.0])], 1);
+            assert!(e.contains("NaN or Inf"));
+        }
+        assert_eq!(
+            err(rank, &[s, text("x")], 1),
+            "Tolerance for 'rank' must be a real scalar."
+        );
+    }
+
+    #[test]
+    fn eig_chol_lu_qr_and_svd_through_the_builtins() {
+        let e = call(eig, &[mat(2, 2, &[2.0, 1.0, 1.0, 2.0])]).unwrap();
+        assert_eq!((e.rows, e.cols), (2, 1));
+        assert!((e.data[0] - 1.0).abs() < 1e-14 && (e.data[1] - 3.0).abs() < 1e-14);
+        let vd = outputs(eig, &[mat(2, 2, &[2.0, 0.0, 0.0, 3.0])], 2);
+        assert_eq!(vd[1], Matrix::new(2, 2, vec![2.0, 0.0, 0.0, 3.0]));
+        assert_eq!(vd[0], Matrix::identity(2, 2));
+        let e = err(eig, &[mat(2, 2, &[0.0, -1.0, 1.0, 0.0])], 1);
+        assert!(e.starts_with("Complex results are not supported."), "{e}");
+        assert_eq!(
+            err(eig, &[mat(2, 2, &[f64::NAN, 1.0, 1.0, 1.0])], 1),
+            "Input to 'eig' must not contain NaN or Inf."
+        );
+        assert_eq!(
+            err(eig, &[row(&[1.0, 2.0])], 1),
+            "Matrix must be square for 'eig'."
+        );
+        let e = call(eig, &[Value::Mat(Matrix::empty())]).unwrap();
+        assert_eq!((e.rows, e.cols), (0, 1));
+
+        let r = call(chol, &[mat(2, 2, &[4.0, 2.0, 2.0, 3.0])]).unwrap();
+        assert_eq!(r.data[..3], [2.0, 0.0, 1.0]);
+        let pd = "Matrix must be positive definite.";
+        assert_eq!(err(chol, &[mat(2, 2, &[1.0, 2.0, 2.0, 1.0])], 1), pd);
+        assert_eq!(err(chol, &[mat(2, 2, &[f64::NAN, 0.0, 0.0, 1.0])], 1), pd);
+        assert_eq!(
+            err(chol, &[row(&[1.0, 2.0])], 1),
+            "Matrix must be square for 'chol'."
+        );
+        let rp = outputs(chol, &[mat(2, 2, &[1.0, 2.0, 2.0, 1.0])], 2);
+        assert_eq!(
+            (rp[0].data.clone(), rp[1].data.clone()),
+            (vec![1.0], vec![2.0])
+        );
+        let rp = outputs(chol, &[mat(2, 2, &[4.0, 2.0, 2.0, 3.0])], 2);
+        assert_eq!(rp[1].data, [0.0]);
+
+        let a = mat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let one = std::slice::from_ref(&a);
+        let am = a.clone().into_mat().unwrap();
+        let lup = outputs(lu, one, 3);
+        assert!((lup[0].get(1, 0) - 1.0 / 3.0).abs() < 1e-15);
+        let pa = lup[2].matmul(&am).unwrap();
+        assert!(near(&pa, &lup[0].matmul(&lup[1]).unwrap(), 1e-14));
+        let lu2 = outputs(lu, one, 2);
+        assert!(near(&lu2[0].matmul(&lu2[1]).unwrap(), &am, 1e-14));
+        let y = call(lu, one).unwrap();
+        assert_eq!(y.get(0, 0), 3.0);
+
+        let qr2 = outputs(qr, one, 2);
+        assert!(near(&qr2[0].matmul(&qr2[1]).unwrap(), &am, 1e-14));
+        let r = call(qr, one).unwrap();
+        assert!((r.get(0, 0).abs() - 10f64.sqrt()).abs() < 1e-14);
+
+        let s = call(svd, &[mat(2, 2, &[3.0, 0.0, 0.0, 4.0])]).unwrap();
+        assert_eq!((s.rows, s.cols, s.data.clone()), (2, 1, vec![4.0, 3.0]));
+        let usv = outputs(svd, &[mat(2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])], 3);
+        assert_eq!((usv[1].rows, usv[1].cols), (2, 3));
+        let back = usv[0]
+            .matmul(&usv[1])
+            .unwrap()
+            .matmul(&usv[2].transpose())
+            .unwrap();
+        let want = Matrix::new(2, 3, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert!(near(&back, &want, 1e-13));
+    }
+
+    /// A sink the test can read back after the interpreter has written to it.
+    struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+    impl std::io::Write for Shared {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn inv_warns_through_the_error_sink_and_returns_inf() {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        it.err = Box::new(Shared(buf.clone()));
+        let x = inv(&mut it, &[mat(2, 2, &[1.0, 2.0, 2.0, 4.0])], 1).unwrap();
+        let x = x[0].clone().into_mat().unwrap();
+        assert!(x.data.iter().all(|&v| v == f64::INFINITY));
+        assert_eq!(
+            String::from_utf8(buf.borrow().clone()).unwrap(),
+            "Warning: Matrix is singular to working precision.\n"
+        );
+        let x = inv(&mut it, &[num(0.0)], 1).unwrap();
+        assert_eq!(x[0].clone().into_mat().unwrap().data, [f64::INFINITY]);
+        // A regular matrix does not warn.
+        buf.borrow_mut().clear();
+        inv(&mut it, &[mat(2, 2, &[2.0, 1.0, 1.0, 3.0])], 1).unwrap();
+        assert!(buf.borrow().is_empty());
     }
 }

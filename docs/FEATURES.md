@@ -35,9 +35,11 @@ What SplatCrab does today, with the golden case that proves each area works.
 
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
-| `+ - * /` and left division | 00 | `matrix_ops` | Backslash solves square systems only |
-| The singular test is relative to the matrix | 01d | `solve_relative_pivot` | The pivot tolerance scales with the largest finite magnitude in the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15] \ [1; 1]` is solved rather than refused. A fixed `1e-14` used to judge it, and `det` and `\` disagreed on what singular means; they now make the identical test |
-| `^` with an integer exponent | 00 | `demo_smoke` | Negative exponents invert |
+| `+ - * /` and left division | 00 | `matrix_ops`, `backslash_square_regression` | A square system goes through the shared LU since cycle 08 |
+| Least squares `A \ b` and `b / A` | 08 | `backslash_least_squares`, `slash_least_squares` | A non-square system is solved in the least-squares sense by Householder QR with column pivoting; an underdetermined or rank-deficient one gets the basic solution, at most `rank` non-zero rows, and a rank-deficient one warns `Matrix is rank deficient to working precision (rank r).`, SplatCrab's own text. Before cycle 08 a non-square `\` was an error |
+| A singular system warns | 08 | `singular_backslash_warns`, `singular_warning_protocol_out`, `singular_warning_protocol_in_order` | `[1 2; 2 4] \ [1; 2]` writes `Warning: Matrix is singular to working precision.` through `Interp.err` and returns what the substitution gives, `NaN NaN` here; under `--protocol` the warning is in the `eval`'s `out`, in order. It was an error until cycle 08 |
+| The singular test is relative to the matrix | 01d | `solve_relative_pivot` | The pivot tolerance scales with the largest finite magnitude in the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15] \ [1; 1]` is solved rather than refused. A fixed `1e-14` used to judge it, and `det` and `\` disagreed on what singular means; they make the identical test, and since cycle 08 read the one LU |
+| `^` with an integer exponent | 00 | `demo_smoke`, `mpower_singular_warns_inf` | Negative exponents invert; a singular matrix to a negative power warns and is `Inf` everywhere, as `inv` is (cycle 08) |
 | `.* ./ .^` elementwise | 00 | `matrix_ops` | |
 | `.\` elementwise left divide | 01b | `eldiv_vector`, `eldiv_after_number` | `a.\b` is `b./a`; `2.\x` no longer means `2 \ x` |
 | Transpose `'` and `.'` | 00 | `matrix_ops` | |
@@ -141,7 +143,7 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-115 names, each an ordinary function in `src/builtins/` registered by name in
+130 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -154,7 +156,10 @@ Cycle 05 added six, `nargin`, `nargout`, `exist`, `feval`, `addpath` and
 cases. Cycle 07 added thirteen, `cell`, `struct`, `fieldnames`, `isfield`,
 `rmfield`, `getfield`, `setfield`, `iscell`, `isstruct`, `cellfun`,
 `num2cell`, `cell2mat` and `deal`, exercised by the `07-cells-and-structs`
-cases. Cycle 01c removed `e`, which
+cases. Cycle 08 added fifteen, `lu`, `qr`, `chol`, `eig`, `svd`, `rank`,
+`pinv`, `null`, `orth`, `cond`, `kron`, `cross`, `triu`, `tril` and `magic`,
+exercised by the `08-linear-algebra` cases (see
+[Linear algebra](#linear-algebra)). Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -171,6 +176,8 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Two-argument math | `mod rem atan2 hypot power` | 00 | `math.rs` |
 | Classes | `class islogical ischar isnumeric isa logical char double` | 02 | `core.rs` |
 | Linear algebra | `transpose inv det trace diag norm dot` | 00 | `linalg.rs` |
+| Factorisations | `lu qr chol eig svd rank pinv null orth cond` | 08 | `linalg.rs`, over `factor.rs` |
+| Constructions | `kron cross triu tril magic` | 08 | `linalg.rs` |
 | Search and sort | `find sort` | 00 | `linalg.rs` |
 | Output | `disp fprintf sprintf num2str` | 00 | `core.rs` |
 | Errors and warnings | `error rethrow lasterr warning assert` | 00, 04 | `core.rs` |
@@ -184,8 +191,8 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
 a dimension past the array's returns the input unchanged and `0` is an error.
 `sum`, `prod`, `mean`, `any` and `all` also take `'all'`, and so do `max` and
-`min` as their third argument. `max` and `min` also take two arrays. `norm` and
-`sort` accept vectors only, until cycles 08 and 09. `sort` puts `NaN` last
+`min` as their third argument. `max` and `min` also take two arrays. `sort`
+accepts vectors only, until cycle 09; `norm` takes a matrix since cycle 08. `sort` puts `NaN` last
 when ascending and first when descending.
 
 Every numeric builtin returns a double, whatever its argument's class:
@@ -239,7 +246,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | `linspace` includes both end points exactly | 01d | `range_hits_end_point` | The last element is the end point itself, not `a + (b-a)*(n-1)/(n-1)` |
 | `sort(v, 'descend')`, `sort(v, dim)`, `sort(v, dim, direction)` | 01c | `sort_direction`, `sort_descend_stable`, `err_sort_direction` | Stable in both directions; `NaN` first when descending |
 | `find(X, n)`, `find(X, n, 'first')`, `find(X, n, 'last')` | 01c | `find_count`, `err_find_count_zero`, `err_find_count_fraction`, `err_find_direction` | The last `n` stay in ascending order; `n` must be a positive integer |
-| `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | Vectors only until cycle 08. `p = 0` and a negative finite `p` are refused |
+| `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | A matrix takes its own norms since cycle 08 (see [Linear algebra](#linear-algebra)). `p = 0` and a negative finite `p` are refused |
 | `norm` without overflow; an empty sum is `+0` | 01c | `norm_scaled_and_empty_sum` | `norm([1e200 1e200])` is `1.4142e+200`, not `Inf`. `sum([])`, `norm([])` and `dot([], [])` print `0.0000`, not `-0.0000` |
 | `diag(v, k)` and `diag(A, k)` | 01c | `diag_offset`, `err_diag_offset` | A `k` past the matrix gives a 0x1 |
 | `num2str(x, n)` and `num2str(x, formatSpec)` | 01c | `num2str_precision`, `err_num2str_precision` | `%.{n}g`, and `sprintf` with the leading spaces trimmed. A non-scalar keeps its one-row output until cycle 11 |
@@ -250,6 +257,25 @@ implements the ones MATLAB code actually uses. Cases are in
 | `isvector` of a 1x0 or a 0x1 is true | 01c | `isvector_empty` | A 0x0 is not a vector |
 | A bare `toc` needs an earlier bare `tic` | 01c | `toc_after_bare_tic`, `err_toc_before_tic`, `err_toc_value_before_tic`, `err_toc_after_handle_tic` | `t = tic` does not count; `toc(t)` is unaffected |
 | `'all'`, and no char is ever a dimension | 01c | `reduction_all_option`, `err_reduction_char_dim`, `err_cumsum_all`, `err_max_char_dim`, `err_size_char` | `sum(A, 'x')` used to reduce along dimension 120 |
+
+## Linear algebra
+
+Cycle 08. The numerics are in `src/builtins/factor.rs`, the builtins over
+them in `linalg.rs`; the Design notes of `docs/modules/08-linear-algebra.md`
+record every choice.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| One LU for `det`, `inv`, `\`, `/`, `A^-n` and `lu` | 08 | `lu_three_outputs`, `backslash_square_regression` | Partial pivoting on the first largest element, as `idamax` picks it. `[L, U, P] = lu(A)` has `P*A = L*U`, `[L, U] = lu(A)` the permuted `L`, `Y = lu(A)` LAPACK's packed form; any `m`-by-`n` `A`. The arithmetic is the elimination `det` and `\` made before, so `det([1 2; 3 4])` is still exactly `-2` |
+| `inv` and `A^-1` of a singular matrix | 08 | `inv_singular_warns_inf`, `inv_zero_warns_inf`, `mpower_singular_warns_inf` | The singular warning and `Inf` everywhere: `inv([1 2; 2 4])` is `Inf Inf; Inf Inf` and `inv(0)` is `Inf`, as in MATLAB and Octave (QA D26). A matrix singular only to working precision, with no exact zero pivot, warns and returns the computed inverse |
+| `[Q, R] = qr(A)` | 08 | `qr_factors` | Householder, full: `Q` is `m`-by-`m`. `R`'s diagonal takes LAPACK's signs, so it may be negative; below it is exact `0`. `R = qr(A)` gives `R` alone |
+| `chol(A)`, `[R, p] = chol(A)` | 08 | `chol_upper_factor`, `err_chol_not_positive_definite`, `err_chol_nan_input` | Upper `R` with `R'*R = A`, from the upper triangle. Not positive definite, a `NaN` pivot included, is `Matrix must be positive definite.`; the two-output form returns the failing column instead |
+| `eig(A)`, `[V, D] = eig(A)` | 08 | `eig_symmetric_ascending`, `eig_nonsymmetric_real`, `eig_nonsymmetric_hessenberg`, `eig_two_outputs`, `eig_vectors_residual`, `err_eig_complex_eigenvalues`, `err_eig_nan_input` | An exactly symmetric `A` by cyclic Jacobi, eigenvalues ascending; any other by Hessenberg reduction and the shifted double QR iteration, in the order found, unit eigenvectors. A complex eigenvalue is `Complex results are not supported. ...` until cycle 10. A `NaN` or `Inf` is `Input to 'eig' must not contain NaN or Inf.` |
+| `svd(A)`, `[U, S, V] = svd(A)` | 08 | `svd_values_descending`, `svd_three_outputs`, `svd_zero_row_converges`, `err_svd_inf_input` | One-sided Jacobi; values descending; `U` and `V` full and orthogonal. A `NaN` or `Inf` is refused, as for `eig` |
+| `rank pinv null orth cond` | 08 | `rank_deficient_and_full`, `pinv_rank_deficient`, `null_basis`, `orth_basis`, `norm_matrix_and_cond` | Through the SVD. `rank` counts singular values above `max(m, n) * eps(s(1))`, and `null` and `orth` use the same tolerance; `pinv` drops those at or below `max(m, n) * s(1) * eps`. `rank` and `pinv` take a tolerance argument. `cond` is `s(1) / s(end)`, `Inf` for a singular matrix |
+| Matrix `norm` | 08 | `norm_matrix_and_cond`, `err_norm_matrix_type`, `err_norm_matrix_order` | `norm(A)` and `norm(A, 2)` the largest singular value, `norm(A, 1)` the largest column sum, `norm(A, Inf)` the largest row sum, `norm(A, 'fro')` the root sum of squares. Other orders are `Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.` A `NaN` gives `NaN`; an `Inf` gives an `Inf` 2-norm |
+| `kron cross triu tril magic` | 08 | `kron_two_vectors`, `cross_unit_vectors`, `triu_tril`, `magic_three` | `cross` works along the first dimension of length 3 of two same-sized arrays; `triu` and `tril` keep the class; `magic(n)` is MATLAB's construction for odd, doubly even and singly even `n` |
+| Every iteration terminates | 08 | `err_eig_nan_input`, `err_svd_inf_input`, `err_chol_nan_input` | The Jacobi sweeps (100), the SVD sweeps (100) and the QR iteration (`30 * max(10, n)` per eigenvalue) have caps, past which the answer is `'eig' did not converge within its iteration limit.` (or `'svd'`); no input known reaches one. `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `lu`, `qr`, `det`, `inv` and `\` let it spread to a `NaN` result |
 
 ## Output and formatting
 

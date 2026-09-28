@@ -27,7 +27,8 @@ SplatCrab is early software (version 0.1.0). The core language works:
 matrices, the double, logical and char classes, indexing, control flow with
 `switch` and `try`/`catch`, command syntax, user functions in scripts and in
 function files on a path, function handles and anonymous functions, cell
-arrays and structs, formatted output and 115 builtins. Complex numbers and
+arrays and structs, linear algebra, formatted output and 130 builtins.
+Complex numbers and
 plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
@@ -234,11 +235,22 @@ z
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts
   the process any more
-- Square `A\b`, `inv`, `det`, integer matrix powers. The singular test is
-  relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
-  solved rather than written off, and `det` and `\` agree on what singular
-  means
-- 115 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- Linear algebra on one shared LU with partial pivoting: `A\b` and `b/A`,
+  `inv`, `det`, integer matrix powers and `[L, U, P] = lu(A)`. A singular
+  square system, `inv` and `A^-1` warn "Matrix is singular to working
+  precision." and return a result, `Inf` for `inv([1 2; 2 4])`, rather than
+  stopping; the singular test is relative to the matrix, so `det` and `\`
+  agree on what singular means. A non-square `A\b` or `b/A` is a
+  least-squares solution by column-pivoted Householder QR
+- Decompositions: `[Q, R] = qr(A)`, `chol` (and `[R, p] = chol(A)`),
+  `eig` and `[V, D] = eig(A)` (Jacobi for a symmetric matrix, Hessenberg QR
+  for any other; a complex eigenvalue is a clean refusal until cycle 10),
+  `svd` and `[U, S, V] = svd(A)` by one-sided Jacobi, and on top of them
+  `rank`, `pinv`, `null`, `orth`, `cond` and the matrix `norm(A)`,
+  `norm(A, 1)`, `norm(A, Inf)` and `norm(A, 'fro')`. Every iteration has a cap
+  and a `NaN` or `Inf` never makes one hang. Also `kron`, `cross`, `triu`,
+  `tril` and `magic`
+- 130 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -301,7 +313,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 115 builtins,
+                                         builtins/    the 130 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

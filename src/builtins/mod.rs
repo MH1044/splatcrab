@@ -18,6 +18,7 @@
 pub mod args;
 pub mod cells;
 pub mod core;
+pub mod factor;
 pub mod linalg;
 pub mod math;
 
@@ -94,7 +95,7 @@ mod tests {
     /// `str2func`. Cycle 07 added thirteen: `cell`, `struct`,
     /// `fieldnames`, `isfield`, `rmfield`, `getfield`, `setfield`,
     /// `iscell`, `isstruct`, `cellfun`, `num2cell`, `cell2mat` and `deal`.
-    const EXPECTED: usize = 115;
+    const EXPECTED: usize = 130;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {

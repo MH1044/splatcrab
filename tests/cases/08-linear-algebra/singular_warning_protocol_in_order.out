@@ -1,0 +1,2 @@
+{"id":1,"ok":true,"out":"     1\nWarning: Matrix is singular to working precision.\n   Inf   Inf\n   Inf   Inf\n"}
+{"id":2,"ok":true,"out":"Warning: Matrix is singular to working precision.\n     2     1\n"}
