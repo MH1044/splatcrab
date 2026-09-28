@@ -1,2 +1,2 @@
-% covers: 16 - e.stack waits for cycle 05, so it is the dot-indexing error cycle 03 pinned for a value with no fields
-try, error('x'), catch e, e.stack, end
+% covers: 16 - e.stack waited for cycle 05 and then 07; now a struct array, empty for an error raised outside every function
+try, error('x'), catch e, disp(class(e.stack)), disp(numel(e.stack)), end

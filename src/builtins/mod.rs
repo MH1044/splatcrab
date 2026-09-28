@@ -16,6 +16,7 @@
 //! legal as a statement and is "Too many output arguments." in an expression.
 
 pub mod args;
+pub mod cells;
 pub mod core;
 pub mod linalg;
 pub mod math;
@@ -42,6 +43,7 @@ pub type Registry = HashMap<&'static str, Entry>;
 pub fn registry() -> Registry {
     let mut r = Registry::new();
     core::register(&mut r);
+    cells::register(&mut r);
     math::register(&mut r);
     linalg::register(&mut r);
     r
@@ -89,8 +91,10 @@ mod tests {
     /// five: `rethrow`, `lasterr`, `warning`, `assert` and `isequal`. Cycle
     /// 05 added six: `nargin`, `nargout`, `exist`, `feval`, `addpath` and
     /// `rmpath`. Cycle 06 added three: `arrayfun`, `func2str` and
-    /// `str2func`.
-    const EXPECTED: usize = 102;
+    /// `str2func`. Cycle 07 added thirteen: `cell`, `struct`,
+    /// `fieldnames`, `isfield`, `rmfield`, `getfield`, `setfield`,
+    /// `iscell`, `isstruct`, `cellfun`, `num2cell`, `cell2mat` and `deal`.
+    const EXPECTED: usize = 115;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -201,6 +205,19 @@ mod tests {
             "arrayfun",
             "func2str",
             "str2func",
+            "cell",
+            "struct",
+            "fieldnames",
+            "isfield",
+            "rmfield",
+            "getfield",
+            "setfield",
+            "iscell",
+            "isstruct",
+            "cellfun",
+            "num2cell",
+            "cell2mat",
+            "deal",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

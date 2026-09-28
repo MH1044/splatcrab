@@ -75,7 +75,10 @@ Since cycle 04 two more things live here, for the same reason:
   and `otherwise`.
 
 The brace of a `case {...}` list goes on the delimiter stack as `C`, which
-the whitespace rule treats as a bracket, so `case {2 3}` is two values.
+the whitespace rule treats as a bracket, so `case {2 3}` is two values. Since
+cycle 07 so does every brace that does not follow the end of a value, which
+is a cell literal: `{1 -2}` is two elements and a newline in it starts a
+row, while in the brace index `c{1 -2}` the whitespace separates nothing.
 
 Since cycle 03 the lexer also has `{`, `}`, a lone `.` and `@`. The field dot
 is whatever dot is left once a number's decimal point, the five dotted
@@ -114,7 +117,9 @@ An assignment target is an `LValue`, a name and a chain, so `x = v`,
 with `None` for a `~`: `try_targets` reads a bracket as a target list when it
 holds only targets and placeholders and is followed by `=`, and otherwise
 rewinds so that the bracket parses as the matrix literal it always was. A `{`
-where a value should start is a parse error until cycle 07.
+where a value should start is a cell literal, `Expr::Cell(rows)` (cycle 07),
+parsed like a bracket but taking handles as elements and wanting a
+separator after each one, so `{@(x) x 1}` is refused.
 
 Cycle 06 added the two handle forms, `Expr::FuncHandle(name)` for `@name` and
 `Expr::AnonFn(Rc<AnonFn>)` for `@(params) body`. The body is one expression,
@@ -180,7 +185,9 @@ display. Since cycle 04 `Value` has a second variant, `Exception`, the
 `R`, refusing it with `This operation is not supported for a value of class
 'MException'.` Since cycle 06 there is a third, `Func(Rc<Func>)`, a function
 handle, refused the same way with its class `function_handle`; see "Add a
-value type".
+value type". Cycle 07 added the containers, `Cell(Rc<CellArray>)` and
+`Struct(Rc<StructArray>)`, their displays, and the drop worklist that frees
+every nesting value without recursion; see "Containers" below.
 
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
 `name` is a variable and as a call otherwise, and grows arrays on indexed
@@ -203,9 +210,10 @@ running frame, and the frame's `unit`. `call_handle` calls either kind, and
 captures and the parameters, counted against `MAX_RECURSION`, the body run
 through `eval_request`. `eval_request` is what a statement, a multiple
 assignment and an anonymous body share: a call, by name or of a handle
-variable with one `(...)`, is asked for exactly the outputs wanted, and any
-other expression is its one value, which is how `nargout` passes through a
-body that is a single call.
+variable with one `(...)`, is asked for exactly the outputs wanted, an
+access chain gives its cs-list (cycle 07), and any other expression is its
+one value, which is how `nargout` passes through a body that is a single
+call.
 Reading, assignment and deletion share one index pipeline since cycle 03:
 `eval_index_args` turns the subscripts into zero-based `Sel`s (a logical
 subscript becomes the positions `find` would give), `resolve_read`,
@@ -226,8 +234,9 @@ through. `switch` evaluates its case values in order, only until one
 matches.
 
 **`builtins/`** is the library: `mod.rs` holds the registry, `args.rs` the
-argument helpers, and `core.rs`, `math.rs` and `linalg.rs` the builtins
-themselves. Every one has the same shape,
+argument helpers, and `core.rs`, `math.rs`, `linalg.rs` and, since cycle 07,
+`cells.rs` (cells, structs, `cellfun` and the map `arrayfun` shares) the
+builtins themselves. Every one has the same shape,
 `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`, where the `usize` is
 `nargout` and an empty `Vec` means the builtin produced no value.
 
@@ -368,7 +377,7 @@ a `Callee::Name` or a `Callee::Handle`, never through `call_function` or
 nesting budget every frame shares, which is what bounds a function that calls
 a builtin that calls the function (cycle 05's review found `feval` re-entering
 uncounted and overflowing the stack). `feval` and `arrayfun` do so since
-cycle 06; `cellfun` in cycle 07 must too.
+cycle 06, and `cellfun` since cycle 07.
 
 A shape the user asks for goes through the size helpers and stays `f64` until
 it is judged, so that an oversized request is named as asked. `shape` reads a
@@ -439,6 +448,25 @@ itself. The operations that accept it: a call through a variable or a chain,
 `feval`, `arrayfun`, `func2str`, `class` and `isa`; `hcat` refuses it with
 the concatenation message rather than the generic one.
 
+Cycle 07 added the fourth and fifth, the containers `Value::Cell(Rc<CellArray>)`
+and `Value::Struct(Rc<StructArray>)`. Each answers `class_name` (`cell`,
+`struct`), `dims`, `display_body` and `disp_text` itself, and `Value::element`
+gives element `k` of any value as a value of its own, which `arrayfun` and
+`num2cell` hand out. Every value now answers the shape and class queries
+(`size`, `numel`, `length`, `isempty`, `isscalar`, `isvector`, `isa`,
+`class`, `islogical`, `ischar`, `isnumeric`): a handle and an `MException`
+are 1x1. A binary operator on any value that is not a matrix is MATLAB
+R2020a's `Operator '+' is not supported for operands of type 'cell'.`, from
+`Interp::binary`, which evaluates both operands and names the first that is
+not an array; every other operation still reaches a matrix through
+`Value::mat` and keeps the generic refusal.
+
+A value kind that holds other values must go on the drop worklist in
+`value.rs`: `holds_values` names the kinds that nest, and `free` opens each
+one it is the last owner of and moves what it holds onto the list, so no drop
+recurses more than one level. `Drop` for `CellArray`, `StructArray` and `Func`
+hands their contents to it.
+
 ## Key designs to preserve
 
 These are decided and should not be re-litigated inside a cycle. The full
@@ -458,8 +486,10 @@ statement records its own. At the top the line is therefore always a line of
 the code that was run, which is what the protocol's `line` means, and the
 trace, `MError::trace`, is one `  in <fn> (line N)` per frame, innermost
 first, which `main.rs` prints to stderr after the message, in script mode
-and at the REPL alike. The protocol does not send it; `e.stack` is cycle
-07's.
+and at the REPL alike. The protocol does not send it. Since cycle 07 an
+entry also records the file of the function (`MError::leaving_file`, empty
+for a function local to the code that was run), and `e.stack` reads the
+entries as an Nx1 struct array of `file`, `name` and `line`.
 
 **Registry (cycle 01, in place).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
@@ -537,10 +567,43 @@ against `MAX_RECURSION` like a user call. An error leaving it gains a trace
 entry named by its `func2str` text, `  in @(n)g(n)`, with no line, since an
 expression has none.
 
-**Containers (cycle 07).** `CellArray` and `StructArray` as separate types that
-reuse index-resolution helpers factored out of `Matrix`, rather than making
-`Matrix` generic. Writes go through a recursive `assign_chain` that creates the
-right empty container when a path does not exist yet.
+**Containers (cycle 07, in place).** `CellArray` and `StructArray` are
+separate types, not a generic `Matrix`, and both reuse the index pipeline:
+`eval_index_args` makes the `Sel`s, `resolve_read`, `resolve_write` (which
+takes the right-hand side's shape, not a matrix) and `resolve_delete` plan
+against the container's shape, and `pick`, `regrid` and `keep_positions`
+carry the plan out on its column-major items, as `gather`, `scatter` and the
+deletion do on a matrix's. A `CellArray` is `rows x cols` values; a
+`StructArray` is `rows x cols` elements, each one value per field of
+`fields`, in the order the fields were first made. A struct with 32 fields
+or more also keeps a hash index from name to place, built on its first
+lookup and kept current by `ensure_field`, so adding fields one at a time is
+not quadratic; it is private, so every struct is made by
+`StructArray::new` or `scalar`. Both sit behind an `Rc`
+and are copied on write (`Rc::make_mut`), so reading a variable, `c = {c}`
+and a capture are pointer copies, and `c{end+1} = k` in a loop mutates in
+place.
+
+A read is a cs-list: `eval_access` returns `Vec<Value>`, one value for most
+chains and one per selected element for `c{...}` and for a field of a struct
+array. `eval_multi` spreads it where MATLAB does, into a call's arguments and
+the elements of `[...]` and `{...}`, `eval_request` hands it to
+`[a, b] = c{:}`, and everywhere else `one_value` turns any length but one
+into `Expected one output from a curly brace or dot indexing expression, but
+there were N results.`. The leading fields of a variable are walked by
+reference, so `s.data(k)` reads in place as `x(k)` does.
+
+A write goes through `assign_to` for every chain: `resolve_links` evaluates
+each subscript against the shape the path holds at that point (`shape_at`,
+`0x0` where it holds nothing), so `end` means what a read would mean, and
+turns dynamic fields into names; then the recursive `assign_chain`, bounded
+by `MAX_DEPTH` links, stores the value. It creates the right empty
+container where the path does not exist yet (a field of `[]` makes a struct,
+a brace a cell, `p(2).name` a struct array) and grows with `[]` elements.
+Nothing is created or grown until the assignment below it has succeeded,
+and a variable made for the walk is removed on failure, so a failed
+assignment changes nothing. `delete_at` and `nav_mut` delete at the end of a
+longer chain, `s.list(2) = []`.
 
 ## Known deviations from MATLAB
 
@@ -558,7 +621,8 @@ cycle named:
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | Indexing into or growing a second page, `A(:, :, 2) = 5` or `A(:, :, [1 1])`, is "N-D arrays are not supported."; MATLAB builds the N-D array. Cycle 03 accepted it | later, with N-D arrays |
-| An `MException` is minimal: `message`, `identifier` and `class`, with no `stack`, `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`. Cycle 05 added the uncaught error's trace; the data is in the `MError`, but `e.stack` needs a struct array | `e.stack` in 07; the rest later |
+| An `MException` is minimal: `message`, `identifier`, `stack` and `class`, with no `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`. `e.stack` (cycle 07) holds the function frames only, not the script's own, and `file` is empty for a function local to the script that was run | later |
+| Cells and structs, cycle 07: a cs-list is not spread into index subscripts (`x(c{:})`) nor accepted as a target list (`[c{:}] = deal(0)`); a cell or a struct cannot be transposed; `isequal` of cells or structs is false; `varargin` with no extra arguments is 0x0; several message texts are recalled or SplatCrab's own. The Design notes of `docs/modules/07-cells-and-structs.md` have each | later (verify first) |
 | `exist` gives `5` for every builtin, where MATLAB gives `2` for the builtins it ships as `.m` files (`linspace`, for instance): every SplatCrab builtin is built in. What `exist` gives for a function local to the running script is not settled by the MathWorks page; SplatCrab gives `0`, and no case asserts it | by design; the local-function value later (verify first) |
 | The trace names a function alone, `  in g3 (line 8)`, where MATLAB writes `Error in script>g3 (line 8)`; the spec fixes SplatCrab's form | by design |
 | Functions are more permissive than MATLAB's in three ways, none of which changes what a file MATLAB accepts means: a function in a file on the path can call a local function of the script being run (invariant 4 reads the script's local functions after the running file's, where MATLAB keeps local functions private to their file); a file may mix functions that end with `end` and functions that do not; and a script's local functions may go without `end`. Calling a script with arguments or for a value is `Too many input arguments.` or `Too many output arguments.`, where MATLAB names the script | later |
@@ -621,6 +685,9 @@ bracketed assignment targets (QA D32); it also discharged the Known
 deviations row for the `x(0)` message, whose ending now names logical values.
 Cycle 04 fixed the three rows scheduled to it: block comments that executed
 (QA D7), `error`'s argument rules (QA D9) and command syntax (QA D31).
+Cycle 07 fixed the row scheduled to it, the builtins that refused an
+`MException` and a handle, and narrowed it to `isequal` of handles, which
+its spec left out of scope.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -644,7 +711,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | An unexpected character is echoed raw into the message | `unexpected character '<c>'` writes the character itself, so a control character reaches stderr as a raw byte: running `01e-display-and-parser/err_utf16_file.m` writes a literal NUL between the quotes. A control character should be named, for instance as `U+0000`. Found while rebuilding the test inventory after cycle U0 | later, low impact |
-| Most builtins refuse an `MException` | `isa(e, 'MException')`, the usual MATLAB check, is an error, and so are `size(e)`, `isempty(e)` and `ischar(e)`; `who` and the protocol's `workspace` already show it as `1x1 MException`. Cycle 04's Scope named only `class`, `rethrow` and the two fields. Found by cycle 04's review. A function handle, since cycle 06, is the same apart from `isa`: `size(f)`, `isempty(f)` and `isequal(f, f)` refuse it or answer false, where MATLAB answers each (verify the values first) | 07, with the other non-matrix values |
+| `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
 
 **The process-killing family.** The two panics that used to head this list,

@@ -5,6 +5,8 @@
 //! `1`; a char element is one UTF-16 code unit, `0` to `65535`, as in MATLAB,
 //! so `length('😀')` is `2`.
 
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
 
@@ -48,19 +50,28 @@ pub struct Matrix {
 }
 
 /// A value the interpreter can hold. Cycle 02 removed `Str`: text is a
-/// `Char` matrix. Containers join in cycle 07.
+/// `Char` matrix. The containers joined in cycle 07.
 #[derive(Clone, Debug)]
 pub enum Value {
     Mat(Matrix),
     /// The `MException` a `catch e` binds (cycle 04): the error that was
     /// caught, whole, so that `rethrow(e)` raises it again unchanged, its
-    /// line included. `e.message` and `e.identifier` read its two texts;
-    /// `e.stack` waits for cycle 07, which has structs. It is a value of its own, not an array,
-    /// so every array operation refuses it with [`error::not_an_array`].
+    /// line included. `e.message` and `e.identifier` read its two texts and
+    /// `e.stack` (cycle 07) its trace as a struct array. It is a value of
+    /// its own, not an array, so every array operation refuses it with
+    /// [`error::not_an_array`].
     Exception(error::MError),
     /// A function handle (cycle 06), shared: reading the variable that
     /// holds one copies a pointer, not its captured workspace.
     Func(Rc<Func>),
+    /// A cell array (cycle 07). Shared and copied on write, like a handle:
+    /// reading a variable clones its value, and `c = {c}` in a loop must
+    /// not copy the whole nest each time, or it would be quadratic and the
+    /// copy itself would recurse once per level.
+    Cell(Rc<CellArray>),
+    /// A struct or struct array (cycle 07), shared and copied on write for
+    /// the same reasons as a cell.
+    Struct(Rc<StructArray>),
 }
 
 /// The class name an `MException` reports.
@@ -68,6 +79,227 @@ pub const EXCEPTION_CLASS: &str = "MException";
 
 /// The class name a function handle reports.
 pub const FUNC_CLASS: &str = "function_handle";
+
+/// The class name a cell array reports.
+pub const CELL_CLASS: &str = "cell";
+
+/// The class name a struct array reports.
+pub const STRUCT_CLASS: &str = "struct";
+
+/// A cell array (cycle 07): `rows x cols` values of any kind, stored
+/// column-major exactly as a [`Matrix`] stores its elements, so linear
+/// indexing, `c(:)` and growth follow the same rules and reuse the same
+/// index resolution in `interp.rs`. A new element is the 0x0 double `[]`.
+#[derive(Clone, Debug, Default)]
+pub struct CellArray {
+    pub rows: usize,
+    pub cols: usize,
+    /// Column-major: element (r, c) lives at data[c * rows + r].
+    pub data: Vec<Value>,
+}
+
+/// A struct array (cycle 07): `rows x cols` elements that all have the same
+/// fields, in the order they were first assigned. A 1x1 struct array is
+/// what MATLAB calls a struct. Elements are stored column-major, each as
+/// one value per field in the order of `fields`.
+#[derive(Clone, Debug, Default)]
+pub struct StructArray {
+    pub rows: usize,
+    pub cols: usize,
+    pub fields: Vec<String>,
+    /// Column-major; `elems[k][f]` is field `fields[f]` of element `k`.
+    pub elems: Vec<Vec<Value>>,
+    /// Where each name is in `fields`, built on the first lookup once there
+    /// are [`INDEXED_FIELDS`] fields or more, so that adding fields one at a
+    /// time in a loop is not quadratic. Only [`StructArray::new`],
+    /// [`StructArray::scalar`] and [`StructArray::ensure_field`] make or add
+    /// fields, and the last keeps the index up to date.
+    index: OnceCell<HashMap<String, usize>>,
+}
+
+/// The field count from which [`StructArray::field_index`] looks a name up
+/// in a hash index rather than walking the names.
+const INDEXED_FIELDS: usize = 32;
+
+/// The value a new element of a cell, a new field or a new struct element
+/// holds: the 0x0 double `[]`.
+pub fn blank() -> Value {
+    Value::Mat(Matrix::empty())
+}
+
+impl CellArray {
+    pub fn new(rows: usize, cols: usize, data: Vec<Value>) -> CellArray {
+        debug_assert_eq!(rows * cols, data.len());
+        CellArray { rows, cols, data }
+    }
+
+    /// A 1-row cell of `data`; no values is the 0x0 cell `{}`.
+    pub fn row(data: Vec<Value>) -> CellArray {
+        match data.len() {
+            0 => CellArray::default(),
+            n => CellArray::new(1, n, data),
+        }
+    }
+
+    pub fn numel(&self) -> usize {
+        self.data.len()
+    }
+
+    /// `rows x cols` of `[]`, which is what `cell(r, c)` makes.
+    pub fn blanks(rows: usize, cols: usize) -> CellArray {
+        CellArray::new(rows, cols, (0..rows * cols).map(|_| blank()).collect())
+    }
+}
+
+impl StructArray {
+    /// A 1x1 struct with these fields and values.
+    pub fn scalar(fields: Vec<String>, values: Vec<Value>) -> StructArray {
+        debug_assert_eq!(fields.len(), values.len());
+        StructArray::new(1, 1, fields, vec![values])
+    }
+
+    /// A `rows x cols` struct array of `elems`, column-major, each holding
+    /// one value per field.
+    pub fn new(
+        rows: usize,
+        cols: usize,
+        fields: Vec<String>,
+        elems: Vec<Vec<Value>>,
+    ) -> StructArray {
+        debug_assert_eq!(rows * cols, elems.len());
+        StructArray {
+            rows,
+            cols,
+            fields,
+            elems,
+            index: OnceCell::new(),
+        }
+    }
+
+    /// Where `name` is among the fields: the first place it has.
+    pub fn field_index(&self, name: &str) -> Option<usize> {
+        if self.fields.len() < INDEXED_FIELDS {
+            return self.fields.iter().position(|f| f == name);
+        }
+        let index = self.index.get_or_init(|| {
+            let mut m = HashMap::with_capacity(self.fields.len());
+            for (i, f) in self.fields.iter().enumerate() {
+                m.entry(f.clone()).or_insert(i);
+            }
+            m
+        });
+        index.get(name).copied()
+    }
+
+    pub fn numel(&self) -> usize {
+        self.elems.len()
+    }
+
+    /// Element `k` as a 1x1 struct of its own.
+    pub fn element(&self, k: usize) -> StructArray {
+        StructArray::scalar(self.fields.clone(), self.elems[k].clone())
+    }
+
+    /// Adds a field holding `[]` in every element, if it is not there yet,
+    /// and returns where it is.
+    pub fn ensure_field(&mut self, name: &str) -> usize {
+        if let Some(f) = self.field_index(name) {
+            return f;
+        }
+        let f = self.fields.len();
+        self.fields.push(name.to_string());
+        if let Some(index) = self.index.get_mut() {
+            index.insert(name.to_string(), f);
+        }
+        for e in &mut self.elems {
+            e.push(blank());
+        }
+        f
+    }
+
+    /// The same fields as `other`, in any order.
+    pub fn same_fields(&self, other: &StructArray) -> bool {
+        self.fields.len() == other.fields.len()
+            && self.fields.iter().all(|f| other.field_index(f).is_some())
+    }
+
+    /// Element `k` of `other` with its values in this array's field order;
+    /// the caller has checked [`same_fields`](StructArray::same_fields).
+    pub fn reordered(&self, other: &StructArray, k: usize) -> Vec<Value> {
+        self.fields
+            .iter()
+            .map(|f| match other.field_index(f) {
+                Some(i) => other.elems[k][i].clone(),
+                None => blank(),
+            })
+            .collect()
+    }
+}
+
+/// True for a value that holds other values, and so could start a chain
+/// that must be freed without recursion.
+fn holds_values(v: &Value) -> bool {
+    matches!(v, Value::Cell(_) | Value::Struct(_) | Value::Func(_))
+}
+
+/// Frees values with a worklist rather than by recursion (cycles 06 and 07).
+///
+/// A cell can hold a cell, a struct a struct, a handle can capture either
+/// and either can hold a handle: `c = {c}` or `h = @() c; c = {h}` 500,000
+/// times builds a chain that the default drop freed one stack frame per
+/// link, overflowing the stack (exit 134). Here each container this is the
+/// last owner of is opened and what it holds is moved onto the worklist
+/// before it is dropped, so no drop ever recurses more than one level. A
+/// container still shared elsewhere is only released: its count goes down
+/// and nothing else happens.
+fn free(mut pending: Vec<Value>) {
+    while let Some(v) = pending.pop() {
+        match v {
+            Value::Cell(rc) => {
+                if let Ok(mut c) = Rc::try_unwrap(rc) {
+                    pending.extend(c.data.drain(..).filter(holds_values));
+                }
+            }
+            Value::Struct(rc) => {
+                if let Ok(mut s) = Rc::try_unwrap(rc) {
+                    for e in s.elems.drain(..) {
+                        pending.extend(e.into_iter().filter(holds_values));
+                    }
+                }
+            }
+            Value::Func(rc) => {
+                if let Ok(Func::Anon { captured, .. }) = Rc::try_unwrap(rc).as_mut() {
+                    pending.extend(captured.drain(..).map(|(_, v)| v).filter(holds_values));
+                }
+            }
+            // A matrix or an `MException` holds no values.
+            _ => {}
+        }
+        // Whatever was opened above now holds nothing that nests, so the
+        // drop at the end of this iteration does not recurse.
+    }
+}
+
+impl Drop for CellArray {
+    fn drop(&mut self) {
+        if self.data.iter().any(holds_values) {
+            free(std::mem::take(&mut self.data));
+        }
+    }
+}
+
+impl Drop for StructArray {
+    fn drop(&mut self) {
+        if self.elems.iter().flatten().any(holds_values) {
+            free(
+                std::mem::take(&mut self.elems)
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            );
+        }
+    }
+}
 
 /// A function handle: what `@name` and `@(x) body` evaluate to (cycle 06).
 ///
@@ -98,40 +330,20 @@ pub enum Func {
     },
 }
 
-/// Frees a chain of handles with a worklist rather than by recursion.
+/// Frees a chain of handles with the worklist of [`free`] rather than by
+/// recursion.
 ///
 /// An anonymous function holds the variables it captured, and one of them
 /// can be a handle holding its own captures, and so on: `for k = 1:500000,
 /// h = @() h() + 1; end` builds a chain half a million deep, and the default
 /// drop freed it one stack frame per link and overflowed the stack (exit 134,
-/// cycle 06's review). Here each captured handle this is the last owner of
-/// is taken out of its slot and freed from the worklist, with its own
-/// captured handles taken out first, so no drop ever recurses more than
-/// one level. A value kind that later holds handles, a cell array in cycle
-/// 07, must hand them to the same worklist.
+/// cycle 06's review). Cycle 07 extended the worklist to cells and structs,
+/// which can hold handles and be captured by them.
 impl Drop for Func {
     fn drop(&mut self) {
-        let mut pending = Vec::new();
-        take_handles(self, &mut pending);
-        while let Some(rc) = pending.pop() {
-            if let Ok(mut inner) = Rc::try_unwrap(rc) {
-                take_handles(&mut inner, &mut pending);
-                // `inner` now holds no handles, so dropping it here does not
-                // recurse.
-            }
-        }
-    }
-}
-
-/// Moves every handle `f` captured onto `pending`, leaving an empty matrix in
-/// its place.
-fn take_handles(f: &mut Func, pending: &mut Vec<Rc<Func>>) {
-    if let Func::Anon { captured, .. } = f {
-        for (_, v) in captured.iter_mut() {
-            if matches!(v, Value::Func(_)) {
-                if let Value::Func(rc) = std::mem::replace(v, Value::Mat(Matrix::empty())) {
-                    pending.push(rc);
-                }
+        if let Func::Anon { captured, .. } = self {
+            if captured.iter().any(|(_, v)| holds_values(v)) {
+                free(captured.drain(..).map(|(_, v)| v).collect());
             }
         }
     }
@@ -196,6 +408,8 @@ impl Value {
             Value::Mat(m) => m.class.name(),
             Value::Exception(_) => EXCEPTION_CLASS,
             Value::Func(_) => FUNC_CLASS,
+            Value::Cell(_) => CELL_CLASS,
+            Value::Struct(_) => STRUCT_CLASS,
         }
     }
 
@@ -205,12 +419,57 @@ impl Value {
         match self {
             Value::Mat(m) => (m.rows, m.cols),
             Value::Exception(_) | Value::Func(_) => (1, 1),
+            Value::Cell(c) => (c.rows, c.cols),
+            Value::Struct(s) => (s.rows, s.cols),
         }
     }
 
+    /// How many elements: `rows * cols` of [`dims`](Value::dims).
+    pub fn numel(&self) -> usize {
+        let (r, c) = self.dims();
+        r * c
+    }
+
+    /// True for the 0x0 double `[]`, which an assignment or a
+    /// concatenation treats as "nothing here yet": `x = []; x.a = 1` makes
+    /// a struct and `[[] {1}]` is a cell.
+    pub fn is_blank(&self) -> bool {
+        matches!(self, Value::Mat(m) if m.class == Class::Double && m.rows == 0 && m.cols == 0)
+    }
+
+    /// Element `k`, linear and zero-based, as a value of its own: a scalar
+    /// of a matrix's class, a 1x1 cell of a cell, a 1x1 struct of a struct
+    /// array, and the value itself for a handle or an `MException`. What
+    /// `arrayfun` hands its function.
+    pub fn element(&self, k: usize) -> Value {
+        match self {
+            Value::Mat(m) => Value::Mat(Matrix::scalar(m.data[k]).with_class(m.class)),
+            Value::Cell(c) => Value::Cell(Rc::new(CellArray::new(1, 1, vec![c.data[k].clone()]))),
+            Value::Struct(s) => Value::Struct(Rc::new(s.element(k))),
+            v => v.clone(),
+        }
+    }
+
+    /// A cell value.
+    pub fn cell(c: CellArray) -> Value {
+        Value::Cell(Rc::new(c))
+    }
+
+    /// A struct value.
+    pub fn strukt(s: StructArray) -> Value {
+        Value::Struct(Rc::new(s))
+    }
+
     /// `name =`, a blank line, the display body and a closing blank line.
+    /// A struct's first line is `name = `, with the space after the `=`
+    /// that the spec records for MATLAB's struct display (cycle 07).
     pub fn display(&self, name: &str) -> String {
-        format!("{} =\n\n{}\n", name, self.display_body())
+        let eq = if matches!(self, Value::Struct(_)) {
+            "= "
+        } else {
+            "="
+        };
+        format!("{} {}\n\n{}\n", name, eq, self.display_body())
     }
 
     /// What follows `x =` and its blank line.
@@ -227,19 +486,220 @@ impl Value {
             Value::Mat(m) => m.display_body(),
             Value::Exception(e) => exception_line(e),
             Value::Func(f) => format!("  {} with value:\n\n    {}\n", FUNC_CLASS, f.shown()),
+            Value::Cell(c) => cell_body(c),
+            Value::Struct(s) => struct_body(s),
         }
     }
 
     /// What `disp` prints: a matrix's [`Matrix::disp_text`], for an
     /// `MException` the same line its named display shows, and for a
     /// function handle the handle as its display shows it, unindented:
-    /// `@(x)x+1`, which is its `func2str` text, and `@sin`.
+    /// `@(x)x+1`, which is its `func2str` text, and `@sin`. A cell prints
+    /// its rows without the header, and a struct its field lines.
     pub fn disp_text(&self) -> String {
         match self {
             Value::Mat(m) => m.disp_text(),
             Value::Exception(e) => exception_line(e),
             Value::Func(f) => format!("{}\n", f.shown()),
+            Value::Cell(c) => cell_rows(c),
+            Value::Struct(s) if s.numel() == 1 => field_lines(s),
+            Value::Struct(s) => struct_body(s),
         }
+    }
+}
+
+/// `r×c`, the size as every container display writes it.
+fn size_text(r: usize, c: usize) -> String {
+    format!("{r}×{c}")
+}
+
+/// A named display's body for a cell (cycle 07): `  1×2 cell array`, a
+/// blank line and the rows, or `  0×0 empty cell array` for an empty.
+fn cell_body(c: &CellArray) -> String {
+    if c.data.is_empty() {
+        return format!("  {} empty cell array\n", size_text(c.rows, c.cols));
+    }
+    format!(
+        "  {} cell array\n\n{}",
+        size_text(c.rows, c.cols),
+        cell_rows(c)
+    )
+}
+
+/// One element of a cell as its display shows it, and the character
+/// position where the padding that aligns its column goes.
+///
+/// Each element is summarised on one line and never expanded, which is the
+/// rule that keeps the display of a deeply nested cell bounded: a cell
+/// inside a cell is `{1×2 cell}`, whatever it holds. A numeric or logical
+/// scalar is `{[1]}`, padded inside the brackets so numbers right-align;
+/// a 1-row char is `{'ab'}`; a handle is `{@(x)x+1}`; everything else is
+/// its size and class, `{1×2 double}`, `{0×0 char}`, `{1×1 struct}`, and
+/// is padded before its closing brace.
+fn cell_element(v: &Value) -> (String, usize) {
+    let text = match v {
+        Value::Mat(m) if m.is_scalar() && m.class != Class::Char => {
+            let t = format!("{{[{}]}}", m.format().trim());
+            return (t, 2);
+        }
+        Value::Mat(m) if m.class == Class::Char && m.rows == 1 => {
+            format!("{{'{}'}}", m.row_text(0))
+        }
+        Value::Func(f) => format!("{{{}}}", f.shown()),
+        v => {
+            let (r, c) = v.dims();
+            format!("{{{} {}}}", size_text(r, c), v.class_name())
+        }
+    };
+    let at = text.chars().count() - 1;
+    (text, at)
+}
+
+/// `text` widened to `width` characters by spaces inserted at `at`.
+fn pad_at(text: &str, at: usize, width: usize) -> String {
+    let n = text.chars().count();
+    if n >= width {
+        return text.to_string();
+    }
+    let split = text.char_indices().nth(at).map_or(text.len(), |(i, _)| i);
+    format!(
+        "{}{}{}",
+        &text[..split],
+        " ".repeat(width - n),
+        &text[split..]
+    )
+}
+
+/// What `disp` prints for a cell: each row indented four, its columns four
+/// apart and each column as wide as its widest element. A cell too wide for
+/// [`TERM_WIDTH`] is split into blocks of whole columns under the headings
+/// a wide matrix has, `  Columns 1 through 3`.
+fn cell_rows(c: &CellArray) -> String {
+    if c.data.is_empty() {
+        return String::new();
+    }
+    let texts: Vec<(String, usize)> = c.data.iter().map(cell_element).collect();
+    let widths: Vec<usize> = (0..c.cols)
+        .map(|j| {
+            (0..c.rows)
+                .map(|i| texts[j * c.rows + i].0.chars().count())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    // Blocks of whole columns, at least one each.
+    let mut blocks = Vec::new();
+    let mut start = 0;
+    while start < c.cols {
+        let mut end = start + 1;
+        let mut used = 4 + widths[start];
+        while end < c.cols && used + 4 + widths[end] <= TERM_WIDTH {
+            used += 4 + widths[end];
+            end += 1;
+        }
+        blocks.push((start, end));
+        start = end;
+    }
+    let wrapped = blocks.len() > 1;
+    let mut out = String::new();
+    for (b, &(c0, c1)) in blocks.iter().enumerate() {
+        if wrapped {
+            out.push_str(&column_header(c0 + 1, c1));
+            out.push_str("\n\n");
+        }
+        for i in 0..c.rows {
+            let cells: Vec<String> = (c0..c1)
+                .map(|j| {
+                    let (t, at) = &texts[j * c.rows + i];
+                    pad_at(t, *at, widths[j])
+                })
+                .collect();
+            let _ = writeln!(out, "    {}", cells.join("    "));
+        }
+        if wrapped && b + 1 < blocks.len() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A named display's body for a struct array (cycle 07). A 1x1 struct is
+/// `  struct with fields:`, a blank line and one line per field; any other
+/// size lists the field names alone, `  1×2 struct array with fields:`.
+fn struct_body(s: &StructArray) -> String {
+    let n = s.numel();
+    if n == 1 {
+        if s.fields.is_empty() {
+            return "  struct with no fields.\n".to_string();
+        }
+        return format!("  struct with fields:\n\n{}", field_lines(s));
+    }
+    let what = if n == 0 {
+        format!("{} empty struct array", size_text(s.rows, s.cols))
+    } else {
+        format!("{} struct array", size_text(s.rows, s.cols))
+    };
+    if s.fields.is_empty() {
+        return format!("  {what} with no fields.\n");
+    }
+    let names: String = s.fields.iter().map(|f| format!("    {f}\n")).collect();
+    format!("  {what} with fields:\n\n{names}")
+}
+
+/// The field lines of a 1x1 struct: each name right-aligned to the longest,
+/// so the longest is indented four, then `: ` and the value summarised on
+/// one line by [`field_summary`].
+fn field_lines(s: &StructArray) -> String {
+    let w = s
+        .fields
+        .iter()
+        .map(|f| f.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (f, v) in s.fields.iter().zip(&s.elems[0]) {
+        let head = format!("    {:>w$}: ", f, w = w);
+        let room = TERM_WIDTH.saturating_sub(head.chars().count());
+        let _ = writeln!(out, "{}{}", head, field_summary(v, room));
+    }
+    out
+}
+
+/// One value on one line, as a struct's field line shows it. Never expanded
+/// past one level, so a deeply nested struct displays in bounded time and
+/// stack. A numeric or logical scalar is its number, a row of them `[1 2 3]`
+/// when that fits in `room` characters, a 1-row char `'hi'`, `[]` the 0x0
+/// double, a handle its text; anything else is its size and class, `[2×2
+/// double]`, `{1×2 cell}` for a cell and `[1×1 struct]` for a struct.
+fn field_summary(v: &Value, room: usize) -> String {
+    let sized = |v: &Value| {
+        let (r, c) = v.dims();
+        format!("[{} {}]", size_text(r, c), v.class_name())
+    };
+    match v {
+        Value::Mat(m) if m.class == Class::Char => {
+            if m.rows == 0 && m.cols == 0 {
+                "''".to_string()
+            } else if m.rows == 1 {
+                format!("'{}'", m.row_text(0))
+            } else {
+                sized(v)
+            }
+        }
+        Value::Mat(m) if m.is_empty() && m.rows == 0 && m.cols == 0 => "[]".to_string(),
+        Value::Mat(m) if m.is_scalar() => m.format().trim().to_string(),
+        Value::Mat(m) if m.rows == 1 && !m.is_empty() => {
+            let (texts, _, scale) = m.cells();
+            let inline = format!("[{}]", texts.join(" "));
+            if scale.is_none() && inline.chars().count() <= room {
+                inline
+            } else {
+                sized(v)
+            }
+        }
+        Value::Func(f) => f.shown(),
+        Value::Cell(c) => format!("{{{} cell}}", size_text(c.rows, c.cols)),
+        v => sized(v),
     }
 }
 
@@ -1768,5 +2228,206 @@ mod tests {
         // A non-empty string is still the row of codes it always was.
         let ab = Value::str("ab").into_mat().unwrap();
         assert_eq!((ab.rows, ab.cols), (1, 2));
+    }
+
+    // ---- cells and structs (cycle 07) --------------------------------
+
+    fn num(v: f64) -> Value {
+        Value::Mat(Matrix::scalar(v))
+    }
+
+    #[test]
+    fn a_cell_displays_its_header_and_one_summary_per_element() {
+        let c = Value::cell(CellArray::row(vec![num(1.0), Value::str("ab")]));
+        assert_eq!(
+            c.display("c"),
+            "c =\n\n  1×2 cell array\n\n    {[1]}    {'ab'}\n\n"
+        );
+        assert_eq!(c.disp_text(), "    {[1]}    {'ab'}\n");
+        let empty = Value::cell(CellArray::default());
+        assert_eq!(empty.display("x"), "x =\n\n  0×0 empty cell array\n\n");
+        assert_eq!(empty.disp_text(), "");
+        assert_eq!(
+            Value::cell(CellArray::new(1, 0, vec![])).display_body(),
+            "  1×0 empty cell array\n"
+        );
+    }
+
+    #[test]
+    fn a_cell_column_is_as_wide_as_its_widest_element() {
+        // Numbers are padded inside their brackets, so they right-align;
+        // anything else is padded before its closing brace.
+        let c = Value::cell(CellArray::new(
+            2,
+            2,
+            vec![
+                num(1.0),
+                Value::Mat(Matrix::row(vec![1.0, 2.0, 3.0])),
+                Value::str("ab"),
+                Value::cell(CellArray::row(vec![num(2.0)])),
+            ],
+        ));
+        assert_eq!(
+            c.disp_text(),
+            "    {[       1]}    {'ab'    }\n    {1×3 double}    {1×1 cell}\n"
+        );
+        let wide = Value::cell(CellArray::row((0..30).map(|k| num(k as f64)).collect()));
+        let text = wide.disp_text();
+        assert!(text.starts_with("  Columns 1 through "), "{text}");
+        assert!(
+            text.lines().all(|l| l.chars().count() <= TERM_WIDTH),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_nested_cell_is_summarised_not_expanded() {
+        let mut v = Value::cell(CellArray::default());
+        for _ in 0..1000 {
+            v = Value::cell(CellArray::row(vec![v]));
+        }
+        assert_eq!(v.disp_text(), "    {1×1 cell}\n");
+    }
+
+    #[test]
+    fn a_struct_displays_its_fields_aligned() {
+        let s = Value::strukt(StructArray::scalar(
+            vec!["a".into(), "long".into(), "c".into()],
+            vec![
+                num(1.0),
+                Value::str("hi"),
+                Value::Mat(Matrix::row(vec![1.0, 2.0])),
+            ],
+        ));
+        assert_eq!(
+            s.display("s"),
+            "s = \n\n  struct with fields:\n\n       a: 1\n    long: 'hi'\n       c: [1 2]\n\n"
+        );
+        assert_eq!(
+            s.disp_text(),
+            "       a: 1\n    long: 'hi'\n       c: [1 2]\n"
+        );
+        let nested = Value::strukt(StructArray::scalar(
+            vec!["in".into(), "m".into(), "e".into(), "c".into()],
+            vec![
+                s.clone(),
+                Value::Mat(Matrix::filled(2, 2, 0.0)),
+                blank(),
+                Value::cell(CellArray::blanks(1, 2)),
+            ],
+        ));
+        assert_eq!(
+            nested.disp_text(),
+            "    in: [1×1 struct]\n     m: [2×2 double]\n     e: []\n     c: {1×2 cell}\n"
+        );
+        let none = Value::strukt(StructArray::scalar(vec![], vec![]));
+        assert_eq!(none.display_body(), "  struct with no fields.\n");
+    }
+
+    #[test]
+    fn a_struct_array_lists_its_field_names() {
+        let s = Value::strukt(StructArray::new(
+            1,
+            2,
+            vec!["name".into()],
+            vec![vec![Value::str("A")], vec![Value::str("B")]],
+        ));
+        assert_eq!(
+            s.display_body(),
+            "  1×2 struct array with fields:\n\n    name\n"
+        );
+        let empty = Value::strukt(StructArray::new(0, 1, vec!["file".into()], vec![]));
+        assert_eq!(
+            empty.display_body(),
+            "  0×1 empty struct array with fields:\n\n    file\n"
+        );
+    }
+
+    #[test]
+    fn every_value_answers_class_dims_and_element() {
+        let c = Value::cell(CellArray::blanks(2, 3));
+        assert_eq!((c.class_name(), c.dims(), c.numel()), ("cell", (2, 3), 6));
+        let e = c.element(4);
+        assert!(matches!(&e, Value::Cell(x) if x.numel() == 1));
+        let s = Value::strukt(StructArray::scalar(vec!["a".into()], vec![num(1.0)]));
+        assert_eq!((s.class_name(), s.dims()), ("struct", (1, 1)));
+        assert!(blank().is_blank());
+        assert!(!Value::str("").is_blank());
+    }
+
+    #[test]
+    fn struct_fields_are_added_in_every_element_and_reordered_on_demand() {
+        let mut s = StructArray::new(1, 2, vec!["a".into()], vec![vec![num(1.0)], vec![num(2.0)]]);
+        assert_eq!(s.ensure_field("b"), 1);
+        assert_eq!(s.ensure_field("a"), 0);
+        assert!(s.elems.iter().all(|e| e.len() == 2 && e[1].is_blank()));
+        let t = StructArray::scalar(vec!["b".into(), "a".into()], vec![num(8.0), num(9.0)]);
+        assert!(s.same_fields(&t));
+        let vals = s.reordered(&t, 0);
+        assert!(matches!(&vals[0], Value::Mat(m) if m.data == [9.0]));
+    }
+
+    /// Past `INDEXED_FIELDS` a lookup goes through the hash index, which
+    /// must agree with the names at every step: built on the first lookup,
+    /// kept up to date by `ensure_field`, first place for a name given twice,
+    /// and carried by a clone.
+    #[test]
+    fn the_field_index_agrees_with_the_names() {
+        let names: Vec<String> = (0..INDEXED_FIELDS + 5).map(|k| format!("f{k}")).collect();
+        let mut s = StructArray::scalar(vec![], vec![]);
+        for (k, n) in names.iter().enumerate() {
+            assert_eq!(s.ensure_field(n), k);
+            assert_eq!(s.field_index(n), Some(k));
+            assert_eq!(s.field_index("f0"), Some(0));
+        }
+        assert_eq!(s.field_index("missing"), None);
+        assert_eq!(s.ensure_field("f3"), 3);
+        let mut t = s.clone();
+        assert_eq!(t.ensure_field("late"), names.len());
+        assert_eq!(
+            (t.field_index("late"), s.field_index("late")),
+            (Some(names.len()), None)
+        );
+        let mut twice = names.clone();
+        twice.push("f1".into());
+        let vals = vec![blank(); twice.len()];
+        let d = StructArray::scalar(twice, vals);
+        assert_eq!(d.field_index("f1"), Some(1));
+    }
+
+    /// Chains of every kind, freed on this test's own 2 MB thread: the
+    /// default drop would recurse once per link and overflow it.
+    #[test]
+    fn deep_chains_are_freed_without_recursion() {
+        let depth = 200_000;
+        let mut v = Value::cell(CellArray::default());
+        for _ in 0..depth {
+            v = Value::cell(CellArray::row(vec![v]));
+        }
+        drop(v);
+        let mut v = blank();
+        for _ in 0..depth {
+            v = Value::strukt(StructArray::scalar(vec!["a".into()], vec![v]));
+        }
+        drop(v);
+        // Cell, handle, struct, in turn.
+        let def = Rc::new(AnonFn::new(vec![], crate::parser::Expr::Num(1.0)));
+        let mut v = blank();
+        for k in 0..depth {
+            v = match k % 3 {
+                0 => Value::cell(CellArray::row(vec![v])),
+                1 => Value::Func(Rc::new(Func::Anon {
+                    def: def.clone(),
+                    captured: vec![("c".into(), v)],
+                    unit: Rc::new(Unit::default()),
+                })),
+                _ => Value::strukt(StructArray::scalar(vec!["h".into()], vec![v])),
+            };
+        }
+        // A chain still shared is only released: freeing the other owner
+        // later must still work.
+        let other = v.clone();
+        drop(v);
+        drop(other);
     }
 }

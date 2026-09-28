@@ -23,6 +23,7 @@ each entry. `docs/ROADMAP.md` is the order the rest arrives in.
 - [Matrices](#matrices)
 - [Operators](#operators)
 - [Indexing](#indexing)
+- [Cells and structs](#cells-and-structs)
 - [Control flow](#control-flow)
 - [Functions](#functions)
 - [Builtins](#builtins)
@@ -1576,7 +1577,243 @@ x.a
 Error: Line 2: Dot indexing is not supported for variables of this type.
 ```
 
-Cell arrays and structs, which do support them, arrive in cycle 07.
+Cell arrays and structs, which do support them, are the next section.
+Assigning through a brace or a field into a matrix is MATLAB's assignment
+form of the same error, `Unable to perform assignment because dot indexing
+is not supported for variables of this type.`
+
+## Cells and structs
+
+### Cell arrays
+
+A cell array holds values of any kind, stored column-major like a matrix.
+`{...}` builds one, with a bracket's separators: a comma or whitespace
+between elements, a semicolon or a newline between rows. Braces read an
+element's contents, parentheses index the cell itself and give a cell, and a
+chain goes on into the contents. A brace assignment past the end grows the
+cell with `[]` elements, and `c(k) = []` deletes:
+
+```matlab
+c = {1, 'two', [3 4]}
+disp(c{2})
+disp(c{3}(2))
+d = c(2:3);
+disp(class(d))
+c{5} = 'x';
+disp(size(c))
+c(2) = [];
+disp(numel(c))
+e = cell(2, 2)
+```
+
+```
+c =
+
+  1×3 cell array
+
+    {[1]}    {'two'}    {1×2 double}
+
+two
+     4
+cell
+     1     5
+     4
+e =
+
+  2×2 cell array
+
+    {0×0 double}    {0×0 double}
+    {0×0 double}    {0×0 double}
+
+```
+
+Each element displays on one line: a scalar in brackets, a char row
+quoted, a handle as its text, and anything else as its size and class. A
+cell inside a cell is `{1×2 cell}` and is never expanded, so a cell nested
+any depth displays at once. A column is as wide as its widest element; a
+number is padded inside its brackets and anything else before its closing
+brace. `[{1}, 2]` is a cell, the number becoming one element of it, and `{c}`
+of a cell nests it. A handle may be an element, `{@(x) x + 1, 2}`, and
+`c{1}(3)` calls it. A binary operator on a cell is MATLAB's refusal:
+
+```matlab
+c = {1};
+c + 1
+```
+
+```
+Error: Line 2: Operator '+' is not supported for operands of type 'cell'.
+```
+
+### Structs
+
+Assigning a field makes a struct, and a field of a field a struct inside
+it; `s.(name)` is the field a char names. `struct('a', 1, ...)` builds one
+directly:
+
+```matlab
+s.name = 'Ada';
+s.born = 1815;
+s.inner.v = 3;
+s
+n = 'born';
+disp(s.(n))
+s.inner.v = s.inner.v + 1;
+disp(s.inner.v)
+disp(fieldnames(s))
+t = rmfield(s, 'inner');
+disp(isfield(t, {'name', 'inner'}))
+u = struct('x', 5, 'y', [1 2])
+```
+
+```
+s =
+
+  struct with fields:
+
+     name: 'Ada'
+     born: 1815
+    inner: [1×1 struct]
+
+        1815
+     4
+    {'name' }
+    {'born' }
+    {'inner'}
+   1   0
+u =
+
+  struct with fields:
+
+    x: 5
+    y: [1 2]
+
+```
+
+The field names are right-aligned and each value is summarised on one line,
+as a cell's elements are. `getfield(s, 'a')` and `setfield(s, 'a', v)` are
+the function forms; `setfield` returns a copy and leaves `s` alone.
+`isstruct` and `iscell` test the kind. A struct is not an array of numbers,
+so a binary operator refuses it in the same sentence as a cell's:
+
+```matlab
+s.a = 1;
+s * 2
+```
+
+```
+Error: Line 2: Operator '*' is not supported for operands of type 'struct'.
+```
+
+### Struct arrays and cs-lists
+
+`p(2).name = 'B'` grows a struct array, every element having every field.
+`p.name` of a struct array and `c{:}` of a cell are comma-separated lists:
+in a call's arguments, a bracket or a brace they become one value per
+element, `[a, b] = c{:}` assigns them in order, and anywhere one value is
+needed a list of any other length is MATLAB's error. `struct` with cell
+values makes a struct array of the cells' size:
+
+```matlab
+p(1).name = 'A';
+p(2).name = 'B';
+p
+disp([p.name])
+q = struct('v', {10, 20, 30});
+disp(size(q))
+disp(sum([q.v]))
+c = {1, 2, 3};
+disp([c{:}])
+[a, b] = c{2:3};
+disp(b)
+y = c{:}
+```
+
+```
+p =
+
+  1×2 struct array with fields:
+
+    name
+
+AB
+     1     3
+    60
+     1     2     3
+     3
+Error: Line 12: Expected one output from a curly brace or dot indexing expression, but there were 3 results.
+```
+
+### Functions on cells
+
+`cellfun` calls a function on the contents of each element and collects
+scalar results in an array; with `'UniformOutput', false` it collects any
+results in a cell, and so does `arrayfun`. `cellfun` also takes a function's
+name. `cell2mat` joins a cell of arrays, `num2cell` splits an array into a
+cell, and `deal` copies its input to every output. `for` over a cell takes
+one column at a time, itself a cell:
+
+```matlab
+disp(cellfun(@numel, {'ab', 'cde', ''}))
+r = cellfun(@(x) x * 2, {1, [2 3]}, 'UniformOutput', false);
+disp(r{2})
+disp(cellfun('isempty', {[], 1}))
+r = arrayfun(@(x) x * [1 1], 1:2, 'UniformOutput', false)
+disp(cell2mat({1 2; 3 4}))
+x = num2cell([1 2])
+[a, b] = deal(7);
+fprintf('%d %d\n', a, b)
+for k = {1, 'a'}
+    disp(class(k))
+end
+```
+
+```
+     2     3     0
+     4     6
+   1   0
+r =
+
+  1×2 cell array
+
+    {1×2 double}    {1×2 double}
+
+     1     2
+     3     4
+x =
+
+  1×2 cell array
+
+    {[1]}    {[2]}
+
+7 7
+cell
+cell
+```
+
+### `varargin` and `varargout`
+
+A last parameter `varargin` collects the remaining arguments in a cell, and
+a last output `varargout` supplies the remaining outputs from its elements.
+`nargin` and `nargout` count all of them:
+
+```matlab
+disp(count(1, 'a', {}))
+[lo, hi] = bounds([4 1 9]);
+fprintf('%d %d\n', lo, hi)
+function n = count(varargin)
+n = nargin;
+end
+function varargout = bounds(v)
+varargout{1} = min(v);
+varargout{2} = max(v);
+end
+```
+
+```
+     3
+1 9
+```
 
 ## Control flow
 
@@ -1789,20 +2026,53 @@ inner
 after
 ```
 
-`e.stack` is a struct array in MATLAB, so it arrives with structs in cycle
-07; until then it is the Dot error any other field gives. The trace of an
-uncaught error is printed already; see [the error trace](#the-error-trace):
+`e.stack` is a struct array with the fields `file`, `name` and `line`, one
+element per function the error left, innermost first: the frames of
+[the error trace](#the-error-trace). `file` is empty for a function local to
+the script that was run, since SplatCrab is not told the script's path, and
+an error raised outside every function has a 0x1 stack:
+
+```matlab
+try
+    check(-1)
+catch e
+    e.stack
+    disp(e.stack(1).name)
+    disp(e.stack(1).line)
+end
+function check(x)
+if x < 0
+    error('chk:neg', 'negative')
+end
+end
+```
+
+```
+ans =
+
+  struct with fields:
+
+    file: ''
+    name: 'check'
+    line: 10
+
+check
+    10
+```
+
+An `MException` is not an array either, so a binary operator on one is the
+same refusal as on a cell, a struct or a handle:
 
 ```matlab
 try
     error('x')
 catch e
-    e.stack
+    e + 1
 end
 ```
 
 ```
-Error: Line 4: Dot indexing is not supported for variables of this type.
+Error: Line 4: Operator '+' is not supported for operands of type 'MException'.
 ```
 
 ### What counts as true
@@ -2092,11 +2362,24 @@ disp(isa(h, 'function_handle'))
 operators and a comma between the elements of a bracket, so `[x 1]` comes
 back as `[x,1]` and still means two elements. MATLAB keeps the text as
 written; only the forms without brackets or spacing choices are known to
-agree. `arrayfun` needs every result to be a scalar; `'UniformOutput',
-false`, which returns a cell, arrives with cells in cycle 07. A handle is
+agree. `arrayfun` needs every result to be a scalar unless it is given
+`'UniformOutput', false`, which returns a cell; see
+[functions on cells](#functions-on-cells). A handle is
 one function and not an array, so `[f g]` is refused, and so is
 `[@(x) x+1]` in the source. `str2func` of an `'@(...)'` text captures
 nothing, since it cannot see the workspace it is called from.
+
+For the same reason a binary operator refuses a handle, in MATLAB's
+sentence; call the handle first, `f(0) + 1`:
+
+```matlab
+f = @sin;
+f + 1
+```
+
+```
+Error: Line 2: Operator '+' is not supported for operands of type 'function_handle'.
+```
 
 ### Function files, scripts and the path
 
@@ -2335,6 +2618,31 @@ c =
 
      3
 
+```
+
+The queries answer for every value, not only for arrays: a cell or a struct
+array has its own size, and a function handle and an `MException` are 1x1
+and never empty:
+
+```matlab
+f = @sin;
+disp(size(f))
+disp(isempty(f))
+c = cell(2, 3);
+disp(size(c))
+try, error('a:b', 'm'), catch e, end
+disp(numel(e))
+disp(isa(e, 'MException'))
+disp(isnumeric({1}))
+```
+
+```
+     1     1
+   0
+     2     3
+     1
+   1
+   0
 ```
 
 ### Rearrangement
@@ -4085,8 +4393,9 @@ Error: Line 1: NaN's cannot be converted to logicals.
 - There are no N-D arrays, so `A(:, :, [1 1])`, `A(:, :, [])` and growth into
   a second page (`A(1, 1, 2) = 5`) are `N-D arrays are not supported.`, where
   MATLAB builds the N-D array.
-- `s.a = 1` on an undefined `s` is the Dot error rather than a new struct,
-  until cycle 07.
+- A cs-list is not spread into index subscripts, so `x(c{:})` of a
+  two-element `c` is the cs-list error, and `[c{:}] = deal(0)` is not a
+  target list; MATLAB accepts both. A cell cannot be transposed, `c'`.
 - `A(:, :) = []` leaves an empty with no rows and the original columns;
   that has not been checked against MATLAB.
 - `[m, i] = max(a, b)`, the two-array form, is `Too many output arguments.`
@@ -4207,9 +4516,10 @@ square systems only and errors where MATLAB warns and returns a least-squares
 answer. `inv` of a singular matrix errors where MATLAB warns and returns
 `Inf`. `who` prints the typed table that is MATLAB's `whos`.
 
-A caught error is a minimal `MException`: `e.message`, `e.identifier` and
-`class(e)`, with no `e.stack` until cycle 07, and a one-line display of
-SplatCrab's own. An error the interpreter raises itself has an empty
+A caught error is a minimal `MException`: `e.message`, `e.identifier`,
+`e.stack` and `class(e)`, with no `cause`, and a one-line display of
+SplatCrab's own. `e.stack` lists the function frames only, not the script's
+own. `isequal` of two cells or two structs is false whatever they hold. An error the interpreter raises itself has an empty
 identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`.
 `warning('off')` and `lastwarn` do not exist: `warning('off')` prints
 `Warning: off`.
@@ -4287,11 +4597,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 | Missing | Arrives in |
 |---|---|
-| `e.stack` of a caught error | 07 |
-| `varargin`, `varargout`, `global`, `persistent`, nested functions | 07 and later |
-| `arrayfun(..., 'UniformOutput', false)` and `cellfun` | 07 |
-| Cell arrays `{...}` | 07 |
-| Structs `s.field` | 07 |
+| `global`, `persistent`, nested functions | later |
 | Matrix `norm`, least squares, `\` of a non-square system | 08 |
 | Matrix `sort`, and `[s, i] = sort(...)` of a matrix | 09 |
 | Complex numbers, `1i`, `real`, `imag`, `abs` of a complex | 10 |
@@ -4304,14 +4610,6 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
-
-```matlab
-c = {1, 2}
-```
-
-```
-Error: Line 1: unexpected '{' in expression
-```
 
 ```matlab
 plot(1:10)

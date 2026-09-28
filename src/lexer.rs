@@ -793,16 +793,14 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
             }
             // A brace is pushed like a bracket so that `[c{1 2} 3]` knows,
             // inside the braces, that it is not directly inside `[`: the
-            // whitespace rule belongs to the bracket alone. Whether it also
-            // applies directly inside a cell literal `{1 -2}` is cycle 07's.
-            // The brace of a `case {2 3}` list does separate its values by
-            // whitespace, as a bracket does.
+            // whitespace rule belongs to the bracket alone. A brace that
+            // opens a value rather than indexing one, a cell literal (cycle
+            // 07) or the brace of a `case {2 3}` list, separates its values
+            // by whitespace and its rows by newlines, as a bracket does: it
+            // is the brace that does not follow the end of a value.
             ('{', _) => {
-                open.push(if toks.last() == Some(&Token::Case) {
-                    'C'
-                } else {
-                    '{'
-                });
+                let literal = !toks.last().is_some_and(ends_value);
+                open.push(if literal { 'C' } else { '{' });
                 (Token::LBrace, 1)
             }
             ('}', _) => {
@@ -2046,5 +2044,83 @@ mod tests {
         );
         assert_eq!(lx("(x)'")[3], Token::Transpose);
         assert_eq!(lx("@(x) (x)'")[7], Token::Transpose);
+    }
+
+    // ---- cell literals (cycle 07) ------------------------------------
+
+    /// A brace that does not follow the end of a value opens a cell
+    /// literal, where whitespace separates elements and a newline starts a
+    /// row, as in a bracket; a brace after a value indexes, and whitespace
+    /// inside it separates nothing.
+    #[test]
+    fn a_cell_literal_brace_separates_like_a_bracket() {
+        let n = Token::Num;
+        assert_eq!(
+            lx("{1 -2}"),
+            vec![
+                Token::LBrace,
+                n(1.0),
+                Token::Comma,
+                Token::Minus,
+                n(2.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            lx("c{1 -2}"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                n(1.0),
+                Token::Minus,
+                n(2.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            lx("{1\n2}"),
+            vec![
+                Token::LBrace,
+                n(1.0),
+                Token::Semi,
+                n(2.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
+        // After `=`, a comma or another brace, a brace is a literal too.
+        assert_eq!(
+            lx("x = {{1} 2}"),
+            vec![
+                id("x"),
+                Token::Assign,
+                Token::LBrace,
+                Token::LBrace,
+                n(1.0),
+                Token::RBrace,
+                Token::Comma,
+                n(2.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
+        // A brace index after a closing brace: `c{1}{2}`.
+        assert_eq!(
+            lx("c{1}{2 -1}"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                n(1.0),
+                Token::RBrace,
+                Token::LBrace,
+                n(2.0),
+                Token::Minus,
+                n(1.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
     }
 }

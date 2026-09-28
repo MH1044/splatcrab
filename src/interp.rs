@@ -11,11 +11,12 @@ use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::{scan, scan_known};
+use crate::parser::binop_text;
 use crate::parser::{
     Access, AnonFn, BinOp, CaseArm, Expr, Function, LValue, Located, MAX_DEPTH, Parser, Program,
     Stmt,
 };
-use crate::value::{Class, Func, Matrix, Value, nonfinite};
+use crate::value::{CellArray, Class, Func, Matrix, StructArray, Value, blank, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
 /// `error.rs`; the re-export is what let cycle 01b swap `String` for `MError`
@@ -75,6 +76,10 @@ pub struct Unit {
     functions: HashMap<String, Rc<Function>>,
     /// A function file's first function, which its file name calls.
     entry: Option<Rc<Function>>,
+    /// The path of the file it was read from, which `e.stack` reports
+    /// (cycle 07); empty for the code `run` was given, whose file the
+    /// interpreter is not told.
+    pub(crate) file: String,
 }
 
 impl Unit {
@@ -165,6 +170,26 @@ enum Flow {
     Continue,
     /// `return`: ends the running function or script.
     Return,
+}
+
+/// What [`Interp::eval_request`] found the expression to be: a call, asked
+/// for the outputs wanted; an access chain, whose values are a cs-list of
+/// any length (cycle 07); or any other expression, one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Got {
+    Call,
+    List,
+    One,
+}
+
+/// One link of an assignment target after its subscripts are evaluated:
+/// what [`assign_chain`] walks (cycle 07). A dynamic field has become the
+/// name it evaluated to.
+#[derive(Debug)]
+enum Link {
+    Paren(Vec<Sel>),
+    Brace(Vec<Sel>),
+    Field(String),
 }
 
 /// What a builtin asks [`Interp::call_nested`] to call: a function by name,
@@ -470,7 +495,18 @@ impl Interp {
                 // A statement asks for no values, so a builtin that produces
                 // none (disp, fprintf, tic, ...) is legal here and returns an
                 // empty Vec, and so is a handle whose body is such a call.
-                let (result, _) = self.eval_request(e, 0)?;
+                let (result, got) = self.eval_request(e, 0)?;
+                // A cs-list as a statement, `c{:}`, is each of its values in
+                // turn as `ans` (cycle 07).
+                if got == Got::List && result.len() != 1 {
+                    for v in result {
+                        self.vars_mut().insert("ans".to_string(), v.clone());
+                        if *show {
+                            self.emit(&v.display("ans"))?;
+                        }
+                    }
+                    return Ok(Flow::Normal);
+                }
                 if let Some(v) = result.into_iter().next() {
                     let name = match e {
                         Expr::Ident(n) if self.vars().contains_key(n) => n.clone(),
@@ -491,6 +527,11 @@ impl Interp {
                     // store of an empty; see `is_deletion`.
                     ([Access::Paren(args)], e) if is_deletion(e) => {
                         self.delete_index(&target.name, args)?
+                    }
+                    // `s.list(2) = []`, `c{1}(2) = []`: a deletion at the
+                    // end of a longer chain, in the container it names.
+                    ([.., Access::Paren(_)], e) if is_deletion(e) => {
+                        self.delete_at(&target.name, &target.chain)?
                     }
                     _ => {
                         let v = self.eval(e)?;
@@ -536,7 +577,18 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::For(name, e, body) => {
-                let m = self.eval_mat(e)?;
+                let m = match self.eval(e)? {
+                    Value::Mat(m) => m,
+                    // A cell or a struct array iterates its columns, each a
+                    // cell or a struct of its own (cycle 07).
+                    v @ (Value::Cell(_) | Value::Struct(_)) => {
+                        self.loop_depth += 1;
+                        let flow = self.run_for_items(name, &v, body);
+                        self.loop_depth -= 1;
+                        return flow;
+                    }
+                    v => bail!(error::not_an_array(v.class_name())),
+                };
                 // A loop that does not run still assigns its variable, as
                 // MATLAB does: after `k = 7; for k = []; end`, `k` is the
                 // empty, not `7`, and a name that did not exist comes into
@@ -660,6 +712,47 @@ impl Interp {
         Ok(Flow::Normal)
     }
 
+    /// `for x = c` over a cell or a struct array (cycle 07): one iteration
+    /// per column, `x` being that column as a cell or a struct array of its
+    /// own, so over a row each is 1x1. As for a matrix, a loop over no
+    /// columns still assigns its variable, the empty of the same kind.
+    fn run_for_items(&mut self, name: &str, v: &Value, body: &[Located]) -> R<Flow> {
+        let (rows, cols) = v.dims();
+        let column = |j: usize| match v {
+            Value::Cell(c) => Value::cell(CellArray::new(
+                rows,
+                1,
+                c.data[j * rows..(j + 1) * rows].to_vec(),
+            )),
+            Value::Struct(s) => Value::strukt(StructArray::new(
+                rows,
+                1,
+                s.fields.clone(),
+                s.elems[j * rows..(j + 1) * rows].to_vec(),
+            )),
+            v => v.clone(),
+        };
+        if cols == 0 {
+            let empty = match v {
+                Value::Struct(s) => {
+                    Value::strukt(StructArray::new(rows, 0, s.fields.clone(), Vec::new()))
+                }
+                _ => Value::cell(CellArray::new(rows, 0, Vec::new())),
+            };
+            self.vars_mut().insert(name.to_string(), empty);
+        }
+        for j in 0..cols {
+            let x = column(j);
+            self.vars_mut().insert(name.to_string(), x);
+            match self.exec_block(body)? {
+                Flow::Break => break,
+                Flow::Return => return Ok(Flow::Return),
+                Flow::Normal | Flow::Continue => {}
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
     /// The iterations of a `while`; see [`run_for`](Interp::run_for).
     fn run_while(&mut self, cond: &Expr, body: &[Located]) -> R<Flow> {
         while self.eval_mat(cond)?.truth()? {
@@ -700,8 +793,10 @@ impl Interp {
                 .map(|n| Value::Mat(Matrix::scalar(*n as f64)))
                 .ok_or_else(error::end_outside_index),
             Expr::Colon => Err(error::colon_outside_index()),
-            Expr::Access(n, chain) => self.eval_access(n, chain),
+            // Where one value is wanted, a cs-list must be exactly one.
+            Expr::Access(n, chain) => one_value(self.eval_access(n, chain)?),
             Expr::Matrix(rows) => self.build_matrix(rows),
+            Expr::Cell(rows) => self.build_cell(rows),
             // Both signs are arithmetic, so both give a double: `+'a'` is 97.
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
             Expr::Pos(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| x))),
@@ -771,8 +866,39 @@ impl Interp {
             .ok_or_else(|| error::not_a_scalar(what))
     }
 
+    /// The arguments of a call. A cs-list among them, `f(c{:})` or
+    /// `f(s.name)` of a struct array, is spread into as many arguments as
+    /// it has values, none included (cycle 07).
     fn eval_args(&mut self, args: &[Expr]) -> R<Vec<Value>> {
-        args.iter().map(|a| self.eval(a)).collect()
+        let mut out = Vec::with_capacity(args.len());
+        for a in args {
+            out.extend(self.eval_multi(a)?);
+        }
+        Ok(out)
+    }
+
+    /// An expression where a cs-list is welcome: a call's argument, an
+    /// element of `[...]` or of `{...}`. An access chain gives all of its
+    /// values; anything else its one value.
+    fn eval_multi(&mut self, e: &Expr) -> R<Vec<Value>> {
+        match e {
+            Expr::Access(n, chain) => {
+                self.deepen()?;
+                let v = self.eval_access(n, chain);
+                self.depth -= 1;
+                v
+            }
+            e => Ok(vec![self.eval(e)?]),
+        }
+    }
+
+    /// An operand of a binary operator: a matrix, or MATLAB R2020a's
+    /// refusal naming the operator and the operand's class (cycle 07).
+    fn operand(&mut self, e: &Expr, op: BinOp) -> R<Matrix> {
+        match self.eval(e)? {
+            Value::Mat(m) => Ok(m),
+            v => Err(error::operator_unsupported(binop_text(op), v.class_name())),
+        }
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> R<Value> {
@@ -782,19 +908,26 @@ impl Interp {
         // already decides the answer, so `0 && undefined_fn()` is `0`.
         match op {
             BinOp::AndAnd => {
-                let l = self.eval_mat(a)?.logical_scalar()?;
-                let v = l && self.eval_mat(b)?.logical_scalar()?;
+                let l = self.operand(a, op)?.logical_scalar()?;
+                let v = l && self.operand(b, op)?.logical_scalar()?;
                 return Ok(Value::Mat(Matrix::from_bool(v)));
             }
             BinOp::OrOr => {
-                let l = self.eval_mat(a)?.logical_scalar()?;
-                let v = l || self.eval_mat(b)?.logical_scalar()?;
+                let l = self.operand(a, op)?.logical_scalar()?;
+                let v = l || self.operand(b, op)?.logical_scalar()?;
                 return Ok(Value::Mat(Matrix::from_bool(v)));
             }
             _ => {}
         }
-        let a = self.eval_mat(a)?;
-        let b = self.eval_mat(b)?;
+        // Both operands are evaluated before either is judged, so `c + x`
+        // with `x` undefined names `x`, and the class named is the first
+        // operand's that is not an array.
+        let (a, b) = match (self.eval(a)?, self.eval(b)?) {
+            (Value::Mat(a), Value::Mat(b)) => (a, b),
+            (Value::Mat(_), v) | (v, _) => {
+                bail!(error::operator_unsupported(binop_text(op), v.class_name()))
+            }
+        };
         let bool_op =
             |f: fn(f64, f64) -> bool| move |x: f64, y: f64| if f(x, y) { 1.0 } else { 0.0 };
         let r = match op {
@@ -879,11 +1012,45 @@ impl Interp {
         for row in rows {
             let mut elems = Vec::with_capacity(row.len());
             for e in row {
-                elems.push(self.eval(e)?);
+                elems.extend(self.eval_multi(e)?);
             }
             row_vals.push(hcat(elems)?);
         }
         vcat(row_vals)
+    }
+
+    /// `{a, b; c, d}` (cycle 07): each value is one element of the cell,
+    /// whatever it is, so `{c}` of a cell nests it. A cs-list among them
+    /// gives one element per value. Every row must have as many elements
+    /// as the first; a row that comes to none is left out, so `{}` is 0x0.
+    fn build_cell(&mut self, rows: &[Vec<Expr>]) -> R<Value> {
+        let mut grid: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut elems = Vec::with_capacity(row.len());
+            for e in row {
+                elems.extend(self.eval_multi(e)?);
+            }
+            if !elems.is_empty() {
+                grid.push(elems);
+            }
+        }
+        let Some(first) = grid.first() else {
+            return Ok(Value::cell(CellArray::default()));
+        };
+        let (nr, nc) = (grid.len(), first.len());
+        if grid.iter().any(|r| r.len() != nc) {
+            bail!(error::concat_dims());
+        }
+        // Row-major as written; column-major as stored.
+        let mut cells: Vec<std::vec::IntoIter<Value>> =
+            grid.into_iter().map(Vec::into_iter).collect();
+        let mut data = Vec::with_capacity(nr * nc);
+        for _ in 0..nc {
+            for r in cells.iter_mut() {
+                data.extend(r.next());
+            }
+        }
+        Ok(Value::cell(CellArray::new(nr, nc, data)))
     }
 
     // ---- indexing ----------------------------------------------------
@@ -911,12 +1078,14 @@ impl Interp {
     /// The expression is evaluated either way, so an error inside it is
     /// reported first.
     fn eval_outputs(&mut self, e: &Expr, n: usize) -> R<Vec<Value>> {
-        let (values, called) = self.eval_request(e, n)?;
-        if !called && n > 1 {
-            bail!(error::insufficient_outputs());
-        }
-        if values.len() < n {
-            bail!(error::too_many_outputs());
+        let (values, got) = self.eval_request(e, n)?;
+        match got {
+            // A cs-list, `[a, b] = c{:}` (cycle 07), supplies its values in
+            // order, and too few is the right-hand side's shortfall.
+            Got::List if values.len() < n => bail!(error::insufficient_outputs()),
+            Got::One if n > 1 => bail!(error::insufficient_outputs()),
+            _ if values.len() < n => bail!(error::too_many_outputs()),
+            _ => {}
         }
         Ok(values)
     }
@@ -929,16 +1098,19 @@ impl Interp {
     /// This is also how an anonymous function's body runs (cycle 06), which
     /// is what carries `nargout` through a body that is a single call:
     /// `f = @(v) max(v); [m, i] = f(v)` asks `max` for two.
-    fn eval_request(&mut self, e: &Expr, nargout: usize) -> R<(Vec<Value>, bool)> {
+    fn eval_request(&mut self, e: &Expr, nargout: usize) -> R<(Vec<Value>, Got)> {
         if let Some((name, args)) = self.call_form(e) {
             let a = self.eval_args(args)?;
-            return Ok((self.call_function(name, a, nargout)?, true));
+            return Ok((self.call_function(name, a, nargout)?, Got::Call));
         }
         if let Some((f, args)) = self.handle_form(e) {
             let a = self.eval_args(args)?;
-            return Ok((self.call_handle(&f, a, nargout)?, true));
+            return Ok((self.call_handle(&f, a, nargout)?, Got::Call));
         }
-        Ok((vec![self.eval(e)?], false))
+        if let Expr::Access(..) = e {
+            return Ok((self.eval_multi(e)?, Got::List));
+        }
+        Ok((vec![self.eval(e)?], Got::One))
     }
 
     /// The handle an expression calls, if it is `f(args)` with `f` a
@@ -962,100 +1134,178 @@ impl Interp {
         self.emit(&shown)
     }
 
-    /// `name` followed by its access chain.
+    /// `name` followed by its access chain, as the values it gives: one for
+    /// most chains, and a cs-list of any length for a brace index that
+    /// selects several elements of a cell or a field of a struct array
+    /// (cycle 07). A caller that wants one value says so with
+    /// [`one_value`].
     ///
-    /// On a variable the first link is applied to the variable where it is
-    /// stored, so `x(k)` in a loop reads one element rather than copying `x`.
-    /// A name that is not a variable is a call: its first `(...)` is the
-    /// argument list, and a call with no parentheses takes no arguments.
-    /// Every link after the first applies to the value so far.
-    fn eval_access(&mut self, name: &str, chain: &[Access]) -> R<Value> {
-        let Some((first, rest)) = chain.split_first() else {
-            return self.eval_node(&Expr::Ident(name.to_string()));
-        };
-        let mut v = if let Some(var) = self.vars().get(name) {
-            match (var, first) {
-                (Value::Mat(_), Access::Paren(args)) => self.index_var(name, args)?,
-                (Value::Mat(_), other) => bail!(container_access(other)),
-                // A handle variable's `(...)` is a call of the handle.
-                (Value::Func(f), Access::Paren(args)) => {
-                    let f = f.clone();
-                    let a = self.eval_args(args)?;
-                    self.call_handle_for_value(&f, a)?
-                }
-                // Not an array, so not read in place: an `MException` is
-                // small, and its fields are the only thing it offers.
-                (var, other) => {
-                    let var = var.clone();
-                    self.apply_access(var, other)?
-                }
-            }
+    /// On a variable, the leading fields of scalar structs are walked where
+    /// the variable is stored, and a `(...)` of a matrix reached that way is
+    /// read in place, so `x(k)` and `s.data(k)` in a loop read one element
+    /// rather than copying the array. A name that is not a variable is a
+    /// call: its first `(...)` is the argument list, and a call with no
+    /// parentheses takes no arguments. Every link after that applies to the
+    /// value so far, which must be one value: a cs-list in the middle of a
+    /// chain, `p.name(1)` of a 1x2 `p`, is the cs-list error.
+    fn eval_access(&mut self, name: &str, chain: &[Access]) -> R<Vec<Value>> {
+        let (mut vals, done) = if self.vars().contains_key(name) {
+            self.read_var(name, chain)?
         } else {
-            match first {
-                Access::Paren(args) => {
+            match chain.first() {
+                Some(Access::Paren(args)) => {
                     let a = self.eval_args(args)?;
-                    self.call_for_value(name, a)?
+                    (vec![self.call_for_value(name, a)?], 1)
                 }
-                other => {
-                    let v = self.call_for_value(name, vec![])?;
-                    self.apply_access(v, other)?
-                }
+                _ => (vec![self.call_for_value(name, vec![])?], 0),
             }
         };
-        for a in rest {
-            v = self.apply_access(v, a)?;
+        for a in &chain[done..] {
+            let v = one_value(vals)?;
+            vals = self.apply_access(v, a)?;
         }
-        Ok(v)
+        Ok(vals)
     }
 
-    /// One link of a chain applied to a value. A matrix has only `(...)`;
-    /// braces and fields are cycle 07's containers.
-    fn apply_access(&mut self, v: Value, a: &Access) -> R<Value> {
+    /// The start of a chain on the variable `name`: its leading fields of
+    /// scalar structs walked in place, then a `(...)` of what they reach
+    /// when that is a matrix (read in place) or a handle (called). Returns
+    /// the values and how many links it used; the rest are the caller's.
+    ///
+    /// The subscripts are evaluated knowing only the shape, because they
+    /// need `&mut self`; the path is walked again afterwards rather than
+    /// borrowed across them. A subscript that clears the variable
+    /// (`x(clear('x'))`) therefore finds it gone instead of reading freed
+    /// storage, and one that could change its shape is judged against the
+    /// shape it has now.
+    fn read_var(&mut self, name: &str, chain: &[Access]) -> R<(Vec<Value>, usize)> {
+        let nf = self.plain_fields(name, chain);
+        if let Some(Access::Paren(args)) = chain.get(nf) {
+            let fields = &chain[..nf];
+            let shape = match self.at_fields(name, fields) {
+                Some(Value::Mat(m)) => Some((m.rows, m.cols)),
+                _ => None,
+            };
+            if let Some((rows, cols)) = shape {
+                let sel = self.eval_index_args(rows, cols, args)?;
+                let Some(Value::Mat(m)) = self.at_fields(name, fields) else {
+                    return Err(error::undefined(name));
+                };
+                // Indexing keeps the class, so `s(2)` of a char is a char and
+                // `s(:)` is a char column (QA D17).
+                let g = resolve_read(m.rows, m.cols, &sel)?;
+                return Ok((vec![Value::Mat(gather(m, &g))], nf + 1));
+            }
+            // A handle's `(...)` is a call of the handle.
+            if let Some(Value::Func(f)) = self.at_fields(name, fields) {
+                let f = f.clone();
+                let a = self.eval_args(args)?;
+                return Ok((vec![self.call_handle_for_value(&f, a)?], nf + 1));
+            }
+        }
+        let v = self
+            .at_fields(name, &chain[..nf])
+            .cloned()
+            .ok_or_else(|| error::undefined(name))?;
+        Ok((vec![v], nf))
+    }
+
+    /// How many links at the start of `chain` are fields that exist, each
+    /// of a 1x1 struct, starting from the variable `name`.
+    fn plain_fields(&self, name: &str, chain: &[Access]) -> usize {
+        let mut at = self.vars().get(name);
+        let mut n = 0;
+        for a in chain {
+            match (at, a) {
+                (Some(Value::Struct(s)), Access::Field(f)) if s.numel() == 1 => {
+                    match s.field_index(f) {
+                        Some(i) => at = Some(&s.elems[0][i]),
+                        None => break,
+                    }
+                }
+                _ => break,
+            }
+            n += 1;
+        }
+        n
+    }
+
+    /// The value the variable `name` holds at the end of `fields`, which
+    /// [`plain_fields`](Interp::plain_fields) has vouched are all fields of
+    /// scalar structs; `None` if the path has gone since.
+    fn at_fields(&self, name: &str, fields: &[Access]) -> Option<&Value> {
+        let mut at = self.vars().get(name)?;
+        for a in fields {
+            match (at, a) {
+                (Value::Struct(s), Access::Field(f)) if s.numel() == 1 => {
+                    at = &s.elems[0][s.field_index(f)?];
+                }
+                _ => return None,
+            }
+        }
+        Some(at)
+    }
+
+    /// One link of a chain applied to one value, giving the values it
+    /// selects. A matrix has only `(...)`; a cell has `(...)`, which gives a
+    /// cell, and `{...}`, which gives the elements themselves; a struct
+    /// array has `(...)`, which gives a struct array, and its fields, one
+    /// value per element (cycle 07).
+    fn apply_access(&mut self, v: Value, a: &Access) -> R<Vec<Value>> {
         match (v, a) {
-            (Value::Exception(e), Access::Field(f)) => exception_field(&e, f),
+            (Value::Exception(e), Access::Field(f)) => Ok(vec![exception_field(&e, f)?]),
             (Value::Exception(e), Access::DynField(f)) => match self.eval(f)?.text() {
-                Some(f) => exception_field(&e, &f),
+                Some(f) => Ok(vec![exception_field(&e, &f)?]),
                 None => Err(error::dot_indexing_unsupported()),
             },
-            (Value::Exception(_), Access::Brace(_)) => Err(error::brace_indexing_unsupported()),
-            // A handle a chain produced, `add(3)(4)`, is called, as chained
-            // indexing reads each link in turn.
+            // A handle a chain produced, `add(3)(4)` or `c{1}(2)`, is
+            // called, as chained indexing reads each link in turn.
             (Value::Func(f), Access::Paren(args)) => {
                 let a = self.eval_args(args)?;
-                self.call_handle_for_value(&f, a)
+                Ok(vec![self.call_handle_for_value(&f, a)?])
             }
-            (v, Access::Paren(args)) => {
-                let m = v.into_mat()?;
+            (Value::Mat(m), Access::Paren(args)) => {
                 let sel = self.eval_index_args(m.rows, m.cols, args)?;
                 let g = resolve_read(m.rows, m.cols, &sel)?;
-                Ok(Value::Mat(gather(&m, &g)))
+                Ok(vec![Value::Mat(gather(&m, &g))])
             }
+            (Value::Cell(c), Access::Brace(args)) => {
+                let sel = self.eval_index_args(c.rows, c.cols, args)?;
+                let g = resolve_read(c.rows, c.cols, &sel)?;
+                Ok(pick(&c.data, &g.pos))
+            }
+            (Value::Cell(c), Access::Paren(args)) => {
+                let sel = self.eval_index_args(c.rows, c.cols, args)?;
+                let g = resolve_read(c.rows, c.cols, &sel)?;
+                let data = pick(&c.data, &g.pos);
+                Ok(vec![Value::cell(CellArray::new(g.rows, g.cols, data))])
+            }
+            (Value::Struct(s), Access::Paren(args)) => {
+                let sel = self.eval_index_args(s.rows, s.cols, args)?;
+                let g = resolve_read(s.rows, s.cols, &sel)?;
+                Ok(vec![Value::strukt(StructArray::new(
+                    g.rows,
+                    g.cols,
+                    s.fields.clone(),
+                    pick(&s.elems, &g.pos),
+                ))])
+            }
+            (Value::Struct(s), Access::Field(f)) => struct_field(&s, f),
+            (Value::Struct(s), Access::DynField(x)) => {
+                let f = self.field_name(x)?;
+                struct_field(&s, &f)
+            }
+            (v, Access::Paren(_)) => Err(error::not_an_array(v.class_name())),
             (_, other) => Err(container_access(other)),
         }
     }
 
-    /// `name(args)` of a variable, read where the variable is stored.
-    ///
-    /// The subscripts are evaluated first, knowing only the variable's
-    /// shape, because they need `&mut self`; the variable is looked up again
-    /// afterwards rather than borrowed across them. A subscript that clears
-    /// it (`x(clear('x'))`) therefore finds it gone instead of reading freed
-    /// storage, and one that could change its shape is judged against the
-    /// shape it has now.
-    fn index_var(&mut self, name: &str, args: &[Expr]) -> R<Value> {
-        let (rows, cols) = match self.vars().get(name) {
-            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
-            None => return Err(error::undefined(name)),
-        };
-        let sel = self.eval_index_args(rows, cols, args)?;
-        let m = match self.vars().get(name) {
-            Some(v) => v.mat()?,
-            None => return Err(error::undefined(name)),
-        };
-        // Indexing keeps the class, so `s(2)` of a char is a char and `s(:)`
-        // is a char column (QA D17).
-        let g = resolve_read(m.rows, m.cols, &sel)?;
-        Ok(Value::Mat(gather(m, &g)))
+    /// The name a dynamic field `.(expr)` evaluates to: text, or the
+    /// refusal.
+    fn field_name(&mut self, e: &Expr) -> R<String> {
+        self.eval(e)?
+            .text()
+            .ok_or_else(error::dynamic_field_not_text)
     }
 
     /// Evaluates the subscripts of an index into an array of `rows x cols`.
@@ -1105,97 +1355,142 @@ impl Interp {
     }
 
     /// Assigns `v` to a target, whatever its chain.
+    ///
+    /// Since cycle 07 every chain goes one way: its subscripts and dynamic
+    /// field names are evaluated first, against the shapes the path has
+    /// now (`resolve_links`), and [`assign_chain`] then stores `v` at the
+    /// end of the path, where it lies, creating whatever the path does not
+    /// hold yet. A variable that did not exist is created as `[]` for the
+    /// walk and removed again if the assignment fails, so a failed
+    /// assignment changes nothing.
     fn assign_to(&mut self, target: &LValue, v: Value) -> R<()> {
-        match target.chain.as_slice() {
-            [] => {
-                self.vars_mut().insert(target.name.clone(), v);
+        if target.chain.is_empty() {
+            self.vars_mut().insert(target.name.clone(), v);
+            return Ok(());
+        }
+        // `assign_chain` recurses once per link; the parser reads a chain
+        // as a flat list and bounds nothing, so the bound is here.
+        if target.chain.len() > MAX_DEPTH {
+            bail!(error::nesting_too_deep(MAX_DEPTH));
+        }
+        let links = self.resolve_links(&target.name, &target.chain)?;
+        let name = &target.name;
+        let existed = self.vars().contains_key(name);
+        if !existed {
+            self.vars_mut().insert(name.clone(), blank());
+        }
+        let slot = self
+            .vars_mut()
+            .get_mut(name)
+            .expect("the variable exists or was inserted above");
+        let r = assign_chain(slot, &links, v);
+        if r.is_err() && !existed {
+            self.vars_mut().remove(name);
+        }
+        r
+    }
+
+    /// The links of an assignment target with their subscripts evaluated
+    /// (cycle 07): each `(...)` and `{...}` against the shape of what the
+    /// path holds at that point, so `end` means what it would mean if the
+    /// path were read, and `0x0` where the path holds nothing yet; each
+    /// `.(expr)` becomes the field it names, which must be a valid name.
+    fn resolve_links(&mut self, name: &str, chain: &[Access]) -> R<Vec<Link>> {
+        let mut links = Vec::with_capacity(chain.len());
+        for a in chain {
+            let link = match a {
+                Access::Field(f) => Link::Field(f.clone()),
+                Access::DynField(x) => {
+                    let f = self.field_name(x)?;
+                    if !is_identifier(&f) {
+                        bail!(error::invalid_field_name(&f));
+                    }
+                    Link::Field(f)
+                }
+                Access::Paren(args) => {
+                    let (rows, cols) = self.shape_at(name, &links);
+                    Link::Paren(self.eval_index_args(rows, cols, args)?)
+                }
+                Access::Brace(args) => {
+                    let (rows, cols) = self.shape_at(name, &links);
+                    Link::Brace(self.eval_index_args(rows, cols, args)?)
+                }
+            };
+            links.push(link);
+        }
+        Ok(links)
+    }
+
+    /// The shape of what the variable `name` holds at the end of `links`,
+    /// walked by reference, or `0x0` where the path does not reach: an
+    /// undefined variable, a missing field, a position past the end.
+    fn shape_at(&self, name: &str, links: &[Link]) -> (usize, usize) {
+        /// A value, or element `k` of a struct array, which is not a value
+        /// of its own until a field of it is taken.
+        #[derive(Clone, Copy)]
+        enum At<'a> {
+            V(&'a Value),
+            E(&'a StructArray, usize),
+        }
+        let Some(v) = self.vars().get(name) else {
+            return (0, 0);
+        };
+        let mut at = At::V(v);
+        for l in links {
+            let next = match (at, l) {
+                (At::V(Value::Struct(s)), Link::Field(f)) if s.numel() == 1 => {
+                    s.field_index(f).map(|i| At::V(&s.elems[0][i]))
+                }
+                (At::E(s, k), Link::Field(f)) => s.field_index(f).map(|i| At::V(&s.elems[k][i])),
+                (At::V(Value::Cell(c)), Link::Brace(sel)) => {
+                    one_position(c.rows, c.cols, sel).map(|p| At::V(&c.data[p]))
+                }
+                (At::V(Value::Struct(s)), Link::Paren(sel)) => {
+                    one_position(s.rows, s.cols, sel).map(|p| At::E(s, p))
+                }
+                _ => None,
+            };
+            match next {
+                Some(n) => at = n,
+                None => return (0, 0),
+            }
+        }
+        match at {
+            At::V(v) => v.dims(),
+            At::E(..) => (1, 1),
+        }
+    }
+
+    /// `name(args) = []`: deletes elements, rows or columns of a matrix, a
+    /// cell or a struct array, keeping its kind and class. Checked in full
+    /// before the variable changes.
+    fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
+        let (rows, cols) = self.vars().get(name).map_or((0, 0), Value::dims);
+        let sel = self.eval_index_args(rows, cols, args)?;
+        match self.vars_mut().get_mut(name) {
+            Some(v) => delete_in(v, &sel),
+            None => {
+                let mut v = blank();
+                delete_in(&mut v, &sel)?;
+                self.vars_mut().insert(name.to_string(), v);
                 Ok(())
             }
-            [Access::Paren(args)] => self.assign_index(&target.name, args, v),
-            // A brace or a field anywhere in the chain is a container's,
-            // which a matrix is not; the first one says which. What is left
-            // is `x(1)(2) = v`, which MATLAB does not allow either.
-            chain => match chain.iter().find(|a| !matches!(a, Access::Paren(_))) {
-                Some(a) => Err(container_access(a)),
-                None => Err(error::invalid_assignment_target()),
-            },
         }
     }
 
-    /// The variable an indexed assignment or a deletion changes, where it is
-    /// stored, created as `[]` if it does not exist yet. Looked up by `&str`
-    /// so that the common case, an existing variable, allocates nothing.
-    fn target_mut(&mut self, name: &str) -> R<&mut Matrix> {
-        if !self.vars().contains_key(name) {
-            self.vars_mut()
-                .insert(name.to_string(), Value::Mat(Matrix::empty()));
-        }
-        match self.vars_mut().get_mut(name) {
-            Some(Value::Mat(m)) => Ok(m),
-            Some(v) => Err(error::not_an_array(v.class_name())),
-            None => unreachable!("inserted above"),
-        }
-    }
-
-    /// `name(args) = rhs`, in place.
-    ///
-    /// Everything that can fail is done first: the subscripts, the class
-    /// conversion of the right-hand side, the growth and its size check, and
-    /// the element count. Only then is the variable's storage touched, and it
-    /// is changed where it lies, never cloned. Growth along the last
-    /// dimension (a row gaining columns, a column gaining rows, a matrix
-    /// gaining columns) keeps the column-major layout, so it is a `resize`
-    /// of the storage, which `Vec` amortises: `z(end+1) = k` in a loop is
-    /// linear overall, not quadratic.
-    fn assign_index(&mut self, name: &str, args: &[Expr], rhs: Value) -> R<()> {
-        let rhs = rhs.into_mat()?;
-        // The left-hand side keeps its class, so `s(1) = 'X'` of a char stays
-        // a char and `y(2) = 'a'` of a double stores `97`. A variable that
-        // does not exist yet, or is the 0x0 double `[]`, takes the class of
-        // what is assigned into it, which is how `s = []; s(1) = 'a'` builds
-        // a char.
-        let (rows, cols, class) = match self.vars().get(name) {
-            Some(v) => v.mat().map(|m| (m.rows, m.cols, m.class))?,
-            None => (0, 0, Class::Double),
+    /// `s.list(2) = []` or `c{1}(2) = []` (cycle 07): a deletion at the end
+    /// of a longer chain, in the container the rest of the chain names,
+    /// which must already exist.
+    fn delete_at(&mut self, name: &str, chain: &[Access]) -> R<()> {
+        let links = self.resolve_links(name, chain)?;
+        let Some((Link::Paren(sel), path)) = links.split_last() else {
+            bail!(error::invalid_assignment_target());
         };
-        let class = if class == Class::Double && rows == 0 && cols == 0 {
-            rhs.class
-        } else {
-            class
-        };
-        let rhs = rhs.to_class(class)?;
-        let sel = self.eval_index_args(rows, cols, args)?;
-        // Judged against the shape the variable has now; see `index_var`.
-        let (rows, cols) = match self.vars().get(name) {
-            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
-            None => (0, 0),
-        };
-        let plan = resolve_write(rows, cols, &sel, &rhs)?;
-        let m = self.target_mut(name)?;
-        m.class = class;
-        scatter(m, &plan, &rhs);
-        Ok(())
-    }
-
-    /// `name(args) = []`: deletes elements, rows or columns, keeping the
-    /// class. Checked in full before the variable changes.
-    fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
-        let (rows, cols) = match self.vars().get(name) {
-            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
-            None => (0, 0),
-        };
-        let sel = self.eval_index_args(rows, cols, args)?;
-        let (rows, cols) = match self.vars().get(name) {
-            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
-            None => (0, 0),
-        };
-        let keep = resolve_delete(rows, cols, &sel)?;
-        let m = self.target_mut(name)?;
-        let data: Vec<f64> = keep.pos.iter().map(|&p| m.data[p]).collect();
-        m.data = data;
-        m.rows = keep.rows;
-        m.cols = keep.cols;
-        Ok(())
+        let v = self
+            .vars_mut()
+            .get_mut(name)
+            .ok_or_else(|| error::undefined(name))?;
+        delete_in(nav_mut(v, path)?, sel)
     }
 
     // ---- builtins ----------------------------------------------------
@@ -1345,7 +1640,10 @@ impl Interp {
         args: Vec<Value>,
         nargout: usize,
     ) -> R<Vec<Value>> {
-        if args.len() > def.params.len() {
+        // A last parameter `varargin` takes the rest, as a function's does
+        // (cycle 07).
+        let var_in = def.params.last().is_some_and(|p| p == "varargin");
+        if !var_in && args.len() > def.params.len() {
             bail!(error::too_many_args());
         }
         self.enter()?;
@@ -1355,16 +1653,22 @@ impl Interp {
         for (n, v) in captured {
             frame.vars.insert(n.clone(), v.clone());
         }
-        for (p, v) in def.params.iter().zip(args) {
+        let named = def.params.len() - var_in as usize;
+        let mut args = args.into_iter();
+        for (p, v) in def.params[..named].iter().zip(args.by_ref()) {
             if p != "~" {
                 frame.vars.insert(p.clone(), v);
             }
+        }
+        if var_in {
+            let rest = CellArray::row(args.collect());
+            frame.vars.insert("varargin".to_string(), Value::cell(rest));
         }
         self.frames.push(frame);
         let result = self.eval_request(&def.body, nargout);
         self.frames.pop();
         self.calls -= 1;
-        let (values, _) = result.map_err(|e| e.leaving(&f.text()))?;
+        let (values, _) = result.map_err(|e| e.leaving_file(&f.text(), &unit.file))?;
         Ok(values)
     }
 
@@ -1435,6 +1739,13 @@ impl Interp {
     /// outputs, and one it did not assign is MATLAB's "Output argument ...
     /// not assigned" error. Asked for none, as a statement asks, it returns
     /// its first output if it assigned one, which becomes `ans`.
+    ///
+    /// A last parameter named `varargin` takes every argument past the
+    /// named ones, as a 1xN cell (0x0 when there are none), and a last
+    /// output named `varargout` supplies every output past the named ones
+    /// from its elements, in order (cycle 07). `nargin` and `nargout` count
+    /// every argument and every output asked for, those in `varargin` and
+    /// `varargout` included, which is MATLAB's rule inside the function.
     fn call_user(
         &mut self,
         unit: Rc<Unit>,
@@ -1443,20 +1754,30 @@ impl Interp {
         args: Vec<Value>,
         nargout: usize,
     ) -> R<Vec<Value>> {
-        if args.len() > f.params.len() {
+        let var_in = f.params.last().is_some_and(|p| p == "varargin");
+        let var_out = f.outputs.last().is_some_and(|o| o == "varargout");
+        let named_in = f.params.len() - var_in as usize;
+        let named_out = f.outputs.len() - var_out as usize;
+        if !var_in && args.len() > f.params.len() {
             bail!(error::too_many_args());
         }
-        if nargout > f.outputs.len() {
+        if !var_out && nargout > f.outputs.len() {
             bail!(error::too_many_outputs());
         }
         self.enter()?;
+        let file = unit.file.clone();
         let mut frame = Frame::new(unit, Some(name.to_string()));
         frame.nargin = args.len();
         frame.nargout = nargout;
-        for (p, v) in f.params.iter().zip(args) {
+        let mut args = args.into_iter();
+        for (p, v) in f.params[..named_in].iter().zip(args.by_ref()) {
             if p != "~" {
                 frame.vars.insert(p.clone(), v);
             }
+        }
+        if var_in {
+            let rest = CellArray::row(args.collect());
+            frame.vars.insert("varargin".to_string(), Value::cell(rest));
         }
         self.frames.push(frame);
         let loop_depth = std::mem::take(&mut self.loop_depth);
@@ -1464,14 +1785,39 @@ impl Interp {
         self.loop_depth = loop_depth;
         let frame = self.frames.pop().expect("the frame pushed above");
         self.calls -= 1;
-        result.map_err(|e| e.leaving(name))?;
+        result.map_err(|e| e.leaving_file(name, &file))?;
         let mut vars = frame.vars;
         let mut out = Vec::new();
-        for (k, o) in f.outputs.iter().enumerate().take(nargout.max(1)) {
+        for (k, o) in f.outputs[..named_out]
+            .iter()
+            .enumerate()
+            .take(nargout.max(1))
+        {
             match vars.remove(o) {
                 Some(v) => out.push(v),
                 None if k < nargout => bail!(error::output_not_assigned(o, name)),
                 None => {}
+            }
+        }
+        // The outputs past the named ones, from `varargout`; asked for none,
+        // a function whose only output is `varargout` gives its first
+        // element if it has one, which becomes `ans`.
+        let want = nargout.max(1);
+        if var_out && out.len() == named_out && want > named_out {
+            let extra: Vec<Value> = match vars.remove("varargout") {
+                Some(Value::Cell(c)) => c.data.clone(),
+                Some(_) => bail!(error::varargout_not_a_cell()),
+                None => Vec::new(),
+            };
+            let mut extra = extra.into_iter();
+            for k in named_out..want {
+                match extra.next() {
+                    Some(v) => out.push(v),
+                    None if k < nargout => {
+                        bail!(error::varargout_not_assigned(k - named_out + 1, name))
+                    }
+                    None => {}
+                }
             }
         }
         Ok(out)
@@ -1503,7 +1849,7 @@ impl Interp {
         self.loop_depth = loop_depth;
         self.frame_mut().unit = running;
         self.calls -= 1;
-        result.map_err(|e| e.leaving(name))?;
+        result.map_err(|e| e.leaving_file(name, &unit.file))?;
         Ok(Vec::new())
     }
 
@@ -1561,7 +1907,9 @@ impl Interp {
         let prog = scan(&src)
             .and_then(|lexed| Parser::with_lines(lexed).at_depth(depth).parse_program())
             .map_err(|e| e.leaving(name))?;
-        let unit = Rc::new(Unit::from_program(prog));
+        let mut unit = Unit::from_program(prog);
+        unit.file = path.display().to_string();
+        let unit = Rc::new(unit);
         self.files.insert(
             path.to_path_buf(),
             CachedFile {
@@ -1784,14 +2132,415 @@ fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
 // The `resolve_*` functions change nothing, which is what lets an assignment
 // validate everything before it touches the target.
 
-/// `e.message` and `e.identifier` of an `MException`. Any other name is the
-/// Dot error a matrix gives, until cycle 07 adds `e.stack`, a struct array.
+/// `e.message`, `e.identifier` and, since cycle 07, `e.stack` of an
+/// `MException`. Any other name is the Dot error a matrix gives.
 fn exception_field(e: &error::MError, field: &str) -> R<Value> {
     match field {
         "message" => Ok(Value::str(&e.msg)),
         "identifier" => Ok(Value::str(e.identifier())),
+        "stack" => Ok(exception_stack(e)),
         _ => Err(error::dot_indexing_unsupported()),
     }
+}
+
+/// `e.stack` (cycle 07): an Nx1 struct array with the fields `file`,
+/// `name` and `line`, one element per frame the error unwound out of,
+/// innermost first, which is cycle 05's trace. `file` is the path of the
+/// function's file, and empty for a function local to the code that was
+/// run, whose file the interpreter is not told; `line` is `[]` for an
+/// anonymous function, which has no line. An error raised outside every
+/// function has no frames, and its stack is 0x1.
+fn exception_stack(e: &error::MError) -> Value {
+    let fields = ["file", "name", "line"].map(String::from).to_vec();
+    let elems: Vec<Vec<Value>> = e
+        .stack()
+        .iter()
+        .map(|s| {
+            let line = s
+                .line
+                .map_or_else(blank, |l| Value::Mat(Matrix::scalar(l as f64)));
+            vec![Value::str(&s.file), Value::str(&s.name), line]
+        })
+        .collect();
+    Value::strukt(StructArray::new(elems.len(), 1, fields, elems))
+}
+
+/// The one value a cs-list must be where one is wanted, or MATLAB's
+/// error naming how many it had (cycle 07).
+fn one_value(mut vals: Vec<Value>) -> R<Value> {
+    if vals.len() == 1 {
+        Ok(vals.pop().expect("one value"))
+    } else {
+        Err(error::cs_list_count(vals.len()))
+    }
+}
+
+/// Field `f` of every element of a struct array, in column-major order:
+/// the cs-list `s.f` gives (cycle 07).
+fn struct_field(s: &StructArray, f: &str) -> R<Vec<Value>> {
+    let i = s.field_index(f).ok_or_else(|| error::no_such_field(f))?;
+    Ok(s.elems.iter().map(|e| e[i].clone()).collect())
+}
+
+/// The items at `pos`, zero-based and linear, in that order: a read of a
+/// cell's or a struct array's elements, as `gather` is a matrix's.
+fn pick<T: Clone>(items: &[T], pos: &[usize]) -> Vec<T> {
+    pos.iter().map(|&p| items[p].clone()).collect()
+}
+
+/// The one linear position `sel` selects in bounds of a `rows x cols`
+/// array, if it selects exactly one.
+fn one_position(rows: usize, cols: usize, sel: &[Sel]) -> Option<usize> {
+    match resolve_read(rows, cols, sel).ok()?.pos[..] {
+        [p] => Some(p),
+        _ => None,
+    }
+}
+
+/// Grows column-major `items` from `rows x cols` to `nr x nc`, keeping
+/// every item at its row and column and filling the new ones with `fill`:
+/// `scatter`'s growth, for a cell's elements or a struct array's (cycle
+/// 07). When the linear positions do not move, the storage is resized in
+/// place, which `Vec` amortises.
+fn regrid<T>(
+    items: &mut Vec<T>,
+    (rows, cols): (usize, usize),
+    (nr, nc): (usize, usize),
+    fill: impl Fn() -> T,
+) {
+    if (rows, cols) == (nr, nc) {
+        return;
+    }
+    if rows == nr || items.is_empty() || (cols == 1 && nc == 1) {
+        items.resize_with(nr * nc, fill);
+        return;
+    }
+    let mut old = std::mem::take(items).into_iter();
+    let mut out = Vec::with_capacity(nr * nc);
+    for c in 0..nc {
+        for r in 0..nr {
+            if c < cols && r < rows {
+                out.extend(old.next());
+            } else {
+                out.push(fill());
+            }
+        }
+    }
+    *items = out;
+}
+
+/// The items at `pos`, which is increasing, moved out of `items`: what a
+/// deletion keeps.
+fn keep_positions<T>(items: Vec<T>, pos: &[usize]) -> Vec<T> {
+    let mut want = pos.iter().peekable();
+    let mut out = Vec::with_capacity(pos.len());
+    for (k, v) in items.into_iter().enumerate() {
+        if want.peek() == Some(&&k) {
+            want.next();
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Stores `rhs` at the end of `links`, starting from `cur` (cycle 07).
+///
+/// It recurses once per link; `assign_to` has bounded the chain by
+/// [`MAX_DEPTH`]. Whatever the path does not hold yet is created as it is
+/// assigned: a field of `[]` makes a struct, a brace of `[]` a cell,
+/// `p(2).name` of `[]` a struct array, and a position past the end grows
+/// the container with `[]` elements. Nothing is created or grown until the
+/// assignment below it has succeeded: a new element or field is built on
+/// its own first and only then put in place, and the container `[]`
+/// becomes is built beside it, so a failure leaves `cur` as it was.
+fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
+    let Some((first, rest)) = links.split_first() else {
+        *cur = rhs;
+        return Ok(());
+    };
+    if cur.is_blank() {
+        let empty = match first {
+            Link::Field(_) => Some(StructArray::scalar(Vec::new(), Vec::new())),
+            Link::Paren(_) if !rest.is_empty() => Some(StructArray::default()),
+            _ => None,
+        };
+        if let Some(s) = empty {
+            let mut v = Value::strukt(s);
+            assign_chain(&mut v, links, rhs)?;
+            *cur = v;
+            return Ok(());
+        }
+        if let Link::Brace(_) = first {
+            let mut v = Value::cell(CellArray::default());
+            assign_chain(&mut v, links, rhs)?;
+            *cur = v;
+            return Ok(());
+        }
+    }
+    match first {
+        Link::Field(f) => {
+            let Value::Struct(rc) = cur else {
+                bail!(error::dot_assign_unsupported());
+            };
+            match (rc.numel(), rc.field_index(f)) {
+                (1, Some(i)) => assign_chain(&mut Rc::make_mut(rc).elems[0][i], rest, rhs),
+                (0 | 1, _) => {
+                    let mut child = blank();
+                    assign_chain(&mut child, rest, rhs)?;
+                    let s = Rc::make_mut(rc);
+                    if s.elems.is_empty() {
+                        (s.rows, s.cols) = (1, 1);
+                        s.elems.push(vec![blank(); s.fields.len()]);
+                    }
+                    let i = s.ensure_field(f);
+                    s.elems[0][i] = child;
+                    Ok(())
+                }
+                _ => Err(error::scalar_struct_required()),
+            }
+        }
+        Link::Brace(sel) => {
+            let Value::Cell(rc) = cur else {
+                bail!(error::brace_assign_unsupported());
+            };
+            let plan = resolve_write(rc.rows, rc.cols, sel, (1, 1))?;
+            let [p] = plan.pos[..] else {
+                bail!(error::cs_list_count(plan.pos.len()));
+            };
+            if (plan.rows, plan.cols) == (rc.rows, rc.cols) {
+                return assign_chain(&mut Rc::make_mut(rc).data[p], rest, rhs);
+            }
+            let mut child = blank();
+            assign_chain(&mut child, rest, rhs)?;
+            let c = Rc::make_mut(rc);
+            regrid(&mut c.data, (c.rows, c.cols), (plan.rows, plan.cols), blank);
+            (c.rows, c.cols) = (plan.rows, plan.cols);
+            c.data[p] = child;
+            Ok(())
+        }
+        Link::Paren(sel) if rest.is_empty() => assign_paren(cur, sel, rhs),
+        // `p(k).name = v`: one element of a struct array, then its field.
+        Link::Paren(sel) => {
+            let Some((Link::Field(f), rest)) = rest.split_first() else {
+                bail!(error::invalid_assignment_target());
+            };
+            let Value::Struct(rc) = cur else {
+                bail!(error::dot_assign_unsupported());
+            };
+            let plan = resolve_write(rc.rows, rc.cols, sel, (1, 1))?;
+            let [p] = plan.pos[..] else {
+                bail!(error::cs_list_count(plan.pos.len()));
+            };
+            let grows = (plan.rows, plan.cols) != (rc.rows, rc.cols);
+            match (grows, rc.field_index(f)) {
+                (false, Some(i)) => assign_chain(&mut Rc::make_mut(rc).elems[p][i], rest, rhs),
+                _ => {
+                    let mut child = blank();
+                    assign_chain(&mut child, rest, rhs)?;
+                    let s = Rc::make_mut(rc);
+                    let i = s.ensure_field(f);
+                    let nf = s.fields.len();
+                    regrid(
+                        &mut s.elems,
+                        (s.rows, s.cols),
+                        (plan.rows, plan.cols),
+                        || vec![blank(); nf],
+                    );
+                    (s.rows, s.cols) = (plan.rows, plan.cols);
+                    s.elems[p][i] = child;
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// `x(sel) = rhs`, the last link of a chain: a matrix into a matrix, a
+/// cell into a cell, a struct array into a struct array with the same
+/// fields (cycle 07). `[]` takes whichever arrives. Anything else is a
+/// conversion MATLAB does not make: `c(2) = 5` of a cell, `x(2) = {1}` of
+/// a matrix.
+fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
+    match (cur, rhs) {
+        (Value::Mat(m), Value::Mat(r)) => assign_matrix(m, sel, r),
+        (cur, rhs @ (Value::Cell(_) | Value::Struct(_))) if cur.is_blank() => {
+            let mut v = match &rhs {
+                Value::Struct(r) => {
+                    Value::strukt(StructArray::new(0, 0, r.fields.clone(), Vec::new()))
+                }
+                _ => Value::cell(CellArray::default()),
+            };
+            assign_paren(&mut v, sel, rhs)?;
+            *cur = v;
+            Ok(())
+        }
+        (Value::Cell(rc), Value::Cell(r)) => {
+            let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
+            let c = Rc::make_mut(rc);
+            regrid(&mut c.data, (c.rows, c.cols), (plan.rows, plan.cols), blank);
+            (c.rows, c.cols) = (plan.rows, plan.cols);
+            for (k, &p) in plan.pos.iter().enumerate() {
+                c.data[p] = r.data[if r.data.len() == 1 { 0 } else { k }].clone();
+            }
+            Ok(())
+        }
+        (Value::Struct(rc), Value::Struct(r)) => {
+            if !rc.same_fields(&r) {
+                bail!(error::dissimilar_structs());
+            }
+            let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
+            let s = Rc::make_mut(rc);
+            let nf = s.fields.len();
+            regrid(
+                &mut s.elems,
+                (s.rows, s.cols),
+                (plan.rows, plan.cols),
+                || vec![blank(); nf],
+            );
+            (s.rows, s.cols) = (plan.rows, plan.cols);
+            for (k, &p) in plan.pos.iter().enumerate() {
+                let vals = s.reordered(&r, if r.numel() == 1 { 0 } else { k });
+                s.elems[p] = vals;
+            }
+            Ok(())
+        }
+        (Value::Cell(_), r) => Err(error::conversion("cell", r.class_name())),
+        (Value::Struct(_), r) => Err(error::conversion("struct", r.class_name())),
+        (Value::Mat(m), r @ (Value::Cell(_) | Value::Struct(_))) => {
+            Err(error::conversion(m.class.name(), r.class_name()))
+        }
+        (Value::Mat(_), r) => Err(error::not_an_array(r.class_name())),
+        (cur, _) => Err(error::not_an_array(cur.class_name())),
+    }
+}
+
+/// `m(sel) = rhs` of a matrix, in place.
+///
+/// Everything that can fail is done first: the class conversion of the
+/// right-hand side, the growth and its size check, and the element count.
+/// Only then is the storage touched, and it is changed where it lies,
+/// never cloned. Growth along the last dimension (a row gaining columns, a
+/// column gaining rows, a matrix gaining columns) keeps the column-major
+/// layout, so it is a `resize` of the storage, which `Vec` amortises:
+/// `z(end+1) = k` in a loop is linear overall, not quadratic.
+///
+/// The left-hand side keeps its class, so `s(1) = 'X'` of a char stays a
+/// char and `y(2) = 'a'` of a double stores `97`. The 0x0 double `[]`, which
+/// is also what a variable that does not exist yet starts as, takes the
+/// class of what is assigned into it, which is how `s = []; s(1) = 'a'`
+/// builds a char.
+fn assign_matrix(m: &mut Matrix, sel: &[Sel], rhs: Matrix) -> R<()> {
+    let class = if m.class == Class::Double && m.rows == 0 && m.cols == 0 {
+        rhs.class
+    } else {
+        m.class
+    };
+    let rhs = rhs.to_class(class)?;
+    let plan = resolve_write(m.rows, m.cols, sel, (rhs.rows, rhs.cols))?;
+    m.class = class;
+    scatter(m, &plan, &rhs);
+    Ok(())
+}
+
+/// `v(sel) = []` of a matrix, a cell or a struct array: what
+/// `resolve_delete` keeps, moved into place (cycle 07 added the
+/// containers).
+fn delete_in(v: &mut Value, sel: &[Sel]) -> R<()> {
+    if matches!(v, Value::Exception(_) | Value::Func(_)) {
+        bail!(error::not_an_array(v.class_name()));
+    }
+    let (rows, cols) = v.dims();
+    let keep = resolve_delete(rows, cols, sel)?;
+    match v {
+        Value::Mat(m) => {
+            m.data = keep.pos.iter().map(|&p| m.data[p]).collect();
+            (m.rows, m.cols) = (keep.rows, keep.cols);
+        }
+        Value::Cell(rc) => {
+            let c = Rc::make_mut(rc);
+            c.data = keep_positions(std::mem::take(&mut c.data), &keep.pos);
+            (c.rows, c.cols) = (keep.rows, keep.cols);
+        }
+        Value::Struct(rc) => {
+            let s = Rc::make_mut(rc);
+            s.elems = keep_positions(std::mem::take(&mut s.elems), &keep.pos);
+            (s.rows, s.cols) = (keep.rows, keep.cols);
+        }
+        Value::Exception(_) | Value::Func(_) => {}
+    }
+    Ok(())
+}
+
+/// The value at the end of `links` from `cur`, which must exist, borrowed
+/// for change (cycle 07): where `delete_at` deletes. Walked in a loop, so
+/// it needs no bound of its own.
+fn nav_mut<'a>(mut cur: &'a mut Value, links: &[Link]) -> R<&'a mut Value> {
+    /// Where one step goes, judged on a shared borrow first.
+    enum Step {
+        Field(usize),
+        Item(usize),
+        Elem(usize, usize),
+    }
+    let mut k = 0;
+    while k < links.len() {
+        let step = match (&*cur, &links[k]) {
+            (Value::Struct(s), Link::Field(f)) if s.numel() == 1 => {
+                Step::Field(s.field_index(f).ok_or_else(|| error::no_such_field(f))?)
+            }
+            (Value::Struct(_), Link::Field(_)) => bail!(error::scalar_struct_required()),
+            (Value::Cell(c), Link::Brace(sel)) => {
+                let g = resolve_read(c.rows, c.cols, sel)?;
+                let [p] = g.pos[..] else {
+                    bail!(error::cs_list_count(g.pos.len()));
+                };
+                Step::Item(p)
+            }
+            (Value::Struct(s), Link::Paren(sel)) => {
+                let Some(Link::Field(f)) = links.get(k + 1) else {
+                    bail!(error::invalid_assignment_target());
+                };
+                let g = resolve_read(s.rows, s.cols, sel)?;
+                let [p] = g.pos[..] else {
+                    bail!(error::cs_list_count(g.pos.len()));
+                };
+                let i = s.field_index(f).ok_or_else(|| error::no_such_field(f))?;
+                k += 1;
+                Step::Elem(p, i)
+            }
+            (_, Link::Brace(_)) => bail!(error::brace_indexing_unsupported()),
+            (_, Link::Field(_)) => bail!(error::dot_indexing_unsupported()),
+            (_, Link::Paren(_)) => bail!(error::invalid_assignment_target()),
+        };
+        cur = match (cur, step) {
+            (Value::Struct(rc), Step::Field(i)) => &mut Rc::make_mut(rc).elems[0][i],
+            (Value::Cell(rc), Step::Item(p)) => &mut Rc::make_mut(rc).data[p],
+            (Value::Struct(rc), Step::Elem(p, i)) => &mut Rc::make_mut(rc).elems[p][i],
+            // Every step above was judged on this same value.
+            _ => bail!(error::invalid_assignment_target()),
+        };
+        k += 1;
+    }
+    Ok(cur)
+}
+
+/// `setfield(s, 'a', 'b', v)`: `v` stored at the field path, created where
+/// it does not exist, as `s.a.b = v` would store it (cycle 07).
+pub(crate) fn set_fields(cur: &mut Value, fields: &[String], rhs: Value) -> R<()> {
+    if fields.len() > MAX_DEPTH {
+        bail!(error::nesting_too_deep(MAX_DEPTH));
+    }
+    for f in fields {
+        if !is_identifier(f) {
+            bail!(error::invalid_field_name(f));
+        }
+    }
+    let links: Vec<Link> = fields.iter().cloned().map(Link::Field).collect();
+    assign_chain(cur, &links, rhs)
+}
+
+/// True for a name MATLAB accepts as a field: an identifier (cycle 07).
+pub(crate) fn is_field_name(name: &str) -> bool {
+    is_identifier(name)
 }
 
 /// The error for a brace or field access on a matrix.
@@ -1971,7 +2720,7 @@ fn gather(m: &Matrix, g: &Gather) -> Matrix {
 /// `1x1e+300` rather than the `usize` it would have saturated to. The
 /// right-hand side is a scalar, which fills every position, or has exactly
 /// one element per position.
-fn resolve_write(rows: usize, cols: usize, sel: &[Sel], rhs: &Matrix) -> R<Scatter> {
+fn resolve_write(rows: usize, cols: usize, sel: &[Sel], (rr, rc): (usize, usize)) -> R<Scatter> {
     let numel = rows * cols;
     let (nr, nc, pos) = if let [one] = sel {
         let need = one.extent(numel);
@@ -1996,7 +2745,7 @@ fn resolve_write(rows: usize, cols: usize, sel: &[Sel], rhs: &Matrix) -> R<Scatt
             Sel::All if have == 0 => theirs,
             _ => have,
         };
-        let (rspan, cspan) = (span(&sel[0], rows, rhs.rows), span(&sel[1], cols, rhs.cols));
+        let (rspan, cspan) = (span(&sel[0], rows, rr), span(&sel[1], cols, rc));
         let r = sel[0].extent(rspan).max(rows as f64);
         let c = sel[1].extent(cspan).max(cols as f64);
         let (nr, nc) = crate::builtins::args::check_shape(r, c)?;
@@ -2009,8 +2758,8 @@ fn resolve_write(rows: usize, cols: usize, sel: &[Sel], rhs: &Matrix) -> R<Scatt
         }
         (nr, nc, pos)
     };
-    if !rhs.is_scalar() && rhs.numel() != pos.len() {
-        bail!(error::assignment_size(pos.len(), rhs.numel()));
+    if rr * rc != 1 && rr * rc != pos.len() {
+        bail!(error::assignment_size(pos.len(), rr * rc));
     }
     Ok(Scatter {
         rows: nr,
@@ -2176,7 +2925,120 @@ fn concat_class(mats: &[Matrix]) -> Class {
     }
 }
 
-fn hcat(vals: Vec<Value>) -> R<Value> {
+/// `[a, b]` or `[a; b]` where a cell or a struct takes part (cycle 07), or
+/// `None` when none does and the operands are the matrices' business.
+///
+/// With a cell among them the result is a cell: a cell contributes its
+/// elements, anything else becomes one element of its own, so `[{1}, 2]`
+/// is `{1, 2}`. With a struct, every operand must be a struct array with
+/// the same fields, and the result is a struct array. Either way the 0x0
+/// double `[]` and every empty operand contribute nothing, as they do to a
+/// matrix, and the sizes must agree along the other dimension.
+fn concat_containers(vals: &mut Vec<Value>, vertical: bool) -> Option<R<Value>> {
+    let join = |parts: Vec<(usize, usize)>| -> R<(usize, usize)> {
+        let (r0, c0) = parts[0];
+        if vertical {
+            if parts.iter().any(|&(_, c)| c != c0) {
+                bail!(error::concat_dims());
+            }
+            Ok((parts.iter().map(|&(r, _)| r).sum(), c0))
+        } else {
+            if parts.iter().any(|&(r, _)| r != r0) {
+                bail!(error::concat_dims());
+            }
+            Ok((r0, parts.iter().map(|&(_, c)| c).sum()))
+        }
+    };
+    // Column-major items of each part, laid out as the joined array holds
+    // them.
+    fn lay<T: Clone>(parts: &[(usize, usize, &[T])], vertical: bool, cols: usize) -> Vec<T> {
+        if !vertical {
+            return parts.iter().flat_map(|p| p.2.iter().cloned()).collect();
+        }
+        let mut out = Vec::new();
+        for c in 0..cols {
+            for &(r, _, items) in parts {
+                out.extend_from_slice(&items[c * r..(c + 1) * r]);
+            }
+        }
+        out
+    }
+    if vals.iter().any(|v| matches!(v, Value::Cell(_))) {
+        let cells: Vec<Rc<CellArray>> = std::mem::take(vals)
+            .into_iter()
+            .filter(|v| v.numel() > 0)
+            .map(|v| match v {
+                Value::Cell(c) => c,
+                v => Rc::new(CellArray::new(1, 1, vec![v])),
+            })
+            .collect();
+        if cells.is_empty() {
+            return Some(Ok(Value::cell(CellArray::default())));
+        }
+        let shape = match join(cells.iter().map(|c| (c.rows, c.cols)).collect()) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        let parts: Vec<(usize, usize, &[Value])> = cells
+            .iter()
+            .map(|c| (c.rows, c.cols, c.data.as_slice()))
+            .collect();
+        let data = lay(&parts, vertical, shape.1);
+        return Some(Ok(Value::cell(CellArray::new(shape.0, shape.1, data))));
+    }
+    if vals.iter().any(|v| matches!(v, Value::Struct(_))) {
+        let mut structs: Vec<Rc<StructArray>> = Vec::new();
+        for v in std::mem::take(vals) {
+            match v {
+                Value::Struct(s) => structs.push(s),
+                v if v.is_blank() => {}
+                v => return Some(Err(error::conversion("struct", v.class_name()))),
+            }
+        }
+        let first = structs[0].clone();
+        if structs.iter().any(|s| !first.same_fields(s)) {
+            return Some(Err(error::struct_concat_fields()));
+        }
+        structs.retain(|s| s.numel() > 0);
+        if structs.is_empty() {
+            return Some(Ok(Value::Struct(first)));
+        }
+        let shape = match join(structs.iter().map(|s| (s.rows, s.cols)).collect()) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        // Every part's elements in the first part's field order.
+        let reordered: Vec<Vec<Vec<Value>>> = structs
+            .iter()
+            .map(|s| (0..s.numel()).map(|k| first.reordered(s, k)).collect())
+            .collect();
+        let parts: Vec<(usize, usize, &[Vec<Value>])> = structs
+            .iter()
+            .zip(&reordered)
+            .map(|(s, e)| (s.rows, s.cols, e.as_slice()))
+            .collect();
+        let elems = lay(&parts, vertical, shape.1);
+        return Some(Ok(Value::strukt(StructArray::new(
+            shape.0,
+            shape.1,
+            first.fields.clone(),
+            elems,
+        ))));
+    }
+    None
+}
+
+/// Rows of values joined as the bracket `[r1; r2; ...]` would join them:
+/// what `cell2mat` does with a cell's rows (cycle 07).
+pub(crate) fn concat_rows(rows: Vec<Vec<Value>>) -> R<Value> {
+    let joined = rows.into_iter().map(hcat).collect::<R<Vec<Value>>>()?;
+    vcat(joined)
+}
+
+fn hcat(mut vals: Vec<Value>) -> R<Value> {
+    if let Some(r) = concat_containers(&mut vals, false) {
+        return r;
+    }
     // A handle is one function, not an element (cycle 06): `[f 1]`, and
     // `[f]` too, which is a bracket of one.
     if vals.iter().any(|v| matches!(v, Value::Func(_))) {
@@ -2203,9 +3065,12 @@ fn hcat(vals: Vec<Value>) -> R<Value> {
     Ok(Value::Mat(Matrix::new(rows, cols, data).to_class(class)?))
 }
 
-fn vcat(vals: Vec<Value>) -> R<Value> {
+fn vcat(mut vals: Vec<Value>) -> R<Value> {
     if vals.len() == 1 {
         return Ok(vals.into_iter().next().unwrap());
+    }
+    if let Some(r) = concat_containers(&mut vals, true) {
+        return r;
     }
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
@@ -3573,7 +4438,7 @@ mod tests {
     fn the_write_resolver_plans_growth_without_touching_anything() {
         let rhs = Matrix::scalar(9.0);
         // A row grows along its length.
-        let p = resolve_write(1, 2, &[Sel::row(vec![3])], &rhs).unwrap();
+        let p = resolve_write(1, 2, &[Sel::row(vec![3])], (rhs.rows, rhs.cols)).unwrap();
         assert_eq!(
             p,
             Scatter {
@@ -3583,13 +4448,19 @@ mod tests {
             }
         );
         // A column grows down; an empty becomes a row.
-        let p = resolve_write(2, 1, &[Sel::row(vec![2])], &rhs).unwrap();
+        let p = resolve_write(2, 1, &[Sel::row(vec![2])], (rhs.rows, rhs.cols)).unwrap();
         assert_eq!((p.rows, p.cols), (3, 1));
-        let p = resolve_write(0, 0, &[Sel::row(vec![2])], &rhs).unwrap();
+        let p = resolve_write(0, 0, &[Sel::row(vec![2])], (rhs.rows, rhs.cols)).unwrap();
         assert_eq!((p.rows, p.cols), (1, 3));
         // Two subscripts grow either dimension, and positions are in the
         // grown shape.
-        let p = resolve_write(2, 2, &[Sel::row(vec![2]), Sel::row(vec![2])], &rhs).unwrap();
+        let p = resolve_write(
+            2,
+            2,
+            &[Sel::row(vec![2]), Sel::row(vec![2])],
+            (rhs.rows, rhs.cols),
+        )
+        .unwrap();
         assert_eq!(
             p,
             Scatter {
@@ -3599,11 +4470,11 @@ mod tests {
             }
         );
         // A matrix cannot grow through one subscript.
-        let e = resolve_write(2, 2, &[Sel::row(vec![4])], &rhs).unwrap_err();
+        let e = resolve_write(2, 2, &[Sel::row(vec![4])], (rhs.rows, rhs.cols)).unwrap_err();
         assert_eq!(e.msg, "Attempt to grow array along ambiguous dimension.");
         // The count is checked against the positions.
         let two = Matrix::row(vec![1.0, 2.0]);
-        let e = resolve_write(1, 3, &[Sel::row(vec![0, 1, 2])], &two).unwrap_err();
+        let e = resolve_write(1, 3, &[Sel::row(vec![0, 1, 2])], (two.rows, two.cols)).unwrap_err();
         assert!(e.msg.contains("left side has 3 elements"), "{}", e.msg);
     }
 
@@ -3619,7 +4490,7 @@ mod tests {
             cols: 1,
             max: 1e300,
         };
-        let e = resolve_write(0, 0, &[huge], &Matrix::scalar(1.0)).unwrap_err();
+        let e = resolve_write(0, 0, &[huge], (1, 1)).unwrap_err();
         assert_eq!(e.msg, msg);
         assert_eq!(
             err_msg("x = zeros(3, 1); x(1e300) = 1;"),
@@ -3747,9 +4618,12 @@ mod tests {
         // On a builtin's value too, and on an assignment target.
         assert_eq!(err_msg("pi.a"), dot);
         assert_eq!(err_msg("y = pi{1};"), brace);
-        assert_eq!(err_msg("x = [1 2]; x{1} = 3;"), brace);
-        assert_eq!(err_msg("x = [1 2]; x.a = 3;"), dot);
-        assert_eq!(err_msg("x = [1 2]; x(1).a = 3;"), dot);
+        // An assignment says so in MATLAB's assignment form (cycle 07).
+        let brace_asg = "Unable to perform assignment because brace indexing is not supported for variables of this type.";
+        let dot_asg = "Unable to perform assignment because dot indexing is not supported for variables of this type.";
+        assert_eq!(err_msg("x = [1 2]; x{1} = 3;"), brace_asg);
+        assert_eq!(err_msg("x = [1 2]; x.a = 3;"), dot_asg);
+        assert_eq!(err_msg("x = [1 2]; x(1).a = 3;"), dot_asg);
         // An undefined name is still undefined first.
         assert_eq!(err_msg("q{1}"), "Unrecognized function or variable 'q'.");
         // A second `(...)` indexes the value so far.
@@ -4037,12 +4911,20 @@ mod tests {
             "e =\n\n  MException: plain\n\n"
         );
         const DOT: &str = "Dot indexing is not supported for variables of this type.";
-        assert_eq!(err_msg(&format!("{pre}e.stack")), DOT);
         assert_eq!(err_msg(&format!("{pre}e.Message")), DOT);
-        assert_eq!(err_msg(&format!("{pre}e.message = 'x'")), DOT);
-        // It is not an array.
+        // Its fields are read, never assigned (cycle 07's assignment text).
+        assert_eq!(
+            err_msg(&format!("{pre}e.message = 'x'")),
+            "Unable to perform assignment because dot indexing is not supported for variables of this type."
+        );
+        // It is not an array; a binary operator says so in MATLAB's words
+        // since cycle 07, and everything else in SplatCrab's.
         const NOT: &str = "This operation is not supported for a value of class 'MException'.";
-        assert_eq!(err_msg(&format!("{pre}e + 1")), NOT);
+        assert_eq!(
+            err_msg(&format!("{pre}e + 1")),
+            "Operator '+' is not supported for operands of type 'MException'."
+        );
+        assert_eq!(err_msg(&format!("{pre}-e")), NOT);
         assert_eq!(err_msg(&format!("{pre}e(1)")), NOT);
         assert_eq!(err_msg(&format!("{pre}sum(e)")), NOT);
         assert_eq!(err_msg(&format!("{pre}x = [e 1]")), NOT);
@@ -4934,6 +5816,10 @@ mod tests {
         assert_eq!(err_msg("f = @sin; x = [f];"), concat);
         assert_eq!(
             err_msg("f = @sin; x = f + 1;"),
+            "Operator '+' is not supported for operands of type 'function_handle'."
+        );
+        assert_eq!(
+            err_msg("f = @sin; x = -f;"),
             "This operation is not supported for a value of class 'function_handle'."
         );
     }
@@ -4999,5 +5885,400 @@ mod tests {
             err_msg("f = @(x) @() x + y; y = 5; g = f(10); g()"),
             "Unrecognized function or variable 'y'."
         );
+    }
+
+    // ---- cells and structs (cycle 07) --------------------------------
+
+    /// A cell literal nests what it is given; braces read the contents and
+    /// parentheses a cell; a chain indexes into an element.
+    #[test]
+    fn cells_are_built_and_read_by_brace_and_paren() {
+        assert_eq!(
+            ok_out(
+                "c = {1, 'two', [3 4]}; disp(class(c)); disp(c{2}); disp(c{3}(2)); disp(size(c(2:3)))"
+            ),
+            "cell\ntwo\n     4\n     1     2\n"
+        );
+        // Whitespace separates, a semicolon or a newline starts a row, and
+        // the storage is column-major like a matrix's.
+        assert_eq!(
+            ok_out("c = {1 -2; 3 4}; disp(c{2}); disp(c{1, 2})"),
+            "     3\n    -2\n"
+        );
+        assert_eq!(ok_out("c = {1, 2\n3, 4}; disp(size(c))"), "     2     2\n");
+        // `{c}` of a cell nests it rather than joining it.
+        assert_eq!(
+            ok_out("c = {1}; d = {c, 2}; disp(class(d{1})); disp(d{1}{1})"),
+            "cell\n     1\n"
+        );
+        assert_eq!(ok_out("c = {}; disp(size(c))"), "     0     0\n");
+        assert_eq!(err_msg("c = {1, 2; 3}"), error::concat_dims().msg);
+        assert_eq!(
+            ok_out("c = {1, 2, 3}; disp(c{end}); d = c([1 3]); disp(d{2})"),
+            "     3\n     3\n"
+        );
+        assert_eq!(
+            err_msg("c = {1, 2}; c{3}"),
+            error::index_exceeds_numel(2).msg
+        );
+    }
+
+    /// Growth, deletion and the assignment of cells into cells; a failed
+    /// assignment leaves the cell as it was.
+    #[test]
+    fn a_cell_grows_and_shrinks() {
+        assert_eq!(
+            ok_out(
+                "c = cell(1, 3); disp(isempty(c{1})); c{5} = 'x'; disp(numel(c)); c(2) = []; disp(numel(c))"
+            ),
+            "   1\n     5\n     4\n"
+        );
+        assert_eq!(
+            ok_out("c = {1}; c{2, 3} = 5; disp(size(c)); disp(isempty(c{2, 2}))"),
+            "     2     3\n   1\n"
+        );
+        assert_eq!(
+            ok_out("c = {1, 2, 3}; c(2) = {9}; disp(c{2}); c(1:2) = {0}; disp([c{:}])"),
+            "     9\n     0     0     3\n"
+        );
+        assert_eq!(
+            ok_out("x = []; x{2} = 1; disp(class(x)); disp(size(x))"),
+            "cell\n     1     2\n"
+        );
+        assert_eq!(ok_out("q{3} = 1; disp(size(q))"), "     1     3\n");
+        assert_eq!(
+            err_msg("c = {1}; c(2) = 5;"),
+            error::conversion("cell", "double").msg
+        );
+        assert_eq!(
+            err_msg("x = [1 2]; x(2) = {3};"),
+            error::conversion("double", "cell").msg
+        );
+        assert_eq!(
+            err_msg("x = 1; x{1} = 2;"),
+            error::brace_assign_unsupported().msg
+        );
+        assert_eq!(
+            ok_out("c = {1, 2}; try, c(5) = 7; catch, end; disp(size(c))"),
+            "     1     2\n"
+        );
+        // An assignment that creates the variable and fails leaves none.
+        assert_eq!(
+            ok_out("try, q.a{2}(0) = 1; catch, end; disp(exist('q'))"),
+            "     0\n"
+        );
+    }
+
+    /// A copy is independent: the shared storage is copied on the first
+    /// write, and only then.
+    #[test]
+    fn containers_are_values() {
+        assert_eq!(
+            ok_out("c = {1, 2}; d = c; d{1} = 9; disp(c{1}); disp(d{1})"),
+            "     1\n     9\n"
+        );
+        assert_eq!(
+            ok_out("s.a = 1; t = s; t.a = 2; disp(s.a); disp(t.a)"),
+            "     1\n     2\n"
+        );
+        assert_eq!(
+            ok_out("c = {1}; c{2} = c; disp(class(c{2})); disp(numel(c{2}))"),
+            "cell\n     1\n"
+        );
+    }
+
+    /// Field assignment creates what does not exist, down any path; a
+    /// dynamic field is a field named at run time.
+    #[test]
+    fn fields_are_created_by_assignment() {
+        assert_eq!(
+            ok_out(
+                "s = struct('x', 5, 'y', [1 2]); disp(s.y(2)); s.inner.v = 3; s.inner.v = s.inner.v + 1; disp(s.inner.v); n = 'x'; disp(s.(n))"
+            ),
+            "     2\n     4\n     5\n"
+        );
+        assert_eq!(
+            ok_out("n = 'k'; s.(n) = 7; s.(n) = s.(n) + 1; disp(s.k)"),
+            "     8\n"
+        );
+        assert_eq!(
+            ok_out("s.data(end + 1) = 4; s.data(end + 1) = 5; disp(s.data)"),
+            "     4     5\n"
+        );
+        assert_eq!(
+            ok_out("s.c{2} = 'b'; disp(class(s.c)); disp(s.c{2})"),
+            "cell\nb\n"
+        );
+        assert_eq!(ok_out("x = []; x.a = 1; disp(isstruct(x))"), "   1\n");
+        assert_eq!(
+            err_msg("x = 1; x.a = 2;"),
+            error::dot_assign_unsupported().msg
+        );
+        assert_eq!(err_msg("s.a = 1; s.b"), error::no_such_field("b").msg);
+        assert_eq!(err_msg("s.(5) = 1;"), error::dynamic_field_not_text().msg);
+        assert_eq!(
+            err_msg("s.('a b') = 1;"),
+            error::invalid_field_name("a b").msg
+        );
+        // A failure deep in the path adds no field on the way.
+        assert_eq!(
+            ok_out("s.a = 1; try, s.b.c = [1 2]; s.b.c(0) = 1; catch, end; disp(isfield(s, 'b'))"),
+            "   1\n"
+        );
+        assert_eq!(
+            ok_out("s.a = 1; try, s.z.w(0) = 1; catch, end; disp(isfield(s, 'z'))"),
+            "   0\n"
+        );
+    }
+
+    /// `p(k).f = v` grows a struct array; `p.f` of one is a cs-list; a
+    /// struct array needs one element for a field assignment.
+    #[test]
+    fn a_struct_array_grows_by_element() {
+        assert_eq!(
+            ok_out(
+                "p(1).name = 'A'; p(2).name = 'B'; disp(numel(p)); disp(p(2).name); disp(class(p)); q = [p.name]; disp(q)"
+            ),
+            "     2\nB\nstruct\nAB\n"
+        );
+        assert_eq!(
+            ok_out("p(3).v = 1; disp(size(p)); disp(isempty(p(1).v))"),
+            "     1     3\n   1\n"
+        );
+        assert_eq!(
+            ok_out("p(2).a = 1; p(1).b = 2; disp(isempty(p(2).b)); disp(p(1).b)"),
+            "   1\n     2\n"
+        );
+        assert_eq!(
+            err_msg("p(2).a = 1; p.a = 3;"),
+            error::scalar_struct_required().msg
+        );
+        assert_eq!(err_msg("p(2).a = 1; z = p.a;"), error::cs_list_count(2).msg);
+        assert_eq!(ok_out("p(2).a = 1; p(1) = []; disp(numel(p))"), "     1\n");
+        assert_eq!(
+            err_msg("s.a = 1; t.b = 2; s(2) = t;"),
+            error::dissimilar_structs().msg
+        );
+        assert_eq!(
+            ok_out("s.a = 1; t.a = 2; s(2) = t; disp([s.a])"),
+            "     1     2\n"
+        );
+    }
+
+    /// Where a cs-list goes: spread into a call's arguments, a bracket and
+    /// a brace; a statement shows each value; one value is wanted anywhere
+    /// else.
+    #[test]
+    fn a_cs_list_spreads_or_must_be_one() {
+        assert_eq!(
+            ok_out("c = {1, 2, 3}; disp([c{:}]); disp(max(c{2:3}))"),
+            "     1     2     3\n     3\n"
+        );
+        assert_eq!(
+            ok_out("c = {1, 2}; d = {c{:}, 3}; disp(size(d))"),
+            "     1     3\n"
+        );
+        assert_eq!(ok_out("c = {}; disp(size([c{:}]))"), "     0     0\n");
+        assert_eq!(
+            ok_out("c = {1, 2}; c{:}"),
+            "ans =\n\n     1\n\nans =\n\n     2\n\n"
+        );
+        assert_eq!(ok_out("c = {1, 2}; [a, b] = c{:}; disp(b)"), "     2\n");
+        assert_eq!(
+            err_msg("c = {1, 2}; y = c{:};"),
+            error::cs_list_count(2).msg
+        );
+        assert_eq!(err_msg("c = {}; y = c{:};"), error::cs_list_count(0).msg);
+        assert_eq!(
+            err_msg("c = {1, 2}; [a, b, d] = c{:};"),
+            error::insufficient_outputs().msg
+        );
+        assert_eq!(
+            err_msg("c = {1, 2}; y = c{:} + 1;"),
+            error::cs_list_count(2).msg
+        );
+    }
+
+    /// `for` over a cell or a struct array takes one column at a time.
+    #[test]
+    fn for_iterates_the_columns_of_a_container() {
+        assert_eq!(
+            ok_out("for c = {1, 'a'}, disp(class(c)), end"),
+            "cell\ncell\n"
+        );
+        assert_eq!(
+            ok_out("for c = {1; 2}, disp(size(c)), end"),
+            "     2     1\n"
+        );
+        assert_eq!(
+            ok_out("for s = struct('v', {4, 5}), disp(s.v), end"),
+            "     4\n     5\n"
+        );
+        assert_eq!(ok_out("for c = {}, disp(1), end; disp(class(c))"), "cell\n");
+    }
+
+    /// A last parameter `varargin` takes the rest of the arguments and a
+    /// last output `varargout` gives the rest of the outputs; `nargin` and
+    /// `nargout` count them all.
+    #[test]
+    fn varargin_and_varargout() {
+        let fns = "\nfunction r = cnt(varargin)\nr = nargin;\nend\nfunction varargout = mv()\nvarargout{1} = 1; varargout{2} = 2;\nend\nfunction [a, varargout] = two(x, varargin)\na = x; varargout = varargin; disp(nargout)\nend";
+        assert_eq!(
+            ok_out(&format!("disp(cnt(1, 2, 3)); disp(cnt()){fns}")),
+            "     3\n     0\n"
+        );
+        assert_eq!(
+            ok_out(&format!("[a, b] = mv(); disp([a b]){fns}")),
+            "     1     2\n"
+        );
+        assert_eq!(ok_out(&format!("mv(){fns}")), "ans =\n\n     1\n\n");
+        assert_eq!(
+            ok_out(&format!("[p, q, r] = two(1, 2, 3); disp([p q r]){fns}")),
+            "     3\n     1     2     3\n"
+        );
+        assert_eq!(
+            err_msg(&format!("[a, b, c] = mv();{fns}")),
+            error::varargout_not_assigned(3, "mv").msg
+        );
+        assert_eq!(
+            ok_out("f = @(varargin) numel(varargin); disp(f(1, 2, 3))"),
+            "     3\n"
+        );
+        assert_eq!(
+            ok_out(&format!("c = {{1, 2}}; disp(cnt(c{{:}}, 3)){fns}")),
+            "     3\n"
+        );
+    }
+
+    /// A binary operator refuses a value that is not an array in MATLAB's
+    /// R2020a words, naming the operator and the first such operand's
+    /// class; a unary one keeps SplatCrab's generic text.
+    #[test]
+    fn an_operator_on_a_container_names_its_class() {
+        assert_eq!(
+            err_msg("c = {1}; c + 1"),
+            error::operator_unsupported("+", "cell").msg
+        );
+        assert_eq!(
+            err_msg("c = {1}; 1 + c"),
+            error::operator_unsupported("+", "cell").msg
+        );
+        assert_eq!(
+            err_msg("s.a = 1; s * 2"),
+            error::operator_unsupported("*", "struct").msg
+        );
+        assert_eq!(
+            err_msg("c = {1}; c == 1"),
+            error::operator_unsupported("==", "cell").msg
+        );
+        assert_eq!(
+            err_msg("f = @sin; f && 1"),
+            error::operator_unsupported("&&", "function_handle").msg
+        );
+        assert_eq!(err_msg("c = {1}; -c"), error::not_an_array("cell").msg);
+    }
+
+    /// `e.stack` is an Nx1 struct array of the frames, innermost first.
+    #[test]
+    fn e_stack_is_a_struct_array_of_the_frames() {
+        let src = "try, g1(), catch e, end\ndisp(size(e.stack)); disp(e.stack(1).name); disp(e.stack(1).line); disp(e.stack(2).name); disp(isempty(e.stack(1).file))\nfunction g1()\ng2();\nend\nfunction g2()\nerror('x:y', 'deep');\nend";
+        assert_eq!(ok_out(src), "     2     1\ng2\n     7\ng1\n   1\n");
+        assert_eq!(
+            ok_out(
+                "try, error('x'), catch e, end; disp(size(e.stack)); f = fieldnames(e.stack); disp([f{:}])"
+            ),
+            "     0     1\nfilenameline\n"
+        );
+    }
+
+    /// A deep chain through cells, structs and handles is freed without
+    /// recursion, on this test's own 2 MB thread, whether it is cleared or
+    /// reassigned or simply dropped with the interpreter.
+    #[test]
+    fn deep_chains_through_containers_are_freed_iteratively() {
+        let cells = "c = {}; for k = 1:100000, c = {c}; end";
+        assert_eq!(ok_out(&format!("{cells}; clear c; disp(1)")), "     1\n");
+        assert_eq!(ok_out(&format!("{cells}; c = 0; disp(2)")), "     2\n");
+        assert_eq!(ok_out(&format!("{cells}; disp(3)")), "     3\n");
+        let mixed = "c = {}; for k = 1:100000, h = @() c; c = {h}; end";
+        assert_eq!(ok_out(&format!("{mixed}; clear c h; disp(4)")), "     4\n");
+        let structs = "s = 0; for k = 1:100000, s = struct('a', {{s}}); end";
+        assert_eq!(ok_out(&format!("{structs}; clear s; disp(5)")), "     5\n");
+        let fields = "s = 0; for k = 1:100000, t.a = s; s = t; end";
+        assert_eq!(ok_out(&format!("{fields}; clear s t; disp(6)")), "     6\n");
+        // Displaying one is bounded too: a nested cell is summarised.
+        assert_eq!(
+            ok_out(&format!("{cells}; c")),
+            "c =\n\n  1×1 cell array\n\n    {1×1 cell}\n\n"
+        );
+    }
+
+    /// Brackets make a cell when a cell takes part, and a struct array
+    /// when structs do.
+    #[test]
+    fn brackets_join_cells_and_structs() {
+        assert_eq!(
+            ok_out("d = [{1}, 2]; disp(class(d)); disp(numel(d))"),
+            "cell\n     2\n"
+        );
+        assert_eq!(ok_out("d = [{1}; {2}]; disp(size(d))"), "     2     1\n");
+        assert_eq!(ok_out("d = [{}, {1}, []]; disp(size(d))"), "     1     1\n");
+        assert_eq!(
+            ok_out("s.a = 1; t.a = 2; u = [s t]; disp(size(u)); disp(u(2).a)"),
+            "     1     2\n     2\n"
+        );
+        assert_eq!(
+            err_msg("s.a = 1; t.b = 2; u = [s t];"),
+            error::struct_concat_fields().msg
+        );
+        assert_eq!(
+            err_msg("s.a = 1; u = [s 1];"),
+            error::conversion("struct", "double").msg
+        );
+        assert_eq!(
+            err_msg("c = {1, 2}; d = [c; {1}];"),
+            error::concat_dims().msg
+        );
+    }
+
+    /// The link resolver judges `end` against what the path holds, and a
+    /// path that does not exist yet against `0x0`.
+    #[test]
+    fn assignment_links_resolve_end_along_the_path() {
+        assert_eq!(
+            ok_out("s.c = {1, 2}; s.c{end + 1} = 3; disp(numel(s.c))"),
+            "     3\n"
+        );
+        assert_eq!(ok_out("s.c{end + 1} = 3; disp(numel(s.c))"), "     1\n");
+        assert_eq!(
+            ok_out("p(2).v = [1 2]; p(2).v(end + 1) = 3; disp(p(2).v)"),
+            "     1     2     3\n"
+        );
+        assert_eq!(
+            ok_out("c = {[1 2]}; c{1}(end) = []; disp(c{1})"),
+            "     1\n"
+        );
+    }
+
+    /// The pure helpers: growth of column-major items and what a deletion
+    /// keeps.
+    #[test]
+    fn regrid_and_keep_positions_respect_column_major_order() {
+        let mut v = vec![1, 2, 3, 4];
+        regrid(&mut v, (2, 2), (3, 2), || 0);
+        assert_eq!(v, [1, 2, 0, 3, 4, 0]);
+        let mut v = vec![1, 2];
+        regrid(&mut v, (1, 2), (1, 4), || 0);
+        assert_eq!(v, [1, 2, 0, 0]);
+        let mut v: Vec<i32> = Vec::new();
+        regrid(&mut v, (0, 0), (2, 1), || 7);
+        assert_eq!(v, [7, 7]);
+        assert_eq!(
+            keep_positions(vec!['a', 'b', 'c', 'd'], &[0, 2, 3]),
+            ['a', 'c', 'd']
+        );
+        assert_eq!(one_position(2, 2, &[Sel::row(vec![3])]), Some(3));
+        assert_eq!(one_position(2, 2, &[Sel::row(vec![4])]), None);
+        assert_eq!(one_position(2, 2, &[Sel::row(vec![0, 1])]), None);
     }
 }

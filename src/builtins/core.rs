@@ -6,7 +6,7 @@ use super::args::{at_most, check_shape, dim, mat, need, scalar, shape, string};
 use super::{Registry, add, none, one, one_as, one_mat};
 use crate::error;
 use crate::interp::{Callee, Interp, R, fmt_e, fmt_g};
-use crate::value::{Class, FUNC_CLASS, Func, Matrix, Value, decode_units, nonfinite};
+use crate::value::{Class, Func, Matrix, Value, decode_units, nonfinite};
 
 /// The registration table is one line per builtin on purpose: it is the index
 /// of the library, and rustfmt would otherwise spread each entry over five
@@ -39,7 +39,7 @@ pub fn register(r: &mut Registry) {
     add(r, "isvector", isvector, "isvector(A) - true when A is 1-by-N or N-by-1, N >= 0.");
 
     // ---- classes -----------------------------------------------------
-    add(r, "class", class, "class(A) - the class of A: 'double', 'logical', 'char', 'function_handle' or 'MException'.");
+    add(r, "class", class, "class(A) - the class of A: 'double', 'logical', 'char', 'cell', 'struct', 'function_handle' or 'MException'.");
     add(r, "islogical", islogical, "islogical(A) - true when A is logical.");
     add(r, "ischar", ischar, "ischar(A) - true when A is a char array.");
     add(r, "isnumeric", isnumeric, "isnumeric(A) - true when A is numeric; logical and char are not.");
@@ -75,7 +75,7 @@ pub fn register(r: &mut Registry) {
     add(r, "rmpath", rmpath, "rmpath(d1,...) - take folders off the search path.");
 
     // ---- function handles (cycle 06) ---------------------------------
-    add(r, "arrayfun", arrayfun, "arrayfun(f,A,...) - call f on each element of A, ..., and collect the scalar results in A's shape.");
+    add(r, "arrayfun", arrayfun, "arrayfun(f,A,...,'UniformOutput',tf) - call f on each element of A, ..., and collect the results in A's shape.");
     add(r, "func2str", func2str, "func2str(f) - the text of a function handle: its name, or @(x)... .");
     add(r, "str2func", str2func, "str2func(s) - a function handle from a name or an '@(x) ...' text.");
 
@@ -258,54 +258,80 @@ fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 /// the trailing singletons, `1`. `size(A, dim)` is one value.
 fn size(_: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(args, 2, "size")?;
-    let m = mat(args, 0, "size")?;
+    let (rows, cols) = arg_dims(args, 0, "size")?;
     if args.len() >= 2 {
         // A dimension past the array's is a singleton; `0` is an error.
         let v = match dim(args, 1, "size")? {
-            1 => m.rows,
-            2 => m.cols,
+            1 => rows,
+            2 => cols,
             _ => 1,
         };
         one_mat(Matrix::scalar(v as f64))
     } else if nargout >= 2 {
-        let dims = [m.rows as f64, m.cols as f64];
+        let dims = [rows as f64, cols as f64];
         Ok((0..nargout)
             .map(|k| Value::Mat(Matrix::scalar(dims.get(k).copied().unwrap_or(1.0))))
             .collect())
     } else {
-        one_mat(Matrix::row(vec![m.rows as f64, m.cols as f64]))
+        one_mat(Matrix::row(vec![rows as f64, cols as f64]))
     }
+}
+
+/// The dimensions of argument `i`, of any value (cycle 07): an array's,
+/// a cell's or a struct array's own, and `1x1` for a function handle or
+/// an `MException`, each of which is one object.
+fn arg_dims(args: &[Value], i: usize, name: &str) -> R<(usize, usize)> {
+    args.get(i)
+        .map(Value::dims)
+        .ok_or_else(|| error::not_enough_args(name))
 }
 
 fn numel(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "numel")?;
-    one_mat(Matrix::scalar(mat(args, 0, "numel")?.numel() as f64))
+    let (r, c) = arg_dims(args, 0, "numel")?;
+    one_mat(Matrix::scalar((r * c) as f64))
 }
 
 fn length(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "length")?;
-    let m = mat(args, 0, "length")?;
-    let n = if m.is_empty() { 0 } else { m.rows.max(m.cols) };
+    let (r, c) = arg_dims(args, 0, "length")?;
+    let n = if r == 0 || c == 0 { 0 } else { r.max(c) };
     one_mat(Matrix::scalar(n as f64))
 }
 
-/// A predicate on one argument, answered with a logical scalar, as every
-/// MATLAB `is*` function answers.
-fn predicate(args: &[Value], name: &str, test: impl Fn(&Matrix) -> bool) -> R<Vec<Value>> {
+/// A predicate on the shape of one argument of any value, answered with a
+/// logical scalar, as every MATLAB `is*` function answers (cycle 07 let it
+/// answer for every value).
+fn shape_predicate(
+    args: &[Value],
+    name: &str,
+    test: impl Fn(usize, usize) -> bool,
+) -> R<Vec<Value>> {
     at_most(args, 1, name)?;
-    one_as(Matrix::from_bool(test(&mat(args, 0, name)?)))
+    let (r, c) = arg_dims(args, 0, name)?;
+    one_as(Matrix::from_bool(test(r, c)))
+}
+
+/// A predicate on the class of one argument of any value; a value that is
+/// not a matrix is of none of the matrix classes.
+fn class_predicate(args: &[Value], name: &str, test: impl Fn(Class) -> bool) -> R<Vec<Value>> {
+    at_most(args, 1, name)?;
+    let v = args.first().ok_or_else(|| error::not_enough_args(name))?;
+    one_as(Matrix::from_bool(
+        matches!(v, Value::Mat(m) if test(m.class)),
+    ))
 }
 
 fn isempty(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "isempty", Matrix::is_empty)
+    shape_predicate(args, "isempty", |r, c| r * c == 0)
 }
 
 fn isscalar(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "isscalar", Matrix::is_scalar)
+    shape_predicate(args, "isscalar", |r, c| r * c == 1)
 }
 
 fn isvector(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "isvector", Matrix::is_vector)
+    shape_predicate(args, "isvector", |r, c| r == 1 || c == 1)
 }
 
 // ---- classes ---------------------------------------------------------
@@ -317,17 +343,17 @@ fn class(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 }
 
 fn islogical(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "islogical", |m| m.class == Class::Logical)
+    class_predicate(args, "islogical", |c| c == Class::Logical)
 }
 
 fn ischar(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "ischar", |m| m.class == Class::Char)
+    class_predicate(args, "ischar", |c| c == Class::Char)
 }
 
 /// Only `double` is numeric of the three classes; MATLAB counts neither
 /// logical nor char, so `isnumeric(true)` is false.
 fn isnumeric(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    predicate(args, "isnumeric", |m| m.class == Class::Double)
+    class_predicate(args, "isnumeric", |c| c == Class::Double)
 }
 
 /// `isa(A, name)`: `name` is a class name or one of MATLAB's groups.
@@ -335,19 +361,16 @@ fn isnumeric(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 /// integer and single classes do not exist; `'integer'` therefore holds
 /// nothing. The name is matched exactly, as MATLAB matches it.
 ///
-/// A function handle is of the class `'function_handle'` and of no group
-/// (cycle 06), which is MATLAB's check for one: `isa(f, 'function_handle')`.
+/// Every value answers (cycle 07): a function handle is of the class
+/// `'function_handle'`, a caught error of `'MException'`, a cell of
+/// `'cell'` and a struct of `'struct'`, and none of them is in a group.
 fn isa(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 2, "isa")?;
-    if let Some(Value::Func(_)) = args.first() {
-        let name = string(args, 1, "isa")?;
-        return one_as(Matrix::from_bool(name == FUNC_CLASS));
-    }
-    let m = mat(args, 0, "isa")?;
+    need(args, 1, "isa")?;
     let name = string(args, 1, "isa")?;
-    let yes = match name.as_str() {
-        "numeric" | "float" => m.class == Class::Double,
-        n => n == m.class.name(),
+    let yes = match (&args[0], name.as_str()) {
+        (Value::Mat(m), "numeric" | "float") => m.class == Class::Double,
+        (v, n) => n == v.class_name(),
     };
     one_as(Matrix::from_bool(yes))
 }
@@ -682,67 +705,10 @@ fn handle(args: &[Value], i: usize, name: &str) -> R<std::rc::Rc<Func>> {
     }
 }
 
-/// `arrayfun(f, A1, ..., An)`: `f` called on the elements of the arrays at
-/// each position in turn, in column-major order, and asked for as many
-/// outputs as `arrayfun` was. Every array must have the first one's size,
-/// and every result must be a scalar; the outputs are arrays of that size,
-/// each of the results' class when they all share one and double
-/// otherwise. Asked for no output, as a statement asks, `f` is asked for
-/// none too, and a result it gives anyway becomes the one output.
-///
-/// Each call goes through `call_nested`, so a handle that calls `arrayfun`
-/// that calls the handle stays bounded. `'UniformOutput', false` returns a
-/// cell and is cycle 07's.
+/// `arrayfun(f, A1, ..., An)` and its `'UniformOutput', false` form (cycle 07):
+/// see `cells::map_elements`, which `cellfun` shares.
 fn arrayfun(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
-    need(args, 2, "arrayfun")?;
-    let f = handle(args, 0, "arrayfun")?;
-    let arrays: Vec<&Matrix> = args[1..].iter().map(Value::mat).collect::<R<_>>()?;
-    let (rows, cols) = (arrays[0].rows, arrays[0].cols);
-    if arrays.iter().any(|m| m.rows != rows || m.cols != cols) {
-        return Err(error::arrayfun_size());
-    }
-    let outs = nargout.max(1);
-    let mut data: Vec<Vec<f64>> = vec![Vec::with_capacity(rows * cols); outs];
-    let mut classes: Vec<Option<Class>> = vec![None; outs];
-    // Whether `f` gives values; a statement's `arrayfun` finds out from the
-    // first call.
-    let mut gives = nargout > 0;
-    for k in 0..rows * cols {
-        let elems = arrays
-            .iter()
-            .map(|m| Value::Mat(Matrix::scalar(m.data[k]).with_class(m.class)))
-            .collect();
-        let vals = it.call_nested(Callee::Handle(&f), elems, nargout)?;
-        if k == 0 && nargout == 0 {
-            gives = !vals.is_empty();
-        }
-        if !gives {
-            continue;
-        }
-        if vals.len() < outs {
-            return Err(error::too_many_outputs());
-        }
-        for (o, v) in vals.iter().take(outs).enumerate() {
-            let m = v.mat()?;
-            let x = m
-                .scalar_value()
-                .ok_or_else(|| error::arrayfun_nonscalar(k + 1, o + 1))?;
-            data[o].push(x);
-            classes[o] = match classes[o] {
-                None => Some(m.class),
-                Some(c) if c == m.class => Some(c),
-                Some(_) => Some(Class::Double),
-            };
-        }
-    }
-    if !gives && rows * cols > 0 {
-        return none();
-    }
-    Ok(data
-        .into_iter()
-        .zip(classes)
-        .map(|(d, c)| Value::Mat(Matrix::new(rows, cols, d).with_class(c.unwrap_or_default())))
-        .collect())
+    super::cells::map_elements(it, args, nargout, "arrayfun")
 }
 
 /// `func2str(f)`: a named handle's name, or an anonymous function's text
@@ -1977,5 +1943,51 @@ mod tests {
         assert!(yes(&[e("x"), e("x")]));
         assert!(!yes(&[e("x"), e("y")]));
         assert!(!yes(&[e("x"), num(1.0)]));
+    }
+
+    /// Since cycle 07 the shape and class queries answer for every value: a
+    /// handle and an `MException` are 1x1 and never empty, a cell and a
+    /// struct have their own sizes, and none of them is of a matrix class.
+    #[test]
+    fn the_queries_answer_for_every_value() {
+        use crate::value::{CellArray, StructArray};
+        let handle = Value::Func(std::rc::Rc::new(Func::Named {
+            name: "sin".into(),
+            local: None,
+        }));
+        let caught = Value::Exception(error::raised("m".into(), "a:b".into()));
+        let cell = Value::cell(CellArray::blanks(1, 3));
+        let empty = Value::cell(CellArray::default());
+        let strukt = Value::strukt(StructArray::scalar(vec!["a".into()], vec![num(1.0)]));
+        let yes = |f: super::super::BuiltinFn, v: &Value| {
+            mat_of(f, std::slice::from_ref(v)).data[0] == 1.0
+        };
+        for v in [&handle, &caught, &strukt] {
+            assert_eq!(shape_of(size, std::slice::from_ref(v)), (1, 2));
+            assert_eq!(mat_of(size, std::slice::from_ref(v)).data, [1.0, 1.0]);
+            assert_eq!(mat_of(numel, std::slice::from_ref(v)).data, [1.0]);
+            assert!(yes(isscalar, v) && !yes(isempty, v) && yes(isvector, v));
+        }
+        assert_eq!(mat_of(size, std::slice::from_ref(&cell)).data, [1.0, 3.0]);
+        assert_eq!(mat_of(length, std::slice::from_ref(&cell)).data, [3.0]);
+        assert!(yes(isempty, &empty) && !yes(isempty, &cell));
+        for v in [&handle, &caught, &cell, &strukt] {
+            assert!(!yes(islogical, v) && !yes(ischar, v) && !yes(isnumeric, v));
+            assert_eq!(class_name(isempty, std::slice::from_ref(v)), "logical");
+        }
+        let isa_of = |v: &Value, name: &str| mat_of(isa, &[v.clone(), Value::str(name)]).data[0];
+        assert_eq!(isa_of(&caught, "MException"), 1.0);
+        assert_eq!(isa_of(&handle, "function_handle"), 1.0);
+        assert_eq!(isa_of(&cell, "cell"), 1.0);
+        assert_eq!(isa_of(&strukt, "struct"), 1.0);
+        assert_eq!(isa_of(&cell, "numeric"), 0.0);
+        assert_eq!(isa_of(&strukt, "cell"), 0.0);
+        let text_of = |v: &Value| {
+            call(class, std::slice::from_ref(v), 1).unwrap()[0]
+                .text()
+                .unwrap()
+        };
+        assert_eq!(text_of(&cell), "cell");
+        assert_eq!(text_of(&strukt), "struct");
     }
 }

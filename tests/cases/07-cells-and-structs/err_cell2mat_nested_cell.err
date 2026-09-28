@@ -1,0 +1,1 @@
+Error: Line 6: cell2mat does not support cells holding cells, structs, handles or MExceptions.

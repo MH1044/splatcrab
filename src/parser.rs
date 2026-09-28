@@ -101,7 +101,9 @@ impl<'a> FreeNames<'a> {
                     }
                 }
             }
-            Expr::Matrix(rows) => rows.iter().flatten().for_each(|x| self.walk(x)),
+            Expr::Matrix(rows) | Expr::Cell(rows) => {
+                rows.iter().flatten().for_each(|x| self.walk(x))
+            }
             Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::Transpose(a) => self.walk(a),
             Expr::Binary(_, a, b) => {
                 self.walk(a);
@@ -130,6 +132,9 @@ pub enum Expr {
     Colon,
     /// `[a b; c d]` — rows of elements.
     Matrix(Vec<Vec<Expr>>),
+    /// `{a b; c d}`, a cell literal (cycle 07): rows of elements, each of
+    /// which becomes one element of the cell, whatever it is.
+    Cell(Vec<Vec<Expr>>),
     /// `name` followed by one or more accesses: `x(2)`, `f(a, b)`, `c{1}`,
     /// `s.a`, `s.(n)` and chains of them such as `c{1}(2).b`. The chain is
     /// never empty; a bare name is [`Expr::Ident`]. The first `(...)` is
@@ -179,7 +184,7 @@ fn binop_prec(op: BinOp) -> u8 {
     }
 }
 
-fn binop_text(op: BinOp) -> &'static str {
+pub(crate) fn binop_text(op: BinOp) -> &'static str {
     match op {
         BinOp::Add => "+",
         BinOp::Sub => "-",
@@ -256,15 +261,19 @@ fn render_into(e: &Expr, s: &mut String) {
         Expr::Ident(n) => s.push_str(n),
         Expr::End => s.push_str("end"),
         Expr::Colon => s.push(':'),
-        Expr::Matrix(rows) => {
-            s.push('[');
+        Expr::Matrix(rows) | Expr::Cell(rows) => {
+            let (open, close) = match e {
+                Expr::Cell(_) => ('{', '}'),
+                _ => ('[', ']'),
+            };
+            s.push(open);
             for (k, row) in rows.iter().enumerate() {
                 if k > 0 {
                     s.push(';');
                 }
                 list(row, s);
             }
-            s.push(']');
+            s.push(close);
         }
         Expr::Access(n, chain) => {
             s.push_str(n);
@@ -1267,6 +1276,9 @@ impl Parser {
                 Ok(e)
             }
             Token::LBracket => self.parse_matrix(),
+            // A cell literal (cycle 07). The lexer has already told it from
+            // a brace index: this `{` does not follow the end of a value.
+            Token::LBrace => self.parse_cell(),
             Token::End if self.in_index > 0 => Ok(Expr::End),
             Token::Ident(name) => {
                 let chain = self.parse_chain()?;
@@ -1277,8 +1289,7 @@ impl Parser {
                 }
             }
             Token::At => self.parse_handle_rest(line),
-            // A `{` opening a cell literal, which is cycle 07's, and anything
-            // else that cannot start a value.
+            // Anything else that cannot start a value.
             t => bail!(error::unexpected_in_expression(&t).at(line)),
         }
     }
@@ -1431,6 +1442,54 @@ impl Parser {
                         bail!(error::handle_concatenation().at(line));
                     }
                     row.push(e)
+                }
+            }
+        }
+    }
+
+    /// The rows of a cell literal `{...}`, after the `{`, through the `}`
+    /// (cycle 07). The separators are a bracket's: the lexer has turned the
+    /// whitespace between elements into commas and the newlines between
+    /// rows into semicolons. Unlike a bracket, a cell literal may hold a
+    /// handle, `{@(x) x + 1, 2}`: each element is one value of the cell.
+    fn parse_cell(&mut self) -> R<Expr> {
+        let mut rows: Vec<Vec<Expr>> = Vec::new();
+        let mut row: Vec<Expr> = Vec::new();
+        loop {
+            match self.peek() {
+                Token::RBrace => {
+                    self.next();
+                    if !row.is_empty() {
+                        rows.push(row);
+                    }
+                    return Ok(Expr::Cell(rows));
+                }
+                Token::Semi => {
+                    self.next();
+                    if !row.is_empty() {
+                        rows.push(std::mem::take(&mut row));
+                    }
+                }
+                Token::Comma => {
+                    self.next();
+                }
+                Token::Eof => {
+                    let line = self.line();
+                    bail!(error::expected_token(&Token::RBrace, self.peek()).at(line))
+                }
+                _ => {
+                    row.push(self.parse_expr()?);
+                    // An element ends at a separator or the closer. What
+                    // else can follow one is what an anonymous function's
+                    // body left, whose spaces separate nothing: the `1` of
+                    // `{@(x) x 1}`.
+                    if !matches!(
+                        self.peek(),
+                        Token::Comma | Token::Semi | Token::RBrace | Token::Eof
+                    ) {
+                        let line = self.line();
+                        bail!(error::unexpected_token(self.peek()).at(line));
+                    }
                 }
             }
         }
@@ -2132,8 +2191,10 @@ mod tests {
         assert_eq!(msg("f = @3"), "unexpected '@' in expression");
         assert_eq!(msg("@"), "unexpected '@' in expression");
         assert_eq!(msg("x = 1 @ 2"), "unexpected '@'");
-        // A brace cannot open a value either, until cycle 07's cells.
-        assert_eq!(msg("c = {1}"), "unexpected '{' in expression");
+        // Since cycle 07 a brace opens a value, a cell literal, which must
+        // be closed.
+        assert!(parse_result("c = {1}").is_ok());
+        assert_eq!(msg("c = {1"), "expected '}' but found end of input");
     }
 
     #[test]
@@ -2604,8 +2665,14 @@ mod tests {
         ] {
             assert_eq!(msg(src), concat, "{src}");
         }
-        // Where the body swallows a space, what is left is not an operator.
-        assert_eq!(msg("y = {@(x) x 1}"), "unexpected '{' in expression");
+        // Where the body swallows a space, what is left is not an operator,
+        // and a cell literal (cycle 07) wants a separator after an element.
+        assert_eq!(msg("y = {@(x) x 1}"), "unexpected '1'");
+        // In a cell literal, a handle is an element like any other.
+        match &parse("y = {@(x) x + 1, 2}")[0].stmt {
+            Stmt::Assign(_, Expr::Cell(rows), _) => assert_eq!(rows, &vec![two.clone()]),
+            s => panic!("not a cell literal: {s:?}"),
+        }
     }
 
     /// The names a body reads that are not its parameters: what is
@@ -2698,5 +2765,51 @@ mod tests {
             handle("sin").unwrap_err().msg,
             "expected '@' but found 'sin'"
         );
+    }
+
+    // ---- cell literals (cycle 07) ------------------------------------
+
+    #[test]
+    fn a_cell_literal_is_rows_of_elements() {
+        assert_eq!(
+            parse_expr("{1, 'a'; 2, 3}"),
+            Expr::Cell(vec![
+                vec![num(1.0), Expr::Str("a".into())],
+                vec![num(2.0), num(3.0)],
+            ])
+        );
+        assert_eq!(parse_expr("{}"), Expr::Cell(vec![]));
+        assert_eq!(
+            parse_expr("{1 -2}"),
+            Expr::Cell(vec![vec![num(1.0), neg(num(2.0))]])
+        );
+        assert_eq!(
+            parse_expr("{{1}}"),
+            Expr::Cell(vec![vec![Expr::Cell(vec![vec![num(1.0)]])]])
+        );
+        // An element may be a cs-list, a chain like any other.
+        assert_eq!(
+            parse_expr("{c{:}}"),
+            Expr::Cell(vec![vec![access(
+                "c",
+                vec![Access::Brace(vec![Expr::Colon])]
+            )]])
+        );
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("c = {1, 2"), "expected '}' but found end of input");
+    }
+
+    /// `func2str` reads a cell literal back in braces, and it parses back
+    /// to the same tree.
+    #[test]
+    fn a_cell_literal_renders_in_braces() {
+        let e = parse_expr("@() {1, 'a'; x, {2}}");
+        let Expr::AnonFn(f) = &e else {
+            panic!("not a handle: {e:?}");
+        };
+        assert_eq!(f.text(), "@(){1,'a';x,{2}}");
+        assert_eq!(parse_expr(&f.text()), e);
+        // The names a cell literal reads are captured.
+        assert_eq!(f.free_names(), ["x"]);
     }
 }

@@ -1,0 +1,1 @@
+Error: Line 5: Operator '*' is not supported for operands of type 'struct'.

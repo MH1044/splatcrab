@@ -49,12 +49,15 @@ struct Extra {
     stack: Vec<StackEntry>,
 }
 
-/// One frame an error unwound out of: the function's name and the line of
-/// the statement that failed in it.
+/// One frame an error unwound out of: the function's name, the line of the
+/// statement that failed in it, and since cycle 07 the file it came from,
+/// empty when the function is local to the code that was run, whose file
+/// the interpreter is not told.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackEntry {
     pub name: String,
     pub line: Option<u32>,
+    pub file: String,
 }
 
 /// Every fallible path in the interpreter returns this.
@@ -88,10 +91,17 @@ impl MError {
     /// the line it carried, which is a line of that function's file, moves
     /// into a new outermost [`StackEntry`], and `line` is cleared so that
     /// the calling statement records its own.
-    pub fn leaving(mut self, name: &str) -> MError {
+    pub fn leaving(self, name: &str) -> MError {
+        self.leaving_file(name, "")
+    }
+
+    /// [`leaving`](MError::leaving), recording the file the function came
+    /// from, which `e.stack` reports (cycle 07).
+    pub fn leaving_file(mut self, name: &str, file: &str) -> MError {
         let entry = StackEntry {
             name: name.to_string(),
             line: self.line.take(),
+            file: file.to_string(),
         };
         self.extra
             .get_or_insert_with(Box::default)
@@ -375,6 +385,138 @@ pub fn brace_indexing_unsupported() -> MError {
 /// for a matrix after cycle 07 gives structs their fields.
 pub fn dot_indexing_unsupported() -> MError {
     MError::new("Dot indexing is not supported for variables of this type.")
+}
+
+// ---- cells and structs (cycle 07) ---------------------------------------
+
+/// MATLAB's wording, recorded by the spec: a cs-list, `c{:}` of a cell with
+/// two elements or `p.name` of a 1x2 struct array, where one value is
+/// needed. SplatCrab says the same for a cs-list of none, `c{:}` of `{}`.
+pub fn cs_list_count(n: usize) -> MError {
+    MError::new(format!(
+        "Expected one output from a curly brace or dot indexing expression, but there were {} results.",
+        n
+    ))
+}
+
+/// MATLAB's wording, recorded by the spec: `x = 1; x.a = 2`, a field
+/// assigned into a value that is not a struct.
+pub fn dot_assign_unsupported() -> MError {
+    MError::new(
+        "Unable to perform assignment because dot indexing is not supported for variables of this type.",
+    )
+}
+
+/// `x = 1; x{1} = 2`: the brace counterpart of [`dot_assign_unsupported`],
+/// in the same form; not confirmed against a MathWorks source.
+pub fn brace_assign_unsupported() -> MError {
+    MError::new(
+        "Unable to perform assignment because brace indexing is not supported for variables of this type.",
+    )
+}
+
+/// MATLAB R2020a's wording, recorded by the spec: a binary operator with an
+/// operand that is not an array, `c + 1` of a cell, `f + 1` of a handle,
+/// `s * 2` of a struct or `e + 1` of an `MException`. `class` is the first
+/// such operand's.
+pub fn operator_unsupported(op: &str, class: &str) -> MError {
+    MError::new(format!(
+        "Operator '{}' is not supported for operands of type '{}'.",
+        op, class
+    ))
+}
+
+/// `s.b` of a struct with no field `b`. MATLAB's wording as recalled, not
+/// confirmed against a MathWorks source.
+pub fn no_such_field(name: &str) -> MError {
+    MError::new(format!("Unrecognized field name \"{}\".", name))
+}
+
+/// A value stored where it cannot go: `c(2) = 5` of a cell, `x(2) = {1}`
+/// of a non-empty matrix, `[s 1]`. MATLAB's form as recalled.
+pub fn conversion(to: &str, from: &str) -> MError {
+    MError::new(format!(
+        "Conversion to {} from {} is not possible.",
+        to, from
+    ))
+}
+
+/// `p(2) = q` where `q` has other fields than `p`. MATLAB's wording as
+/// recalled.
+pub fn dissimilar_structs() -> MError {
+    MError::new("Subscripted assignment between dissimilar structures.")
+}
+
+/// `[s1 s2]` where the two have other fields. SplatCrab's wording.
+pub fn struct_concat_fields() -> MError {
+    MError::new("Structures being concatenated must have the same field names.")
+}
+
+/// `p.name = 'x'` where `p` is a struct array of more than one element.
+/// MATLAB's wording as recalled.
+pub fn scalar_struct_required() -> MError {
+    MError::new("Scalar structure required for this assignment.")
+}
+
+/// A field name that is not a MATLAB identifier: `s.('1a') = 1`,
+/// `struct('a b', 1)`, `setfield(s, '', 1)`. MATLAB's form as recalled.
+pub fn invalid_field_name(name: &str) -> MError {
+    MError::new(format!("Invalid field name: '{}'.", name))
+}
+
+/// `s.(5)`: a dynamic field name that is not text. SplatCrab's wording.
+pub fn dynamic_field_not_text() -> MError {
+    MError::new("A dynamic field name must be a character vector.")
+}
+
+/// `struct('a')`: a field name with no value. SplatCrab's wording.
+pub fn struct_pairs() -> MError {
+    MError::new("Field names and values to 'struct' must come in pairs.")
+}
+
+/// `struct('a', {1 2}, 'b', {1 2 3})`: cell values that make struct arrays
+/// of two sizes. SplatCrab's wording.
+pub fn struct_cell_dims() -> MError {
+    MError::new("The cell values given to 'struct' must all have one size, or be 1x1.")
+}
+
+/// `cell2mat({{1}})`: a cell holding something that is not an array.
+/// SplatCrab's wording.
+pub fn cell2mat_contents() -> MError {
+    MError::new("cell2mat does not support cells holding cells, structs, handles or MExceptions.")
+}
+
+/// `[a, b] = deal(1, 2, 3)`: neither one input nor one per output.
+/// MATLAB's wording as recalled.
+pub fn deal_count() -> MError {
+    MError::new("The number of outputs should match the number of inputs.")
+}
+
+/// `cellfun(f, 5)`: an input that must be a cell. SplatCrab's wording, in
+/// the form of [`arg_not_a_string`].
+pub fn arg_not_a_cell(pos: usize, name: &str) -> MError {
+    MError::new(format!(
+        "Argument {} to '{}' must be a cell array.",
+        pos, name
+    ))
+}
+
+/// `fieldnames(5)`: an input that must be a struct. SplatCrab's wording,
+/// in the form of [`arg_not_a_cell`].
+pub fn arg_not_a_struct(pos: usize, name: &str) -> MError {
+    MError::new(format!("Argument {} to '{}' must be a struct.", pos, name))
+}
+
+/// A function that set `varargout` to something other than a cell and was
+/// asked for the outputs it holds. SplatCrab's wording.
+pub fn varargout_not_a_cell() -> MError {
+    MError::new("The variable varargout must be a cell array.")
+}
+
+/// A function with `varargout` asked for more outputs than it put in
+/// `varargout`: [`output_not_assigned`] naming the missing element.
+pub fn varargout_not_assigned(k: usize, func: &str) -> MError {
+    output_not_assigned(&format!("varargout{{{}}}", k), func)
 }
 
 /// MATLAB's wording: `[a, b] = 5`, more targets than a value that is not a
@@ -920,6 +1062,33 @@ mod tests {
         assert_eq!(e.trace(), "  in g3 (line 8)\n  in outer (line 4)\n");
         assert_eq!(undefined("x").trace(), "");
         assert_eq!(too_many_outputs().leaving("f").trace(), "  in f\n");
+        // Cycle 07: an entry also records the file, which `e.stack` reports
+        // and the trace does not show.
+        let e = undefined("x")
+            .at(3)
+            .leaving_file("h", "/p/h.m")
+            .leaving("g");
+        let files: Vec<&str> = e.stack().iter().map(|s| s.file.as_str()).collect();
+        assert_eq!(files, ["/p/h.m", ""]);
+        assert_eq!(e.trace(), "  in h (line 3)\n  in g\n");
+    }
+
+    /// Cycle 07's texts that take arguments.
+    #[test]
+    fn the_container_messages() {
+        assert_eq!(
+            cs_list_count(2).msg,
+            "Expected one output from a curly brace or dot indexing expression, but there were 2 results."
+        );
+        assert_eq!(
+            operator_unsupported("+", "cell").msg,
+            "Operator '+' is not supported for operands of type 'cell'."
+        );
+        assert_eq!(
+            conversion("cell", "double").msg,
+            "Conversion to cell from double is not possible."
+        );
+        assert_eq!(no_such_field("b").msg, "Unrecognized field name \"b\".");
     }
 
     #[test]

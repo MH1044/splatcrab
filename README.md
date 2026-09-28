@@ -26,8 +26,8 @@ x =
 SplatCrab is early software (version 0.1.0). The core language works:
 matrices, the double, logical and char classes, indexing, control flow with
 `switch` and `try`/`catch`, command syntax, user functions in scripts and in
-function files on a path, function handles and anonymous functions,
-formatted output and 102 builtins. Cells, structs, complex numbers and
+function files on a path, function handles and anonymous functions, cell
+arrays and structs, formatted output and 115 builtins. Complex numbers and
 plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
@@ -190,16 +190,26 @@ z
   rules. A failed indexed assignment leaves its variable untouched
 - Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
   `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(v)`,
-  `[r, c] = size(A)` and `[r, c, v] = find(X)`. The parser also reads the
-  access chains cells and structs will use, `c{1}`, `s.a` and `s.(n)`; on a
-  matrix they are MATLAB's clean errors
+  `[r, c] = size(A)` and `[r, c, v] = find(X)`. On a matrix, `c{1}`, `s.a`
+  and `s.(n)` are MATLAB's clean errors
+- Cell arrays: `{1, 'two'; [3 4], {5}}` literals, brace and paren indexing,
+  growth, deletion, concatenation with `[ ]`, `for` over a cell, `cell`,
+  `iscell`, `num2cell`, `cell2mat` and `cellfun`. Structs and struct arrays:
+  fields and dynamic fields `s.(name)` created by assignment down any path,
+  `p(2).name = 'B'`, `struct`, `fieldnames`, `isfield`, `rmfield`,
+  `getfield`, `setfield` and `isstruct`. Comma-separated lists `c{:}` and
+  `p.name` spread into calls and brackets, `[a, b] = c{:}`, `deal`, and
+  `varargin` and `varargout` with `nargin` and `nargout` counting them.
+  MATLAB's displays, `{[1]}    {'ab'}` and `struct with fields:`, bounded for
+  any depth of nesting, and a chain nested half a million deep is freed
+  without recursion
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`. A `for` that runs zero times still assigns the empty to
   its loop variable, as MATLAB does, and a `break` with no loop around it is
   an error rather than a silent end to the script
 - `switch` / `case` / `otherwise` on numbers and text, with `case {a, b}`
   lists; `try` / `catch e`, where `e` is a minimal `MException` with
-  `e.message` and `e.identifier`; `error('id:x', fmt, ...)` with MATLAB's
+  `e.message`, `e.identifier` and `e.stack`; `error('id:x', fmt, ...)` with MATLAB's
   argument rules, `rethrow`, `lasterr`, `warning`, `assert` and `isequal`
 - User functions: local functions at the end of a script, function files
   with subfunctions, and scripts on the path, which run in the caller's
@@ -215,8 +225,11 @@ z
   their body reads when they are made and run in a workspace of their own.
   A body that is a single call passes `nargout` on, so `[m, i] = f(v)`
   works for `f = @(v) max(v)`. `feval` of a handle, `arrayfun` with
-  uniform output, `func2str`, `str2func`, and `class` and `isa` with
-  `'function_handle'`
+  uniform output or `'UniformOutput', false`, `func2str`, `str2func`, and
+  `class` and `isa` with `'function_handle'`. `size`, `numel`, `isempty`,
+  `isa` and the other class and shape queries answer for a handle, an
+  `MException`, a cell and a struct, and a binary operator on one of them is
+  MATLAB's `Operator '+' is not supported for operands of type 'cell'.`
 - Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts
@@ -225,9 +238,9 @@ z
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
   means
-- 102 builtins in a registry, from `zeros` and `linspace` through `sum` and
-  `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun` and
-  `tic`/`toc`. Each is an ordinary
+- 115 builtins in a registry, from `zeros` and `linspace` through `sum` and
+  `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
+  `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
   `min`, `sort`, `size` and `find` answer with more than one value when asked
 - The argument forms MATLAB code uses: size vectors such as
@@ -277,7 +290,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-Cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -288,7 +301,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 102 builtins,
+                                         builtins/    the 115 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text
