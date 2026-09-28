@@ -45,10 +45,21 @@ pub enum Token {
     RParen,
     LBracket,
     RBracket,
+    /// `{`, which opens a brace index `c{1}` (and, from cycle 07, a cell
+    /// literal).
+    LBrace,
+    RBrace,
     Comma,
     Semi,
     Newline,
     Colon,
+    /// A lone `.`, the field access of `s.a` and `s.(name)`. Every dotted
+    /// operator (`.*`, `./`, `.\`, `.^`, `.'`), a number's decimal point and
+    /// a `...` continuation are recognised before this is.
+    Dot,
+    /// `@`, which cycle 06 gives function handles. Until then it lexes, and
+    /// the parser refuses it.
+    At,
 
     If,
     ElseIf,
@@ -115,9 +126,13 @@ impl fmt::Display for Token {
             Token::RParen => ")",
             Token::LBracket => "[",
             Token::RBracket => "]",
+            Token::LBrace => "{",
+            Token::RBrace => "}",
             Token::Comma => ",",
             Token::Semi => ";",
             Token::Colon => ":",
+            Token::Dot => ".",
+            Token::At => "@",
 
             Token::If => "if",
             Token::ElseIf => "elseif",
@@ -143,6 +158,7 @@ fn ends_value(t: &Token) -> bool {
             | Token::Str(_)
             | Token::RParen
             | Token::RBracket
+            | Token::RBrace
             | Token::Transpose
             | Token::End
     )
@@ -257,6 +273,10 @@ pub fn scan(src: &str) -> R<Lexed> {
                     || next == '_'
                     || next == '('
                     || next == '['
+                    // `[a {1}]` and `[a @f]` are two elements, never the
+                    // brace index `a{1}` or a stray `@` after `a`.
+                    || next == '{'
+                    || next == '@'
                     || next == '\''
                     || next == '"'
                     || next == '~'
@@ -442,9 +462,26 @@ pub fn scan(src: &str) -> R<Lexed> {
                 open.pop();
                 (Token::RBracket, 1)
             }
+            // A brace is pushed like a bracket so that `[c{1 2} 3]` knows,
+            // inside the braces, that it is not directly inside `[`: the
+            // whitespace rule belongs to the bracket alone. Whether it also
+            // applies directly inside a cell literal `{1 -2}` is cycle 07's.
+            ('{', _) => {
+                open.push('{');
+                (Token::LBrace, 1)
+            }
+            ('}', _) => {
+                open.pop();
+                (Token::RBrace, 1)
+            }
             (',', _) => (Token::Comma, 1),
             (';', _) => (Token::Semi, 1),
             (':', _) => (Token::Colon, 1),
+            // Every dotted operator matched above, and a number's point and
+            // a continuation were taken before this match, so what is left
+            // is the field access of `s.a` and `s.(n)`.
+            ('.', _) => (Token::Dot, 1),
+            ('@', _) => (Token::At, 1),
             _ => bail!(error::unexpected_char(c).at(line)),
         };
         toks.push(tok, line);
@@ -997,8 +1034,9 @@ mod tests {
 
     #[test]
     fn unexpected_character_is_an_error() {
-        assert!(lex("a @ b").is_err());
+        assert!(lex("a # b").is_err());
         assert!(lex("#").is_err());
+        assert!(lex("$").is_err());
     }
 
     // ---- line numbers ---------------------------------------------------
@@ -1038,9 +1076,209 @@ mod tests {
 
     #[test]
     fn a_lexer_error_names_the_line_it_happened_on() {
-        assert_eq!(scan("x = 1\ny = @").unwrap_err().line, Some(2));
+        assert_eq!(scan("x = 1\ny = #").unwrap_err().line, Some(2));
         assert_eq!(scan("x = 1\n\ny = 'abc").unwrap_err().line, Some(3));
         // A continuation before the bad character still moves the count on.
-        assert_eq!(scan("x = 1 ...\n@").unwrap_err().line, Some(2));
+        assert_eq!(scan("x = 1 ...\n#").unwrap_err().line, Some(2));
+    }
+
+    // ---- braces, the field dot and `@` (cycle 03) ----------------------
+
+    #[test]
+    fn braces_dot_and_at_are_tokens() {
+        assert_eq!(
+            lx("c{2}"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                Token::Num(2.0),
+                Token::RBrace,
+                Token::Eof
+            ]
+        );
+        assert_eq!(lx("s.a"), vec![id("s"), Token::Dot, id("a"), Token::Eof]);
+        assert_eq!(
+            lx("s.(n)"),
+            vec![
+                id("s"),
+                Token::Dot,
+                Token::LParen,
+                id("n"),
+                Token::RParen,
+                Token::Eof
+            ]
+        );
+        assert_eq!(lx("@"), vec![Token::At, Token::Eof]);
+        assert_eq!(lx("@sin"), vec![Token::At, id("sin"), Token::Eof]);
+        assert_eq!(
+            lx("c{1}(2).b"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                Token::Num(1.0),
+                Token::RBrace,
+                Token::LParen,
+                Token::Num(2.0),
+                Token::RParen,
+                Token::Dot,
+                id("b"),
+                Token::Eof,
+            ]
+        );
+    }
+
+    /// The field dot must not take over any of the dotted forms that already
+    /// existed: a decimal point, the five dotted operators and a `...`.
+    #[test]
+    fn the_field_dot_leaves_every_older_dot_alone() {
+        assert_eq!(lx("1.5"), vec![Token::Num(1.5), Token::Eof]);
+        assert_eq!(lx(".5"), vec![Token::Num(0.5), Token::Eof]);
+        assert_eq!(
+            lx("x.^2"),
+            vec![id("x"), Token::DotCaret, Token::Num(2.0), Token::Eof]
+        );
+        assert_eq!(
+            lx("x.*y"),
+            vec![id("x"), Token::DotStar, id("y"), Token::Eof]
+        );
+        assert_eq!(
+            lx("x./y"),
+            vec![id("x"), Token::DotSlash, id("y"), Token::Eof]
+        );
+        assert_eq!(
+            lx("x.\\y"),
+            vec![id("x"), Token::DotBackslash, id("y"), Token::Eof]
+        );
+        assert_eq!(lx("x.'"), vec![id("x"), Token::Transpose, Token::Eof]);
+        assert_eq!(
+            lx("a...\n+ b"),
+            vec![id("a"), Token::Plus, id("b"), Token::Eof]
+        );
+        assert_eq!(
+            lx("a = 1...\n+ 2"),
+            vec![
+                id("a"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Plus,
+                Token::Num(2.0),
+                Token::Eof
+            ]
+        );
+        // `2.5.^x` keeps its decimal point and its operator.
+        assert_eq!(
+            lx("2.5.^x"),
+            vec![Token::Num(2.5), Token::DotCaret, id("x"), Token::Eof]
+        );
+    }
+
+    /// A quote after a closing brace or a field name is a transpose.
+    #[test]
+    fn a_quote_after_a_brace_or_a_field_is_a_transpose() {
+        assert_eq!(
+            lx("c{1}'"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                Token::Num(1.0),
+                Token::RBrace,
+                Token::Transpose,
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            lx("s.a'"),
+            vec![id("s"), Token::Dot, id("a"), Token::Transpose, Token::Eof]
+        );
+        // A quote straight after the dot is the `.'` operator, as before.
+        assert_eq!(lx("s.'"), vec![id("s"), Token::Transpose, Token::Eof]);
+        // After an opening brace it still opens a string.
+        assert_eq!(
+            lx("c{'a'}"),
+            vec![id("c"), Token::LBrace, st("a"), Token::RBrace, Token::Eof]
+        );
+    }
+
+    /// Inside brackets a brace or an `@` after whitespace starts an element,
+    /// and inside a brace index the bracket's whitespace rule does not apply.
+    #[test]
+    fn braces_and_at_meet_the_whitespace_rule() {
+        assert_eq!(
+            lx("[a {1}]"),
+            vec![
+                Token::LBracket,
+                id("a"),
+                Token::Comma,
+                Token::LBrace,
+                Token::Num(1.0),
+                Token::RBrace,
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("[a @f]"),
+            vec![
+                Token::LBracket,
+                id("a"),
+                Token::Comma,
+                Token::At,
+                id("f"),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("[c{1 -2} 3]"),
+            vec![
+                Token::LBracket,
+                id("c"),
+                Token::LBrace,
+                Token::Num(1.0),
+                Token::Minus,
+                Token::Num(2.0),
+                Token::RBrace,
+                Token::Comma,
+                Token::Num(3.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        // `[s.a s.b]` is two elements.
+        assert_eq!(
+            lx("[s.a s.b]"),
+            vec![
+                Token::LBracket,
+                id("s"),
+                Token::Dot,
+                id("a"),
+                Token::Comma,
+                id("s"),
+                Token::Dot,
+                id("b"),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        // `[a, ~] = ...` and `[a ~]` both separate the placeholder.
+        assert_eq!(
+            lx("[a ~]"),
+            vec![
+                Token::LBracket,
+                id("a"),
+                Token::Comma,
+                Token::Not,
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_new_tokens_display_as_written() {
+        assert_eq!(Token::LBrace.to_string(), "'{'");
+        assert_eq!(Token::RBrace.to_string(), "'}'");
+        assert_eq!(Token::Dot.to_string(), "'.'");
+        assert_eq!(Token::At.to_string(), "'@'");
     }
 }

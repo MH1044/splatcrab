@@ -190,21 +190,13 @@ pub fn shape(args: &[Value], from: usize, name: &str, max_dims: usize) -> R<(f64
     trailing_ones(&dims)
 }
 
-/// `rows * cols`, refusing to overflow or to ask for an absurd allocation.
-/// Indexed growth reaches it with sizes that are already `usize`; every
-/// requested size goes through `check_shape` instead.
-pub fn check_size(rows: usize, cols: usize) -> R<usize> {
-    match rows.checked_mul(cols) {
-        Some(n) if n <= MAX_ELEMS => Ok(n),
-        _ => Err(error::size_overflow(&rows.to_string(), &cols.to_string())),
-    }
-}
-
 /// A shape the user asked for, judged before anything is allocated. Both
 /// sizes are non-negative integers or `+Inf`, still as `f64`, so a size past
 /// `usize` is refused under its own name: `zeros(1e300)` reports
 /// `1e+300x1e+300`, not the `usize::MAX` it used to saturate to. Constructors,
-/// `reshape`, `repmat`, `diag`, `linspace` and the `:` operator all come here.
+/// `reshape`, `repmat`, `diag`, `linspace`, the `:` operator and, since cycle
+/// 03, indexed growth all come here; `check_size`, which took sizes already
+/// saturated to `usize`, went with the growth path that used it.
 pub fn check_shape(rows: f64, cols: f64) -> R<(usize, usize)> {
     // `usize::MAX as f64` rounds up to 2^64, so anything below it fits.
     let limit = usize::MAX as f64;
@@ -456,23 +448,5 @@ mod tests {
         assert!(msg(0.0, 1e300).contains("0x1e+300"));
         assert!(check_shape(MAX_ELEMS as f64, 1.0).is_ok());
         assert!(check_shape(MAX_ELEMS as f64 + 1.0, 1.0).is_err());
-    }
-
-    #[test]
-    fn check_size_refuses_to_overflow_or_to_allocate_the_world() {
-        assert_eq!(check_size(2, 3).unwrap(), 6);
-        assert_eq!(check_size(0, 9).unwrap(), 0);
-        // The shape that used to abort the process.
-        let huge = 10_000_000_000usize;
-        let e = check_size(huge, huge).unwrap_err().msg;
-        assert!(e.contains("10000000000x10000000000"), "{e}");
-        // Just over the cap is refused too, without overflowing.
-        assert!(check_size(MAX_ELEMS + 1, 1).is_err());
-        assert!(check_size(MAX_ELEMS, 1).is_ok());
-        assert!(check_size(usize::MAX, 2).is_err());
-        // Indexed growth still names the usize it saturated to; cycle 03
-        // rewrites that path.
-        let e = check_size(1, usize::MAX).unwrap_err().msg;
-        assert!(e.contains("1x18446744073709551615"), "{e}");
     }
 }

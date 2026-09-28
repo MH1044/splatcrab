@@ -222,13 +222,19 @@ pub fn fractional_matrix_power() -> MError {
     MError::new("Only integer matrix powers are supported.")
 }
 
+/// `x()`, an index with no subscripts at all. Since cycle 03 accepted
+/// trailing singleton subscripts (QA D22), this is the one form that reaches
+/// it; a third subscript that would need an N-D array is
+/// [`nd_unsupported`] instead.
 pub fn indexing_rank() -> MError {
     MError::new("Only 1-D and 2-D indexing is supported.")
 }
 
+/// MATLAB's wording. The ending names logical values since cycle 03, when
+/// a logical index became a mask rather than a refusal.
 pub fn index_not_positive_integer(pos: usize) -> MError {
     MError::new(format!(
-        "Index in position {} is invalid. Array indices must be positive integers.",
+        "Index in position {} is invalid. Array indices must be positive integers or logical values.",
         pos
     ))
 }
@@ -247,8 +253,31 @@ pub fn index_exceeds_bound(pos: usize, limit: usize) -> MError {
     ))
 }
 
-pub fn deletion_unsupported() -> MError {
-    MError::new("Deleting elements with '= []' is not supported yet.")
+/// MATLAB's wording: `A(1, 2) = []`, a deletion with two subscripts that
+/// each select part of their dimension. Only a whole row or column set can
+/// be removed from a matrix.
+pub fn null_assignment_indices() -> MError {
+    MError::new("A null assignment can have only one non-colon index.")
+}
+
+/// MATLAB's wording: `x{1}` where `x` is a matrix. It stays right for a
+/// matrix after cycle 07 gives cells a brace index of their own.
+pub fn brace_indexing_unsupported() -> MError {
+    MError::new("Brace indexing is not supported for variables of this type.")
+}
+
+/// MATLAB's wording: `x.a` or `x.(n)` where `x` is a matrix. It stays right
+/// for a matrix after cycle 07 gives structs their fields.
+pub fn dot_indexing_unsupported() -> MError {
+    MError::new("Dot indexing is not supported for variables of this type.")
+}
+
+/// MATLAB's wording: `[a, b] = 5`, more targets than a value that is not a
+/// call can supply.
+pub fn insufficient_outputs() -> MError {
+    MError::new(
+        "Insufficient number of outputs from right hand side of equal sign to satisfy assignment.",
+    )
 }
 
 pub fn assignment_size(lhs: usize, rhs: usize) -> MError {
@@ -525,13 +554,6 @@ pub fn toc_without_tic() -> MError {
     MError::new(
         "You must call TIC without an output argument before calling TOC without an input argument.",
     )
-}
-
-/// An index of class logical, until cycle 03 implements logical indexing
-/// (QA D6). Refusing it is what stops `x(x > 0)` reading a mask of ones as
-/// the position `1` repeated.
-pub fn logical_indexing_unsupported() -> MError {
-    MError::new("Logical indexing is not supported yet.")
 }
 
 pub fn eps_class() -> MError {

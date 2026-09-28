@@ -141,10 +141,18 @@ z
 - A char element is a UTF-16 code unit, as in MATLAB, so `length('😀')` is
   `2`, and output decodes it back to UTF-8. On Windows the console is switched
   to UTF-8, so the `×` in a `2×3 char array` header renders
-- Indexing `A(i)`, `A(i,j)`, `v(2:4)`, `A(:,1)`, `A(end)`, and growth on
-  indexed assignment such as `z(end+1) = x`. A logical index such as
-  `x(x > 0)` is a clean error until cycle 03, rather than the wrong answer it
-  used to give in silence
+- Indexing `A(i)`, `A(i,j)`, `v(2:4)`, `A(:,1)`, `A(end)`, trailing singleton
+  subscripts such as `A(2, 1, 1)`, and growth on indexed assignment such as
+  `z(end+1) = x`, which changes the variable in place, so appending in a loop
+  stays linear. Logical indexing reads and writes through a mask, `x(x > 0)`
+  and `x(isnan(x)) = 0`, selecting what `find(mask)` would. Deletion
+  `x(i) = []`, `A(:, j) = []` and `A(i, :) = []` follows MATLAB's shape
+  rules. A failed indexed assignment leaves its variable untouched
+- Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
+  `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(v)`,
+  `[r, c] = size(A)` and `[r, c, v] = find(X)`. The parser also reads the
+  access chains cells and structs will use, `c{1}`, `s.a` and `s.(n)`; on a
+  matrix they are MATLAB's clean errors
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`. A `for` that runs zero times still assigns the empty to
   its loop variable, as MATLAB does, and a `break` with no loop around it is
@@ -159,7 +167,8 @@ z
   means
 - 88 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class` and `tic`/`toc`. Each is an ordinary
-  function with `nargout` in its signature, in `src/builtins/`
+  function with `nargout` in its signature, in `src/builtins/`, and `max`,
+  `min`, `sort`, `size` and `find` answer with more than one value when asked
 - The argument forms MATLAB code uses: size vectors such as
   `zeros(size(A))` and `reshape(A, [], 2)`, `true(n)` and `eps(x)`,
   `sort(v, 'descend')`, `find(x, n, 'last')`, `norm(v, p)`, `diag(v, k)`,
@@ -200,9 +209,8 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-User functions, multiple return values, logical indexing, element deletion,
-`switch`, `try`, cells, structs, integer classes, complex numbers, and
-plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+User functions, function handles, `switch`, `try`, cells, structs, N-D
+arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built

@@ -31,7 +31,7 @@ pub fn register(r: &mut Registry) {
     add(r, "linspace", linspace, "linspace(a,b,n) - floor(n) points evenly spaced from a to b.");
 
     // ---- shape queries -----------------------------------------------
-    add(r, "size", size, "size(A), size(A,dim) - the dimensions of A.");
+    add(r, "size", size, "size(A), size(A,dim), [r,c] = size(A) - the dimensions of A.");
     add(r, "numel", numel, "numel(A) - the number of elements of A.");
     add(r, "length", length, "length(A) - the longest dimension, or 0 if empty.");
     add(r, "isempty", isempty, "isempty(A) - true when A has no elements.");
@@ -233,7 +233,12 @@ fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 // ---- shape queries ---------------------------------------------------
 
-fn size(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+/// `size(A)` is the row `[rows cols]`. Asked for several outputs, it gives
+/// one dimension each, and MATLAB's rule is that the last output takes the
+/// product of every dimension from its own on: `[n] = size(A)` is still the
+/// row, `[r, c] = size(A)` is the two sizes, and outputs past the second are
+/// the trailing singletons, `1`. `size(A, dim)` is one value.
+fn size(_: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(args, 2, "size")?;
     let m = mat(args, 0, "size")?;
     if args.len() >= 2 {
@@ -244,6 +249,11 @@ fn size(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
             _ => 1,
         };
         one_mat(Matrix::scalar(v as f64))
+    } else if nargout >= 2 {
+        let dims = [m.rows as f64, m.cols as f64];
+        Ok((0..nargout)
+            .map(|k| Value::Mat(Matrix::scalar(dims.get(k).copied().unwrap_or(1.0))))
+            .collect())
     } else {
         one_mat(Matrix::row(vec![m.rows as f64, m.cols as f64]))
     }
@@ -1501,5 +1511,29 @@ mod tests {
         let two =
             Value::Mat(Matrix::new(2, 2, vec![97.0, 99.0, 98.0, 100.0]).with_class(Class::Char));
         assert_eq!(format_printf(&[Value::str("%s"), two]).unwrap(), "acbd");
+    }
+
+    /// `[r, c] = size(A)`, and the last output's product rule: outputs past
+    /// the second are the trailing singletons.
+    #[test]
+    fn size_answers_one_dimension_per_output() {
+        let a = Value::Mat(Matrix::filled(2, 5, 0.0));
+        let dims = |n: usize| -> Vec<f64> {
+            call(size, std::slice::from_ref(&a), n)
+                .unwrap()
+                .into_iter()
+                .map(|v| v.into_mat().data[0])
+                .collect()
+        };
+        assert_eq!(dims(2), [2.0, 5.0]);
+        assert_eq!(dims(4), [2.0, 5.0, 1.0, 1.0]);
+        // One output, or none at statement level, is the size row.
+        for n in [0, 1] {
+            let out = call(size, std::slice::from_ref(&a), n).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].mat().data, [2.0, 5.0]);
+        }
+        // `size(A, dim)` is one value however many are asked for.
+        assert_eq!(call(size, &[a, num(2.0)], 2).unwrap().len(), 1);
     }
 }

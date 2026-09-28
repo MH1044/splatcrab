@@ -19,12 +19,13 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Matrix literals, space/comma/newline separators | 00 | `matrix_ops` | `[1 -2]` is two elements, `[1 - 2]` is one |
 | Nested concatenation `[A; B]`, `[a' b']` | 00 | `builtins_sample` | |
 | Ranges `a:b` and `a:s:b` | 00 | `ranges` | Descending and fractional steps |
-| A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_size` |
+| A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_shape` |
 | A range lands exactly on its end point | 01d | `range_hits_end_point` | `x = 0:0.1:0.3; x(end) == 0.3` is `1`, and `-1:0.01:1` is symmetric: the upper half is computed from the right-hand end point, not by repeated addition |
 | An infinite range end point is refused | 01d | `err_range_end_inf`, `err_range_start_neg_inf` | `0:Inf` and `-Inf:1:0` report `1xInf` rather than quietly giving a 1x0. `1:NaN` is still an empty, and still in Known bugs |
 | An infinite range *step* follows the documented count | 01e | `range_infinite_step` | `1:Inf:5` is the 1x1 `1`: `fix((k-j)/i)` is `fix(4/Inf)`, which is `0`, and a count of `0` is one element. It used to be a 1x0. A range that runs against its step is still empty, `5:Inf:1` included |
 | Chained ranges `1:2:3:4` | 01e | `err_chained_range` | Reads as `(1:2:3):4`, as MATLAB reads it; `parse_range` took at most two colons and did not loop, so it was a parse error. Both spellings then meet the same refusal, since a colon start that is not a scalar is an error here (Known bugs) |
 | A leading UTF-8 byte-order mark is skipped | 01e | `bom_is_skipped` | The three bytes `EF BB BF` a Windows editor writes are an encoding marker, not source. A file that is not valid UTF-8 is now decoded leniently rather than refused, so a Windows-1252 comment runs; UTF-16 is still unread (Known bugs) |
+| The tokens `{ }`, the field `.` and `@` | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `c{1}`, `s.a` and `s.(n)` lex and parse, alone or chained (`c{1}(2).b`), without disturbing `1.5`, `.5`, `x.^2`, `x.*y`, `x./y`, `x.\y`, `x.'` or a `...` continuation. Inside brackets a brace or an `@` after a space starts an element. A bare `@` is `unexpected '@' in expression` until cycle 06's function handles, and a `{` opening a value is a parse error until cycle 07's cells |
 | Nesting is bounded, not unbounded | 01e | `err_nesting_parens`, `err_nesting_brackets`, `err_nesting_calls`, `err_nesting_flat_sum` | 10,000 levels of parentheses, brackets, calls, indexes, blocks or chained operators. Past that, a clean error from the parser and the identical one from the evaluator; about 96,000 levels used to abort the process with exit 134 (QA D4) |
 
 ## Operators
@@ -60,9 +61,14 @@ What SplatCrab does today, with the golden case that proves each area works.
 | String indexing | 00 | `strings` | Returns a char. A char **variable** only: `'abc'(2)` is a parse error, as indexing any literal is |
 | `s(:)` of a char is a char column | 01e | `empty_result_shapes` | `size(s(:))` is `3 1`, not `1 3`, since 01e; since 02 the column is a char rather than character codes (QA D17) |
 | Indexing keeps the class; indexed assignment keeps the left-hand side's | 02 | `indexed_assign_keeps_class`, `char_arith_and_assign` | `s = 'abc'; s(2) = 'Z'` is `'aZc'`, not `97 90 99`, and growth stays a char too. A logical target stores `logical(value)`, so `x = true(1,3); x(2) = 5` stays logical; a double target stores a char's code, so `y(2) = 'a'` stores `97`. A new variable, or the 0x0 `[]`, takes the class assigned into it |
-| A logical index is a clean error | 02 | `err_logical_index` | `x(x > 0)` used to give `5 5 5` in silence, reading the mask as positions (QA D6). Now `Logical indexing is not supported yet.`, reading or assigning, until cycle 03 |
-| Logical indexing | 03 | | Planned |
-| Deletion `x(i) = []` | 03 | `err_delete_unsupported` | Currently an error |
+| Logical indexing, reading and assigning | 03 | `logical_mask_read`, `logical_mask_assign`, `logical_mask_matrix_column`, `logical_mask_all_true` | A logical subscript is a mask, never a list of positions: `x(x > 2)`, `x(x > 4) = 0`, `A(A > 5)`. A mask with no zeros is still a mask, so `x(x > 0)` of `[5 6 7]` is `5 6 7`; until cycle 02 it was `5 5 5` in silence (QA D6), and in cycle 02 a clean error. A double of ones and zeros is still positions, as in MATLAB |
+| A mask indexes as `find(mask)` would | 03 | `mask_find_shape`, `mask_shorter_than_array`, `mask_assign_grows`, `err_mask_true_past_end` | The mask becomes the positions `find` returns, in `find`'s shape, and then indexes as a numeric index would: a mask on a vector keeps the vector's orientation, a row mask on a matrix gives a row, a matrix mask a column. A shorter mask selects among the elements it covers; a `true` past the end is the out-of-bounds error on read and grows the array on assignment. Masks work in either subscript of two, `A(mask, :)` |
+| Deletion `x(i) = []` | 03 | `delete_vector_elements`, `delete_linear_from_matrix`, `delete_column_and_row`, `err_delete_two_indices` | By position or by mask. A vector keeps its orientation, a linear deletion from a matrix leaves a row, `x(:) = []` a 0x0; `A(:, j) = []` and `A(i, :) = []` remove columns and rows, and a subscript spanning its whole dimension (`1:end`) counts as a colon. Two subscripts that each select part of their dimension are `A null assignment can have only one non-colon index.` Only the literal `[]` deletes: `e = []; x(2) = e` is an assignment, and a count mismatch. The class is kept |
+| Indexed assignment in place | 03 | `growth_perf_guard`, `repl_failed_assign_unchanged` | Every subscript, the class conversion, the growth and the element count are checked before the variable changes, so a failed assignment leaves it exactly as it was. A multiple assignment `[a, b] = ...` assigns its targets one at a time, so one that fails part-way keeps the targets already assigned. The variable is then changed where it is stored, never copied, and growth along its last dimension is an amortised resize, so `z(end+1) = k` 200000 times is linear. A read `x(k)` no longer copies `x` either |
+| Growth names the size asked for | 03 | `err_growth_size_named` | `x = []; x(1e300) = 1` reports `Requested 1x1e+300 array exceeds the maximum array size.`, not the `1x18446744073709551615` of the saturated `usize`: the grown size stays an `f64` until `check_shape` judges it |
+| Trailing singleton subscripts | 03 | `trailing_singleton_subscripts`, `trailing_singleton_end`, `err_trailing_singleton_bound` | `A(2, 1, 1)`, `A(:, :, 1)` and `A(1, 2, 1) = 9` index a 2-D matrix, `end` is `1` in a third or later position, and a third subscript past 1 is `Index in position 3 exceeds array bounds. Index must not exceed 1.` (QA D22). Selecting a second page, or growing into one, is `N-D arrays are not supported.` |
+| The invalid-index message names logical values | 03 | `err_index_zero_ending` | `x(0)` is `Index in position 1 is invalid. Array indices must be positive integers or logical values.`, MATLAB's text, now that logical indices exist |
+| Brace and dot access on a matrix are errors | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `x{1}` is `Brace indexing is not supported for variables of this type.` and `x.a` is `Dot indexing is not supported for variables of this type.`, reading or assigning; both stay right for a matrix once cycle 07 adds cells and structs. A second `(...)` indexes the value so far, `x(2:3)(2)` |
 
 ## Control flow
 
@@ -121,7 +127,7 @@ are the ones MATLAB makes. The rearrangements `transpose`, `fliplr`, `flipud`,
 the predicates `any`, `all`, `isnan`, `isinf`, `isfinite`, `isempty`,
 `isscalar`, `isvector`, `islogical`, `ischar`, `isnumeric` and `isa`, return
 logicals (`predicates_return_logical`), which is what will let cycle 03's
-`x(isnan(x))` select. The argument forms each builtin
+`x(isnan(x))` select, and since cycle 03 it does. The argument forms each builtin
 takes are in [Builtin arguments](#builtin-arguments).
 
 ### Calling convention
@@ -136,6 +142,12 @@ takes are in [Builtin arguments](#builtin-arguments).
 | A size that would overflow is a clean error | 01 | `err_huge_size_*` | `zeros(1e10)` used to abort the process |
 | `NaN(n)` and `Inf(r,c)` fill a matrix | 01 | `nan_inf_constructors` | `true(n)` and `false(n)` too, since 01c |
 | `tic`, `toc` and `toc(t)` | 01 | `tic_toc_value`, `tic_toc_handle` | `t = tic` returns a handle; bare `toc` prints the elapsed time |
+| Multiple assignment `[a, b] = f(...)` | 03 | `multi_assign_max_display`, `multi_assign_size`, `multi_assign_sort`, `multi_assign_find`, `multi_assign_tilde_min` | The call is asked for as many values as there are targets, which are assigned and then shown in order unless the statement ends in `;`. `~` takes an output and discards it; a target may be indexed, `[v(2), k] = max(w)`; `[x] = f(...)` is the one-target form. A multiple assignment does not set `ans`. It used to be a parse error (QA D32) |
+| ... and its two errors | 03 | `err_multi_assign_insufficient`, `err_multi_assign_too_many` | `[a, b] = 5`, or any value that is not a call, is `Insufficient number of outputs from right hand side of equal sign to satisfy assignment.`; a builtin asked for more values than it has, `[a, b] = sum(x)`, is `Too many output arguments.` |
+| `[m, i] = max(...)`, `[m, i] = min(...)` | 03 | `multi_assign_max_display`, `multi_assign_tilde_min` | The index of each extremum along the dimension reduced, the first of a tie, ignoring `NaN`; with `'all'` a linear index. The two-array form has no index |
+| `[s, i] = sort(...)` | 03 | `multi_assign_sort` | The permutation, so `s` is `v(i)`; stable in both directions |
+| `[r, c] = size(A)` | 03 | `multi_assign_size` | One dimension per output, and outputs past the second are `1`, the trailing singletons; `[n] = size(A)` is still the size row |
+| `[r, c] = find(X)`, `[r, c, v] = find(X)` | 03 | `multi_assign_find` | Row and column subscripts, and the values in the argument's class, in `find`'s shape; the count and direction still apply |
 | A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread, and since 01e the parser and the evaluator refuse anything past 10,000 levels, so the stack is never reached at all |
 
 ### Builtin arguments
@@ -153,7 +165,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | Size vectors: `zeros(size(A))` | 01c | `size_vectors_constructors`, `err_size_vector_column` | `zeros`, `ones`, `eye`, `rand`, `NaN`, `Inf`, `true`, `false`. The vector must be a row |
 | `reshape(A, sz)`, `reshape(A, r, [])`, `repmat(A, sz)` | 01c | `size_vectors_reshape_repmat`, `err_reshape_placeholder_divisible`, `err_reshape_two_placeholders` | One `[]` placeholder, for the size that makes the count come out |
 | Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_third_size`, `err_nd_zero_third_size`, `err_nd_fourth_size`, `err_nd_size_vector`, `err_nd_reshape` | `zeros(2, 3, 1)` is 2x3. Any other third size, `0` included, is "N-D arrays are not supported."; N-D arrays are not built yet. `eye` still takes two sizes |
-| A size past `usize` is named as asked | 01c | `err_size_overflow_named`, `err_size_overflow_g_form`, `err_size_overflow_range_inf` | `zeros(1e300)` reports `1e+300x1e+300`, and `0:1e-300:1e300` reports `1xInf`, not the `usize::MAX` clamp. Indexed growth still names the clamp (cycle 03) |
+| A size past `usize` is named as asked | 01c | `err_size_overflow_named`, `err_size_overflow_g_form`, `err_size_overflow_range_inf` | `zeros(1e300)` reports `1e+300x1e+300`, and `0:1e-300:1e300` reports `1xInf`, not the `usize::MAX` clamp. Indexed growth does too since cycle 03 (`err_growth_size_named`) |
 | `linspace` floors its count | 01c | `linspace_floor_count` | `linspace(0, 1, 2.7)` is two points; a count below 1 is 1x0 |
 | `linspace` includes both end points exactly | 01d | `range_hits_end_point` | The last element is the end point itself, not `a + (b-a)*(n-1)/(n-1)` |
 | `sort(v, 'descend')`, `sort(v, dim)`, `sort(v, dim, direction)` | 01c | `sort_direction`, `sort_descend_stable`, `err_sort_direction` | Stable in both directions; `NaN` first when descending |

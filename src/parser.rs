@@ -18,8 +18,11 @@ pub enum Expr {
     Colon,
     /// `[a b; c d]` — rows of elements.
     Matrix(Vec<Vec<Expr>>),
-    /// `name(args)` — indexing if `name` is a variable, otherwise a call.
-    Index(String, Vec<Expr>),
+    /// `name` followed by one or more accesses: `x(2)`, `f(a, b)`, `c{1}`,
+    /// `s.a`, `s.(n)` and chains of them such as `c{1}(2).b`. The chain is
+    /// never empty; a bare name is [`Expr::Ident`]. The first `(...)` is
+    /// indexing if `name` is a variable and a call otherwise.
+    Access(String, Vec<Access>),
     Neg(Box<Expr>),
     /// Unary plus. It is not a no-op: it is arithmetic, so `+'a'` is the
     /// double `97` and `+true` the double `1`.
@@ -29,6 +32,27 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `a:b` or `a:s:b`
     Range(Box<Expr>, Option<Box<Expr>>, Box<Expr>),
+}
+
+/// One link of an access chain, in the order written.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Access {
+    /// `(args)`: indexing, or the arguments of a call.
+    Paren(Vec<Expr>),
+    /// `{args}`: brace indexing, which cycle 07's cells give a meaning.
+    Brace(Vec<Expr>),
+    /// `.name`: a field, which cycle 07's structs give a meaning.
+    Field(String),
+    /// `.(expr)`: a dynamic field name.
+    DynField(Box<Expr>),
+}
+
+/// An assignment target: a name and the accesses that select what inside it
+/// is assigned. `x = ...` has an empty chain and `x(2) = ...` a one-link one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LValue {
+    pub name: String,
+    pub chain: Vec<Access>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,8 +84,12 @@ pub enum BinOp {
 pub enum Stmt {
     /// Expression statement; bool = display result (no trailing `;`).
     Expr(Expr, bool),
-    Assign(String, Expr, bool),
-    IndexAssign(String, Vec<Expr>, Expr, bool),
+    /// `target = rhs`; bool = display the assigned variable.
+    Assign(LValue, Expr, bool),
+    /// `[a, ~, c] = rhs`: one target per output, `None` for a `~`
+    /// placeholder, which asks for the output and discards it. `[x] = rhs`
+    /// is the one-target form.
+    MultiAssign(Vec<Option<LValue>>, Expr, bool),
     If(Vec<IfArm>, Option<Vec<Located>>),
     For(String, Expr, Vec<Located>),
     While(Expr, Vec<Located>),
@@ -304,22 +332,80 @@ impl Parser {
                 bail!(error::block_with_no_opener(self.peek()).at(line))
             }
             _ => {
+                if self.peek() == &Token::LBracket {
+                    if let Some(targets) = self.try_targets() {
+                        // `try_targets` stopped on the `=`.
+                        self.next();
+                        let rhs = self.parse_expr()?;
+                        let show = self.end_stmt()?;
+                        return Ok(Stmt::MultiAssign(targets, rhs, show));
+                    }
+                }
                 let e = self.parse_expr()?;
                 if self.peek() == &Token::Assign {
                     self.next();
                     let rhs = self.parse_expr()?;
                     let show = self.end_stmt()?;
-                    match e {
-                        Expr::Ident(n) => Ok(Stmt::Assign(n, rhs, show)),
-                        Expr::Index(n, args) => Ok(Stmt::IndexAssign(n, args, rhs, show)),
+                    let target = match e {
+                        Expr::Ident(name) => LValue {
+                            name,
+                            chain: Vec::new(),
+                        },
+                        Expr::Access(name, chain) => LValue { name, chain },
                         _ => bail!(error::invalid_assignment_target().at(line)),
-                    }
+                    };
+                    Ok(Stmt::Assign(target, rhs, show))
                 } else {
                     let show = self.end_stmt()?;
                     Ok(Stmt::Expr(e, show))
                 }
             }
         }
+    }
+
+    /// The target list of `[a, ~, c] = ...`, when the statement starting at
+    /// the `[` is one, leaving the parser on the `=`. Anything else, such as
+    /// the matrix literal of `[a, b]` or `[1 2] == x`, rewinds to the `[` and
+    /// returns `None`, so the statement is parsed as an expression and any
+    /// error is reported by that parse, as it always was.
+    ///
+    /// A target is a name with an optional access chain, and a `~` alone
+    /// between separators is a placeholder. The lexer has already turned
+    /// the whitespace of `[a b]` and `[a ~]` into commas.
+    fn try_targets(&mut self) -> Option<Vec<Option<LValue>>> {
+        let (pos, depth, in_index) = (self.pos, self.depth, self.in_index);
+        match self.targets() {
+            Ok(Some(t)) => Some(t),
+            _ => {
+                self.pos = pos;
+                self.depth = depth;
+                self.in_index = in_index;
+                None
+            }
+        }
+    }
+
+    fn targets(&mut self) -> R<Option<Vec<Option<LValue>>>> {
+        self.expect(Token::LBracket)?;
+        let mut out = Vec::new();
+        loop {
+            match self.next() {
+                Token::Not if matches!(self.peek(), Token::Comma | Token::RBracket) => {
+                    out.push(None)
+                }
+                Token::Ident(name) => {
+                    let chain = self.parse_chain()?;
+                    out.push(Some(LValue { name, chain }));
+                }
+                _ => return Ok(None),
+            }
+            match self.next() {
+                Token::Comma => {}
+                Token::RBracket => break,
+                _ => return Ok(None),
+            }
+        }
+        Ok((self.peek() == &Token::Assign).then_some(out))
     }
 
     /// Consume a statement terminator. Returns true if the result should be displayed.
@@ -434,7 +520,10 @@ impl Parser {
         // Bare `:` inside an index: `A(:, 1)`
         if self.in_index > 0
             && self.peek() == &Token::Colon
-            && matches!(self.peek_at(1), Token::Comma | Token::RParen)
+            && matches!(
+                self.peek_at(1),
+                Token::Comma | Token::RParen | Token::RBrace
+            )
         {
             self.next();
             return Ok(Expr::Colon);
@@ -595,27 +684,82 @@ impl Parser {
             Token::LBracket => self.parse_matrix(),
             Token::End if self.in_index > 0 => Ok(Expr::End),
             Token::Ident(name) => {
-                if self.peek() == &Token::LParen {
-                    self.next();
-                    let mut args = Vec::new();
-                    self.in_index += 1;
-                    if self.peek() != &Token::RParen {
-                        loop {
-                            args.push(self.parse_expr()?);
-                            if !self.eat(&Token::Comma) {
-                                break;
-                            }
-                        }
-                    }
-                    self.in_index -= 1;
-                    self.expect(Token::RParen)?;
-                    Ok(Expr::Index(name, args))
-                } else {
+                let chain = self.parse_chain()?;
+                if chain.is_empty() {
                     Ok(Expr::Ident(name))
+                } else {
+                    Ok(Expr::Access(name, chain))
                 }
             }
+            // A bare `@`, a `{` opening a cell literal, and anything else
+            // that cannot start a value. Function handles are cycle 06's and
+            // cell literals cycle 07's.
             t => bail!(error::unexpected_in_expression(&t).at(line)),
         }
+    }
+
+    /// The accesses after a name, in the order written: `(args)`, `{args}`,
+    /// `.name` and `.(expr)`, as many as follow. The chain is a flat list, so
+    /// a long one deepens nothing; each argument is an expression of its own
+    /// and is counted there.
+    fn parse_chain(&mut self) -> R<Vec<Access>> {
+        let mut chain = Vec::new();
+        loop {
+            match self.peek() {
+                Token::LParen => {
+                    self.next();
+                    chain.push(Access::Paren(self.parse_args(Token::RParen)?));
+                }
+                Token::LBrace => {
+                    self.next();
+                    chain.push(Access::Brace(self.parse_args(Token::RBrace)?));
+                }
+                Token::Dot => {
+                    self.next();
+                    let line = self.line();
+                    match self.next() {
+                        Token::Ident(field) => chain.push(Access::Field(field)),
+                        Token::LParen => {
+                            // A dynamic field name is not an index argument,
+                            // so `end` and a bare `:` mean nothing in it,
+                            // even inside an index further out.
+                            let in_index = std::mem::take(&mut self.in_index);
+                            let e = self.parse_expr();
+                            self.in_index = in_index;
+                            let e = e?;
+                            self.expect(Token::RParen)?;
+                            chain.push(Access::DynField(Box::new(e)));
+                        }
+                        t => bail!(error::unexpected_in_expression(&t).at(line)),
+                    }
+                }
+                _ => return Ok(chain),
+            }
+        }
+    }
+
+    /// The arguments of `(...)` or `{...}`, after the opener, through the
+    /// closer. `end` and a bare `:` are legal inside.
+    fn parse_args(&mut self, close: Token) -> R<Vec<Expr>> {
+        self.in_index += 1;
+        let args = self.arg_list(&close);
+        self.in_index -= 1;
+        let args = args?;
+        self.expect(close)?;
+        Ok(args)
+    }
+
+    fn arg_list(&mut self, close: &Token) -> R<Vec<Expr>> {
+        let mut args = Vec::new();
+        if self.peek() != close {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(args)
     }
 
     fn parse_matrix(&mut self) -> R<Expr> {
@@ -706,6 +850,19 @@ mod tests {
 
     fn range(a: Expr, step: Option<Expr>, b: Expr) -> Expr {
         Expr::Range(Box::new(a), step.map(Box::new), Box::new(b))
+    }
+
+    /// A plain assignment target.
+    fn lv(name: &str) -> LValue {
+        LValue {
+            name: name.to_string(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// `name(args)`, as the parser builds it: an access chain of one `(...)`.
+    fn call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::Access(name.to_string(), vec![Access::Paren(args)])
     }
 
     // ---- precedence and associativity ---------------------------------
@@ -946,7 +1103,7 @@ mod tests {
     fn semicolon_suppresses_display() {
         assert_eq!(
             parse("x = 3;"),
-            vec![at(1, Stmt::Assign("x".to_string(), num(3.0), false))]
+            vec![at(1, Stmt::Assign(lv("x"), num(3.0), false))]
         );
     }
 
@@ -954,7 +1111,7 @@ mod tests {
     fn missing_semicolon_shows_result() {
         assert_eq!(
             parse("x = 3"),
-            vec![at(1, Stmt::Assign("x".to_string(), num(3.0), true))]
+            vec![at(1, Stmt::Assign(lv("x"), num(3.0), true))]
         );
     }
 
@@ -964,9 +1121,11 @@ mod tests {
             parse("x(end+1) = 3"),
             vec![at(
                 1,
-                Stmt::IndexAssign(
-                    "x".to_string(),
-                    vec![bin(BinOp::Add, Expr::End, num(1.0))],
+                Stmt::Assign(
+                    LValue {
+                        name: "x".to_string(),
+                        chain: vec![Access::Paren(vec![bin(BinOp::Add, Expr::End, num(1.0))])],
+                    },
                     num(3.0),
                     true,
                 )
@@ -980,20 +1139,14 @@ mod tests {
             parse("A(:, 1)"),
             vec![at(
                 1,
-                Stmt::Expr(
-                    Expr::Index("A".to_string(), vec![Expr::Colon, num(1.0)]),
-                    true
-                )
+                Stmt::Expr(call("A", vec![Expr::Colon, num(1.0)]), true)
             )]
         );
     }
 
     #[test]
     fn end_inside_an_index_is_expr_end() {
-        assert_eq!(
-            parse_expr("a(end)"),
-            Expr::Index("a".to_string(), vec![Expr::End])
-        );
+        assert_eq!(parse_expr("a(end)"), call("a", vec![Expr::End]));
     }
 
     #[test]
@@ -1009,8 +1162,8 @@ mod tests {
         assert_eq!(
             parse("x = 1;\ny = 2\n"),
             vec![
-                at(1, Stmt::Assign("x".to_string(), num(1.0), false)),
-                at(2, Stmt::Assign("y".to_string(), num(2.0), true)),
+                at(1, Stmt::Assign(lv("x"), num(1.0), false)),
+                at(2, Stmt::Assign(lv("y"), num(2.0), true)),
             ]
         );
     }
@@ -1021,10 +1174,7 @@ mod tests {
             parse("disp(1, x);"),
             vec![at(
                 1,
-                Stmt::Expr(
-                    Expr::Index("disp".to_string(), vec![num(1.0), ident("x")]),
-                    false
-                )
+                Stmt::Expr(call("disp", vec![num(1.0), ident("x")]), false)
             )]
         );
     }
@@ -1072,10 +1222,7 @@ mod tests {
                 Stmt::For(
                     "k".to_string(),
                     range(num(1.0), None, num(3.0)),
-                    vec![at(
-                        1,
-                        Stmt::Expr(Expr::Index("disp".to_string(), vec![ident("k")]), false)
-                    )],
+                    vec![at(1, Stmt::Expr(call("disp", vec![ident("k")]), false))],
                 )
             )]
         );
@@ -1244,5 +1391,207 @@ mod tests {
         let toks = lex("x = 1;\ny = 2;").expect("lex should succeed");
         let stmts = Parser::new(toks).parse_program().expect("should parse");
         assert_eq!(stmts.iter().map(|s| s.line).collect::<Vec<_>>(), vec![1, 1]);
+    }
+
+    // ---- access chains and multiple assignment (cycle 03) --------------
+
+    fn access(name: &str, chain: Vec<Access>) -> Expr {
+        Expr::Access(name.to_string(), chain)
+    }
+
+    /// Acceptance test 14: each form of access, and a chain of all three.
+    #[test]
+    fn access_chains_parse_in_the_order_written() {
+        assert_eq!(
+            parse_expr("x{2}"),
+            access("x", vec![Access::Brace(vec![num(2.0)])])
+        );
+        assert_eq!(
+            parse_expr("s.a"),
+            access("s", vec![Access::Field("a".to_string())])
+        );
+        assert_eq!(
+            parse_expr("s.(n)"),
+            access("s", vec![Access::DynField(Box::new(ident("n")))])
+        );
+        assert_eq!(
+            parse_expr("c{1}(2).b"),
+            access(
+                "c",
+                vec![
+                    Access::Brace(vec![num(1.0)]),
+                    Access::Paren(vec![num(2.0)]),
+                    Access::Field("b".to_string()),
+                ]
+            )
+        );
+        // `end` and a bare `:` are index arguments inside braces too.
+        assert_eq!(
+            parse_expr("c{end, :}"),
+            access("c", vec![Access::Brace(vec![Expr::End, Expr::Colon])])
+        );
+        // A plain call is a one-link chain, and a bare name no chain at all.
+        assert_eq!(parse_expr("f(1)"), call("f", vec![num(1.0)]));
+        assert_eq!(parse_expr("f()"), call("f", vec![]));
+        assert_eq!(parse_expr("f"), ident("f"));
+        // Postfix operators apply to the whole chain.
+        assert_eq!(
+            parse_expr("s.a'"),
+            tr(access("s", vec![Access::Field("a".to_string())]))
+        );
+        assert_eq!(
+            parse_expr("-c{1}.^2"),
+            neg(bin(
+                BinOp::EPow,
+                access("c", vec![Access::Brace(vec![num(1.0)])]),
+                num(2.0)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_dynamic_field_is_not_an_index_argument() {
+        // `end` inside `.( )` is not the `end` of an enclosing index.
+        assert!(parse_result("x(s.(end))").is_err());
+        assert_eq!(
+            parse_expr("x(s.(n), end)"),
+            call(
+                "x",
+                vec![
+                    access("s", vec![Access::DynField(Box::new(ident("n")))]),
+                    Expr::End
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn a_dot_must_be_followed_by_a_name_or_a_parenthesis() {
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("s.1"), "unexpected '0.1'");
+        assert_eq!(msg("s.;"), "unexpected ';' in expression");
+        assert_eq!(msg("s.end"), "unexpected 'end' in expression");
+    }
+
+    /// Until cycle 06 an `@` is a clean parse error wherever it appears.
+    #[test]
+    fn a_bare_at_is_a_parse_error() {
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("f = @sin"), "unexpected '@' in expression");
+        assert_eq!(msg("@"), "unexpected '@' in expression");
+        assert_eq!(msg("x = 1 @ 2"), "unexpected '@'");
+        // A brace cannot open a value either, until cycle 07's cells.
+        assert_eq!(msg("c = {1}"), "unexpected '{' in expression");
+    }
+
+    #[test]
+    fn a_chain_is_an_assignment_target() {
+        assert_eq!(
+            parse("c{1}(2).b = 5;"),
+            vec![at(
+                1,
+                Stmt::Assign(
+                    LValue {
+                        name: "c".to_string(),
+                        chain: vec![
+                            Access::Brace(vec![num(1.0)]),
+                            Access::Paren(vec![num(2.0)]),
+                            Access::Field("b".to_string()),
+                        ],
+                    },
+                    num(5.0),
+                    false
+                )
+            )]
+        );
+    }
+
+    fn target(name: &str, chain: Vec<Access>) -> Option<LValue> {
+        Some(LValue {
+            name: name.to_string(),
+            chain,
+        })
+    }
+
+    /// Acceptance test 14: `[a, ~, c] = f(x)` is one statement with three
+    /// targets, the middle one a placeholder.
+    #[test]
+    fn a_bracketed_target_list_is_a_multi_assign() {
+        let three = Stmt::MultiAssign(
+            vec![target("a", vec![]), None, target("c", vec![])],
+            call("f", vec![ident("x")]),
+            true,
+        );
+        assert_eq!(parse("[a, ~, c] = f(x)"), vec![at(1, three.clone())]);
+        // Whitespace separates targets as it separates elements.
+        assert_eq!(parse("[a ~, c] = f(x)"), vec![at(1, three.clone())]);
+        assert_eq!(parse("[a,~,c]=f(x)"), vec![at(1, three)]);
+        // `[a ~ c]` is the matrix `[a, ~c]`, as in a literal: the lexer puts
+        // no separator after a `~`, so it is not a target list.
+        assert!(parse_result("[a ~ c] = f(x)").is_err());
+        // The one-target form, and suppression.
+        assert_eq!(
+            parse("[x] = size(A, 1);"),
+            vec![at(
+                1,
+                Stmt::MultiAssign(
+                    vec![target("x", vec![])],
+                    call("size", vec![ident("A"), num(1.0)]),
+                    false
+                )
+            )]
+        );
+        // A target may be indexed.
+        assert_eq!(
+            parse("[v(2), ~] = max(w);"),
+            vec![at(
+                1,
+                Stmt::MultiAssign(
+                    vec![target("v", vec![Access::Paren(vec![num(2.0)])]), None],
+                    call("max", vec![ident("w")]),
+                    false
+                )
+            )]
+        );
+    }
+
+    /// A bracket that is not a target list is the matrix literal it always
+    /// was, and its errors are the ones it always had.
+    #[test]
+    fn a_bracket_that_is_not_a_target_list_is_an_expression() {
+        assert_eq!(
+            parse("[a, b]"),
+            vec![at(
+                1,
+                Stmt::Expr(Expr::Matrix(vec![vec![ident("a"), ident("b")]]), true)
+            )]
+        );
+        assert_eq!(
+            parse("[a b] == c;"),
+            vec![at(
+                1,
+                Stmt::Expr(
+                    bin(
+                        BinOp::Eq,
+                        Expr::Matrix(vec![vec![ident("a"), ident("b")]]),
+                        ident("c")
+                    ),
+                    false
+                )
+            )]
+        );
+        assert_eq!(
+            parse("[~a, b]"),
+            vec![at(
+                1,
+                Stmt::Expr(Expr::Matrix(vec![vec![not(ident("a")), ident("b")]]), true)
+            )]
+        );
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("[1, b] = 2"), "invalid assignment target");
+        assert_eq!(msg("[a; b] = 2"), "invalid assignment target");
+        assert_eq!(msg("[] = 2"), "invalid assignment target");
+        assert_eq!(msg("[a + 1, b] = 2"), "invalid assignment target");
+        assert_eq!(msg("[a, b"), "unterminated matrix literal: missing ']'");
     }
 }

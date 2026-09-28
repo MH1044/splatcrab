@@ -15,8 +15,8 @@ pub fn register(r: &mut Registry) {
     add(r, "mean", |_, a, _| reduction(a, "mean", Red::Mean), "mean(A), mean(A,dim), mean(A,'all') - average of the elements.");
     add(r, "any", |_, a, _| reduction(a, "any", Red::Any), "any(A), any(A,dim), any(A,'all') - true if any element is non-zero, ignoring NaN.");
     add(r, "all", |_, a, _| reduction(a, "all", Red::All), "all(A), all(A,dim), all(A,'all') - true if every element is non-zero.");
-    add(r, "max", |_, a, _| extremum(a, "max", true), "max(A), max(A,B), max(A,[],dim), max(A,[],'all') - largest elements.");
-    add(r, "min", |_, a, _| extremum(a, "min", false), "min(A), min(A,B), min(A,[],dim), min(A,[],'all') - smallest elements.");
+    add(r, "max", |_, a, n| extremum(a, "max", true, n), "max(A), max(A,B), max(A,[],dim), max(A,[],'all'), [M,I] = max(...) - largest elements.");
+    add(r, "min", |_, a, n| extremum(a, "min", false, n), "min(A), min(A,B), min(A,[],dim), min(A,[],'all'), [M,I] = min(...) - smallest elements.");
     add(r, "cumsum", |_, a, _| cumulative(a, "cumsum", true), "cumsum(A), cumsum(A,dim) - cumulative sum.");
     add(r, "cumprod", |_, a, _| cumulative(a, "cumprod", false), "cumprod(A), cumprod(A,dim) - cumulative product.");
 
@@ -223,7 +223,14 @@ fn reduce_all(m: &Matrix, f: impl Fn(&[f64]) -> f64) -> Matrix {
 /// `max` and `min`. Of a logical they stay logical, as MATLAB's do: the
 /// largest of some trues and falses is itself a true or a false. Any other
 /// argument, a char included, gives a double.
-fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
+///
+/// Asked for two outputs, the second is the index of each extremum along
+/// the dimension reduced, a double: the first occurrence when there is a
+/// tie, and `1` for a slice of `NaN` alone, whose extremum is that first
+/// `NaN`. With `'all'` it is a linear index. The two-array form `max(A, B)`
+/// has no index, so it produces one value and asking for two is "Too many
+/// output arguments.".
+fn extremum(args: &[Value], name: &str, is_max: bool, nargout: usize) -> R<Vec<Value>> {
     let out = extremum_value(args, name, is_max)?;
     let logical = |i: usize| args.get(i).is_some_and(|v| v.mat().class == Class::Logical);
     let keep = if args.len() == 2 {
@@ -232,7 +239,67 @@ fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
         logical(0)
     };
     let class = if keep { Class::Logical } else { Class::Double };
-    one_as(out.into_iter().next().unwrap().into_mat().with_class(class))
+    let value = out.into_iter().next().unwrap().into_mat().with_class(class);
+    if nargout < 2 || args.len() == 2 {
+        return one_as(value);
+    }
+    let index = extremum_index(args, name, is_max)?;
+    Ok(vec![Value::Mat(value), Value::Mat(index)])
+}
+
+/// Where `max` or `min` reduces a one- or three-argument call.
+fn extremum_along_arg(args: &[Value], m: &Matrix, name: &str) -> R<Along> {
+    Ok(if args.len() >= 3 {
+        dim_or_all(args, 2, name)?
+    } else {
+        // The first non-singleton dimension, which for a 0x0 is the first.
+        Along::Dim(if m.rows == 1 { 2 } else { 1 })
+    })
+}
+
+/// The one-based position of the extremum of `xs`, ignoring `NaN`: the first
+/// of equal values, and `1` when every element is `NaN`.
+pub fn arg_extremum(xs: &[f64], is_max: bool) -> usize {
+    let mut best: Option<(usize, f64)> = None;
+    for (k, &v) in xs.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((_, b)) => (is_max && v > b) || (!is_max && v < b),
+        };
+        if better {
+            best = Some((k, v));
+        }
+    }
+    best.map_or(1, |(k, _)| k + 1)
+}
+
+/// The second output of `max` and `min`, shaped as the first is.
+fn extremum_index(args: &[Value], name: &str, is_max: bool) -> R<Matrix> {
+    let m = mat(args, 0, name)?;
+    let f = move |xs: &[f64]| arg_extremum(xs, is_max) as f64;
+    Ok(match extremum_along_arg(args, &m, name)? {
+        Along::All if m.is_empty() => Matrix::empty(),
+        Along::All => Matrix::scalar(f(&m.data)),
+        Along::Dim(d) => {
+            let len = match d {
+                1 => m.rows,
+                2 => m.cols,
+                _ => 1,
+            };
+            if len == 0 {
+                // The empty the first output is, with no elements to index.
+                Matrix::new(m.rows, m.cols, Vec::new())
+            } else if d >= 3 {
+                // Every slice is one element, the first of its slice.
+                Matrix::filled(m.rows, m.cols, 1.0)
+            } else {
+                reduce(&m, Some(d), f)?
+            }
+        }
+    })
 }
 
 fn extremum_value(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
@@ -254,12 +321,7 @@ fn extremum_value(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
         };
         return one_mat(m.zip(&b, name, f)?);
     }
-    let along = if args.len() >= 3 {
-        dim_or_all(args, 2, name)?
-    } else {
-        // The first non-singleton dimension, which for a 0x0 is the first.
-        Along::Dim(if m.rows == 1 { 2 } else { 1 })
-    };
+    let along = extremum_along_arg(args, &m, name)?;
     let f = move |xs: &[f64]| {
         xs.iter()
             .copied()
@@ -683,7 +745,7 @@ mod tests {
         assert_eq!(round(&four).unwrap_err().msg, "Too many input arguments.");
         assert!(binary(&one, "mod", f64::atan2).is_err());
         assert!(binary(&two, "mod", f64::atan2).is_ok());
-        assert!(extremum(&three, "max", true).is_ok());
+        assert!(extremum(&three, "max", true, 1).is_ok());
     }
 
     fn call(args: &[Value], name: &str, kind: Red) -> R<Matrix> {
@@ -774,10 +836,10 @@ mod tests {
         assert_eq!(e, Matrix::scalar(0.0));
         let e = call(&[val(Matrix::empty()), all.clone()], "prod", Red::Prod).unwrap();
         assert_eq!(e, Matrix::scalar(1.0));
-        let max = |a: &[Value]| extremum(a, "max", true).unwrap()[0].clone().into_mat();
+        let max = |a: &[Value]| extremum(a, "max", true, 1).unwrap()[0].clone().into_mat();
         let none = val(Matrix::empty());
         assert_eq!(max(&[a.clone(), none.clone(), all.clone()]).data, [4.0]);
-        let min = extremum(&[a.clone(), none.clone(), all.clone()], "min", false).unwrap();
+        let min = extremum(&[a.clone(), none.clone(), all.clone()], "min", false, 1).unwrap();
         assert_eq!(min[0].clone().into_mat().data, [1.0]);
         // max has no identity element, so an empty stays the empty.
         let e = max(&[none.clone(), none.clone(), all]);
@@ -790,7 +852,7 @@ mod tests {
             e,
             "Dimension argument to 'sum' must be a positive integer scalar."
         );
-        assert!(extremum(&[a, none, text("x")], "max", true).is_err());
+        assert!(extremum(&[a, none, text("x")], "max", true, 1).is_err());
     }
 
     #[test]
@@ -801,7 +863,7 @@ mod tests {
                 args.push(val(Matrix::empty()));
                 args.push(val(Matrix::scalar(d)));
             }
-            let r = extremum(&args, "max", is_max).unwrap()[0]
+            let r = extremum(&args, "max", is_max, 1).unwrap()[0]
                 .clone()
                 .into_mat();
             (r.rows, r.cols)
@@ -941,5 +1003,66 @@ mod tests {
         assert!(e.contains("positive integer"), "{e}");
         let e = cumulative(&args, "cumsum", true).unwrap_err().msg;
         assert!(e.contains("positive integer"), "{e}");
+    }
+
+    // ---- the second output of max and min (cycle 03) -----------------
+
+    fn two(args: &[Value], is_max: bool) -> (Matrix, Matrix) {
+        let mut out = extremum(args, if is_max { "max" } else { "min" }, is_max, 2).unwrap();
+        assert_eq!(out.len(), 2);
+        let i = out.pop().unwrap().into_mat();
+        (out.pop().unwrap().into_mat(), i)
+    }
+
+    #[test]
+    fn arg_extremum_takes_the_first_of_a_tie_and_skips_nan() {
+        assert_eq!(arg_extremum(&[3.0, 9.0, 2.0], true), 2);
+        assert_eq!(arg_extremum(&[3.0, 9.0, 2.0], false), 3);
+        assert_eq!(arg_extremum(&[5.0, 5.0, 1.0], true), 1);
+        assert_eq!(arg_extremum(&[1.0, 5.0, 5.0], true), 2);
+        assert_eq!(arg_extremum(&[f64::NAN, 2.0, 1.0], true), 2);
+        assert_eq!(arg_extremum(&[f64::NAN, f64::NAN], true), 1);
+        assert_eq!(arg_extremum(&[-f64::INFINITY, -1.0], false), 1);
+    }
+
+    #[test]
+    fn max_and_min_give_an_index_along_the_reduced_dimension() {
+        let v = val(Matrix::row(vec![3.0, 9.0, 2.0]));
+        let (m, i) = two(std::slice::from_ref(&v), true);
+        assert_eq!((m.data, i.data), (vec![9.0], vec![2.0]));
+        let (m, i) = two(&[v], false);
+        assert_eq!((m.data, i.data), (vec![2.0], vec![3.0]));
+        // A matrix reduces down its columns; the index is a double.
+        let a = val(rmat(2, 2, &[4.0, 1.0, 2.0, 3.0]));
+        let (m, i) = two(std::slice::from_ref(&a), false);
+        assert_eq!((m.data, i.data.clone()), (vec![2.0, 1.0], vec![2.0, 1.0]));
+        assert_eq!((i.rows, i.cols, i.class), (1, 2, Class::Double));
+        // Along the second dimension, and over 'all' as a linear index.
+        let none = val(Matrix::empty());
+        let (_, i) = two(&[a.clone(), none.clone(), val(Matrix::scalar(2.0))], true);
+        assert_eq!((i.rows, i.cols, i.data), (2, 1, vec![1.0, 2.0]));
+        let (m, i) = two(&[a.clone(), none.clone(), text("all")], true);
+        assert_eq!((m.data, i.data), (vec![4.0], vec![1.0]));
+        let (m, i) = two(&[a.clone(), none.clone(), text("all")], false);
+        assert_eq!((m.data, i.data), (vec![1.0], vec![3.0]));
+        // A dimension past the array's is every element, each at 1.
+        let (_, i) = two(&[a, none.clone(), val(Matrix::scalar(3.0))], true);
+        assert_eq!((i.rows, i.cols, i.data), (2, 2, vec![1.0; 4]));
+        // An empty gives an empty index of the same shape as the value: a
+        // reduced dimension of 0 keeps the whole shape, as the value does.
+        let (m, i) = two(&[val(Matrix::new(0, 3, vec![]))], true);
+        assert_eq!((m.rows, m.cols, i.rows, i.cols), (0, 3, 0, 3));
+        let (m, i) = two(&[val(Matrix::empty())], true);
+        assert_eq!((m.rows, m.cols, i.rows, i.cols), (0, 0, 0, 0));
+        // A logical keeps its class in the value, never in the index.
+        let t = val(Matrix::row(vec![0.0, 1.0]).with_class(Class::Logical));
+        let (m, i) = two(&[t], true);
+        assert_eq!(
+            (m.class, i.class, i.data),
+            (Class::Logical, Class::Double, vec![2.0])
+        );
+        // The two-array form has no index to give.
+        let pair = [val(Matrix::scalar(1.0)), val(Matrix::scalar(2.0))];
+        assert_eq!(extremum(&pair, "max", true, 2).unwrap().len(), 1);
     }
 }

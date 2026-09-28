@@ -9,7 +9,7 @@ use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::scan;
-use crate::parser::{BinOp, Expr, Located, MAX_DEPTH, Parser, Stmt};
+use crate::parser::{Access, BinOp, Expr, LValue, Located, MAX_DEPTH, Parser, Stmt};
 use crate::value::{Class, Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -48,11 +48,115 @@ enum Flow {
     Continue,
 }
 
-/// One index argument after evaluation.
+/// One subscript after evaluation, zero-based.
+///
+/// `eval_index_args` is the one place a one-based subscript becomes one of
+/// these (invariant 2); everything that reads a `Sel` is zero-based.
+#[derive(Clone, Debug, PartialEq)]
 enum Sel {
+    /// `:`, every position along the dimension it indexes.
     All,
-    /// 0-based indices plus the shape of the index expression.
-    List(Vec<usize>, usize, usize),
+    /// Positions, zero-based, with the shape the index had: the index
+    /// array's own, or for a logical mask the shape `find(mask)` would have.
+    /// `max` is the largest one-based position asked for, kept as an `f64`:
+    /// a position past `usize` saturates in `idx`, and growth must still be
+    /// able to name the size that was asked for (`x(1e300) = 1`).
+    List {
+        idx: Vec<usize>,
+        rows: usize,
+        cols: usize,
+        max: f64,
+    },
+}
+
+impl Sel {
+    /// A list of positions shaped as a row, for tests and callers that build
+    /// one directly.
+    #[cfg(test)]
+    fn row(idx: Vec<usize>) -> Sel {
+        let max = idx.iter().map(|&k| k as f64 + 1.0).fold(0.0, f64::max);
+        let cols = idx.len();
+        Sel::List {
+            idx,
+            rows: 1,
+            cols,
+            max,
+        }
+    }
+
+    /// The zero-based positions this selects along a dimension of `n`.
+    fn positions(&self, n: usize) -> Vec<usize> {
+        match self {
+            Sel::All => (0..n).collect(),
+            Sel::List { idx, .. } => idx.clone(),
+        }
+    }
+
+    /// How many positions this selects along a dimension of `n`.
+    fn count(&self, n: usize) -> usize {
+        match self {
+            Sel::All => n,
+            Sel::List { idx, .. } => idx.len(),
+        }
+    }
+
+    /// The largest one-based position, or `n` for a colon.
+    fn extent(&self, n: usize) -> f64 {
+        match self {
+            Sel::All => n as f64,
+            Sel::List { max, .. } => *max,
+        }
+    }
+
+    /// True when this selects every position along a dimension of `n`, in
+    /// any order: `:`, `1:end` or `[2 1]` of a two-row matrix. A deletion
+    /// treats such a subscript as a colon.
+    fn covers(&self, n: usize) -> bool {
+        match self {
+            Sel::All => true,
+            Sel::List { idx, .. } => {
+                let mut seen = vec![false; n];
+                for &k in idx {
+                    if k < n {
+                        seen[k] = true;
+                    }
+                }
+                seen.into_iter().all(|b| b)
+            }
+        }
+    }
+}
+
+/// Which elements a read takes, and the shape of what it returns:
+/// `resolve_read`'s answer, which `gather` carries out.
+#[derive(Debug, PartialEq)]
+struct Gather {
+    /// Linear, zero-based, column-major positions in the source, in the
+    /// order the result holds them.
+    pos: Vec<usize>,
+    rows: usize,
+    cols: usize,
+}
+
+/// Where an assignment stores, and the shape the target has afterwards:
+/// `resolve_write`'s answer. Computing it changes nothing, so every check is
+/// done before the target is touched.
+#[derive(Debug, PartialEq)]
+struct Scatter {
+    /// The target's shape after growth; its own shape when it does not grow.
+    rows: usize,
+    cols: usize,
+    /// Linear, zero-based positions in the grown target, in the order the
+    /// right-hand side's elements are taken.
+    pos: Vec<usize>,
+}
+
+/// What a deletion keeps, and the shape of what is left.
+#[derive(Debug, PartialEq)]
+struct Keep {
+    pos: Vec<usize>,
+    rows: usize,
+    cols: usize,
 }
 
 impl Default for Interp {
@@ -140,15 +244,12 @@ impl Interp {
                 // A statement asks for no values, so a builtin that produces
                 // none (disp, fprintf, tic, ...) is legal here and returns an
                 // empty Vec. Nothing else calls a builtin in this cycle.
-                let result = match e {
-                    Expr::Ident(n) if !self.vars.contains_key(n) => {
-                        self.call_builtin(n, vec![], 0)?
-                    }
-                    Expr::Index(n, args) if !self.vars.contains_key(n) => {
+                let result = match self.call_form(e) {
+                    Some((n, args)) => {
                         let a = self.eval_args(args)?;
                         self.call_builtin(n, a, 0)?
                     }
-                    _ => vec![self.eval(e)?],
+                    None => vec![self.eval(e)?],
                 };
                 if let Some(v) = result.into_iter().next() {
                     let name = match e {
@@ -164,20 +265,34 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::Assign(name, e, show) => {
-                let v = self.eval(e)?;
-                if *show {
-                    self.emit(&v.display(name))?;
+            Stmt::Assign(target, e, show) => {
+                match (target.chain.as_slice(), e) {
+                    // `x(i) = []` with the literal `[]` is a deletion, not a
+                    // store of an empty; see `is_deletion`.
+                    ([Access::Paren(args)], e) if is_deletion(e) => {
+                        self.delete_index(&target.name, args)?
+                    }
+                    _ => {
+                        let v = self.eval(e)?;
+                        self.assign_to(target, v)?;
+                    }
                 }
-                self.vars.insert(name.clone(), v);
+                if *show {
+                    self.show_var(&target.name)?;
+                }
                 Ok(Flow::Normal)
             }
-            Stmt::IndexAssign(name, args, e, show) => {
-                let rhs = self.eval(e)?;
-                self.assign_index(name, args, rhs)?;
-                if *show {
-                    let shown = self.vars[name].display(name);
-                    self.emit(&shown)?;
+            Stmt::MultiAssign(targets, e, show) => {
+                let values = self.eval_outputs(e, targets.len())?;
+                // Each output is assigned, then shown, in the order written;
+                // a `~` takes its output and drops it.
+                for (target, v) in targets.iter().zip(values) {
+                    if let Some(target) = target {
+                        self.assign_to(target, v)?;
+                        if *show {
+                            self.show_var(&target.name)?;
+                        }
+                    }
                 }
                 Ok(Flow::Normal)
             }
@@ -296,7 +411,7 @@ impl Interp {
                 .map(|n| Value::Mat(Matrix::scalar(*n as f64)))
                 .ok_or_else(error::end_outside_index),
             Expr::Colon => Err(error::colon_outside_index()),
-            Expr::Index(n, args) => self.index(n, args),
+            Expr::Access(n, chain) => self.eval_access(n, chain),
             Expr::Matrix(rows) => self.build_matrix(rows),
             // Both signs are arithmetic, so both give a double: `+'a'` is 97.
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
@@ -449,23 +564,148 @@ impl Interp {
 
     // ---- indexing ----------------------------------------------------
 
-    fn index(&mut self, name: &str, args: &[Expr]) -> R<Value> {
-        let var = match self.vars.get(name) {
-            Some(v) => v.clone(),
-            None => {
-                let a = self.eval_args(args)?;
-                return self.call_for_value(name, a);
-            }
-        };
-        let m = var.into_mat();
-        let sel = self.eval_index_args(&m, args)?;
-        // Indexing keeps the class, so `s(2)` of a char is a char and `s(:)`
-        // is a char column (QA D17).
-        Ok(Value::Mat(index_read(&m, &sel)?))
+    /// The builtin call an expression makes, if it is one: a name that is
+    /// not a variable, bare or with one `(...)`. Those are the forms that can
+    /// be asked for other than one value; everything else is evaluated.
+    fn call_form<'e>(&self, e: &'e Expr) -> Option<(&'e str, &'e [Expr])> {
+        match e {
+            Expr::Ident(n) if !self.vars.contains_key(n) => Some((n, &[])),
+            Expr::Access(n, chain) if !self.vars.contains_key(n) => match chain.as_slice() {
+                [Access::Paren(args)] => Some((n, args)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
-    fn eval_index_args(&mut self, m: &Matrix, args: &[Expr]) -> R<Vec<Sel>> {
-        if args.is_empty() || args.len() > 2 {
+    /// The `n` values the right-hand side of `[a, b, ...] = rhs` supplies.
+    ///
+    /// A call is asked for `n` values and must produce at least that many;
+    /// a builtin that produces fewer, such as `sum`, is "Too many output
+    /// arguments." Any other expression is one value, which satisfies a
+    /// single target and is "Insufficient number of outputs ..." for more.
+    /// The expression is evaluated either way, so an error inside it is
+    /// reported first.
+    fn eval_outputs(&mut self, e: &Expr, n: usize) -> R<Vec<Value>> {
+        let values = match self.call_form(e) {
+            Some((name, args)) => {
+                let a = self.eval_args(args)?;
+                self.call_builtin(name, a, n)?
+            }
+            None => {
+                let v = self.eval(e)?;
+                if n > 1 {
+                    bail!(error::insufficient_outputs());
+                }
+                vec![v]
+            }
+        };
+        if values.len() < n {
+            bail!(error::too_many_outputs());
+        }
+        Ok(values)
+    }
+
+    /// Shows a variable under its own name, after an assignment to it.
+    fn show_var(&mut self, name: &str) -> R<()> {
+        let shown = match self.vars.get(name) {
+            Some(v) => v.display(name),
+            None => return Ok(()),
+        };
+        self.emit(&shown)
+    }
+
+    /// `name` followed by its access chain.
+    ///
+    /// On a variable the first link is applied to the variable where it is
+    /// stored, so `x(k)` in a loop reads one element rather than copying `x`.
+    /// A name that is not a variable is a call: its first `(...)` is the
+    /// argument list, and a call with no parentheses takes no arguments.
+    /// Every link after the first applies to the value so far.
+    fn eval_access(&mut self, name: &str, chain: &[Access]) -> R<Value> {
+        let Some((first, rest)) = chain.split_first() else {
+            return self.eval_node(&Expr::Ident(name.to_string()));
+        };
+        let mut v = if self.vars.contains_key(name) {
+            match first {
+                Access::Paren(args) => self.index_var(name, args)?,
+                other => bail!(container_access(other)),
+            }
+        } else {
+            match first {
+                Access::Paren(args) => {
+                    let a = self.eval_args(args)?;
+                    self.call_for_value(name, a)?
+                }
+                other => {
+                    let v = self.call_for_value(name, vec![])?;
+                    self.apply_access(v, other)?
+                }
+            }
+        };
+        for a in rest {
+            v = self.apply_access(v, a)?;
+        }
+        Ok(v)
+    }
+
+    /// One link of a chain applied to a value. A matrix has only `(...)`;
+    /// braces and fields are cycle 07's containers.
+    fn apply_access(&mut self, v: Value, a: &Access) -> R<Value> {
+        match a {
+            Access::Paren(args) => {
+                let m = v.into_mat();
+                let sel = self.eval_index_args(m.rows, m.cols, args)?;
+                let g = resolve_read(m.rows, m.cols, &sel)?;
+                Ok(Value::Mat(gather(&m, &g)))
+            }
+            other => Err(container_access(other)),
+        }
+    }
+
+    /// `name(args)` of a variable, read where the variable is stored.
+    ///
+    /// The subscripts are evaluated first, knowing only the variable's
+    /// shape, because they need `&mut self`; the variable is looked up again
+    /// afterwards rather than borrowed across them. A subscript that clears
+    /// it (`x(clear('x'))`) therefore finds it gone instead of reading freed
+    /// storage, and one that could change its shape is judged against the
+    /// shape it has now.
+    fn index_var(&mut self, name: &str, args: &[Expr]) -> R<Value> {
+        let (rows, cols) = match self.vars.get(name) {
+            Some(v) => (v.mat().rows, v.mat().cols),
+            None => return Err(error::undefined(name)),
+        };
+        let sel = self.eval_index_args(rows, cols, args)?;
+        let m = match self.vars.get(name) {
+            Some(v) => v.mat(),
+            None => return Err(error::undefined(name)),
+        };
+        // Indexing keeps the class, so `s(2)` of a char is a char and `s(:)`
+        // is a char column (QA D17).
+        let g = resolve_read(m.rows, m.cols, &sel)?;
+        Ok(Value::Mat(gather(m, &g)))
+    }
+
+    /// Evaluates the subscripts of an index into an array of `rows x cols`.
+    ///
+    /// **Invariant 2: this is the one place a one-based subscript becomes
+    /// zero-based.** Everything downstream of it, reading, assignment and
+    /// deletion alike, works on the [`Sel`]s it returns.
+    ///
+    /// `end` is the number of elements for a single subscript, the rows and
+    /// the columns in the first two positions of several, and `1` in any
+    /// position after those: a matrix has a trailing singleton dimension in
+    /// every position past the second (QA D22).
+    ///
+    /// A logical subscript is a mask, never a list of positions (QA D6): it
+    /// selects the positions `find(mask)` would return, in the shape `find`
+    /// would give them, so `x(x > 0)` of `[5 6 7]` is `5 6 7`. A mask shorter
+    /// than the array selects among the elements it covers, and a `true`
+    /// past the end is a position past the end, for the reader or the writer
+    /// to judge.
+    fn eval_index_args(&mut self, rows: usize, cols: usize, args: &[Expr]) -> R<Vec<Sel>> {
+        if args.is_empty() {
             bail!(error::indexing_rank());
         }
         let mut out = Vec::with_capacity(args.len());
@@ -474,123 +714,115 @@ impl Interp {
                 out.push(Sel::All);
                 continue;
             }
-            let end_val = if args.len() == 1 {
-                m.numel()
-            } else if k == 0 {
-                m.rows
-            } else {
-                m.cols
+            let end_val = match (args.len(), k) {
+                (1, _) => rows * cols,
+                (_, 0) => rows,
+                (_, 1) => cols,
+                _ => 1,
             };
             self.end_stack.push(end_val);
             let v = self.eval_mat(a);
             self.end_stack.pop();
             let v = v?;
-            // A mask such as `x > 0` must never be read as a list of
-            // positions, which made `x(x > 0)` give `5 5 5` (QA D6). Cycle 03
-            // replaces this refusal with logical indexing itself.
-            if v.class == Class::Logical {
-                bail!(error::logical_indexing_unsupported());
-            }
-            let mut idx = Vec::with_capacity(v.numel());
-            for x in &v.data {
-                if x.fract() != 0.0 || *x < 1.0 {
-                    bail!(error::index_not_positive_integer(k + 1));
-                }
-                idx.push(*x as usize - 1);
-            }
-            out.push(Sel::List(idx, v.rows, v.cols));
+            out.push(if v.class == Class::Logical {
+                mask_positions(&v)
+            } else {
+                index_positions(&v, k + 1)?
+            });
         }
         Ok(out)
     }
 
+    /// Assigns `v` to a target, whatever its chain.
+    fn assign_to(&mut self, target: &LValue, v: Value) -> R<()> {
+        match target.chain.as_slice() {
+            [] => {
+                self.vars.insert(target.name.clone(), v);
+                Ok(())
+            }
+            [Access::Paren(args)] => self.assign_index(&target.name, args, v),
+            // A brace or a field anywhere in the chain is a container's,
+            // which a matrix is not; the first one says which. What is left
+            // is `x(1)(2) = v`, which MATLAB does not allow either.
+            chain => match chain.iter().find(|a| !matches!(a, Access::Paren(_))) {
+                Some(a) => Err(container_access(a)),
+                None => Err(error::invalid_assignment_target()),
+            },
+        }
+    }
+
+    /// The variable an indexed assignment or a deletion changes, where it is
+    /// stored, created as `[]` if it does not exist yet. Looked up by `&str`
+    /// so that the common case, an existing variable, allocates nothing.
+    fn target_mut(&mut self, name: &str) -> &mut Matrix {
+        if !self.vars.contains_key(name) {
+            self.vars
+                .insert(name.to_string(), Value::Mat(Matrix::empty()));
+        }
+        match self.vars.get_mut(name) {
+            Some(Value::Mat(m)) => m,
+            None => unreachable!("inserted above"),
+        }
+    }
+
+    /// `name(args) = rhs`, in place.
+    ///
+    /// Everything that can fail is done first: the subscripts, the class
+    /// conversion of the right-hand side, the growth and its size check, and
+    /// the element count. Only then is the variable's storage touched, and it
+    /// is changed where it lies, never cloned. Growth along the last
+    /// dimension (a row gaining columns, a column gaining rows, a matrix
+    /// gaining columns) keeps the column-major layout, so it is a `resize`
+    /// of the storage, which `Vec` amortises: `z(end+1) = k` in a loop is
+    /// linear overall, not quadratic.
     fn assign_index(&mut self, name: &str, args: &[Expr], rhs: Value) -> R<()> {
         let rhs = rhs.into_mat();
-        if rhs.is_empty() {
-            bail!(error::deletion_unsupported());
-        }
         // The left-hand side keeps its class, so `s(1) = 'X'` of a char stays
         // a char and `y(2) = 'a'` of a double stores `97`. A variable that
         // does not exist yet, or is the 0x0 double `[]`, takes the class of
         // what is assigned into it, which is how `s = []; s(1) = 'a'` builds
         // a char.
-        let mut m = match self.vars.get(name) {
-            Some(v) => v.clone().into_mat(),
-            None => Matrix::empty(),
+        let (rows, cols, class) = match self.vars.get(name) {
+            Some(v) => (v.mat().rows, v.mat().cols, v.mat().class),
+            None => (0, 0, Class::Double),
         };
-        if m.class == Class::Double && m.rows == 0 && m.cols == 0 {
-            m.class = rhs.class;
-        }
-        let rhs = rhs.to_class(m.class)?;
-        let sel = self.eval_index_args(&m, args)?;
-        if sel.len() == 1 {
-            let idx: Vec<usize> = match &sel[0] {
-                Sel::All => (0..m.numel()).collect(),
-                Sel::List(i, _, _) => i.clone(),
-            };
-            let need = idx.iter().copied().max().map_or(0, |x| x + 1);
-            if need > m.numel() {
-                crate::builtins::args::check_size(1, need)?;
-                if m.is_empty() {
-                    m = Matrix::filled(1, need, 0.0).with_class(m.class);
-                } else if m.rows == 1 {
-                    m.data.resize(need, 0.0);
-                    m.cols = need;
-                } else if m.cols == 1 {
-                    m.data.resize(need, 0.0);
-                    m.rows = need;
-                } else {
-                    bail!(error::ambiguous_growth());
-                }
-            }
-            if !rhs.is_scalar() && rhs.numel() != idx.len() {
-                bail!(error::assignment_size(idx.len(), rhs.numel()));
-            }
-            for (n, &k) in idx.iter().enumerate() {
-                m.data[k] = if rhs.is_scalar() {
-                    rhs.data[0]
-                } else {
-                    rhs.data[n]
-                };
-            }
+        let class = if class == Class::Double && rows == 0 && cols == 0 {
+            rhs.class
         } else {
-            let rows: Vec<usize> = match &sel[0] {
-                Sel::All => (0..if m.rows == 0 { rhs.rows } else { m.rows }).collect(),
-                Sel::List(i, _, _) => i.clone(),
-            };
-            let cols: Vec<usize> = match &sel[1] {
-                Sel::All => (0..if m.cols == 0 { rhs.cols } else { m.cols }).collect(),
-                Sel::List(i, _, _) => i.clone(),
-            };
-            let nr = rows.iter().max().map_or(m.rows, |x| (x + 1).max(m.rows));
-            let nc = cols.iter().max().map_or(m.cols, |x| (x + 1).max(m.cols));
-            if nr != m.rows || nc != m.cols {
-                crate::builtins::args::check_size(nr, nc)?;
-                let mut grown = Matrix::filled(nr, nc, 0.0).with_class(m.class);
-                for c in 0..m.cols {
-                    for r in 0..m.rows {
-                        grown.set(r, c, m.get(r, c));
-                    }
-                }
-                m = grown;
-            }
-            let count = rows.len() * cols.len();
-            if !rhs.is_scalar() && rhs.numel() != count {
-                bail!(error::assignment_size(count, rhs.numel()));
-            }
-            let mut n = 0;
-            for &c in &cols {
-                for &r in &rows {
-                    let v = if rhs.is_scalar() {
-                        rhs.data[0]
-                    } else {
-                        rhs.data[n]
-                    };
-                    m.set(r, c, v);
-                    n += 1;
-                }
-            }
-        }
-        self.vars.insert(name.to_string(), Value::Mat(m));
+            class
+        };
+        let rhs = rhs.to_class(class)?;
+        let sel = self.eval_index_args(rows, cols, args)?;
+        // Judged against the shape the variable has now; see `index_var`.
+        let (rows, cols) = match self.vars.get(name) {
+            Some(v) => (v.mat().rows, v.mat().cols),
+            None => (0, 0),
+        };
+        let plan = resolve_write(rows, cols, &sel, &rhs)?;
+        let m = self.target_mut(name);
+        m.class = class;
+        scatter(m, &plan, &rhs);
+        Ok(())
+    }
+
+    /// `name(args) = []`: deletes elements, rows or columns, keeping the
+    /// class. Checked in full before the variable changes.
+    fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
+        let (rows, cols) = match self.vars.get(name) {
+            Some(v) => (v.mat().rows, v.mat().cols),
+            None => (0, 0),
+        };
+        let sel = self.eval_index_args(rows, cols, args)?;
+        let (rows, cols) = match self.vars.get(name) {
+            Some(v) => (v.mat().rows, v.mat().cols),
+            None => (0, 0),
+        };
+        let keep = resolve_delete(rows, cols, &sel)?;
+        let m = self.target_mut(name);
+        let data: Vec<f64> = keep.pos.iter().map(|&p| m.data[p]).collect();
+        m.data = data;
+        m.rows = keep.rows;
+        m.cols = keep.cols;
         Ok(())
     }
 
@@ -725,26 +957,130 @@ fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
     Ok(result)
 }
 
-/// `m(sel)`, keeping `m`'s class.
-fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
-    Ok(index_values(m, sel)?.with_class(m.class))
+// ---- index resolution ------------------------------------------------
+//
+// Reading, assignment and deletion share one pipeline: `eval_index_args`
+// turns the subscripts into zero-based `Sel`s, a `resolve_*` function judges
+// them against the array's shape and says which positions are involved and
+// what shape results, and `gather`, `scatter` or the deletion carry that out.
+// The `resolve_*` functions change nothing, which is what lets an assignment
+// validate everything before it touches the target.
+
+/// The error for a brace or field access on a matrix.
+fn container_access(a: &Access) -> error::MError {
+    match a {
+        Access::Brace(_) => error::brace_indexing_unsupported(),
+        _ => error::dot_indexing_unsupported(),
+    }
 }
 
-fn index_values(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
-    if sel.len() == 1 {
-        match &sel[0] {
-            Sel::All => Ok(Matrix::col(m.data.clone())),
-            Sel::List(idx, ir, ic) => {
-                let mut data = Vec::with_capacity(idx.len());
-                for &k in idx {
-                    if k >= m.numel() {
-                        bail!(error::index_exceeds_numel(m.numel()));
-                    }
-                    data.push(m.data[k]);
+/// The deletion form: the right-hand side is the literal `[]` (or `[ ]`, or
+/// any bracket with no elements), written as such. An empty value that
+/// arrives any other way, `e = []; x(2) = e`, is an ordinary assignment and
+/// must match the element count, as in MATLAB.
+fn is_deletion(e: &Expr) -> bool {
+    matches!(e, Expr::Matrix(rows) if rows.is_empty())
+}
+
+/// A logical subscript: the positions of its `true` elements, shaped as
+/// `find(mask)` would shape them. A row mask gives a row, a `0x0` mask a
+/// `0x0`, and any other mask a column.
+fn mask_positions(v: &Matrix) -> Sel {
+    let idx: Vec<usize> = v
+        .data
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| **x != 0.0)
+        .map(|(i, _)| i)
+        .collect();
+    let max = idx.last().map_or(0.0, |&k| k as f64 + 1.0);
+    let n = idx.len();
+    let (rows, cols) = if v.rows == 0 && v.cols == 0 {
+        (0, 0)
+    } else if v.rows == 1 {
+        (1, n)
+    } else {
+        (n, 1)
+    };
+    Sel::List {
+        idx,
+        rows,
+        cols,
+        max,
+    }
+}
+
+/// A numeric (or char) subscript in position `pos`: each element must be a
+/// positive integer. It becomes zero-based here; a position past `usize`
+/// saturates, and `max` keeps it exactly for growth to name.
+fn index_positions(v: &Matrix, pos: usize) -> R<Sel> {
+    let mut idx = Vec::with_capacity(v.numel());
+    let mut max = 0.0f64;
+    for &x in &v.data {
+        if x.fract() != 0.0 || x < 1.0 {
+            bail!(error::index_not_positive_integer(pos));
+        }
+        max = max.max(x);
+        idx.push(x as usize - 1);
+    }
+    Ok(Sel::List {
+        idx,
+        rows: v.rows,
+        cols: v.cols,
+        max,
+    })
+}
+
+/// The subscripts past the second, which index trailing singleton
+/// dimensions. Each must select position 1 exactly once: `:`, `1`, `end` or
+/// a mask `true`. A position past 1 is the ordinary bounds error when
+/// reading; `grows` says the caller is assigning, where it would need an N-D
+/// array, as would selecting position 1 twice or not at all.
+fn check_trailing(sel: &[Sel], grows: bool) -> R<()> {
+    for (k, s) in sel.iter().enumerate().skip(2) {
+        if let Sel::List { idx, .. } = s {
+            if idx.iter().any(|&i| i > 0) {
+                if grows {
+                    bail!(error::nd_unsupported());
                 }
-                // Vector indexed by a vector keeps the source orientation.
-                let (rows, cols) = if m.is_vector() && (*ir == 1 || *ic == 1) {
-                    if m.rows == 1 {
+                bail!(error::index_exceeds_bound(k + 1, 1));
+            }
+            if idx.len() != 1 {
+                bail!(error::nd_unsupported());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Which elements `m(sel)` reads from an array of `rows x cols`, and the
+/// shape of the result. Every position is bounds-checked here.
+///
+/// One subscript is linear: a vector indexed by a vector keeps the source's
+/// orientation, anything else takes the shape of the index, and `:` is a
+/// column. Two or more are rows by columns, with the result's size judged by
+/// `check_shape` before anything is allocated.
+fn resolve_read(rows: usize, cols: usize, sel: &[Sel]) -> R<Gather> {
+    let numel = rows * cols;
+    if let [one] = sel {
+        return match one {
+            Sel::All => Ok(Gather {
+                pos: (0..numel).collect(),
+                rows: numel,
+                cols: 1,
+            }),
+            Sel::List {
+                idx,
+                rows: ir,
+                cols: ic,
+                ..
+            } => {
+                if idx.iter().any(|&k| k >= numel) {
+                    bail!(error::index_exceeds_numel(numel));
+                }
+                let is_vector = rows == 1 || cols == 1;
+                let (r, c) = if is_vector && (*ir == 1 || *ic == 1) {
+                    if rows == 1 {
                         (1, idx.len())
                     } else {
                         (idx.len(), 1)
@@ -752,38 +1088,241 @@ fn index_values(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
                 } else {
                     (*ir, *ic)
                 };
-                Ok(Matrix::new(rows, cols, data))
+                Ok(Gather {
+                    pos: idx.clone(),
+                    rows: r,
+                    cols: c,
+                })
             }
+        };
+    }
+    if let Sel::List { idx, .. } = &sel[0] {
+        if idx.iter().any(|&r| r >= rows) {
+            bail!(error::index_exceeds_bound(1, rows));
+        }
+    }
+    if let Sel::List { idx, .. } = &sel[1] {
+        if idx.iter().any(|&c| c >= cols) {
+            bail!(error::index_exceeds_bound(2, cols));
+        }
+    }
+    check_trailing(sel, false)?;
+    // A read of several subscripts sizes its result from the subscripts, not
+    // from the array: `A(ones(1, 1e5), ones(1, 1e5))` asks for 1e10 elements
+    // out of a 2x2 `A`. The bounds tests come first, so an out-of-range
+    // subscript is still reported as one.
+    let (nr, nc) = (sel[0].count(rows), sel[1].count(cols));
+    crate::builtins::args::check_shape(nr as f64, nc as f64)?;
+    let (rs, cs) = (sel[0].positions(rows), sel[1].positions(cols));
+    let mut pos = Vec::with_capacity(nr * nc);
+    for &c in &cs {
+        for &r in &rs {
+            pos.push(c * rows + r);
+        }
+    }
+    Ok(Gather {
+        pos,
+        rows: nr,
+        cols: nc,
+    })
+}
+
+/// Carries out a read, keeping the source's class.
+fn gather(m: &Matrix, g: &Gather) -> Matrix {
+    let data = g.pos.iter().map(|&p| m.data[p]).collect();
+    Matrix::new(g.rows, g.cols, data).with_class(m.class)
+}
+
+/// Where `m(sel) = rhs` stores into an array of `rows x cols`, and the shape
+/// the array grows to. Nothing is changed; see `scatter`.
+///
+/// A position past the end grows the array: a single subscript grows a
+/// vector along its length (an empty becomes a row) and cannot grow a matrix
+/// at all; two subscripts grow either dimension. The grown size stays an
+/// `f64` until `check_shape` has judged it, so `x = []; x(1e300) = 1` names
+/// `1x1e+300` rather than the `usize` it would have saturated to. The
+/// right-hand side is a scalar, which fills every position, or has exactly
+/// one element per position.
+fn resolve_write(rows: usize, cols: usize, sel: &[Sel], rhs: &Matrix) -> R<Scatter> {
+    let numel = rows * cols;
+    let (nr, nc, pos) = if let [one] = sel {
+        let need = one.extent(numel);
+        let (nr, nc) = if need <= numel as f64 {
+            (rows, cols)
+        } else {
+            let (r, c) = if numel == 0 || rows == 1 {
+                (1.0, need)
+            } else if cols == 1 {
+                (need, 1.0)
+            } else {
+                bail!(error::ambiguous_growth());
+            };
+            crate::builtins::args::check_shape(r, c)?
+        };
+        (nr, nc, one.positions(numel))
+    } else {
+        check_trailing(sel, true)?;
+        // A colon over a dimension the target does not have yet takes the
+        // right-hand side's extent: `A = []; A(:, 1) = [1; 2]` is 2x1.
+        let span = |s: &Sel, have: usize, theirs: usize| match s {
+            Sel::All if have == 0 => theirs,
+            _ => have,
+        };
+        let (rspan, cspan) = (span(&sel[0], rows, rhs.rows), span(&sel[1], cols, rhs.cols));
+        let r = sel[0].extent(rspan).max(rows as f64);
+        let c = sel[1].extent(cspan).max(cols as f64);
+        let (nr, nc) = crate::builtins::args::check_shape(r, c)?;
+        let (rs, cs) = (sel[0].positions(rspan), sel[1].positions(cspan));
+        let mut pos = Vec::with_capacity(rs.len() * cs.len());
+        for &c in &cs {
+            for &r in &rs {
+                pos.push(c * nr + r);
+            }
+        }
+        (nr, nc, pos)
+    };
+    if !rhs.is_scalar() && rhs.numel() != pos.len() {
+        bail!(error::assignment_size(pos.len(), rhs.numel()));
+    }
+    Ok(Scatter {
+        rows: nr,
+        cols: nc,
+        pos,
+    })
+}
+
+/// Carries out a write planned by `resolve_write`, growing `m` in place.
+///
+/// When the growth keeps every existing element at its linear position (the
+/// row count is unchanged, or a column grows longer, or there was nothing to
+/// keep), the storage is resized where it lies; otherwise the elements move
+/// to their new column-major positions. New elements are zero, which for a
+/// char is the code unit 0.
+fn scatter(m: &mut Matrix, plan: &Scatter, rhs: &Matrix) {
+    let (nr, nc) = (plan.rows, plan.cols);
+    if (nr, nc) != (m.rows, m.cols) {
+        let in_place = m.rows == nr || m.data.is_empty() || (m.cols == 1 && nc == 1);
+        if in_place {
+            m.data.resize(nr * nc, 0.0);
+        } else {
+            let mut data = vec![0.0; nr * nc];
+            for c in 0..m.cols {
+                data[c * nr..c * nr + m.rows]
+                    .copy_from_slice(&m.data[c * m.rows..(c + 1) * m.rows]);
+            }
+            m.data = data;
+        }
+        m.rows = nr;
+        m.cols = nc;
+    }
+    if rhs.is_scalar() {
+        let v = rhs.data[0];
+        for &p in &plan.pos {
+            m.data[p] = v;
         }
     } else {
-        let rows: Vec<usize> = match &sel[0] {
-            Sel::All => (0..m.rows).collect(),
-            Sel::List(i, _, _) => i.clone(),
-        };
-        let cols: Vec<usize> = match &sel[1] {
-            Sel::All => (0..m.cols).collect(),
-            Sel::List(i, _, _) => i.clone(),
-        };
-        if rows.iter().any(|r| *r >= m.rows) {
-            bail!(error::index_exceeds_bound(1, m.rows));
+        for (&p, &v) in plan.pos.iter().zip(&rhs.data) {
+            m.data[p] = v;
         }
-        if cols.iter().any(|c| *c >= m.cols) {
-            bail!(error::index_exceeds_bound(2, m.cols));
+    }
+}
+
+/// What `m(sel) = []` leaves of an array of `rows x cols`.
+///
+/// One subscript deletes elements by linear position: a vector keeps its
+/// orientation, a matrix becomes a row, and `x(:) = []` leaves a 0x0. With
+/// two or more, at most one of the first two may select part of its
+/// dimension; a subscript that selects all of it (`:`, `1:end`) counts as a
+/// colon, and that one removes whole rows or columns. Every subscript past
+/// the second must be a colon too, as a singleton it can only select all of.
+/// A deletion that removes nothing leaves the array as it is.
+fn resolve_delete(rows: usize, cols: usize, sel: &[Sel]) -> R<Keep> {
+    let numel = rows * cols;
+    let unchanged = || Keep {
+        pos: (0..numel).collect(),
+        rows,
+        cols,
+    };
+    if let [one] = sel {
+        let Sel::List { idx, .. } = one else {
+            return Ok(Keep {
+                pos: Vec::new(),
+                rows: 0,
+                cols: 0,
+            });
+        };
+        if idx.iter().any(|&k| k >= numel) {
+            bail!(error::index_exceeds_numel(numel));
         }
-        // A two-subscript read sizes its result from the subscripts, not from
-        // the array: `A(ones(1, 1e5), ones(1, 1e5))` asks for 1e10 elements
-        // out of a 2x2 `A`, and used to abort in the allocator on the
-        // `with_capacity` below. The bounds tests come first, so an
-        // out-of-range subscript is still reported as one.
-        crate::builtins::args::check_shape(rows.len() as f64, cols.len() as f64)?;
-        let mut data = Vec::with_capacity(rows.len() * cols.len());
-        for &c in &cols {
-            for &r in &rows {
-                data.push(m.get(r, c));
+        let mut gone = vec![false; numel];
+        for &k in idx {
+            gone[k] = true;
+        }
+        let pos: Vec<usize> = (0..numel).filter(|&k| !gone[k]).collect();
+        if pos.len() == numel {
+            return Ok(unchanged());
+        }
+        let n = pos.len();
+        let (r, c) = if cols == 1 && rows != 1 {
+            (n, 1)
+        } else {
+            (1, n)
+        };
+        return Ok(Keep {
+            pos,
+            rows: r,
+            cols: c,
+        });
+    }
+    for (k, (s, n)) in sel.iter().zip([rows, cols]).enumerate() {
+        if let Sel::List { idx, .. } = s {
+            if idx.iter().any(|&i| i >= n) {
+                bail!(error::index_exceeds_bound(k + 1, n));
             }
         }
-        Ok(Matrix::new(rows.len(), cols.len(), data))
     }
+    for (k, s) in sel.iter().enumerate().skip(2) {
+        if let Sel::List { idx, .. } = s {
+            if idx.iter().any(|&i| i > 0) {
+                bail!(error::index_exceeds_bound(k + 1, 1));
+            }
+            if !s.covers(1) {
+                bail!(error::null_assignment_indices());
+            }
+        }
+    }
+    let (row_all, col_all) = (sel[0].covers(rows), sel[1].covers(cols));
+    // The dimension that loses something: the one subscript that is not a
+    // colon, or, when both select everything, the one written as a list, or
+    // the rows when both are `:`.
+    let by_cols = match (row_all, col_all) {
+        (false, false) => bail!(error::null_assignment_indices()),
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => matches!(sel[1], Sel::List { .. }),
+    };
+    let (dim_sel, n) = if by_cols {
+        (&sel[1], cols)
+    } else {
+        (&sel[0], rows)
+    };
+    let mut gone = vec![false; n];
+    for k in dim_sel.positions(n) {
+        gone[k] = true;
+    }
+    if !gone.iter().any(|&g| g) {
+        return Ok(unchanged());
+    }
+    let left = gone.iter().filter(|&&g| !g).count();
+    let pos: Vec<usize> = (0..numel)
+        .filter(|&p| !gone[if by_cols { p / rows } else { p % rows }])
+        .collect();
+    let (r, c) = if by_cols { (rows, left) } else { (left, cols) };
+    Ok(Keep {
+        pos,
+        rows: r,
+        cols: c,
+    })
 }
 
 /// The class of a concatenation: `Char` if any operand is a char, else
@@ -1394,19 +1933,20 @@ mod tests {
         let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
         // 20000 squared is past the 2^28-element cap; every subscript is 1,
         // so the 2x2 source is never the problem.
-        let big = || Sel::List(vec![0; 20_000], 1, 20_000);
-        let e = index_read(&a, &[big(), big()]).unwrap_err().msg;
+        let read = |sel: &[Sel]| resolve_read(a.rows, a.cols, sel).map(|g| gather(&a, &g));
+        let big = || Sel::row(vec![0; 20_000]);
+        let e = read(&[big(), big()]).unwrap_err().msg;
         assert_eq!(
             e,
             "Requested 20000x20000 array exceeds the maximum array size."
         );
         // An out-of-range subscript is still reported as one: the bounds
         // tests come before the size guard.
-        let out = Sel::List(vec![5; 20_000], 1, 20_000);
-        let e = index_read(&a, &[out, big()]).unwrap_err().msg;
+        let out = Sel::row(vec![5; 20_000]);
+        let e = read(&[out, big()]).unwrap_err().msg;
         assert!(e.contains("exceeds array bounds"), "{e}");
         // A result that fits is unaffected.
-        let ok = index_read(&a, &[Sel::List(vec![0], 1, 1), Sel::All]).unwrap();
+        let ok = read(&[Sel::row(vec![0]), Sel::All]).unwrap();
         assert_eq!(ok.data, [1.0, 2.0]);
     }
 
@@ -1472,8 +2012,11 @@ mod tests {
             err_msg("zeros(1e300)"),
             "Requested 1e+300x1e+300 array exceeds the maximum array size."
         );
-        // Indexed growth is cycle 03's, and still names the clamp.
-        assert!(err_msg("x = []; x(1e300) = 1;").contains("18446744073709551615"));
+        // Indexed growth names it as asked too, since cycle 03.
+        assert_eq!(
+            err_msg("x = []; x(1e300) = 1;"),
+            "Requested 1x1e+300 array exceeds the maximum array size."
+        );
     }
 
     #[test]
@@ -1909,28 +2452,571 @@ mod tests {
         );
     }
 
-    /// QA D6: an index of class logical is refused, reading and assigning,
-    /// rather than read as positions. Cycle 03 implements it.
+    // ---- logical indexing (cycle 03) ---------------------------------
+
+    /// A mask as `find(mask)` would read it: positions, zero-based, shaped
+    /// as `find` shapes them.
     #[test]
-    fn a_logical_index_is_refused_until_cycle_03() {
-        let want = "Logical indexing is not supported yet.";
-        for src in [
-            "x = [5 6 7]; x(x > 0)",
-            "x = [5 6 7]; y = x(x > 5);",
-            "x = [5 6 7]; x(x > 0) = 0;",
-            "x = [5 6 7]; x(true)",
-            "A = [1 2; 3 4]; A(1, [true false])",
-            "A = [1 2; 3 4]; A(true, 1) = 9;",
-            "x = [5 6 7]; x(isnan(x))",
-        ] {
-            assert_eq!(err_msg(src), want, "{src}");
-        }
-        // A double of ones and zeros is still a list of positions, and a
-        // char index is its codes, as in MATLAB.
+    fn a_mask_resolves_to_the_positions_find_would_give() {
+        let row = Matrix::row(vec![0.0, 1.0, 1.0]).with_class(Class::Logical);
+        assert_eq!(
+            mask_positions(&row),
+            Sel::List {
+                idx: vec![1, 2],
+                rows: 1,
+                cols: 2,
+                max: 3.0
+            }
+        );
+        let col = Matrix::col(vec![1.0, 0.0, 1.0]).with_class(Class::Logical);
+        assert_eq!(
+            mask_positions(&col),
+            Sel::List {
+                idx: vec![0, 2],
+                rows: 2,
+                cols: 1,
+                max: 3.0
+            }
+        );
+        // A matrix mask gives a column; a 0x0 mask a 0x0; no trues, nothing.
+        let sq = rmat(2, 2, &[1.0, 0.0, 0.0, 1.0]).with_class(Class::Logical);
+        assert_eq!(
+            mask_positions(&sq),
+            Sel::List {
+                idx: vec![0, 3],
+                rows: 2,
+                cols: 1,
+                max: 4.0
+            }
+        );
+        let none = Matrix::empty().with_class(Class::Logical);
+        assert_eq!(
+            mask_positions(&none),
+            Sel::List {
+                idx: vec![],
+                rows: 0,
+                cols: 0,
+                max: 0.0
+            }
+        );
+        let falses = Matrix::row(vec![0.0, 0.0]).with_class(Class::Logical);
+        assert_eq!(
+            mask_positions(&falses),
+            Sel::List {
+                idx: vec![],
+                rows: 1,
+                cols: 0,
+                max: 0.0
+            }
+        );
+    }
+
+    /// Acceptance tests 1, 2, 3 and 16 (QA D6): a mask is a mask, including
+    /// one with no zeros, which used to read as the position 1 three times.
+    #[test]
+    fn a_logical_index_selects_by_mask() {
+        assert_eq!(
+            ok_out("x = [5 3 8 1]; disp(x(x > 2))"),
+            "     5     3     8\n"
+        );
+        assert_eq!(
+            ok_out("x = 1:6; x(x > 4) = 0; disp(x)"),
+            "     1     2     3     4     0     0\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2 3; 4 5 6; 7 8 9]; disp(A(A > 5)')"),
+            "     7     8     6     9\n"
+        );
+        assert_eq!(
+            ok_out("x = [5 6 7]; disp(x(x > 0)); x(x > 0) = 0; disp(x)"),
+            "     5     6     7\n     0     0     0\n"
+        );
+        // A double of ones is still a list of positions, and a char index is
+        // its codes, as in MATLAB.
         assert_eq!(ok_out("x = [5 6 7]; disp(x([1 1]))"), "     5     5\n");
         assert_eq!(
             ok_out("x = [5 6 7]; disp(x(double(x > 5) + 1))"),
             "     5     6     6\n"
+        );
+        // The mask of a column vector reads a column, and a mask with no
+        // trues reads an empty of the vector's orientation.
+        assert_eq!(ok_out("c = [4; 5; 6]; disp(c(c ~= 5))"), "     4\n     6\n");
+        assert_eq!(
+            ok_out("x = [5 6 7]; disp(size(x(x > 9)))"),
+            "     1     0\n"
+        );
+        // Reading keeps the source's class, and a mask of a char is a char.
+        assert_eq!(ok_out("s = 'abcd'; disp(s(s ~= 'b'))"), "acd\n");
+    }
+
+    /// Acceptance test 19: a short mask selects among what it covers; a
+    /// `true` past the end grows the array on assignment.
+    #[test]
+    fn a_mask_shorter_or_longer_than_the_array() {
+        assert_eq!(
+            ok_out("x = [10 20 30]; disp(x(logical([1 0])))"),
+            "    10\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; disp(A(logical([1 0 0 1])))"),
+            "     1     4\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; disp(A(logical([1 0; 0 1])))"),
+            "     1\n     4\n"
+        );
+        assert_eq!(
+            ok_out("y = [1 2]; y(logical([0 0 1])) = 9; disp(y)"),
+            "     1     2     9\n"
+        );
+        // Falses past the end are harmless; a true past the end is the
+        // out-of-bounds error on read, as the position would be.
+        assert_eq!(
+            ok_out("x = [10 20]; disp(x(logical([0 1 0 0])))"),
+            "    20\n"
+        );
+        assert_eq!(
+            err_msg("x = [10 20]; x(logical([0 0 1]))"),
+            "Index exceeds the number of array elements. Index must not exceed 2."
+        );
+    }
+
+    #[test]
+    fn a_mask_works_in_either_subscript_of_two() {
+        assert_eq!(
+            ok_out("A = [1 2; 3 4; 5 6]; disp(A(A(:, 1) > 1, :))"),
+            "     3     4\n     5     6\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; disp(A(:, logical([0 1])))"),
+            "     2\n     4\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; A(logical([1 0]), :) = 0; disp(A)"),
+            "     0     0\n     3     4\n"
+        );
+        let e = err_msg("A = [1 2; 3 4]; A(logical([0 0 1]), 1)");
+        assert_eq!(
+            e,
+            "Index in position 1 exceeds array bounds. Index must not exceed 2."
+        );
+    }
+
+    /// Acceptance test 11: the invalid-index message has MATLAB's ending.
+    #[test]
+    fn an_invalid_index_names_logical_values() {
+        let want = "Index in position 1 is invalid. Array indices must be positive \
+                    integers or logical values.";
+        assert_eq!(err_msg("x = 1:5; x(0)"), want);
+        assert_eq!(err_msg("x = 1:5; x(1.5)"), want);
+        assert_eq!(err_msg("x = 1:5; x(-1) = 2;"), want);
+        assert_eq!(err_msg("x = 1:5; x(NaN)"), want);
+        assert_eq!(
+            err_msg("A = eye(2); A(1, 0)"),
+            "Index in position 2 is invalid. Array indices must be positive \
+             integers or logical values."
+        );
+    }
+
+    // ---- deletion ----------------------------------------------------
+
+    /// Acceptance tests 4, 5 and 6.
+    #[test]
+    fn deletion_follows_matlabs_shape_rules() {
+        assert_eq!(
+            ok_out("x = 1:5; x(2) = []; disp(x); x(logical([1 0 1 0])) = []; disp(x)"),
+            "     1     3     4     5\n     3     5\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2 3; 4 5 6]; A(:, 2) = []; disp(A); A(1, :) = []; disp(A)"),
+            "     1     3\n     4     6\n     4     6\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; A(2) = []; disp(size(A))"),
+            "     1     3\n"
+        );
+        assert_eq!(
+            err_msg("A = [1 2; 3 4]; A(1, 2) = []"),
+            "A null assignment can have only one non-colon index."
+        );
+        // A column keeps its orientation; `x(:) = []` leaves a 0x0.
+        assert_eq!(
+            ok_out("c = [1; 2; 3]; c(1) = []; disp(size(c))"),
+            "     2     1\n"
+        );
+        assert_eq!(
+            ok_out("x = 1:3; x(:) = []; disp(size(x))"),
+            "     0     0\n"
+        );
+        // A subscript that spans its whole dimension counts as a colon.
+        assert_eq!(
+            ok_out("A = [1 2 3; 4 5 6]; A(1:end, [1 3]) = []; disp(A)"),
+            "     2\n     5\n"
+        );
+        // Deleting nothing leaves the array alone, and the class survives.
+        assert_eq!(
+            ok_out("A = eye(2); A([]) = []; disp(size(A))"),
+            "     2     2\n"
+        );
+        assert_eq!(
+            ok_out("s = 'abc'; s(2) = []; disp(s); disp(class(s))"),
+            "ac\nchar\n"
+        );
+        // A trailing singleton subscript is a colon here too.
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; A(:, 1, 1) = []; disp(A)"),
+            "     2\n     4\n"
+        );
+        // Out of range is the usual bounds error, and changes nothing.
+        let (r, _) = run("x = 1:3; x(5) = [];");
+        assert!(r.unwrap_err().msg.contains("must not exceed 3"));
+        let (r, _) = run("A = eye(2); A(:, 3) = [];");
+        assert!(
+            r.unwrap_err()
+                .msg
+                .contains("position 2 exceeds array bounds")
+        );
+    }
+
+    /// Only the literal `[]` deletes. An empty that arrives as a value is
+    /// stored, and must match the element count like any other.
+    #[test]
+    fn only_the_literal_brackets_delete() {
+        assert_eq!(
+            err_msg("e = []; x = 1:3; x(2) = e;"),
+            "Unable to perform assignment because the left side has 1 elements and \
+             the right side has 0."
+        );
+        assert_eq!(ok_out("x = 1:3; x(2) = [ ]; disp(x)"), "     1     3\n");
+        // A statement display after a deletion shows what is left.
+        assert_eq!(ok_out("x = 1:3; x(1) = []"), "x =\n\n     2     3\n\n");
+    }
+
+    #[test]
+    fn the_deletion_resolver_keeps_what_is_left() {
+        // 2x3, deleting column 2.
+        let k = resolve_delete(2, 3, &[Sel::All, Sel::row(vec![1])]).unwrap();
+        assert_eq!(
+            k,
+            Keep {
+                pos: vec![0, 1, 4, 5],
+                rows: 2,
+                cols: 2
+            }
+        );
+        // Deleting row 1.
+        let k = resolve_delete(2, 3, &[Sel::row(vec![0]), Sel::All]).unwrap();
+        assert_eq!(
+            k,
+            Keep {
+                pos: vec![1, 3, 5],
+                rows: 1,
+                cols: 3
+            }
+        );
+        // Linear deletion from a matrix makes a row; repeats count once.
+        let k = resolve_delete(2, 2, &[Sel::row(vec![1, 1])]).unwrap();
+        assert_eq!(
+            k,
+            Keep {
+                pos: vec![0, 2, 3],
+                rows: 1,
+                cols: 3
+            }
+        );
+        // Both colons remove every row.
+        let k = resolve_delete(2, 3, &[Sel::All, Sel::All]).unwrap();
+        assert_eq!((k.rows, k.cols, k.pos.len()), (0, 3, 0));
+        let e = resolve_delete(2, 2, &[Sel::row(vec![0]), Sel::row(vec![1])]);
+        assert_eq!(
+            e.unwrap_err().msg,
+            "A null assignment can have only one non-colon index."
+        );
+    }
+
+    // ---- assignment in place -----------------------------------------
+
+    #[test]
+    fn the_write_resolver_plans_growth_without_touching_anything() {
+        let rhs = Matrix::scalar(9.0);
+        // A row grows along its length.
+        let p = resolve_write(1, 2, &[Sel::row(vec![3])], &rhs).unwrap();
+        assert_eq!(
+            p,
+            Scatter {
+                rows: 1,
+                cols: 4,
+                pos: vec![3]
+            }
+        );
+        // A column grows down; an empty becomes a row.
+        let p = resolve_write(2, 1, &[Sel::row(vec![2])], &rhs).unwrap();
+        assert_eq!((p.rows, p.cols), (3, 1));
+        let p = resolve_write(0, 0, &[Sel::row(vec![2])], &rhs).unwrap();
+        assert_eq!((p.rows, p.cols), (1, 3));
+        // Two subscripts grow either dimension, and positions are in the
+        // grown shape.
+        let p = resolve_write(2, 2, &[Sel::row(vec![2]), Sel::row(vec![2])], &rhs).unwrap();
+        assert_eq!(
+            p,
+            Scatter {
+                rows: 3,
+                cols: 3,
+                pos: vec![8]
+            }
+        );
+        // A matrix cannot grow through one subscript.
+        let e = resolve_write(2, 2, &[Sel::row(vec![4])], &rhs).unwrap_err();
+        assert_eq!(e.msg, "Attempt to grow array along ambiguous dimension.");
+        // The count is checked against the positions.
+        let two = Matrix::row(vec![1.0, 2.0]);
+        let e = resolve_write(1, 3, &[Sel::row(vec![0, 1, 2])], &two).unwrap_err();
+        assert!(e.msg.contains("left side has 3 elements"), "{}", e.msg);
+    }
+
+    /// Acceptance test 17: the size asked for is named, not the `usize` it
+    /// would saturate to.
+    #[test]
+    fn growth_past_usize_names_the_size_asked_for() {
+        let msg = "Requested 1x1e+300 array exceeds the maximum array size.";
+        assert_eq!(err_msg("x = []; x(1e300) = 1"), msg);
+        let huge = Sel::List {
+            idx: vec![usize::MAX],
+            rows: 1,
+            cols: 1,
+            max: 1e300,
+        };
+        let e = resolve_write(0, 0, &[huge], &Matrix::scalar(1.0)).unwrap_err();
+        assert_eq!(e.msg, msg);
+        assert_eq!(
+            err_msg("x = zeros(3, 1); x(1e300) = 1;"),
+            "Requested 1e+300x1 array exceeds the maximum array size."
+        );
+        assert_eq!(
+            err_msg("A = []; A(2, 1e20) = 1;"),
+            "Requested 2x1e+20 array exceeds the maximum array size."
+        );
+        // Reading there is just out of bounds.
+        assert!(err_msg("x = 1:3; x(1e300)").contains("must not exceed 3"));
+    }
+
+    /// Validate first, then mutate: a failing assignment leaves the variable
+    /// exactly as it was.
+    #[test]
+    fn a_failed_assignment_changes_nothing() {
+        for src in [
+            "x = 1:3; x(5) = [1 2];",
+            "x = 1:3; x(1e300) = 1;",
+            "x = true(1, 3); x(5) = NaN;",
+            "x = 1:3; x(0) = 1;",
+            "x = 1:3; x([2 9]) = [7 8 9];",
+        ] {
+            let buf = Rc::new(RefCell::new(Vec::new()));
+            let mut it = Interp::with_output(Box::new(Shared(buf)));
+            assert!(it.run(src).is_err(), "{src}");
+            let x = it.vars["x"].mat();
+            assert_eq!((x.rows, x.cols, x.data.len()), (1, 3, 3), "{src}");
+        }
+    }
+
+    /// Acceptance test 10.
+    #[test]
+    fn colon_assignment_and_growth_from_empty() {
+        assert_eq!(
+            ok_out("A = zeros(2); A(:) = 1:4; disp(A); x = []; x(3) = 1; disp(x)"),
+            "     1     3\n     2     4\n     0     0     1\n"
+        );
+        // A matrix grows rows and columns, keeping its elements in place.
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; A(3, 1) = 5; disp(A)"),
+            "     1     2\n     3     4\n     5     0\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; A(1, 3) = 5; disp(A)"),
+            "     1     2     5\n     3     4     0\n"
+        );
+    }
+
+    /// Acceptance test 13's mechanism: growth by one along a row's length is
+    /// a resize of the storage where it lies, so its capacity grows
+    /// geometrically rather than one element at a time.
+    #[test]
+    fn appending_to_a_row_reuses_its_storage() {
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("z = [];").unwrap();
+        let mut reallocations = 0;
+        let mut last = std::ptr::null();
+        for _ in 0..10_000 {
+            it.run("z(end+1) = 1;").unwrap();
+            let p = it.vars["z"].mat().data.as_ptr();
+            if p != last {
+                reallocations += 1;
+                last = p;
+            }
+        }
+        let z = it.vars["z"].mat();
+        assert_eq!((z.rows, z.cols), (1, 10_000));
+        assert!(reallocations < 64, "{reallocations} reallocations");
+        assert_eq!(
+            ok_out("z = []; for k = 1:2000, z(end+1) = k; end; disp(numel(z)); disp(z(2000))"),
+            "        2000\n        2000\n"
+        );
+    }
+
+    // ---- trailing singleton subscripts (QA D22) ----------------------
+
+    /// Acceptance test 15.
+    #[test]
+    fn trailing_singleton_subscripts_are_accepted() {
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; disp(A(2, 1, 1)); disp(A(:, :, 1)); A(1, 2, 1) = 9; disp(A)"),
+            "     3\n     1     2\n     3     4\n     1     9\n     3     4\n"
+        );
+        assert_eq!(
+            err_msg("A = [1 2; 3 4]; A(1, 1, 2)"),
+            "Index in position 3 exceeds array bounds. Index must not exceed 1."
+        );
+        // `end` is 1 in a third position, and a fourth is the same.
+        assert_eq!(ok_out("A = [1 2; 3 4]; disp(A(2, 2, end))"), "     4\n");
+        assert_eq!(ok_out("A = [1 2; 3 4]; disp(A(1, 2, 1, 1))"), "     2\n");
+        assert_eq!(
+            err_msg("A = [1 2; 3 4]; A(1, 1, 1, 3)"),
+            "Index in position 4 exceeds array bounds. Index must not exceed 1."
+        );
+        // A page past the first would need an N-D array.
+        assert_eq!(
+            err_msg("A = [1 2; 3 4]; A(1, 1, 2) = 5;"),
+            "N-D arrays are not supported."
+        );
+        assert_eq!(
+            err_msg("A = [1 2; 3 4]; A(:, :, [1 1])"),
+            "N-D arrays are not supported."
+        );
+        // No subscripts at all is still refused.
+        assert_eq!(
+            err_msg("A = 1; A()"),
+            "Only 1-D and 2-D indexing is supported."
+        );
+    }
+
+    // ---- braces, fields and chains on a matrix -----------------------
+
+    /// Acceptance test 18.
+    #[test]
+    fn brace_and_dot_access_on_a_matrix_are_errors() {
+        let brace = "Brace indexing is not supported for variables of this type.";
+        let dot = "Dot indexing is not supported for variables of this type.";
+        assert_eq!(err_msg("x = [1 2]; x{1}"), brace);
+        assert_eq!(err_msg("x = [1 2]; x.a"), dot);
+        assert_eq!(err_msg("x = [1 2]; n = 'a'; x.(n)"), dot);
+        assert_eq!(err_msg("x = [1 2]; y = x(1).a;"), dot);
+        assert_eq!(err_msg("x = [1 2]; y = x(1){1};"), brace);
+        // On a builtin's value too, and on an assignment target.
+        assert_eq!(err_msg("pi.a"), dot);
+        assert_eq!(err_msg("y = pi{1};"), brace);
+        assert_eq!(err_msg("x = [1 2]; x{1} = 3;"), brace);
+        assert_eq!(err_msg("x = [1 2]; x.a = 3;"), dot);
+        assert_eq!(err_msg("x = [1 2]; x(1).a = 3;"), dot);
+        // An undefined name is still undefined first.
+        assert_eq!(err_msg("q{1}"), "Unrecognized function or variable 'q'.");
+        // A second `(...)` indexes the value so far.
+        assert_eq!(ok_out("x = [5 6 7]; disp(x(2:3)(2))"), "     7\n");
+        assert_eq!(ok_out("disp(size(ones(2, 3))(2))"), "     3\n");
+        assert_eq!(
+            err_msg("x = [1 2]; x(1)(1) = 3;"),
+            "invalid assignment target"
+        );
+    }
+
+    // ---- multiple assignment (QA D32) --------------------------------
+
+    /// Acceptance tests 7, 8 and 9.
+    #[test]
+    fn multiple_outputs_are_assigned_and_shown_in_order() {
+        assert_eq!(
+            ok_out("[m, i] = max([3 9 2])"),
+            "m =\n\n     9\n\ni =\n\n     2\n\n"
+        );
+        assert_eq!(
+            ok_out(
+                "[r, c] = size(zeros(2, 5)); fprintf('%d %d\\n', r, c); \
+                 [~, i] = min([4 2 8]); disp(i); [s, idx] = sort([3 1 2]); disp(idx)"
+            ),
+            "2 5\n     2\n     2     3     1\n"
+        );
+        assert_eq!(
+            ok_out("[r, c] = find([0 1; 1 0]); disp([r c])"),
+            "     2     1\n     1     2\n"
+        );
+        // A placeholder is not assigned, and a suppressed list shows nothing.
+        assert_eq!(ok_out("[~, i] = max([1 5]); disp(i)"), "     2\n");
+        let e = err_msg("[~, i] = max([1 5]); m");
+        assert_eq!(e, "Unrecognized function or variable 'm'.");
+        // The one-target form, and an indexed target.
+        assert_eq!(ok_out("[x] = size(ones(2, 3), 1)"), "x =\n\n     2\n\n");
+        assert_eq!(ok_out("[n] = 7;"), "");
+        assert_eq!(
+            ok_out("v = [0 0]; [v(2), k] = max([4 8]); disp(v); disp(k)"),
+            "     0     8\n     2\n"
+        );
+        // A multiple assignment does not set `ans`.
+        assert!(err_msg("[a, b] = size(1); ans").contains("'ans'"));
+    }
+
+    /// Acceptance test 12.
+    #[test]
+    fn asking_for_more_outputs_than_there_are_is_an_error() {
+        assert_eq!(
+            err_msg("[a, b] = 5"),
+            "Insufficient number of outputs from right hand side of equal sign to \
+             satisfy assignment."
+        );
+        assert_eq!(err_msg("x = 1; [a, b] = x;"), err_msg("[a, b] = 5"));
+        assert_eq!(err_msg("[a, b] = sum([1 2])"), "Too many output arguments.");
+        assert_eq!(
+            err_msg("[a, b, c] = max([1 2])"),
+            "Too many output arguments."
+        );
+        assert_eq!(err_msg("[a, b] = disp(1)"), "Too many output arguments.");
+        assert_eq!(
+            err_msg("[a, b, c, d] = find(1)"),
+            "Too many output arguments."
+        );
+        assert_eq!(
+            err_msg("[a, b] = max([1 2], [3 0])"),
+            "Too many output arguments."
+        );
+        // The right-hand side's own error comes first.
+        assert_eq!(
+            err_msg("[a, b] = nope(1)"),
+            "Unrecognized function or variable 'nope'."
+        );
+        // Nothing is assigned when the outputs fall short.
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        assert!(it.run("[a, b] = sum(1);").is_err());
+        assert!(!it.vars.contains_key("a") && !it.vars.contains_key("b"));
+    }
+
+    /// The `nargout` forms of `size`, `max`, `min`, `sort` and `find`,
+    /// through the interpreter; the builtins' own tests cover the edges.
+    #[test]
+    fn builtins_answer_as_many_outputs_as_asked() {
+        assert_eq!(
+            ok_out("[r, c, p] = size(ones(2, 3)); fprintf('%d %d %d\\n', r, c, p)"),
+            "2 3 1\n"
+        );
+        assert_eq!(ok_out("[r] = size(ones(2, 3)); disp(r)"), "     2     3\n");
+        assert_eq!(
+            ok_out("[m, i] = min([4 1; 2 3]); disp(m); disp(i)"),
+            "     2     1\n     2     1\n"
+        );
+        assert_eq!(
+            ok_out("[s, i] = sort([3 1 2], 'descend'); disp(s); disp(i)"),
+            "     3     2     1\n     1     3     2\n"
+        );
+        assert_eq!(
+            ok_out("[r, c, v] = find([0 7; 5 0]); disp([r c v])"),
+            "     2     1     5\n     1     2     7\n"
         );
     }
 

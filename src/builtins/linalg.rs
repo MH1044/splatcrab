@@ -30,8 +30,8 @@ pub fn register(r: &mut Registry) {
     add(r, "flipud", flipud, "flipud(A) - reverse the order of the rows.");
 
     // ---- search and sort ---------------------------------------------
-    add(r, "find", find, "find(A), find(A,n), find(A,n,'last') - indices of the non-zero elements.");
-    add(r, "sort", sort, "sort(v), sort(v,dim), sort(v,'descend') - a sorted vector, NaN at the high end.");
+    add(r, "find", find, "find(A), find(A,n), find(A,n,'last'), [r,c,v] = find(...) - indices of the non-zero elements.");
+    add(r, "sort", sort, "sort(v), sort(v,dim), sort(v,'descend'), [s,i] = sort(...) - a sorted vector, NaN at the high end.");
 }
 
 // ---- linear algebra --------------------------------------------------
@@ -327,7 +327,12 @@ fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 /// `find([])` is `0x0` rather than the `0x1` "otherwise" would give: a `0x0`
 /// input has no orientation to keep, which MATLAB reflects in the result.
 /// `find(zeros(1, 0))` is still the `1x0` its row shape asks for.
-fn find(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+///
+/// Asked for two outputs, `find` gives the row and column subscripts of the
+/// same elements instead of their linear indices, and asked for three, their
+/// values as well, in the argument's class. All of them take the shape the
+/// one output would have had.
+fn find(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 3, "find")?;
     let m = mat(a, 0, "find")?;
     let mut idx: Vec<f64> = m
@@ -356,13 +361,29 @@ fn find(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
             idx.truncate(n);
         }
     }
-    one_mat(if m.rows == 0 && m.cols == 0 {
-        Matrix::empty()
-    } else if m.rows == 1 {
-        Matrix::row(idx)
-    } else {
-        Matrix::col(idx)
-    })
+    let shape = |data: Vec<f64>| {
+        if m.rows == 0 && m.cols == 0 {
+            Matrix::empty()
+        } else if m.rows == 1 {
+            Matrix::row(data)
+        } else {
+            Matrix::col(data)
+        }
+    };
+    if nargout < 2 {
+        return one_mat(shape(idx));
+    }
+    // `idx` is one-based and column-major: element `k` is at row
+    // `(k - 1) % rows` and column `(k - 1) / rows`, both zero-based.
+    let at = |k: f64| k as usize - 1;
+    let rows = shape(idx.iter().map(|&k| (at(k) % m.rows + 1) as f64).collect());
+    let cols = shape(idx.iter().map(|&k| (at(k) / m.rows + 1) as f64).collect());
+    let mut out = vec![Value::Mat(rows), Value::Mat(cols)];
+    if nargout >= 3 {
+        let vals = shape(idx.iter().map(|&k| m.data[at(k)]).collect());
+        out.push(Value::Mat(vals.with_class(m.class)));
+    }
+    Ok(out)
 }
 
 /// A total order over doubles for sorting: NaN compares greater than every
@@ -385,7 +406,13 @@ fn sort_cmp(a: &f64, b: &f64) -> Ordering {
 /// Descending is `sort_cmp` reversed rather than the ascending result
 /// reversed: that keeps it stable, as the MATLAB page requires "regardless of
 /// sorting direction", and puts `NaN` first, the documented placement.
-fn sort(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+///
+/// Asked for two outputs, the second is the permutation, a double of the
+/// same shape: `s = v(i)`. The sort is of the positions, keyed by value, so
+/// the order the values take and the order the indices record are one and
+/// the same. Along a dimension the vector does not extend in, every index is
+/// `1`.
+fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 3, "sort")?;
     let m = mat(a, 0, "sort")?;
     // The second argument is a direction when it is a char, and a dimension
@@ -412,15 +439,29 @@ fn sort(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         _ => 1,
     };
     let mut out = m;
-    if extent == out.numel() {
+    let n = out.numel();
+    let mut perm: Vec<usize> = (0..n).collect();
+    if extent == n {
+        let data = &out.data;
         if descend {
-            out.data.sort_by(|x, y| sort_cmp(y, x));
+            perm.sort_by(|&x, &y| sort_cmp(&data[y], &data[x]));
         } else {
-            out.data.sort_by(sort_cmp);
+            perm.sort_by(|&x, &y| sort_cmp(&data[x], &data[y]));
         }
+        out.data = perm.iter().map(|&k| data[k]).collect();
+    } else {
+        perm = vec![0; n];
     }
+    let index = Matrix::new(
+        out.rows,
+        out.cols,
+        perm.iter().map(|&k| (k + 1) as f64).collect(),
+    );
     // A sorted char is a char: `sort('cab')` is `'abc'`.
-    one_as(out)
+    if nargout < 2 {
+        return one_as(out);
+    }
+    Ok(vec![Value::Mat(out), Value::Mat(index)])
 }
 
 #[cfg(test)]
@@ -958,5 +999,79 @@ mod tests {
                 .msg,
             "N-D arrays are not supported."
         );
+    }
+
+    // ---- more than one output (cycle 03) ------------------------------
+
+    use crate::value::Class;
+
+    fn outputs(f: crate::builtins::BuiltinFn, args: &[Value], nargout: usize) -> Vec<Matrix> {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        f(&mut it, args, nargout)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.into_mat())
+            .collect()
+    }
+
+    #[test]
+    fn sort_gives_the_permutation_as_a_second_output() {
+        let out = outputs(sort, &[row(&[3.0, 1.0, 2.0])], 2);
+        assert_eq!(out[0].data, [1.0, 2.0, 3.0]);
+        assert_eq!(out[1].data, [2.0, 3.0, 1.0]);
+        assert_eq!(
+            (out[1].rows, out[1].cols, out[1].class),
+            (1, 3, Class::Double)
+        );
+        // Stable in both directions, with NaN at the high end.
+        let v = row(&[2.0, f64::NAN, 1.0, 2.0]);
+        let out = outputs(sort, std::slice::from_ref(&v), 2);
+        assert_eq!(out[1].data, [3.0, 1.0, 4.0, 2.0]);
+        let out = outputs(sort, &[v, text("descend")], 2);
+        assert_eq!(out[1].data, [2.0, 1.0, 4.0, 3.0]);
+        // A column keeps its shape; a dimension it does not extend in moves
+        // nothing and gives ones.
+        let out = outputs(sort, &[col(&[5.0, 4.0])], 2);
+        assert_eq!(
+            (out[1].rows, out[1].cols, out[1].data.clone()),
+            (2, 1, vec![2.0, 1.0])
+        );
+        let out = outputs(sort, &[row(&[5.0, 4.0]), num(1.0)], 2);
+        assert_eq!(
+            (out[0].data.clone(), out[1].data.clone()),
+            (vec![5.0, 4.0], vec![1.0, 1.0])
+        );
+        // One output is the value alone, unchanged.
+        assert_eq!(outputs(sort, &[row(&[2.0, 1.0])], 1).len(), 1);
+        // A char sorts to a char; its permutation is a double.
+        let out = outputs(sort, &[text("cab")], 2);
+        assert_eq!((out[0].class, out[1].class), (Class::Char, Class::Double));
+        assert_eq!(out[1].data, [2.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn find_gives_subscripts_and_values_when_asked() {
+        // [0 7; 5 0]: the non-zeros are (2,1) = 5 and (1,2) = 7.
+        let a = mat(2, 2, &[0.0, 7.0, 5.0, 0.0]);
+        let out = outputs(find, std::slice::from_ref(&a), 3);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].data, [2.0, 1.0]);
+        assert_eq!(out[1].data, [1.0, 2.0]);
+        assert_eq!(out[2].data, [5.0, 7.0]);
+        assert_eq!((out[0].rows, out[0].cols), (2, 1));
+        assert_eq!(outputs(find, std::slice::from_ref(&a), 2).len(), 2);
+        // A row gives rows, and the count and direction still apply.
+        let r = row(&[0.0, 3.0, 0.0, 4.0]);
+        let out = outputs(find, &[r, num(1.0), text("last")], 2);
+        assert_eq!(
+            (out[0].data.clone(), out[1].data.clone()),
+            (vec![1.0], vec![4.0])
+        );
+        assert_eq!((out[1].rows, out[1].cols), (1, 1));
+        // The values keep the argument's class; a 0x0 gives three 0x0s.
+        let t = Value::Mat(Matrix::row(vec![1.0, 0.0]).with_class(Class::Logical));
+        assert_eq!(outputs(find, &[t], 3)[2].class, Class::Logical);
+        let e = outputs(find, &[Value::Mat(Matrix::empty())], 3);
+        assert!(e.iter().all(|m| (m.rows, m.cols) == (0, 0)));
     }
 }

@@ -149,8 +149,9 @@ fn needs_more(src: &str) -> bool {
         match t {
             Token::LBracket => brackets += 1,
             Token::RBracket => brackets -= 1,
-            Token::LParen => parens += 1,
-            Token::RParen => parens -= 1,
+            // An `end` inside `(...)` or `{...}` is an index's, not a block's.
+            Token::LParen | Token::LBrace => parens += 1,
+            Token::RParen | Token::RBrace => parens -= 1,
             Token::If | Token::For | Token::While => blocks += 1,
             Token::End if parens == 0 => blocks -= 1,
             _ => {}

@@ -429,8 +429,8 @@ b = logical(NaN)
 Error: Line 1: NaN's cannot be converted to logicals.
 ```
 
-A logical mask cannot index yet: `x(x > 0)` is a clean error until cycle 03.
-See [Logical values](#logical-values).
+A logical array used as a subscript is a mask: `x(x > 0)` selects the
+elements where it is true. See [Logical indexing](#logical-indexing).
 
 ## Matrices
 
@@ -816,9 +816,9 @@ w =
 ### Comparison
 
 `==  ~=  <  <=  >  >=` compare element by element and return a `logical`
-array, displayed under its `logical array` header in four-wide columns. Using
-one as a mask, `x(x > 0)`, is a clean error until cycle 03; see
-[Logical values](#logical-values).
+array, displayed under its `logical array` header in four-wide columns. Used
+as a subscript, one is a mask, `x(x > 0)`; see
+[Logical indexing](#logical-indexing).
 
 ```matlab
 v = [1 5 3];
@@ -1175,9 +1175,217 @@ A =
 
 ```
 
-Two forms are **not** available yet, and both are clean errors: logical
-indexing (`x(x > 0)`, until cycle 03 — see
-[Logical values](#logical-values)) and deletion (`v(2) = []`).
+Appending with `z(end+1) = k` in a loop is amortised: the array grows in
+place rather than being copied on every step. An indexed assignment checks
+every subscript, the element count and any growth before it changes anything,
+so one that fails leaves the variable exactly as it was.
+
+### Logical indexing
+
+A `logical` subscript is a mask: it selects the elements where it is `true`,
+for reading and for assignment alike.
+
+```matlab
+x = [5 3 8 1];
+a = x(x > 2)
+x(x > 4) = 0
+A = [1 2 3; 4 5 6; 7 8 9];
+b = A(A > 5)'
+```
+
+```
+a =
+
+     5     3     8
+
+x =
+
+     0     3     0     1
+
+b =
+
+     7     8     6     9
+
+```
+
+A mask selects exactly what `find(mask)` would, and that fixes the result's
+shape: a mask indexing a vector keeps the vector's orientation, and any other
+mask gives a column, as `A(A > 5)` does above. A mask shorter than the array
+selects only among the elements it covers. A `true` past the end grows the
+array on assignment, as a numeric index would:
+
+```matlab
+x = [10 20 30];
+a = x(logical([1 0]))
+A = [1 2; 3 4];
+b = A(logical([1 0 0 1]))
+c = A(logical([1 0; 0 1]))
+y = [1 2];
+y(logical([0 0 1])) = 9
+```
+
+```
+a =
+
+    10
+
+b =
+
+     1     4
+
+c =
+
+     1
+     4
+
+y =
+
+     1     2     9
+
+```
+
+On a read, a `true` past the end is the ordinary out-of-bounds error:
+
+```matlab
+x = [10 20 30];
+x(logical([0 0 0 1]))
+```
+
+```
+Error: Line 2: Index exceeds the number of array elements. Index must not exceed 3.
+```
+
+A double of ones and zeros is not a mask: `x([1 1 1])` is the first element
+three times. Convert it with `logical` first.
+
+### Deletion
+
+Assigning the empty literal `[]` to an indexed target deletes those elements.
+With one subscript, a column vector stays a column and anything else, a
+matrix included, becomes a row of what is left, in column-major order. With
+two, one of them must be `:` (or select the whole dimension), and whole rows
+or columns go:
+
+```matlab
+x = 1:5;
+x(2) = []
+x([1 end]) = []
+A = [1 2 3; 4 5 6];
+A(:, 2) = []
+A(1, :) = []
+B = [1 2; 3 4];
+B(2) = []
+```
+
+```
+x =
+
+     1     3     4     5
+
+x =
+
+     3     4
+
+A =
+
+     1     3
+     4     6
+
+A =
+
+     4     6
+
+B =
+
+     1     2     4
+
+```
+
+A mask deletes too: `x(x < 0) = []` removes the negative elements. Deleting a
+single element of a matrix would leave a hole, so it is an error, as in
+MATLAB:
+
+```matlab
+A = [1 2; 3 4];
+A(1, 2) = []
+```
+
+```
+Error: Line 2: A null assignment can have only one non-colon index.
+```
+
+Only the literal `[]` deletes. `e = []; x(2) = e` is an ordinary assignment of
+an empty, and fails the element count.
+
+### Trailing singleton subscripts
+
+A matrix has as many trailing dimensions of size 1 as you care to name, so a
+third (or later) subscript of `1` is accepted, and `end` there is `1`:
+
+```matlab
+A = [1 2; 3 4];
+a = A(2, 1, 1)
+b = A(:, :, 1)
+A(1, 2, 1) = 9
+c = A(1, 1, end)
+```
+
+```
+a =
+
+     3
+
+b =
+
+     1     2
+     3     4
+
+A =
+
+     1     9
+     3     4
+
+c =
+
+     1
+
+```
+
+Anything past 1 there is out of bounds:
+
+```matlab
+A = [1 2; 3 4];
+A(1, 1, 2)
+```
+
+```
+Error: Line 2: Index in position 3 exceeds array bounds. Index must not exceed 1.
+```
+
+### Brace and dot on a matrix
+
+`x{1}`, `x.a` and `x.(name)` parse, but a matrix has no cells and no fields, so
+at run time each is MATLAB's own error:
+
+```matlab
+x = [1 2];
+x{1}
+```
+
+```
+Error: Line 2: Brace indexing is not supported for variables of this type.
+```
+
+```matlab
+x = [1 2];
+x.a
+```
+
+```
+Error: Line 2: Dot indexing is not supported for variables of this type.
+```
+
+Cell arrays and structs, which do support them, arrive in cycle 07.
 
 ## Control flow
 
@@ -1457,8 +1665,24 @@ vv =
 
 ```
 
-`[r, c] = size(A)` does **not** work: multiple assignment is unsupported, and
-even `[x] = size(A, 1)` is `invalid assignment target`. Call `size` twice.
+`[r, c] = size(A)` gives the dimensions one per output; see
+[Multiple return values](#multiple-return-values).
+
+```matlab
+A = [1 2 3; 4 5 6];
+[r, c] = size(A)
+```
+
+```
+r =
+
+     2
+
+c =
+
+     3
+
+```
 
 ### Rearrangement
 
@@ -1928,6 +2152,96 @@ s = sort([3 1; 2 4]);
 Error: Line 1: 'sort' currently supports vectors only.
 ```
 
+### Multiple return values
+
+`[a, b] = f(...)` asks a builtin for two values. `max`, `min`, `sort`, `size`
+and `find` give more than one: `max` and `min` the index of the extreme value
+too (the first of a tie), `sort` the permutation, `size` one dimension per
+output (then `1`s), and `find` the rows and columns. A `~` discards the output
+in its place. Each output is displayed in turn unless the statement ends in
+`;`, and `ans` is not set.
+
+```matlab
+[m, i] = max([3 9 2])
+[r, c] = size(zeros(2, 5))
+[~, k] = min([4 2 8])
+[s, idx] = sort([3 1 2])
+```
+
+```
+m =
+
+     9
+
+i =
+
+     2
+
+r =
+
+     2
+
+c =
+
+     5
+
+k =
+
+     2
+
+s =
+
+     1     2     3
+
+idx =
+
+     2     3     1
+
+```
+
+With three outputs `find` also returns the values, in the argument's class:
+
+```matlab
+[r, c, v] = find([0 7; 5 0])
+```
+
+```
+r =
+
+     2
+     1
+
+c =
+
+     1
+     2
+
+v =
+
+     5
+     7
+
+```
+
+Asking a builtin for more values than it has is an error, and so is asking a
+plain value for more than one:
+
+```matlab
+[a, b] = sum([1 2])
+```
+
+```
+Error: Line 1: Too many output arguments.
+```
+
+```matlab
+[a, b] = 5
+```
+
+```
+Error: Line 1: Insufficient number of outputs from right hand side of equal sign to satisfy assignment.
+```
+
 ### Output
 
 `disp fprintf sprintf num2str error`. See
@@ -2169,8 +2483,6 @@ c =
 A `NaN` no longer widens its row: it has no digits, so it neither changes the
 format nor the column width. The values were always right; only the display
 was wrong.
-one non-finite element currently forces the whole row out of integer format.
-MATLAB prints `1 2 3 NaN`.
 
 ### `find` count and direction
 
@@ -2838,7 +3150,7 @@ v(0)
 ```
 
 ```
-Error: Line 2: Index in position 1 is invalid. Array indices must be positive integers.
+Error: Line 2: Index in position 1 is invalid. Array indices must be positive integers or logical values.
 ```
 
 ```matlab
@@ -2996,16 +3308,15 @@ an infinite end point is an error.
 
 ### Logical values
 
-Comparisons return logicals, but a logical cannot index yet. Before cycle 02
-a mask was a double of ones and zeros and `x(x > 0)` read it as a list of
-positions, giving `5 5 5` with no error. It is now a clean error, in reading
-and in assignment alike, until cycle 03 implements logical indexing. Use
-`find` meanwhile, which returns the positions as doubles:
+Comparisons return logicals, and a logical subscript is a mask, as in MATLAB.
+Before cycle 02 a mask was a double of ones and zeros and `x(x > 0)` read it
+as a list of positions, giving `5 5 5` with no error; from cycle 02 to cycle
+03 it was a clean error. It now selects, including a mask with no zeros:
 
 ```matlab
 x = [5 6 7];
-y = x(find(x > 0))
-z = x(x > 0)
+y = x(x > 0)
+x(x > 0) = 0
 ```
 
 ```
@@ -3013,10 +3324,11 @@ y =
 
      5     6     7
 
-Error: Line 3: Logical indexing is not supported yet.
-```
+x =
 
-MATLAB gives `5 6 7` for `z`, and `x(x > 0) = 0` sets every element to `0`.
+     0     0     0
+
+```
 
 `NaN` cannot be converted to a logical, and `&&` and `||` require an operand
 convertible to a logical scalar. Both refuse, as MATLAB does:
@@ -3030,6 +3342,35 @@ c = [1 1] && 1
 
 ```
 Error: Line 1: NaN's cannot be converted to logicals.
+```
+
+### Indexing
+
+- A second `(...)` indexes the value so far, so `x(2:3)(2)` and `size(A)(2)`
+  work, as in Octave; MATLAB refuses to chain parentheses. `x()` with no
+  subscripts is `Only 1-D and 2-D indexing is supported.`, where MATLAB
+  returns `x`.
+- There are no N-D arrays, so `A(:, :, [1 1])`, `A(:, :, [])` and growth into
+  a second page (`A(1, 1, 2) = 5`) are `N-D arrays are not supported.`, where
+  MATLAB builds the N-D array.
+- `s.a = 1` on an undefined `s` is the Dot error rather than a new struct,
+  until cycle 07.
+- `A(:, :) = []` leaves an empty with no rows and the original columns;
+  that has not been checked against MATLAB.
+- `[m, i] = max(a, b)`, the two-array form, is `Too many output arguments.`
+
+```matlab
+x = [1 2 3];
+x(2:3)(2)
+x()
+```
+
+```
+ans =
+
+     3
+
+Error: Line 3: Only 1-D and 2-D indexing is supported.
 ```
 
 ### Numerics
@@ -3200,14 +3541,12 @@ says strictly more. An unknown name is `Unrecognized function or variable
 'x'.`, which is R2020a's phrasing rather than the older `Undefined function or
 variable`.
 
-Two messages deliberately keep their own wording, because they say more than
-MATLAB's:
-
-- The size-mismatch message names the operator and both shapes. MATLAB says
-  only `Arrays have incompatible sizes for this operation.`
-- The `x(0)` message ends `must be positive integers.` MATLAB's ends
-  `must be positive integers or logical values.`, which is not yet true here;
-  it changes when cycle 03 makes a logical mask index.
+One message deliberately keeps its own wording, because it says more than
+MATLAB's: the size-mismatch message names the operator and both shapes. MATLAB
+says only `Arrays have incompatible sizes for this operation.` The `x(0)`
+message used to end `must be positive integers.`; since logical indexing
+arrived in cycle 03 it ends `must be positive integers or logical values.`,
+as MATLAB's does.
 
 ### REPL
 
@@ -3221,10 +3560,6 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 | Missing | Arrives in |
 |---|---|
-| Logical indexing `x(x > 0)` | 03 |
-| Element deletion `x(i) = []` | 03 |
-| Multiple assignment `[r, c] = size(A)` | 03 |
-| Trailing singleton subscripts `A(2, 1, 1)` | 03 |
 | `switch` / `case` / `otherwise` | 04 |
 | `try` / `catch` | 04 |
 | Command syntax (`clear x`, `format long`) | 04 |
@@ -3235,7 +3570,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Cell arrays `{...}` | 07 |
 | Structs `s.field` | 07 |
 | Matrix `norm`, least squares, `\` of a non-square system | 08 |
-| Matrix `sort`, `[s, i] = sort(...)` | 09 |
+| Matrix `sort`, and `[s, i] = sort(...)` of a matrix | 09 |
 | Complex numbers, `1i`, `real`, `imag`, `abs` of a complex | 10 |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
 | `fprintf(fid, ...)`, `nbytes = fprintf(...)`, string functions | 11 |
@@ -3252,7 +3587,7 @@ f = @(x) x + 1
 ```
 
 ```
-Error: Line 1: unexpected character '@'
+Error: Line 1: unexpected '@' in expression
 ```
 
 ```matlab

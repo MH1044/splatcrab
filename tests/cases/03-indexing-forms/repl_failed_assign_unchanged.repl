@@ -1,0 +1,8 @@
+% covers: 13 - in-place assign_index validates before it mutates, so a failed assignment leaves its target as it was (Scope); only the REPL survives an error to show it. A logical target refuses the NaN in [0 NaN] (02 spec, "A logical target refuses NaN") before writing the 0; y([1 1e300]) must fail growth before writing y(1)
+x = true(1, 3);
+x([1 2]) = [0 NaN]
+disp(x)
+y = [1 2 3];
+y([1 1e300]) = 5
+disp(y)
+exit

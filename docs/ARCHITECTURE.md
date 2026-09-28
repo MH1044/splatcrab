@@ -37,6 +37,14 @@ goes through the same separator check, which is what makes `[1 ...` newline
 covers `* / \ ^ ' .`: the backslash keeps `2.\x` from meaning `2 \ x`, and the
 dot keeps `a = 1...` from lexing as `1.` plus a stray `..`.
 
+Since cycle 03 the lexer also has `{`, `}`, a lone `.` and `@`. The field dot
+is whatever dot is left once a number's decimal point, the five dotted
+operators (`.*`, `./`, `.\`, `.^`, `.'`) and a `...` continuation have been
+recognised, so none of those changed. A `}` ends a value, so `c{1}'` is a
+transpose. Braces go on the delimiter stack like brackets, so that inside
+`[c{1 -2} 3]` the whitespace rule applies to the bracket and not within the
+braces; inside brackets a `{` or an `@` after a space starts a new element.
+
 **`parser.rs`** is recursive descent with MATLAB's precedence, loosest first:
 `||`, `&&`, `|`, `&`, comparison, `:`, `+ -`, `* / \ .* ./ .\`, unary `- ~`,
 `^ .^`, transpose. `end` and a bare `:` are only accepted inside an index
@@ -46,6 +54,19 @@ argument list, tracked by the `in_index` counter. `Expr`, `Stmt`, `BinOp` and
 line sits on a wrapper so the tree shape stays comparable on its own. An `if`
 arm is an `IfArm`, which carries its condition's own line for the same reason:
 an error in an `elseif` condition must name the `elseif`.
+
+A name followed by `(...)`, `{...}`, `.field` or `.(expr)` is
+`Expr::Access(name, Vec<Access>)`, the whole chain in the order written
+(`c{1}(2).b` is one node with three links); a bare name is `Expr::Ident`, and
+`name(args)` is a one-link chain whose first `(...)` is indexing or a call.
+An assignment target is an `LValue`, a name and a chain, so `x = v`,
+`x(2) = v` and `s.a = v` are all `Stmt::Assign(LValue, Expr, bool)`.
+`[a, ~, c] = rhs` is `Stmt::MultiAssign(Vec<Option<LValue>>, Expr, bool)`,
+with `None` for a `~`: `try_targets` reads a bracket as a target list when it
+holds only targets and placeholders and is followed by `=`, and otherwise
+rewinds so that the bracket parses as the matrix literal it always was. A bare
+`@`, and a `{` where a value should start, are parse errors until cycles 06
+and 07.
 
 `Token` also has a `Display` form, which is what every parse message renders
 the offending token through; its `Debug` is the Rust variant name and used to
@@ -76,6 +97,16 @@ display.
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
 `name` is a variable and as a builtin call otherwise, and grows arrays on
 indexed assignment. It no longer knows what any individual builtin does.
+Reading, assignment and deletion share one index pipeline since cycle 03:
+`eval_index_args` turns the subscripts into zero-based `Sel`s (a logical
+subscript becomes the positions `find` would give), `resolve_read`,
+`resolve_write` or `resolve_delete` judges them against the array's shape
+without changing anything, and `gather`, `scatter` or the deletion carries the
+plan out. Because the plan is complete before anything moves, an indexed
+assignment validates every subscript, the class conversion, the growth and
+the element count first and then changes the variable where it is stored,
+never cloning it; growth along the last dimension is a `Vec` resize, which is
+amortised.
 
 **`builtins/`** is the library: `mod.rs` holds the registry, `args.rs` the
 argument helpers, and `core.rs`, `math.rs` and `linalg.rs` the builtins
@@ -94,8 +125,10 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 
 1. **Column-major storage.** See above.
 2. **One-based to zero-based conversion happens at exactly one boundary**,
-   in `eval_index_args`. Everything downstream of it is zero-based; everything
-   in user-facing error messages is one-based.
+   in `eval_index_args` (through its helpers `index_positions` and
+   `mask_positions`), for reading, assignment and deletion alike. Everything
+   downstream of it, the `resolve_*` functions included, is zero-based;
+   everything in user-facing error messages is one-based.
 3. **`end` is resolved through `end_stack`**, pushed per index argument with
    the size of the dimension being indexed. A function call must never push
    to it, or `x(f(end))` would bind `end` to the wrong thing.
@@ -151,14 +184,14 @@ size the N-D error. `size_list` and `trailing_ones` are its lower layers, for
 a builtin such as `reshape` that takes a `[]` placeholder or has no n-by-n
 rule. `size_arg` and `size_value` read one size as an `f64`, where a negative
 size is `0`. `check_shape(rows, cols)` is the only sanctioned way to turn a
-requested shape into allocation lengths. `check_size` takes sizes that are
-already `usize` and serves indexed growth alone; do not use it for a new
-builtin.
+requested shape into allocation lengths. Indexed growth uses it too since
+cycle 03, with the grown size kept as an `f64` until it is judged; the
+`usize`-only `check_size` that growth used before went with it.
 
 A shape the user never spells out goes through `check_shape` too. Since cycle
 01d, any operation whose result shape is computed from its operands' shapes
 calls it before allocating: `Matrix::try_zip` (and so `zip`), `Matrix::matmul`,
-the two-subscript branch of `index_read` and `math::reduce`. The operands can
+the two-subscript branch of `resolve_read` and `math::reduce`. The operands can
 be tiny and the result enormous — `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
 elements from 2e5 — so "the operands fit, therefore the result fits" is never
 true. A new operation of that kind belongs on the same list.
@@ -212,7 +245,11 @@ where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
 value: legal at statement level, "Too many output arguments." in an expression.
 Copy the function pointer out of the map before calling it, or the borrow
 checker will object to `&self` and `&mut self` at once. `Stmt::Expr` asks for
-0 values and `eval` asks for 1; cycle 03 adds the call sites that ask for more.
+0 values, `eval` asks for 1, and since cycle 03 `Stmt::MultiAssign` asks for
+one per target, `~` included. A builtin returns as many values as it has, up
+to `nargout`; the caller, not the builtin, turns too few into "Too many output
+arguments.", so a builtin with one output needs no change to be asked for two.
+`max`, `min`, `sort`, `size` and `find` give more than one.
 
 **Classes (cycle 02, in place).** `Class { Double, Logical, Char }` as a tag
 on `Matrix`. Arithmetic yields `Double`; comparisons and logical operators
@@ -242,8 +279,7 @@ cycle named:
 | Deviation | Fixed in |
 |---|---|
 | `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here | 08, which replaces `det` with a shared LU factorisation (verify first) |
-| Two error texts say more than MATLAB's and keep their own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
-| `x(0)` ends `... must be positive integers.` where MATLAB ends `... must be positive integers or logical values.` | 03, which is when logical values become true of this interpreter |
+| An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | `who` and `whos` print the same typed table | Both produce byte-identical output. In MATLAB `who` is a bare list of names and `whos` is a table with size, bytes and class, so both deviate rather than only `who`, and neither has a bytes column | 13 |
 | `norm` and `sort` accept vectors only | 08, 09 |
 | Backslash solves square systems only, and errors instead of warning | 08 |
@@ -296,8 +332,12 @@ indexed assignment, char rearrangement (QA D17), the scalar fixed-point range
 (QA D20), the logical `disp` width (QA D38), the non-BMP character count
 (QA D37, moved in from cycle 11) and the three cycle-01 cases, whose `disp`
 lines came back and whose `% NOTE:` blocks went, as that row instructed. It
-also turned QA D6 from a silent wrong answer into a clean error, which the
-row below records, and narrowed the `det` deviation above to its value half.
+also turned QA D6 from a silent wrong answer into a clean error and narrowed
+the `det` deviation above to its value half. Cycle 03 fixed the four rows
+scheduled to it: logical indexing itself (QA D6), trailing singleton
+subscripts (QA D22), the growth message that named the `usize` clamp, and
+bracketed assignment targets (QA D32); it also discharged the Known
+deviations row for the `x(0)` message, whose ending now names logical values.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -312,10 +352,6 @@ spec also lists, it removes the row from that spec in the same commit.
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a real MATLAB run | 01d (verify first) |
 | A non-UTF-8 file is unread (was part of QA D29) | A UTF-16LE file is `Error: Line 1: unexpected character` on a replacement character; MATLAB and Octave read it. Cycle 01e skipped the leading UTF-8 byte-order mark and swapped the strict read for a lossy one, which fixed the Windows-1252 half (a `% caf<E9>` comment now runs) and brought the failure inside the `Error:` format; a UTF-16 file still decodes to replacement characters rather than to its text, because that needs encoding detection and not a lossy decode | later |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
-| Logical indexing is unsupported (QA D6) | `x = [5 6 7]; x(x > 0)` and `x(x > 0) = 0` are the clean error `Logical indexing is not supported yet.`; MATLAB gives `5 6 7` and `0 0 0`. Until cycle 02 comparisons returned doubles, so a mask of all ones selected element 1 repeatedly and gave `5 5 5`, **silently and with no error**. Cycle 02 made comparisons and the predicates logical and refused a logical index at `eval_index_args`, in reading and in assignment alike, so the silent half is gone. The workaround until then is `x(find(x > 0))`, since `find` returns positions as doubles | 03 |
-| Trailing singleton subscripts are rejected (QA D22) | `A = [1 2; 3 4]; A(2, 1, 1)` is "Only 1-D and 2-D indexing is supported."; MATLAB gives `3` (Octave agrees) | 03 |
-| A size past `usize` is named as the clamp: indexed growth | `x = []; x(1e300) = 1` reports `Requested 1x18446744073709551615 array exceeds the maximum array size.`, because `eval_index_args` saturates the index before `check_size` sees it. Split from the constructor row, which cycle 01c fixed; cycle 03 rewrites `assign_index` | 03 |
-| Any bracketed assignment target is unsupported (QA D32) | `[r, c] = size(ones(2, 3))` is "invalid assignment target", and so is the single-output spelling `[x] = size(A, 1)`: the parser rejects a bracket on the left of `=` outright, rather than rejecting more than one output. So `[s, i] = sort(v)` and `[m, i] = max(v)` cannot be reached from any syntax the parser accepts. Cycle 03 claims `Stmt::MultiAssign` | 03 |
 | `%{ … %}` block comments execute (QA D7) | `%{` newline `disp(111)` newline `%}` prints `111`; MATLAB prints nothing. Cycle 04 claims block comments | 04 |
 | `error` misreads its arguments (QA D9) | `error('100% sure')` reports `100ure`; with one argument MATLAB applies no format or escape processing, so the message is `100% sure` (the `error` page). `error('MyPkg:myId', 'Value %d too big', 7)` reports `MyPkg:myId`; MATLAB reports `Value 7 too big` and attaches the identifier. `error('')` followed by `disp(2)` exits 1; "If all inputs to error are empty, MATLAB does not throw an error", so `2` prints. Cycle 04 owns `error('id:x', fmt, …)` | 04 |
 | Command syntax is unsupported (QA D31) | `x = 1; clear x` is a parse error, and so are `clear all`, `format long` and `disp hello`. A newcomer hits it in the first minute. Cycle 04 claims command syntax | 04 |
@@ -332,13 +368,14 @@ spec also lists, it removes the row from that spec in the same commit.
 `num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a
 single builtin moved. Cycle 01b closed the third, the uncapped range, by
 routing the `:` operator through `args::check_size` like every builtin shape
-(since cycle 01c, both go through `args::check_shape`).
+(since cycle 01c, both go through `args::check_shape`, and since cycle 03
+indexed growth does too).
 The QA pass found that the family was larger than the two `printf` rows that
 were left. Cycle 01d closed three of the four it added. `printf` bounds its
 width and its precision, so no conversion panics and none builds a pad it
 cannot afford. Every result shape computed from operand shapes now goes
 through `args::check_shape` before anything is allocated: broadcasting in
-`Matrix::try_zip`, `matmul`, two-subscript `index_read` and `math::reduce`
+`Matrix::try_zip`, `matmul`, every read and write through `resolve_read` and `resolve_write` (cycle 03), and `math::reduce`
 (QA D1), which is the same guard that stops a `matmul` size wrapping (QA D2).
 
 **Cycle 01e closed the last member: deep nesting overflows the stack (QA D4),
