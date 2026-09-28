@@ -86,6 +86,7 @@ fn run() -> i32 {
         };
     }
 
+    // Output to stdout and warnings to stderr, for a script and the REPL.
     let mut it = interp::Interp::new();
 
     if args.len() > 1 {
@@ -234,7 +235,8 @@ fn ui(opts: UiOptions) -> i32 {
         server::open_browser(&url);
     }
     let cfg = http::Config { port, token };
-    let mut it = interp::Interp::with_output(Box::new(io::sink()));
+    // Nothing is written outside an `eval`, which captures both sinks.
+    let mut it = interp::Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
     server::serve(&listener, &mut it, &cfg)
 }
 

@@ -39,9 +39,9 @@ pub fn at_most(args: &[Value], n: usize, _name: &str) -> R<()> {
 /// numeric builtin reads `'a'` as `97`.
 pub fn mat(args: &[Value], i: usize, name: &str) -> R<Matrix> {
     args.get(i)
-        .cloned()
-        .map(|v| v.into_mat())
-        .ok_or_else(|| error::not_enough_args(name))
+        .ok_or_else(|| error::not_enough_args(name))?
+        .clone()
+        .into_mat()
 }
 
 /// Argument `i` as a scalar.
@@ -136,7 +136,7 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
         if one.is_char() {
             return Err(error::bad_size_arg(name));
         }
-        let m = one.mat();
+        let m = one.mat()?;
         if let Some(n) = m.scalar_value() {
             let n = size_value(n, name)?;
             return Ok(vec![Some(n), Some(n)]);
@@ -155,7 +155,7 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
     }
     rest.iter()
         .enumerate()
-        .map(|(k, a)| match a.mat() {
+        .map(|(k, a)| match a.mat()? {
             m if m.is_char() => Err(error::bad_size_arg(name)),
             m if m.is_scalar() => size_value(m.data[0], name).map(Some),
             m if auto && m.is_empty() => Ok(None),

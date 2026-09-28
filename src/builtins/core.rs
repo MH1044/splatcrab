@@ -53,10 +53,15 @@ pub fn register(r: &mut Registry) {
     add(r, "fprintf", fprintf, "fprintf(fmt,...) - write formatted text.");
     add(r, "sprintf", sprintf, "sprintf(fmt,...) - format text into a string.");
     add(r, "num2str", num2str_fn, "num2str(x), num2str(x,n), num2str(x,fmt) - convert a number to text.");
-    add(r, "error", error, "error(fmt,...) - raise an error with a message.");
+    add(r, "error", error, "error(msg), error(fmt,...), error(id,fmt,...) - raise an error.");
+    add(r, "rethrow", rethrow, "rethrow(e) - raise the caught MException e again, unchanged.");
+    add(r, "lasterr", lasterr, "lasterr - the message of the last error raised.");
+    add(r, "warning", warning, "warning(msg), warning(fmt,...), warning(id,fmt,...) - print a warning.");
+    add(r, "assert", assert, "assert(cond), assert(cond,fmt,...) - raise an error unless cond holds.");
+    add(r, "isequal", isequal, "isequal(A,B,...) - true when every argument has A's size and values.");
 
     // ---- workspace ---------------------------------------------------
-    add(r, "clear", clear, "clear, clear('a') - remove variables from the workspace.");
+    add(r, "clear", clear, "clear, clear('a'), clear all - remove variables from the workspace.");
     add(r, "clc", clc, "clc - clear the screen.");
     add(r, "who", who, "who - list the variables in the workspace.");
     add(r, "whos", who, "whos - list the workspace variables with their sizes.");
@@ -95,7 +100,7 @@ fn eps(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         Some(v) => match v.text() {
             Some(s) if s.eq_ignore_ascii_case("double") => one_mat(Matrix::scalar(f64::EPSILON)),
             Some(_) => Err(error::eps_class()),
-            None => one_mat(v.mat().map(eps_at)),
+            None => one_mat(v.mat()?.map(eps_at)),
         },
     }
 }
@@ -294,7 +299,8 @@ fn isvector(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 fn class(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "class")?;
-    one(Value::str(mat(args, 0, "class")?.class.name()))
+    need(args, 1, "class")?;
+    one(Value::str(args[0].class_name()))
 }
 
 fn islogical(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
@@ -357,7 +363,7 @@ fn double(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 fn disp(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "disp")?;
     need(args, 1, "disp")?;
-    let text = args[0].mat().disp_text();
+    let text = args[0].disp_text();
     it.emit(&text)?;
     none()
 }
@@ -384,7 +390,7 @@ fn num2str_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     if args[0].is_char() {
         return one(args[0].clone());
     }
-    let m = args[0].mat();
+    let m = args[0].mat()?;
     let s = match args.get(1) {
         None => join_elements(m, num2str),
         Some(fmt) if fmt.is_char() => {
@@ -395,7 +401,7 @@ fn num2str_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
             text.trim_start().to_string()
         }
         Some(p) => {
-            let n = num2str_precision(p.mat())?;
+            let n = num2str_precision(p.mat()?)?;
             join_elements(m, |v| fmt_g(v, n))
         }
     };
@@ -416,10 +422,127 @@ fn join_elements(m: &Matrix, f: impl Fn(f64) -> String) -> String {
     m.data.iter().map(|v| f(*v)).collect::<Vec<_>>().join("  ")
 }
 
+// ---- errors and warnings ---------------------------------------------
+
+/// The identifier and the message that `error`, `warning` and `assert`'s
+/// message arguments spell, by the rules of the MATLAB `error` page (QA D9).
+///
+/// - One argument is the message itself, literal: no format and no escape
+///   processing, so `error('100% sure')` says `100% sure` and `error('a\nb')`
+///   keeps its backslash.
+/// - With more arguments, the first is an identifier when it contains a
+///   colon and no whitespace; the message is then the rest, formatted as
+///   `sprintf` formats it. Otherwise every argument is the format and its
+///   values, and there is no identifier.
+///
+/// `None` when the first argument is not text at all.
+pub fn message_args(args: &[Value]) -> R<Option<(String, String)>> {
+    let Some(first) = args.first().and_then(Value::text) else {
+        return Ok(None);
+    };
+    if args.len() == 1 {
+        return Ok(Some((String::new(), first)));
+    }
+    if is_identifier(&first) {
+        return Ok(Some((first, format_printf(&args[1..])?)));
+    }
+    Ok(Some((String::new(), format_printf(args)?)))
+}
+
+/// MATLAB's test for a message identifier in first position: a colon, and
+/// no whitespace.
+pub fn is_identifier(s: &str) -> bool {
+    s.contains(':') && !s.chars().any(char::is_whitespace)
+}
+
+/// True when every argument is empty, which makes `error` a no-op: "If all
+/// inputs to error are empty, MATLAB does not throw an error".
+fn all_empty(args: &[Value]) -> bool {
+    args.iter()
+        .all(|v| matches!(v.mat(), Ok(m) if m.is_empty()))
+}
+
+/// `error(msg)`, `error(fmt, A1, ...)` and `error(id, fmt, A1, ...)`.
 fn error(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    match args.first() {
-        Some(v) if v.is_char() => Err(error::raised(format_printf(args)?)),
-        _ => Err(error::raised_default()),
+    if !args.is_empty() && all_empty(args) {
+        return none();
+    }
+    match message_args(args)? {
+        Some((id, msg)) => Err(error::raised(msg, id)),
+        None => Err(error::raised_default()),
+    }
+}
+
+/// `rethrow(e)`: raises the caught error again, unchanged, its identifier
+/// and its line included.
+fn rethrow(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "rethrow")?;
+    need(args, 1, "rethrow")?;
+    match &args[0] {
+        Value::Exception(e) => Err(e.clone()),
+        v => Err(error::no_method("rethrow", v.class_name())),
+    }
+}
+
+/// `lasterr`: the message of the last error raised, caught or not, and
+/// `''` before the first.
+fn lasterr(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 0, "lasterr")?;
+    one(Value::str(&it.last_err))
+}
+
+/// `warning(msg)`, `warning(fmt, A1, ...)` and `warning(id, fmt, A1, ...)`:
+/// `Warning: <msg>` on the error sink, read by the same rules as `error`.
+/// Execution goes on.
+fn warning(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    need(args, 1, "warning")?;
+    // `warning('')` prints nothing, as `error('')` raises nothing.
+    if all_empty(args) {
+        return none();
+    }
+    let (_, msg) = message_args(args)?.ok_or_else(error::format_not_a_string)?;
+    it.emit_err(&error::warning_line(&msg))?;
+    none()
+}
+
+/// `assert(cond)` and `assert(cond, msg, ...)`: nothing when `cond` holds,
+/// and otherwise the error, `Assertion failed.` without a message and the
+/// message read as `error` reads its arguments with one. The condition holds
+/// by the rule `if` uses: non-empty, and every element non-zero.
+fn assert(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    need(args, 1, "assert")?;
+    if args[0].mat()?.truth()? {
+        return none();
+    }
+    if args.len() == 1 {
+        return Err(error::assertion_failed());
+    }
+    match message_args(&args[1..])? {
+        Some((id, msg)) => Err(error::raised(msg, id)),
+        None => Err(error::format_not_a_string()),
+    }
+}
+
+/// `isequal(A, B, ...)`: true when every argument has the same size and the
+/// same values as the first. The class is not compared, so `isequal('a',
+/// 97)` is true; a `NaN` is equal to nothing, itself included.
+fn isequal(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    need(args, 2, "isequal")?;
+    let same = args[1..].iter().all(|b| values_equal(&args[0], b));
+    one_as(Matrix::from_bool(same))
+}
+
+/// One pair for [`isequal`]. Two `MException`s are equal when their message
+/// and identifier are; an `MException` equals no array.
+pub fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Mat(a), Value::Mat(b)) => {
+            a.rows == b.rows && a.cols == b.cols && a.data.iter().zip(&b.data).all(|(x, y)| x == y)
+        }
+        (Value::Exception(a), Value::Exception(b)) => {
+            a.msg == b.msg && a.identifier == b.identifier
+        }
+        _ => false,
     }
 }
 
@@ -430,10 +553,17 @@ fn clear(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         it.vars.clear();
     } else {
         // `clear('a')` clears only `a`. Clearing a name that is not there is
-        // not an error in MATLAB either.
-        for i in 0..args.len() {
-            let name = string(args, i, "clear")?;
-            it.vars.remove(&name);
+        // not an error in MATLAB either. `clear all`, and so `clear('all')`,
+        // clears everything, as a bare `clear` does: the functions and
+        // globals it also clears in MATLAB do not exist yet.
+        let names = (0..args.len())
+            .map(|i| string(args, i, "clear"))
+            .collect::<R<Vec<String>>>()?;
+        if names.iter().any(|n| n == "all") {
+            it.vars.clear();
+        }
+        for name in &names {
+            it.vars.remove(name);
         }
     }
     none()
@@ -454,8 +584,9 @@ fn who(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     }
     let mut text = String::from("Your variables are:\n\n");
     for n in &names {
-        let m = it.vars[n].mat();
-        let row = format!("  {:<12} {}x{} {}\n", n, m.rows, m.cols, m.class.name());
+        let v = &it.vars[n];
+        let (rows, cols) = v.dims();
+        let row = format!("  {:<12} {}x{} {}\n", n, rows, cols, v.class_name());
         text.push_str(&row);
     }
     text.push('\n');
@@ -654,7 +785,7 @@ pub fn format_printf(args: &[Value]) -> R<String> {
     };
     let mut flat: Vec<PArg> = Vec::new();
     for (group, a) in args[1..].iter().enumerate() {
-        let m = a.mat();
+        let m = a.mat()?;
         if m.is_char() {
             flat.extend(m.data.iter().map(|v| PArg::Chr(*v, group)));
         } else {
@@ -826,6 +957,7 @@ mod tests {
     fn shape_of(f: super::super::BuiltinFn, args: &[Value]) -> (usize, usize) {
         match &call(f, args, 1).unwrap()[0] {
             Value::Mat(m) => (m.rows, m.cols),
+            other => panic!("expected a matrix, got {other:?}"),
         }
     }
 
@@ -839,6 +971,7 @@ mod tests {
         assert_eq!(shape_of(rand, &[num(2.0), num(2.0)]), (2, 2));
         match &call(eye, &[num(2.0)], 1).unwrap()[0] {
             Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0]),
+            other => panic!("expected a matrix, got {other:?}"),
         }
         // No arguments at all is a 1x1, as in MATLAB.
         assert_eq!(shape_of(zeros, &[]), (1, 1));
@@ -867,6 +1000,7 @@ mod tests {
         assert_eq!(shape_of(inf, &[num(2.0), num(3.0)]), (2, 3));
         match &call(nan, &[num(2.0)], 1).unwrap()[0] {
             Value::Mat(m) => assert!(m.data.iter().all(|v| v.is_nan())),
+            other => panic!("expected a matrix, got {other:?}"),
         }
         assert_eq!(shape_of(inf, &[]), (1, 1));
         // pi has the single syntax `p = pi` on the MATLAB page.
@@ -877,7 +1011,7 @@ mod tests {
     }
 
     fn mat_of(f: super::super::BuiltinFn, args: &[Value]) -> Matrix {
-        call(f, args, 1).unwrap()[0].clone().into_mat()
+        call(f, args, 1).unwrap()[0].clone().into_mat().unwrap()
     }
 
     fn row(v: &[f64]) -> Value {
@@ -956,6 +1090,7 @@ mod tests {
         );
         match &call(eye, &[row(&[2.0, 3.0])], 1).unwrap()[0] {
             Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            other => panic!("expected a matrix, got {other:?}"),
         }
         let nd = "N-D arrays are not supported.";
         assert_eq!(
@@ -1064,7 +1199,11 @@ mod tests {
         // A dimension past the array's is a singleton.
         let args = [a[0].clone(), num(3.0)];
         assert_eq!(
-            call(size, &args, 1).unwrap()[0].clone().into_mat().data,
+            call(size, &args, 1).unwrap()[0]
+                .clone()
+                .into_mat()
+                .unwrap()
+                .data,
             [1.0]
         );
     }
@@ -1104,9 +1243,12 @@ mod tests {
         // Asked for a value, both produce one.
         let handle = tic(&mut it, &[], 1).unwrap();
         assert_eq!(handle.len(), 1);
-        let elapsed = toc(&mut it, &handle, 1).unwrap()[0].clone().into_mat();
+        let elapsed = toc(&mut it, &handle, 1).unwrap()[0]
+            .clone()
+            .into_mat()
+            .unwrap();
         assert!(elapsed.scalar_value().unwrap() >= 0.0);
-        let bare = toc(&mut it, &[], 1).unwrap()[0].clone().into_mat();
+        let bare = toc(&mut it, &[], 1).unwrap()[0].clone().into_mat().unwrap();
         assert!(bare.scalar_value().unwrap() >= 0.0);
     }
 
@@ -1522,7 +1664,7 @@ mod tests {
             call(size, std::slice::from_ref(&a), n)
                 .unwrap()
                 .into_iter()
-                .map(|v| v.into_mat().data[0])
+                .map(|v| v.into_mat().unwrap().data[0])
                 .collect()
         };
         assert_eq!(dims(2), [2.0, 5.0]);
@@ -1531,9 +1673,125 @@ mod tests {
         for n in [0, 1] {
             let out = call(size, std::slice::from_ref(&a), n).unwrap();
             assert_eq!(out.len(), 1);
-            assert_eq!(out[0].mat().data, [2.0, 5.0]);
+            assert_eq!(out[0].mat().unwrap().data, [2.0, 5.0]);
         }
         // `size(A, dim)` is one value however many are asked for.
         assert_eq!(call(size, &[a, num(2.0)], 2).unwrap().len(), 1);
+    }
+
+    // ---- errors and warnings (cycle 04) ----------------------------------
+
+    fn s(text: &str) -> Value {
+        Value::str(text)
+    }
+
+    fn msg_of(args: &[Value]) -> (String, String) {
+        message_args(args).unwrap().expect("text arguments")
+    }
+
+    /// QA D9: one argument is literal, and the identifier is the first of
+    /// several arguments when it has a colon and no whitespace.
+    #[test]
+    fn the_message_argument_rules() {
+        let none = String::new;
+        assert_eq!(msg_of(&[s("100% sure")]), (none(), "100% sure".into()));
+        assert_eq!(msg_of(&[s("a\\nb")]), (none(), "a\\nb".into()));
+        // One argument is never an identifier, colon or not.
+        assert_eq!(msg_of(&[s("a:b")]), (none(), "a:b".into()));
+        assert_eq!(
+            msg_of(&[s("MyPkg:myid"), s("Value %d bad"), num(7.0)]),
+            ("MyPkg:myid".into(), "Value 7 bad".into())
+        );
+        // With an identifier the message is a format, escapes included.
+        assert_eq!(
+            msg_of(&[s("a:b"), s("x\\ny")]),
+            ("a:b".into(), "x\ny".into())
+        );
+        // A colon with whitespace is a format, not an identifier.
+        assert_eq!(
+            msg_of(&[s("Value: %d"), num(5.0)]),
+            (none(), "Value: 5".into())
+        );
+        // No colon: every argument is the format and its values.
+        assert_eq!(msg_of(&[s("n = %d"), num(3.0)]), (none(), "n = 3".into()));
+        assert_eq!(message_args(&[num(1.0)]).unwrap(), None);
+        assert_eq!(message_args(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn error_throws_nothing_when_every_input_is_empty() {
+        assert!(call(error, &[s("")], 0).unwrap().is_empty());
+        assert!(
+            call(error, &[s(""), Value::Mat(Matrix::empty())], 0)
+                .unwrap()
+                .is_empty()
+        );
+        let e = call(error, &[s("100% sure")], 0).unwrap_err();
+        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("100% sure", ""));
+        let e = call(error, &[s("p:q"), s("v %d"), num(2.0)], 0).unwrap_err();
+        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("v 2", "p:q"));
+        assert_eq!(call(error, &[num(1.0)], 0).unwrap_err().msg, "error");
+    }
+
+    #[test]
+    fn assert_passes_or_raises_its_message() {
+        assert!(
+            call(assert, &[Value::Mat(Matrix::from_bool(true))], 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(call(assert, &[num(2.0)], 0).unwrap().is_empty());
+        let no = || Value::Mat(Matrix::from_bool(false));
+        assert_eq!(
+            call(assert, &[no()], 0).unwrap_err().msg,
+            "Assertion failed."
+        );
+        assert_eq!(
+            call(assert, &[no(), s("nope %d"), num(3.0)], 0)
+                .unwrap_err()
+                .msg,
+            "nope 3"
+        );
+        assert_eq!(call(assert, &[no(), s("50%")], 0).unwrap_err().msg, "50%");
+        let e = call(assert, &[no(), s("a:b"), s("m")], 0).unwrap_err();
+        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("m", "a:b"));
+        // The condition is judged as `if` judges it.
+        assert!(call(assert, &[Value::Mat(Matrix::empty())], 0).is_err());
+        assert!(call(assert, &[Value::Mat(Matrix::row(vec![1.0, 0.0]))], 0).is_err());
+        assert!(call(assert, &[Value::Mat(Matrix::scalar(f64::NAN))], 0).is_err());
+    }
+
+    #[test]
+    fn isequal_compares_sizes_and_values_but_not_classes() {
+        let yes = |args: &[Value]| {
+            let v = call(isequal, args, 1)
+                .unwrap()
+                .remove(0)
+                .into_mat()
+                .unwrap();
+            assert_eq!(v.class, Class::Logical);
+            v.data[0] == 1.0
+        };
+        let r = |d: &[f64]| Value::Mat(Matrix::row(d.to_vec()));
+        assert!(yes(&[r(&[1.0, 2.0]), r(&[1.0, 2.0])]));
+        assert!(yes(&[s("a"), s("a"), s("a")]));
+        assert!(!yes(&[r(&[1.0, 2.0]), r(&[1.0, 2.0, 3.0])]));
+        assert!(!yes(&[
+            r(&[1.0, 2.0]),
+            Value::Mat(Matrix::col(vec![1.0, 2.0]))
+        ]));
+        assert!(yes(&[s("a"), num(97.0)]));
+        assert!(yes(&[Value::Mat(Matrix::from_bool(true)), num(1.0)]));
+        assert!(!yes(&[num(f64::NAN), num(f64::NAN)]));
+        assert!(yes(&[Value::Mat(Matrix::empty()), s("")]));
+        assert!(!yes(&[num(1.0), num(1.0), num(2.0)]));
+        assert_eq!(
+            call(isequal, &[num(1.0)], 1).unwrap_err().msg,
+            "Not enough input arguments for 'isequal'."
+        );
+        let e = |m: &str| Value::Exception(crate::error::MError::new(m));
+        assert!(yes(&[e("x"), e("x")]));
+        assert!(!yes(&[e("x"), e("y")]));
+        assert!(!yes(&[e("x"), num(1.0)]));
     }
 }

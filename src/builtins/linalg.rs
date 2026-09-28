@@ -470,7 +470,7 @@ mod tests {
 
     fn call(f: crate::builtins::BuiltinFn, args: &[Value]) -> R<Matrix> {
         let mut it = Interp::with_output(Box::new(std::io::sink()));
-        Ok(f(&mut it, args, 1)?[0].clone().into_mat())
+        Ok(f(&mut it, args, 1)?[0].clone().into_mat().unwrap())
     }
 
     fn row(v: &[f64]) -> Value {
@@ -1010,7 +1010,7 @@ mod tests {
         f(&mut it, args, nargout)
             .unwrap()
             .into_iter()
-            .map(|v| v.into_mat())
+            .map(|v| v.into_mat().unwrap())
             .collect()
     }
 

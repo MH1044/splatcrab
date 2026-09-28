@@ -49,18 +49,31 @@ pub struct Matrix {
 #[derive(Clone, Debug)]
 pub enum Value {
     Mat(Matrix),
+    /// The `MException` a `catch e` binds (cycle 04): the error that was
+    /// caught, whole, so that `rethrow(e)` raises it again unchanged, its
+    /// line included. `e.message` and `e.identifier` read its two texts;
+    /// `e.stack` waits for cycle 05. It is a value of its own, not an array,
+    /// so every array operation refuses it with [`error::not_an_array`].
+    Exception(error::MError),
 }
 
+/// The class name an `MException` reports.
+pub const EXCEPTION_CLASS: &str = "MException";
+
 impl Value {
-    pub fn into_mat(self) -> Matrix {
+    /// The matrix this value is, or the refusal for a value that is not one.
+    pub fn into_mat(self) -> R<Matrix> {
         match self {
-            Value::Mat(m) => m,
+            Value::Mat(m) => Ok(m),
+            Value::Exception(_) => Err(error::not_an_array(EXCEPTION_CLASS)),
         }
     }
 
-    pub fn mat(&self) -> &Matrix {
+    /// The matrix this value is, borrowed; see [`Value::into_mat`].
+    pub fn mat(&self) -> R<&Matrix> {
         match self {
-            Value::Mat(m) => m,
+            Value::Mat(m) => Ok(m),
+            Value::Exception(_) => Err(error::not_an_array(EXCEPTION_CLASS)),
         }
     }
 
@@ -70,18 +83,66 @@ impl Value {
     }
 
     pub fn is_char(&self) -> bool {
-        self.mat().class == Class::Char
+        matches!(self, Value::Mat(m) if m.class == Class::Char)
     }
 
     /// The text of a char value, and `None` for any other class.
     pub fn text(&self) -> Option<String> {
-        let m = self.mat();
-        (m.class == Class::Char).then(|| m.text())
+        match self {
+            Value::Mat(m) if m.class == Class::Char => Some(m.text()),
+            _ => None,
+        }
+    }
+
+    /// What `class` returns.
+    pub fn class_name(&self) -> &'static str {
+        match self {
+            Value::Mat(m) => m.class.name(),
+            Value::Exception(_) => EXCEPTION_CLASS,
+        }
+    }
+
+    /// Rows and columns; an `MException` is one object, 1x1.
+    pub fn dims(&self) -> (usize, usize) {
+        match self {
+            Value::Mat(m) => (m.rows, m.cols),
+            Value::Exception(_) => (1, 1),
+        }
     }
 
     /// `name =`, a blank line, the display body and a closing blank line.
     pub fn display(&self, name: &str) -> String {
-        format!("{} =\n\n{}\n", name, self.mat().display_body())
+        format!("{} =\n\n{}\n", name, self.display_body())
+    }
+
+    /// What follows `x =` and its blank line.
+    ///
+    /// An `MException` shows SplatCrab's own one-line form rather than
+    /// MATLAB's property listing: `  MException: boom`, or
+    /// `  MException (a:b): boom` when it has an identifier.
+    pub fn display_body(&self) -> String {
+        match self {
+            Value::Mat(m) => m.display_body(),
+            Value::Exception(e) => exception_line(e),
+        }
+    }
+
+    /// What `disp` prints: a matrix's [`Matrix::disp_text`], and for an
+    /// `MException` the same line its named display shows.
+    pub fn disp_text(&self) -> String {
+        match self {
+            Value::Mat(m) => m.disp_text(),
+            Value::Exception(e) => exception_line(e),
+        }
+    }
+}
+
+/// The one line an `MException` displays as.
+fn exception_line(e: &error::MError) -> String {
+    if e.identifier.is_empty() {
+        format!("  {}: {}\n", EXCEPTION_CLASS, e.msg)
+    } else {
+        format!("  {} ({}): {}\n", EXCEPTION_CLASS, e.identifier, e.msg)
     }
 }
 
@@ -835,7 +896,7 @@ mod tests {
 
     #[test]
     fn value_conversions() {
-        let m = Value::str("AB").into_mat();
+        let m = Value::str("AB").into_mat().unwrap();
         assert_eq!((m.rows, m.cols), (1, 2));
         assert_eq!(m.data, [65.0, 66.0]);
         assert_eq!(m.class, Class::Char);
@@ -1596,10 +1657,10 @@ mod tests {
     /// be, which is what made `size('')` report `1 0`.
     #[test]
     fn the_empty_string_is_zero_by_zero() {
-        let m = Value::str("").into_mat();
+        let m = Value::str("").into_mat().unwrap();
         assert_eq!((m.rows, m.cols, m.class), (0, 0, Class::Char));
         // A non-empty string is still the row of codes it always was.
-        let ab = Value::str("ab").into_mat();
+        let ab = Value::str("ab").into_mat().unwrap();
         assert_eq!((ab.rows, ab.cols), (1, 2));
     }
 }

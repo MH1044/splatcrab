@@ -483,7 +483,7 @@ fn discard_head(input: &mut impl BufRead, tail: &[u8]) -> io::Result<()> {
 
 /// `splatcrab --http-stdio`: [`handle`] with no socket, over a fresh session.
 pub fn serve_stdio(input: impl BufRead, output: impl Write, cfg: &Config) -> io::Result<()> {
-    let mut it = Interp::with_output(Box::new(io::sink()));
+    let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
     serve_stdio_with(&mut it, input, output, cfg)
 }
 

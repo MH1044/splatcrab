@@ -381,8 +381,70 @@ total =
 a `...` separates elements just as a space does, so `[1 ...` newline `-2]` is
 two elements.
 
-`%{ ... %}` block comments are **not** recognised: the lines between them
-execute. See [Differences](#differences-from-matlab).
+`%{` and `%}`, each alone on its line (spaces around them are allowed),
+bracket a block comment. Blocks nest, and a `%{` with anything else on its
+line is an ordinary one-line comment. A block left open runs to the end of
+the file; at the REPL, the prompt keeps reading until it is closed.
+
+```matlab
+%{
+disp('hidden')
+  %{
+  disp('nested, hidden too')
+  %}
+%}
+%{ this line is an ordinary comment
+disp('shown')
+```
+
+```
+shown
+```
+
+### Command syntax
+
+A statement that starts with a name that is not a variable, then whitespace,
+then a word that is not an operator followed by whitespace, calls that name
+with each following word as a char argument. Quotes group words. So
+`disp hello` is `disp('hello')` and `clear x y` is `clear('x', 'y')`, while
+`x -1` with `x` a variable stays the expression `x - 1`.
+
+```matlab
+disp hello
+disp 'two words'
+x = 1; y = 2;
+clear x
+who
+x = 3;
+x -1
+```
+
+```
+hello
+two words
+Your variables are:
+
+  y            1x1 double
+
+ans =
+
+     2
+
+```
+
+A command ends at a newline, a `,`, a `;` or a `%` outside quotes. Whether a
+name is a variable is decided before the script runs, from the names it has
+assigned by then, as MATLAB decides it in a file. `hold on` and
+`format long` are command syntax too, but `hold` and `format` arrive in
+cycles 12 and 13, so today they are the unrecognized-name error:
+
+```matlab
+hold on
+```
+
+```
+Error: Line 1: Unrecognized function or variable 'hold'.
+```
 
 ### Display and `;`
 
@@ -1596,6 +1658,151 @@ n =
 A `break` or `continue` outside a loop is an error, as in MATLAB. It used to end the script silently with
 exit 0 instead of erroring. See [Differences](#differences-from-matlab).
 
+### `switch`
+
+The first `case` whose value matches runs, and there is no fall-through. A
+`case {a, b}` list matches when any of its values does. A number matches a
+number of equal value, whatever its class; a char matches a char of the same
+text, and never a number by its code. `break` and `continue` inside a
+`switch` act on the loop around it.
+
+```matlab
+x = 2;
+switch x
+    case 1
+        disp('one')
+    case {2, 3}
+        disp('two or three')
+    otherwise
+        disp('other')
+end
+s = 'abc';
+switch s
+    case 'xyz'
+        disp('no')
+    case {'abc', 'def'}
+        disp('text matches text')
+end
+switch 97
+    case 'a'
+        disp('never: a char does not match its code')
+    otherwise
+        disp('97 is not ''a'' here')
+end
+for k = 1:5
+    switch k
+        case 3
+            break
+    end
+    fprintf('%d', k);
+end
+fprintf('\n');
+```
+
+```
+two or three
+text matches text
+97 is not 'a' here
+12
+```
+
+The value switched on must be a scalar or a character vector:
+
+```matlab
+switch [1 2]
+    case 1
+end
+```
+
+```
+Error: Line 1: SWITCH expression must be a scalar or a character vector.
+```
+
+### `try` and `catch`
+
+An error inside `try`, from `error` or from anything else, runs the `catch`
+block instead of ending the script. `catch e` with a name on the same line
+binds the error to `e`; `catch` followed by a comma or a newline binds
+nothing. A `try` with no `catch` ignores the error.
+
+```matlab
+try
+    x = [1 2] * [3 4];
+catch
+    disp('caught')
+end
+try
+    error('MyPkg:myid', 'Value %d bad', 7)
+catch e
+    disp(e.identifier)
+    disp(e.message)
+    disp(class(e))
+end
+try
+    undefined_thing + 1;
+catch e
+    disp(e.message)
+end
+e
+```
+
+```
+caught
+MyPkg:myid
+Value 7 bad
+MException
+Unrecognized function or variable 'undefined_thing'.
+e =
+
+  MException: Unrecognized function or variable 'undefined_thing'.
+
+```
+
+`e` is a minimal `MException`: `e.message` and `e.identifier`, which is empty
+for an error the interpreter raised itself or an `error` call without one.
+Its display is SplatCrab's own one line, `  MException: <message>`, or
+`  MException (<identifier>): <message>`; MATLAB lists the properties.
+`rethrow(e)` raises it again unchanged, and `lasterr` is the message of the
+last error, caught or not:
+
+```matlab
+try
+    try
+        error('inner')
+    catch e
+        rethrow(e)
+    end
+catch e2
+    disp(['outer: ' e2.message])
+end
+disp(lasterr)
+try
+    error('no catch, so nothing happens')
+end
+disp('after')
+```
+
+```
+outer: inner
+inner
+after
+```
+
+`e.stack` arrives with user functions in cycle 05; until then it is the Dot
+error any other field gives:
+
+```matlab
+try
+    error('x')
+catch e
+    e.stack
+end
+```
+
+```
+Error: Line 4: Dot indexing is not supported for variables of this type.
+```
+
 ### What counts as true
 
 A condition is true when it is non-empty and every element is non-zero. An
@@ -1625,7 +1832,7 @@ string true
 
 ## Builtins
 
-88 names, each an ordinary function registered by name. Every one rejects
+93 names, each an ordinary function registered by name. Every one rejects
 arguments it does not understand with `Too many input arguments.` rather than
 ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 `clear`, `who`, bare `tic`, bare `toc`) is legal as a statement and is
@@ -2078,7 +2285,9 @@ complex numbers arrive in cycle 10; see [Numerics](#numerics).
 
 `isnan isinf isfinite`, beside the shape queries `isempty isscalar isvector`
 and the class tests `islogical ischar isnumeric isa`. Every one returns a
-logical.
+logical. `isequal(A, B, ...)` is true when every argument has the first
+one's size and values; the class is not compared, so `isequal('a', 97)` is
+true.
 
 ```matlab
 a = isnan([1 NaN Inf])
@@ -2104,6 +2313,33 @@ c =
   1×3 logical array
 
    1   0   0
+
+```
+
+```matlab
+a = isequal([1 2], [1 2])
+b = isequal('a', 97)
+c = isequal([1 2], [1 2 3])
+```
+
+```
+a =
+
+  logical
+
+   1
+
+b =
+
+  logical
+
+   1
+
+c =
+
+  logical
+
+   0
 
 ```
 
@@ -2372,7 +2608,9 @@ Error: Line 1: Insufficient number of outputs from right hand side of equal sign
 
 ### Output
 
-`disp fprintf sprintf num2str error`. See
+`disp fprintf sprintf num2str`, and `error rethrow lasterr warning assert`,
+which [Errors and exit codes](#errors-and-exit-codes) and
+[`try` and `catch`](#try-and-catch) describe. See
 [Output and formatting](#output-and-formatting) for the detail.
 
 ```matlab
@@ -2399,8 +2637,9 @@ n =
 
 ### Workspace
 
-`clear clc who whos`. `clear()` with no arguments empties the workspace;
-`clear('a')` removes one name. `clc` writes the ANSI clear-screen sequence.
+`clear clc who whos`. `clear()` with no arguments empties the workspace, and
+so does `clear all`; `clear('a')` removes one name, and so does the command
+form `clear a`. `clc` writes the ANSI clear-screen sequence.
 
 ```matlab
 a = 1;
@@ -2436,18 +2675,9 @@ Your variables are:
 done
 ```
 
-Two notes. `who` prints the typed table that MATLAB's `whos` prints, and
-`whos` prints the same thing; and `clear x` in command syntax is a parse
-error, so the parentheses are required:
-
-```matlab
-x = 1;
-clear x
-```
-
-```
-Error: Line 2: unexpected 'x'
-```
+`who` prints the typed table that MATLAB's `whos` prints, and `whos` prints
+the same thing. `clear x`, without parentheses, is
+[command syntax](#command-syntax).
 
 ### Timing
 
@@ -3300,6 +3530,57 @@ error('value %d is too big', 7)
 Error: Line 1: value 7 is too big
 ```
 
+With one argument the message is literal, with no format or escape
+processing, as in MATLAB:
+
+```matlab
+error('100% sure')
+```
+
+```
+Error: Line 1: 100% sure
+```
+
+A first argument with a colon and no whitespace, followed by more arguments,
+is an identifier, which a `catch` reads back as `e.identifier`:
+`error('MyPkg:myid', 'Value %d bad', 7)` reports `Value 7 bad`. When every
+argument is empty, `error` raises nothing:
+
+```matlab
+error('')
+disp('still running')
+```
+
+```
+still running
+```
+
+`warning` takes the same arguments and prints `Warning: <message>` to stderr,
+and the script goes on; the exit code stays 0. Under `--protocol` and `--ui`
+the warning is part of the `eval`'s `out`, where it was raised.
+
+```matlab
+disp('before')
+warning('careful %d', 1)
+```
+
+```
+before
+Warning: careful 1
+```
+
+`assert(cond)` raises `Assertion failed.` when `cond` does not hold by the
+rule `if` uses, and `assert(cond, fmt, ...)` raises that message instead:
+
+```matlab
+assert(1 + 1 == 2)
+assert(1 + 1 == 3, 'arithmetic is off by %d', 1)
+```
+
+```
+Error: Line 2: arithmetic is off by 1
+```
+
 A script is parsed in full before anything runs, so a syntax error anywhere
 means nothing executes:
 
@@ -3570,22 +3851,11 @@ here, where MATLAB is understood to refuse both.
 
 ### Syntax not recognised
 
-Block comments execute their contents:
-
-```matlab
-%{
-disp(111)
-%}
-disp(222)
-```
-
-```
-   111
-   222
-```
-
-Command syntax is a parse error, so `clear x`, `format long` and `disp hello`
-all fail; use `clear('x')`. Chained ranges parse as MATLAB reads them,
+Command syntax decides whether a name is a variable before the script runs,
+from the names the script has assigned by then; a name cleared and then used
+in command form stays an expression. `hold on` and `format long` are
+command syntax whose builtins do not exist yet. Chained ranges parse as
+MATLAB reads them,
 `1:2:3:4` as `(1:2:3):4`, but a colon operand that is not a scalar is then an
 error. Hex literals (`0x1F`) are rejected. A UTF-8 byte-order mark at the
 start of a file is skipped; a UTF-16 file is not read.
@@ -3613,20 +3883,12 @@ square systems only and errors where MATLAB warns and returns a least-squares
 answer. `inv` of a singular matrix errors where MATLAB warns and returns
 `Inf`. `who` prints the typed table that is MATLAB's `whos`.
 
-`error` with a single argument applies format processing, which MATLAB does
-not:
-
-```matlab
-error('100% sure')
-```
-
-```
-Error: Line 1: 100ure
-```
-
-MATLAB reports `100% sure`. With a format and arguments (`error('value %d',
-7)`) SplatCrab is correct; it is the one-argument case that is wrong. An
-identifier first argument is not supported either.
+A caught error is a minimal `MException`: `e.message`, `e.identifier` and
+`class(e)`, with no `e.stack` until cycle 05, and a one-line display of
+SplatCrab's own. An error the interpreter raises itself has an empty
+identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`.
+`warning('off')` and `lastwarn` do not exist: `warning('off')` prints
+`Warning: off`.
 
 Empty-result shapes match MATLAB: `find([])` and `diag([])` are 0x0,
 `size('')` is `0 0`, and `disp([])` prints nothing. All four differed before
@@ -3687,12 +3949,8 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 | Missing | Arrives in |
 |---|---|
-| `switch` / `case` / `otherwise` | 04 |
-| `try` / `catch` | 04 |
-| Command syntax (`clear x`, `format long`) | 04 |
-| Block comments `%{ ... %}` | 04 |
-| `warning` | 04 |
 | User-defined functions, `nargin` / `nargout`, scoping | 05 |
+| `e.stack` and the error trace | 05 |
 | Function handles and anonymous functions `@(x) ...` | 06 |
 | Cell arrays `{...}` | 07 |
 | Structs `s.field` | 07 |

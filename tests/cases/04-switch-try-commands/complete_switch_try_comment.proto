@@ -1,0 +1,4 @@
+% covers: 18 - complete counts switch and try as block openers and an open block comment as unfinished
+{"id":1,"op":"complete","code":"switch x\ncase 1\n"}
+{"id":2,"op":"complete","code":"try\nx = 1;\ncatch\nend"}
+{"id":3,"op":"complete","code":"%{\nnot yet"}

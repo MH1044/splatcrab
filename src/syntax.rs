@@ -17,12 +17,17 @@ use crate::lexer::{self, Token};
 /// rather than a prompt that waits for more input that can never fix it.
 ///
 /// A new statement that opens a block must be counted here, beside `if`,
-/// `for` and `while`.
+/// `for`, `while`, `switch` and `try`. A `%{` block comment still open at the
+/// end is unfinished too, since the lines that close it are still to come.
 pub fn is_complete(src: &str) -> bool {
-    let toks = match lexer::lex(src) {
-        Ok(t) => t,
+    let lexed = match lexer::scan(src) {
+        Ok(l) => l,
         Err(_) => return true,
     };
+    if lexed.open_comment {
+        return false;
+    }
+    let toks = lexed.tokens;
     let mut brackets: i32 = 0;
     let mut parens: i32 = 0;
     let mut blocks: i32 = 0;
@@ -33,7 +38,7 @@ pub fn is_complete(src: &str) -> bool {
             // An `end` inside `(...)` or `{...}` is an index's, not a block's.
             Token::LParen | Token::LBrace => parens += 1,
             Token::RParen | Token::RBrace => parens -= 1,
-            Token::If | Token::For | Token::While => blocks += 1,
+            Token::If | Token::For | Token::While | Token::Switch | Token::Try => blocks += 1,
             Token::End if parens == 0 => blocks -= 1,
             _ => {}
         }
@@ -79,5 +84,23 @@ mod tests {
         assert!(is_complete("\n"));
         assert!(is_complete("x = 'unterminated"));
         assert!(is_complete("x = #"));
+    }
+
+    /// The inputs of cycle 04's acceptance test 18, and their neighbours.
+    #[test]
+    fn switch_try_and_block_comments() {
+        assert!(!is_complete("switch x\ncase 1\n"));
+        assert!(is_complete("switch x\ncase 1\nend"));
+        assert!(is_complete("try\nx = 1;\ncatch\nend"));
+        assert!(!is_complete("try\nx = 1;\ncatch e\n"));
+        assert!(!is_complete("%{\nnot yet"));
+        assert!(is_complete("%{\nnot yet\n%}"));
+        assert!(!is_complete("%{\n%{\n%}\n"));
+        // An `end` inside a block comment closes nothing.
+        assert!(!is_complete("for k = 1:2\n%{\nend\n%}\n"));
+        // A marker that is not alone on its line is an ordinary comment.
+        assert!(is_complete("x = 1 %{"));
+        // `case {` is an index-like brace: an `end` there is not a block's.
+        assert!(is_complete("switch x, case {1, 2}, end"));
     }
 }

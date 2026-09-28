@@ -1,0 +1,4 @@
+% covers: 18 - the REPL shares is_complete, so an open switch keeps it reading: no half of the switch runs, and end of input is the unterminated-block error
+switch 1
+case 1
+disp(5)

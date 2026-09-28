@@ -8,8 +8,8 @@ use crate::bail;
 use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
-use crate::lexer::scan;
-use crate::parser::{Access, BinOp, Expr, LValue, Located, MAX_DEPTH, Parser, Stmt};
+use crate::lexer::scan_known;
+use crate::parser::{Access, BinOp, CaseArm, Expr, LValue, Located, MAX_DEPTH, Parser, Stmt};
 use crate::value::{Class, Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -40,12 +40,26 @@ pub struct Interp {
     /// Everything the interpreter prints goes here. Nothing in this crate
     /// outside `main.rs` may use `print!`, so tests can capture output.
     pub out: Box<dyn Write>,
+    /// The second sink, for diagnostics a program goes on after: `warning`
+    /// (cycle 04), and cycle 11's `fprintf(2, ...)`. Stderr in a script and
+    /// at the REPL; under `--protocol` and `--ui` the same capture as `out`,
+    /// so a warning lands in an `eval`'s `out` in the order it was raised.
+    pub err: Box<dyn Write>,
+    /// The message of the last error raised, caught or not: what `lasterr`
+    /// returns. Empty before the first.
+    pub(crate) last_err: String,
 }
 
 enum Flow {
     Normal,
     Break,
     Continue,
+}
+
+/// What a `switch` compares its cases against.
+enum Subject {
+    Text(String),
+    Num(f64),
 }
 
 /// One subscript after evaluation, zero-based.
@@ -170,8 +184,15 @@ impl Interp {
         Self::with_output(Box::new(io::stdout()))
     }
 
-    /// Builds an interpreter that writes everything to `out`.
+    /// Builds an interpreter that writes its output to `out` and its
+    /// warnings to stderr.
     pub fn with_output(out: Box<dyn Write>) -> Self {
+        Self::with_sinks(out, Box::new(io::stderr()))
+    }
+
+    /// Builds an interpreter over both sinks: `out` for output, `err` for
+    /// warnings.
+    pub fn with_sinks(out: Box<dyn Write>, err: Box<dyn Write>) -> Self {
         Interp {
             vars: HashMap::new(),
             end_stack: Vec::new(),
@@ -182,6 +203,8 @@ impl Interp {
             depth: 0,
             loop_depth: 0,
             out,
+            err,
+            last_err: String::new(),
         }
     }
 
@@ -207,6 +230,15 @@ impl Interp {
         self.out.write_all(s.as_bytes()).map_err(error::output)
     }
 
+    /// The single place a warning leaves the evaluator. `out` is flushed
+    /// first, so that when the two sinks are two streams that end up on one
+    /// terminal, what was printed before the warning shows before it.
+    pub(crate) fn emit_err(&mut self, s: &str) -> R<()> {
+        self.out.flush().map_err(error::output)?;
+        self.err.write_all(s.as_bytes()).map_err(error::output)?;
+        self.err.flush().map_err(error::output)
+    }
+
     pub fn run(&mut self, src: &str) -> R<()> {
         // An entry that failed part-way left its counters raised, and the
         // REPL hands the same interpreter the next line. Without this, one
@@ -214,7 +246,18 @@ impl Interp {
         // a `break` left mid-loop would make a later top-level one legal.
         self.depth = 0;
         self.loop_depth = 0;
-        let lexed = scan(src)?;
+        let result = self.run_entry(src);
+        if let Err(e) = &result {
+            self.last_err = e.msg.clone();
+        }
+        result
+    }
+
+    fn run_entry(&mut self, src: &str) -> R<()> {
+        // Command syntax depends on which names are variables (`x -1` is an
+        // expression when `x` is one), so the lexer is told the workspace.
+        let vars = &self.vars;
+        let lexed = scan_known(src, &|name| vars.contains_key(name))?;
         let stmts = Parser::with_lines(lexed).parse_program()?;
         self.exec_block(&stmts)?;
         Ok(())
@@ -350,10 +393,73 @@ impl Interp {
             // gives a parse error. It is raised here rather than in the
             // parser so that everything the script printed first is still
             // printed, which is what the script's own output shows.
+            Stmt::Switch(subject, arms, otherwise) => self.exec_switch(subject, arms, otherwise),
+            Stmt::Try(body, var, handler) => {
+                // An error unwinding out of the body can leave the nesting
+                // counters raised (a failed `deepen` does not undo itself),
+                // so they are put back to what they were at the `try` before
+                // the handler runs. `end_stack` is popped on every path.
+                let (depth, loop_depth, ends) = (self.depth, self.loop_depth, self.end_stack.len());
+                match self.exec_block(body) {
+                    Ok(flow) => Ok(flow),
+                    Err(e) => {
+                        self.depth = depth;
+                        self.loop_depth = loop_depth;
+                        self.end_stack.truncate(ends);
+                        self.last_err = e.msg.clone();
+                        if let Some(name) = var {
+                            self.vars.insert(name.clone(), Value::Exception(e));
+                        }
+                        self.exec_block(handler)
+                    }
+                }
+            }
             Stmt::Break if self.loop_depth == 0 => Err(error::break_outside_loop()),
             Stmt::Continue if self.loop_depth == 0 => Err(error::continue_outside_loop()),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
+        }
+    }
+
+    /// `switch subject, case ..., otherwise ..., end`.
+    ///
+    /// The subject is a scalar or a character vector. A char subject matches
+    /// a char case with the same text and never a number, so `switch 'a'`
+    /// does not match `case 97`; a numeric or logical subject matches a
+    /// scalar case of equal value that is not a char, whatever its class.
+    /// Case values are evaluated in order, only until one matches; a
+    /// `case {a, b}` list matches when any of its values does.
+    fn exec_switch(
+        &mut self,
+        subject: &Expr,
+        arms: &[CaseArm],
+        otherwise: &Option<Vec<Located>>,
+    ) -> R<Flow> {
+        let subject = match self.eval(subject)? {
+            Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => Subject::Text(m.text()),
+            Value::Mat(m) if m.is_scalar() && m.class != Class::Char => Subject::Num(m.data[0]),
+            _ => bail!(error::switch_expression()),
+        };
+        for arm in arms {
+            for e in &arm.values {
+                let v = self.eval(e).map_err(|err| err.at(arm.line))?;
+                let hit = match (&subject, &v) {
+                    (Subject::Text(s), Value::Mat(m)) => {
+                        m.class == Class::Char && m.rows <= 1 && m.text() == *s
+                    }
+                    (Subject::Num(x), Value::Mat(m)) => {
+                        m.class != Class::Char && m.is_scalar() && m.data[0] == *x
+                    }
+                    _ => false,
+                };
+                if hit {
+                    return self.exec_block(&arm.body);
+                }
+            }
+        }
+        match otherwise {
+            Some(body) => self.exec_block(body),
+            None => Ok(Flow::Normal),
         }
     }
 
@@ -443,7 +549,7 @@ impl Interp {
     }
 
     fn eval_mat(&mut self, e: &Expr) -> R<Matrix> {
-        Ok(self.eval(e)?.into_mat())
+        self.eval(e)?.into_mat()
     }
 
     fn eval_scalar(&mut self, e: &Expr, what: &str) -> R<f64> {
@@ -631,10 +737,16 @@ impl Interp {
         let Some((first, rest)) = chain.split_first() else {
             return self.eval_node(&Expr::Ident(name.to_string()));
         };
-        let mut v = if self.vars.contains_key(name) {
-            match first {
-                Access::Paren(args) => self.index_var(name, args)?,
-                other => bail!(container_access(other)),
+        let mut v = if let Some(var) = self.vars.get(name) {
+            match (var, first) {
+                (Value::Mat(_), Access::Paren(args)) => self.index_var(name, args)?,
+                (Value::Mat(_), other) => bail!(container_access(other)),
+                // Not an array, so not read in place: an `MException` is
+                // small, and its fields are the only thing it offers.
+                (var, other) => {
+                    let var = var.clone();
+                    self.apply_access(var, other)?
+                }
             }
         } else {
             match first {
@@ -657,14 +769,20 @@ impl Interp {
     /// One link of a chain applied to a value. A matrix has only `(...)`;
     /// braces and fields are cycle 07's containers.
     fn apply_access(&mut self, v: Value, a: &Access) -> R<Value> {
-        match a {
-            Access::Paren(args) => {
-                let m = v.into_mat();
+        match (v, a) {
+            (Value::Exception(e), Access::Field(f)) => exception_field(&e, f),
+            (Value::Exception(e), Access::DynField(f)) => match self.eval(f)?.text() {
+                Some(f) => exception_field(&e, &f),
+                None => Err(error::dot_indexing_unsupported()),
+            },
+            (Value::Exception(_), Access::Brace(_)) => Err(error::brace_indexing_unsupported()),
+            (v, Access::Paren(args)) => {
+                let m = v.into_mat()?;
                 let sel = self.eval_index_args(m.rows, m.cols, args)?;
                 let g = resolve_read(m.rows, m.cols, &sel)?;
                 Ok(Value::Mat(gather(&m, &g)))
             }
-            other => Err(container_access(other)),
+            (_, other) => Err(container_access(other)),
         }
     }
 
@@ -678,12 +796,12 @@ impl Interp {
     /// shape it has now.
     fn index_var(&mut self, name: &str, args: &[Expr]) -> R<Value> {
         let (rows, cols) = match self.vars.get(name) {
-            Some(v) => (v.mat().rows, v.mat().cols),
+            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => return Err(error::undefined(name)),
         };
         let sel = self.eval_index_args(rows, cols, args)?;
         let m = match self.vars.get(name) {
-            Some(v) => v.mat(),
+            Some(v) => v.mat()?,
             None => return Err(error::undefined(name)),
         };
         // Indexing keeps the class, so `s(2)` of a char is a char and `s(:)`
@@ -759,13 +877,14 @@ impl Interp {
     /// The variable an indexed assignment or a deletion changes, where it is
     /// stored, created as `[]` if it does not exist yet. Looked up by `&str`
     /// so that the common case, an existing variable, allocates nothing.
-    fn target_mut(&mut self, name: &str) -> &mut Matrix {
+    fn target_mut(&mut self, name: &str) -> R<&mut Matrix> {
         if !self.vars.contains_key(name) {
             self.vars
                 .insert(name.to_string(), Value::Mat(Matrix::empty()));
         }
         match self.vars.get_mut(name) {
-            Some(Value::Mat(m)) => m,
+            Some(Value::Mat(m)) => Ok(m),
+            Some(v) => Err(error::not_an_array(v.class_name())),
             None => unreachable!("inserted above"),
         }
     }
@@ -781,14 +900,14 @@ impl Interp {
     /// of the storage, which `Vec` amortises: `z(end+1) = k` in a loop is
     /// linear overall, not quadratic.
     fn assign_index(&mut self, name: &str, args: &[Expr], rhs: Value) -> R<()> {
-        let rhs = rhs.into_mat();
+        let rhs = rhs.into_mat()?;
         // The left-hand side keeps its class, so `s(1) = 'X'` of a char stays
         // a char and `y(2) = 'a'` of a double stores `97`. A variable that
         // does not exist yet, or is the 0x0 double `[]`, takes the class of
         // what is assigned into it, which is how `s = []; s(1) = 'a'` builds
         // a char.
         let (rows, cols, class) = match self.vars.get(name) {
-            Some(v) => (v.mat().rows, v.mat().cols, v.mat().class),
+            Some(v) => v.mat().map(|m| (m.rows, m.cols, m.class))?,
             None => (0, 0, Class::Double),
         };
         let class = if class == Class::Double && rows == 0 && cols == 0 {
@@ -800,11 +919,11 @@ impl Interp {
         let sel = self.eval_index_args(rows, cols, args)?;
         // Judged against the shape the variable has now; see `index_var`.
         let (rows, cols) = match self.vars.get(name) {
-            Some(v) => (v.mat().rows, v.mat().cols),
+            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
         let plan = resolve_write(rows, cols, &sel, &rhs)?;
-        let m = self.target_mut(name);
+        let m = self.target_mut(name)?;
         m.class = class;
         scatter(m, &plan, &rhs);
         Ok(())
@@ -814,16 +933,16 @@ impl Interp {
     /// class. Checked in full before the variable changes.
     fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
         let (rows, cols) = match self.vars.get(name) {
-            Some(v) => (v.mat().rows, v.mat().cols),
+            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
         let sel = self.eval_index_args(rows, cols, args)?;
         let (rows, cols) = match self.vars.get(name) {
-            Some(v) => (v.mat().rows, v.mat().cols),
+            Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
         let keep = resolve_delete(rows, cols, &sel)?;
-        let m = self.target_mut(name);
+        let m = self.target_mut(name)?;
         let data: Vec<f64> = keep.pos.iter().map(|&p| m.data[p]).collect();
         m.data = data;
         m.rows = keep.rows;
@@ -970,6 +1089,16 @@ fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
 // what shape results, and `gather`, `scatter` or the deletion carry that out.
 // The `resolve_*` functions change nothing, which is what lets an assignment
 // validate everything before it touches the target.
+
+/// `e.message` and `e.identifier` of an `MException`. Any other name is the
+/// Dot error a matrix gives, until cycle 05 adds `e.stack`.
+fn exception_field(e: &error::MError, field: &str) -> R<Value> {
+    match field {
+        "message" => Ok(Value::str(&e.msg)),
+        "identifier" => Ok(Value::str(&e.identifier)),
+        _ => Err(error::dot_indexing_unsupported()),
+    }
+}
 
 /// The error for a brace or field access on a matrix.
 fn container_access(a: &Access) -> error::MError {
@@ -1354,7 +1483,7 @@ fn concat_class(mats: &[Matrix]) -> Class {
 }
 
 fn hcat(vals: Vec<Value>) -> R<Value> {
-    let all: Vec<Matrix> = vals.into_iter().map(|v| v.into_mat()).collect();
+    let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
@@ -1379,7 +1508,7 @@ fn vcat(vals: Vec<Value>) -> R<Value> {
     if vals.len() == 1 {
         return Ok(vals.into_iter().next().unwrap());
     }
-    let all: Vec<Matrix> = vals.into_iter().map(|v| v.into_mat()).collect();
+    let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
@@ -2327,7 +2456,7 @@ mod tests {
         let buf = Rc::new(RefCell::new(Vec::new()));
         let mut it = Interp::with_output(Box::new(Shared(buf)));
         it.run(&format!("{src};")).unwrap();
-        it.vars["ans"].mat().class
+        it.vars["ans"].mat().unwrap().class
     }
 
     /// The propagation table: arithmetic is double, comparisons and logical
@@ -2819,7 +2948,7 @@ mod tests {
             let buf = Rc::new(RefCell::new(Vec::new()));
             let mut it = Interp::with_output(Box::new(Shared(buf)));
             assert!(it.run(src).is_err(), "{src}");
-            let x = it.vars["x"].mat();
+            let x = it.vars["x"].mat().unwrap();
             assert_eq!((x.rows, x.cols, x.data.len()), (1, 3, 3), "{src}");
         }
     }
@@ -2853,13 +2982,13 @@ mod tests {
         let mut last = std::ptr::null();
         for _ in 0..10_000 {
             it.run("z(end+1) = 1;").unwrap();
-            let p = it.vars["z"].mat().data.as_ptr();
+            let p = it.vars["z"].mat().unwrap().data.as_ptr();
             if p != last {
                 reallocations += 1;
                 last = p;
             }
         }
-        let z = it.vars["z"].mat();
+        let z = it.vars["z"].mat().unwrap();
         assert_eq!((z.rows, z.cols), (1, 10_000));
         assert!(reallocations < 64, "{reallocations} reallocations");
         assert_eq!(
@@ -3087,5 +3216,278 @@ mod tests {
 
         assert!(matrix_power(&rmat(1, 2, &[1.0, 2.0]), 2.0).is_err());
         assert!(matrix_power(&a, 0.5).is_err());
+    }
+
+    // ---- switch, try, warnings and commands (cycle 04) -----------------
+
+    #[test]
+    fn switch_matches_numbers_by_value_and_text_by_text() {
+        let src = "x = 2; switch x, case 1, disp('one'), case {2, 3}, disp('two or three'), \
+                   otherwise, disp('other'), end";
+        assert_eq!(ok_out(src), "two or three\n");
+        assert_eq!(
+            ok_out("switch 9, case 1, disp(1), otherwise, disp(0), end"),
+            "     0\n"
+        );
+        // A char never matches a number by its code, either way round.
+        assert_eq!(ok_out("switch 'a', case 97, disp(1), end"), "");
+        assert_eq!(ok_out("switch 97, case 'a', disp(1), end"), "");
+        assert_eq!(
+            ok_out("switch 'abc', case 'ab', disp(1), case 'abc', disp(2), end"),
+            "     2\n"
+        );
+        // The class of a number does not matter.
+        assert_eq!(ok_out("switch true, case 1, disp(1), end"), "     1\n");
+        assert_eq!(
+            ok_out("switch 1, case {'1', true}, disp(1), end"),
+            "     1\n"
+        );
+        // An empty char is a character vector, and matches an empty one.
+        assert_eq!(ok_out("switch '', case '', disp(1), end"), "     1\n");
+        // Only the first matching arm runs, and cases after it are not
+        // evaluated at all.
+        assert_eq!(
+            ok_out("switch 1, case 1, disp(1), case undefined_name, disp(2), end"),
+            "     1\n"
+        );
+    }
+
+    #[test]
+    fn switch_refuses_a_subject_that_is_not_a_scalar_or_a_character_vector() {
+        const MSG: &str = "SWITCH expression must be a scalar or a character vector.";
+        assert_eq!(err_msg("switch [1 2], case 1, end"), MSG);
+        assert_eq!(err_msg("switch [], case 1, end"), MSG);
+        assert_eq!(err_msg("switch ['ab'; 'cd'], case 1, end"), MSG);
+        assert_eq!(err_msg("try, error('x'), catch e, end; switch e, end"), MSG);
+        // An error in a case value names the case's line.
+        assert_eq!(err("switch 1\ncase 2\ncase nope\nend").line, Some(3));
+    }
+
+    #[test]
+    fn break_and_continue_pass_through_switch_and_try() {
+        assert_eq!(
+            ok_out("for k = 1:5, switch k, case 3, break, end, fprintf('%d', k); end"),
+            "12"
+        );
+        assert_eq!(
+            ok_out("for k = 1:4, switch k, case 2, continue, end, fprintf('%d', k); end"),
+            "134"
+        );
+        assert_eq!(
+            ok_out("for k = 1:4, try, if k == 3, break, end, fprintf('%d', k); catch, end, end"),
+            "12"
+        );
+        assert_eq!(
+            ok_out(
+                "k = 0; while true, k = k + 1; try, error('x'), catch, break, end, end; disp(k)"
+            ),
+            "     1\n"
+        );
+    }
+
+    #[test]
+    fn try_catches_every_runtime_error_and_binds_it() {
+        assert_eq!(
+            ok_out(
+                "try, error('boom'), catch e, disp(e.message), disp(isempty(e.identifier)), end"
+            ),
+            "boom\n   1\n"
+        );
+        assert_eq!(
+            ok_out(
+                "try, error('MyPkg:myid', 'Value %d bad', 7), catch e, disp(e.identifier), disp(e.message), end"
+            ),
+            "MyPkg:myid\nValue 7 bad\n"
+        );
+        assert_eq!(
+            ok_out("try, x = [1 2] * [3 4]; catch, disp('caught'), end"),
+            "caught\n"
+        );
+        assert_eq!(
+            ok_out("try, undefined_thing + 1, catch e, disp(e.message), end"),
+            "Unrecognized function or variable 'undefined_thing'.\n"
+        );
+        // A `try` without a `catch` swallows the error; the statements
+        // after the failing one do not run.
+        assert_eq!(ok_out("try, error('x'), disp(1), end, disp(2)"), "     2\n");
+        // Output before the error stays printed.
+        assert_eq!(
+            ok_out("try, disp(1), error('x'), catch, disp(2), end"),
+            "     1\n     2\n"
+        );
+        // An error in the handler is not caught by its own `try`.
+        assert_eq!(err_msg("try, error('a'), catch, error('b'), end"), "b");
+    }
+
+    #[test]
+    fn an_exception_has_two_fields_a_class_and_a_display() {
+        let pre = "try, error('a:b', 'msg'), catch e, end; ";
+        assert_eq!(ok_out(&format!("{pre}disp(class(e))")), "MException\n");
+        assert_eq!(ok_out(&format!("{pre}disp(e.('message'))")), "msg\n");
+        assert_eq!(ok_out(&format!("{pre}disp(e.message(1:2))")), "ms\n");
+        assert_eq!(
+            ok_out(&format!("{pre}e")),
+            "e =\n\n  MException (a:b): msg\n\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{pre}disp(e)")),
+            "  MException (a:b): msg\n"
+        );
+        assert_eq!(
+            ok_out("try, error('plain'), catch e, end; e"),
+            "e =\n\n  MException: plain\n\n"
+        );
+        const DOT: &str = "Dot indexing is not supported for variables of this type.";
+        assert_eq!(err_msg(&format!("{pre}e.stack")), DOT);
+        assert_eq!(err_msg(&format!("{pre}e.Message")), DOT);
+        assert_eq!(err_msg(&format!("{pre}e.message = 'x'")), DOT);
+        // It is not an array.
+        const NOT: &str = "This operation is not supported for a value of class 'MException'.";
+        assert_eq!(err_msg(&format!("{pre}e + 1")), NOT);
+        assert_eq!(err_msg(&format!("{pre}e(1)")), NOT);
+        assert_eq!(err_msg(&format!("{pre}sum(e)")), NOT);
+        assert_eq!(err_msg(&format!("{pre}x = [e 1]")), NOT);
+    }
+
+    #[test]
+    fn rethrow_raises_the_error_unchanged() {
+        assert_eq!(
+            ok_out(
+                "try, try, error('in'), catch e, rethrow(e), end, catch e2, disp(['outer: ' e2.message]), end"
+            ),
+            "outer: in\n"
+        );
+        assert_eq!(
+            ok_out(
+                "try, try, error('p:q', 'm'), catch e, rethrow(e), end, catch f, disp(f.identifier), end"
+            ),
+            "p:q\n"
+        );
+        // Its line is the line it was first raised on.
+        let e = err("try\n  error('first')\ncatch e\nend\nrethrow(e)");
+        assert_eq!((e.msg.as_str(), e.line), ("first", Some(2)));
+        assert_eq!(
+            err_msg("rethrow(5)"),
+            "Undefined function 'rethrow' for input arguments of type 'double'."
+        );
+    }
+
+    #[test]
+    fn lasterr_is_the_last_message_caught_or_not() {
+        assert_eq!(ok_out("disp(isempty(lasterr))"), "   1\n");
+        assert_eq!(
+            ok_out("try, error('one'), catch, end; disp(lasterr)"),
+            "one\n"
+        );
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        assert!(it.run("error('two')").is_err());
+        assert_eq!(it.last_err, "two");
+    }
+
+    #[test]
+    fn a_try_that_catches_a_nesting_error_leaves_the_counters_right() {
+        on_the_interpreter_stack(|| {
+            let mut it = Interp::with_output(Box::new(io::sink()));
+            it.run("x = 1;").unwrap();
+            let before = (it.depth, it.loop_depth);
+            // Built rather than parsed, so the evaluator's limit fires.
+            let stmt = Stmt::Try(
+                vec![Located {
+                    stmt: Stmt::Expr(nested_neg(MAX_DEPTH + 5), false),
+                    line: 1,
+                }],
+                Some("e".into()),
+                vec![],
+            );
+            it.loop_depth = 1;
+            assert!(it.exec(&stmt).is_ok());
+            assert_eq!(it.depth, before.0);
+            assert_eq!(it.loop_depth, 1);
+            assert!(matches!(it.vars.get("e"), Some(Value::Exception(e)) if e.msg == TOO_DEEP));
+        });
+    }
+
+    #[test]
+    fn deep_switch_and_try_are_refused_not_overflowed() {
+        on_the_interpreter_stack(|| {
+            let n = MAX_DEPTH + 1;
+            let tries = format!("{}{}", "try\n".repeat(n), "end\n".repeat(n));
+            assert_eq!(err_msg(&tries), TOO_DEEP);
+            let switches = format!("{}{}", "switch 1\ncase 1\n".repeat(n), "end\n".repeat(n));
+            assert_eq!(err_msg(&switches), TOO_DEEP);
+            // Well inside the limit, both run.
+            let ok = format!("{}disp(1)\n{}", "try\n".repeat(1000), "end\n".repeat(1000));
+            assert_eq!(ok_out(&ok), "     1\n");
+        });
+    }
+
+    /// Runs `src` with both sinks writing into one buffer, as the protocol
+    /// captures them.
+    fn both(src: &str) -> String {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut it =
+            Interp::with_sinks(Box::new(Shared(buf.clone())), Box::new(Shared(buf.clone())));
+        it.run(src).unwrap();
+        String::from_utf8(buf.borrow().clone()).unwrap()
+    }
+
+    #[test]
+    fn a_warning_goes_to_the_error_sink_in_order() {
+        assert_eq!(
+            both("disp(1); warning('careful %d', 1); disp(2)"),
+            "     1\nWarning: careful 1\n     2\n"
+        );
+        // Out alone does not see it.
+        assert_eq!(ok_out("warning('w')"), "");
+        // The same argument rules as `error`: one argument is literal.
+        assert_eq!(both("warning('100% sure')"), "Warning: 100% sure\n");
+        assert_eq!(both("warning('a:b', 'x %d', 3)"), "Warning: x 3\n");
+        assert_eq!(both("warning('')"), "");
+    }
+
+    #[test]
+    fn command_syntax_calls_the_name_with_char_arguments() {
+        assert_eq!(ok_out("disp hello"), "hello\n");
+        assert_eq!(ok_out("disp 'two words'"), "two words\n");
+        assert_eq!(ok_out("disp -1"), "-1\n");
+        assert_eq!(ok_out("x = 3; x -1"), "ans =\n\n     2\n\n");
+        assert_eq!(ok_out("class hello"), "ans =\n\n    'char'\n\n");
+        assert_eq!(ok_out("class hello;"), "");
+        assert_eq!(
+            err_msg("hold on"),
+            "Unrecognized function or variable 'hold'."
+        );
+        assert_eq!(
+            err_msg("x = 1; clear x\nx"),
+            "Unrecognized function or variable 'x'."
+        );
+    }
+
+    #[test]
+    fn clear_all_and_clear_of_names() {
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("x = 1; y = 2; z = 3;").unwrap();
+        it.run("clear x y").unwrap();
+        let mut names: Vec<&String> = it.vars.keys().collect();
+        names.sort();
+        assert_eq!(names, ["z"]);
+        it.run("a = 1; clear all").unwrap();
+        assert!(it.vars.is_empty());
+        // A variable known from an earlier entry is an expression, not a
+        // command.
+        it.run("x = 3;").unwrap();
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        it.out = Box::new(Shared(buf.clone()));
+        it.run("x -1").unwrap();
+        assert_eq!(
+            String::from_utf8(buf.borrow().clone()).unwrap(),
+            "ans =\n\n     2\n\n"
+        );
+    }
+
+    #[test]
+    fn a_block_comment_is_not_run() {
+        assert_eq!(ok_out("%{\ndisp(111)\n%}\ndisp(1)"), "     1\n");
+        assert_eq!(ok_out("disp(1)\n%{\ndisp(2)"), "     1\n");
     }
 }

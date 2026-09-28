@@ -1,0 +1,2 @@
+% covers: 17 - under --protocol a warning goes into the eval's out, before the output that follows it, and nothing reaches stderr
+{"id":1,"op":"eval","code":"warning('w'); disp(1)"}

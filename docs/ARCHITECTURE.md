@@ -55,6 +55,28 @@ goes through the same separator check, which is what makes `[1 ...` newline
 covers `* / \ ^ ' .`: the backslash keeps `2.\x` from meaning `2 \ x`, and the
 dot keeps `a = 1...` from lexing as `1.` plus a stray `..`.
 
+Since cycle 04 two more things live here, for the same reason:
+
+- **Block comments.** A `%{` alone on its line (surrounding whitespace
+  allowed) opens one and a `%}` alone on its line closes it. They nest, and
+  the lexer counts them rather than recursing. An unterminated one runs to the
+  end of the source, and `Lexed::open_comment` says so, which is how
+  `syntax::is_complete` knows the entry is unfinished.
+- **Command syntax.** A name that starts a statement, is not a variable, and
+  is followed by whitespace and then a word that is not an operator followed
+  by whitespace, is a command: the lexer reads the words (quotes group them;
+  a newline, `,`, `;` or `%` outside quotes ends them) and emits the call they
+  mean, `name('w1', 'w2')`, so the parser never sees command syntax.
+  "Is a variable" is judged when the source is lexed, from the workspace
+  `scan_known` is told about and the names the source has assigned so far
+  (`x = `, `x(2) = `, `for x = `, `[a, x] = `, `catch x`), as MATLAB judges it
+  in a file. `scan` is `scan_known` with no workspace. A statement starts
+  after a newline, `;` or `,` with no bracket open, and after `else`, `try`
+  and `otherwise`.
+
+The brace of a `case {...}` list goes on the delimiter stack as `C`, which
+the whitespace rule treats as a bracket, so `case {2 3}` is two values.
+
 Since cycle 03 the lexer also has `{`, `}`, a lone `.` and `@`. The field dot
 is whatever dot is left once a number's decimal point, the five dotted
 operators (`.*`, `./`, `.\`, `.^`, `.'`) and a `...` continuation have been
@@ -86,6 +108,12 @@ rewinds so that the bracket parses as the matrix literal it always was. A bare
 `@`, and a `{` where a value should start, are parse errors until cycles 06
 and 07.
 
+Cycle 04 added `Stmt::Switch(subject, Vec<CaseArm>, otherwise)` and
+`Stmt::Try(body, Option<String>, handler)`. A `CaseArm` carries its values
+(one for `case x`, several for `case {a, b}`), its own line, as an `IfArm`
+does, and its body. The name after `catch` is the bound variable only when
+it follows `catch` directly, with no comma or newline between.
+
 `Token` also has a `Display` form, which is what every parse message renders
 the offending token through; its `Debug` is the Rust variant name and used to
 reach the user as `unexpected Semi in expression`. The parser counts nesting
@@ -95,12 +123,14 @@ deepens the tree without recursing (`1+1+…+1`). `Interp` counts the same way
 against the same constant, so a program the parser accepts is one the
 evaluator can walk; see invariant 6.
 
-**`error.rs`** holds `MError { msg, line }`, the `R<T>` alias every fallible
+**`error.rs`** holds `MError { msg, line, identifier }`, the `R<T>` alias every fallible
 path returns, a `bail!` macro, and a constructor for every message the
 interpreter can raise. Nothing else in the crate spells a message out; a unit
 test scans the other files for an `Err(`, `bail!(` or `ok_or_else` handed a
 literal or a `format!` and fails if it finds one. `MError::at` records a line
-only if none is known yet, so the innermost statement wins.
+only if none is known yet, so the innermost statement wins. The
+`identifier` is the one `error('id:x', fmt, ...)` attached, and empty for
+every error the interpreter raises itself.
 
 **`value.rs`** holds `Matrix`, `Class` and `Value`. Matrices are
 **column-major**, the same as MATLAB: element `(r, c)` lives at
@@ -110,7 +140,10 @@ operation must respect it. Every `Matrix` carries a `class` tag, `Double`,
 `Logical` or `Char`, over the same `f64` storage; a char element is one UTF-16
 code unit. `value.rs` also owns the display: `format` for the numeric body,
 `disp_text` for `disp`, and `display_body` for the class headers of a named
-display.
+display. Since cycle 04 `Value` has a second variant, `Exception`, the
+`MException` a `catch` binds; `Value::mat` and `Value::into_mat` return an
+`R`, refusing it with `This operation is not supported for a value of class
+'MException'.`
 
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
 `name` is a variable and as a builtin call otherwise, and grows arrays on
@@ -126,6 +159,14 @@ the element count first and then changes the variable where it is stored,
 never cloning it; growth along the last dimension is a `Vec` resize, which is
 amortised.
 
+`try` runs its body and, on an error, puts the nesting counters and
+`end_stack` back to what they were at the `try` (a failed `deepen` does not
+undo itself), records the message for `lasterr`, binds the error as a
+`Value::Exception` if `catch` named a variable, and runs the handler. A
+`break` or `continue` in the body is a `Flow` like any other and passes
+through. `switch` evaluates its case values in order, only until one
+matches.
+
 **`builtins/`** is the library: `mod.rs` holds the registry, `args.rs` the
 argument helpers, and `core.rs`, `math.rs` and `linalg.rs` the builtins
 themselves. Every one has the same shape,
@@ -137,7 +178,9 @@ themselves. Every one has the same shape,
 brackets and block openers against their closers over the token stream; the
 REPL asks it after every line and the protocol's `complete` asks it on
 request, so the two can never disagree. It was `needs_more` in `main.rs`
-until cycle U0.
+until cycle U0. Since cycle 04 it counts `switch` and `try` as openers
+beside `if`, `for` and `while`, and an open `%{` block comment as
+unfinished.
 
 **`env.rs`** is the environment as seen from outside the evaluator.
 `completions(prefix, &vars, &registry)` lists every variable and builtin
@@ -157,8 +200,10 @@ one JSON request per line and writes one JSON response per line against one
 `Interp`, flushing after each. `eval` swaps `Interp.out` for a buffer for the
 length of the call and restores it, which is what the sink is for; the
 interpreter is built over a sink otherwise, so nothing but responses reaches
-the writer. A failed evaluation and a malformed request are both answers;
-the loop ends only at end of input. The message texts live in `error.rs`.
+the writer. Since cycle 04 `eval` points `Interp.err` at the same buffer, so
+a warning lands in `out` where it was raised and nothing reaches stderr. A
+failed evaluation and a malformed request are both answers; the loop ends
+only at end of input. The message texts live in `error.rs`.
 
 **`http.rs`** is the UI server's HTTP, as a pure function:
 `handle(request_bytes, &mut Interp, &Config) -> Vec<u8>`, with `Config`
@@ -207,6 +252,11 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    between the two.
 5. **All interpreter output goes through `Interp::emit`.** No `print!` outside
    `src/main.rs`. Tests swap `Interp.out` for a buffer to capture output.
+   Diagnostics a program goes on after, `warning` since cycle 04 and cycle
+   11's `fprintf(2, ...)`, go through `Interp::emit_err` to the second sink,
+   `Interp.err`, which flushes `out` first so the two stay in order. `main.rs`
+   makes it stderr for a script and the REPL; the protocol, and so `--ui`,
+   points it at the same capture as `out`.
 6. **Errors are values, not panics.** Every fallible path returns `R<T>`,
    which is `Result<T, MError>`. A panic is a bug; the REPL must survive any
    bad input. Restored in cycle 01e, which closed the last input that could
@@ -297,9 +347,14 @@ the class: `Matrix::new` and every constructor built on it make a double,
 propagation rules in `interp.rs` (`binary`, `concat_class`, `assign_index`).
 
 A container is a different kind of value, not a class of array. Cells and
-structs (cycle 07) become new `Value` variants beside `Mat`; the code that
-matches on `Value` today is written against a single variant, so adding one
-makes the compiler list every site that needs a decision.
+structs (cycle 07) become new `Value` variants beside `Mat`, as the
+`MException` of cycle 04 already is: `Value::Exception` holds the caught
+`MError` whole, so `rethrow` raises it unchanged, and it answers
+`class_name`, `dims`, `display_body` and `disp_text` itself. Every array
+operation reaches a matrix through `Value::mat` or `Value::into_mat`, which
+return an `R` and refuse any other variant, so a new variant is refused
+everywhere by default and each operation that should accept it says so; a
+`match` on `Value` makes the compiler list the sites that must decide.
 
 ## Key designs to preserve
 
@@ -314,7 +369,9 @@ which keeps the first line it is given, so an error inside a `for` body
 reports the body's line. The `stack` field and the `  in <fn> (line N)` trace
 wait for cycle 05, since a stack only means something once user functions
 exist; adding the field is additive, because no call site formats a message
-itself.
+itself. Cycle 04 added the first such field, `identifier`, the same way, and
+the `MException` that `catch e` binds is the `MError` itself (see "Add a
+value type").
 
 **Registry (cycle 01, in place).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
@@ -398,6 +455,9 @@ cycle named:
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | Indexing into or growing a second page, `A(:, :, 2) = 5` or `A(:, :, [1 1])`, is "N-D arrays are not supported."; MATLAB builds the N-D array. Cycle 03 accepted it | later, with N-D arrays |
+| An `MException` is minimal: `message`, `identifier` and `class`, with no `stack`, `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction` | `stack` in 05; the rest later |
+| Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
+| `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `hold on` and `format long` are the unrecognized-name error | `hold` 12, `format` 13, warning state later |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
 removed, because it misstated MATLAB. Since R2018a, `s = 'abc'` displays as
@@ -452,6 +512,8 @@ scheduled to it: logical indexing itself (QA D6), trailing singleton
 subscripts (QA D22), the growth message that named the `usize` clamp, and
 bracketed assignment targets (QA D32); it also discharged the Known
 deviations row for the `x(0)` message, whose ending now names logical values.
+Cycle 04 fixed the three rows scheduled to it: block comments that executed
+(QA D7), `error`'s argument rules (QA D9) and command syntax (QA D31).
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -466,18 +528,17 @@ spec also lists, it removes the row from that spec in the same commit.
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
 | A non-UTF-8 file is unread (was part of QA D29) | A UTF-16LE file is `Error: Line 2: unexpected character` on a NUL, the high byte of its first ASCII character (`err_utf16_file` pins that text and its exit code 1); MATLAB and Octave read it. Cycle 01e skipped the leading UTF-8 byte-order mark and swapped the strict read for a lossy one, which fixed the Windows-1252 half (a `% caf<E9>` comment now runs) and brought the failure inside the `Error:` format; a UTF-16 file still decodes to replacement characters rather than to its text, because that needs encoding detection and not a lossy decode | later |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
-| `%{ … %}` block comments execute (QA D7) | `%{` newline `disp(111)` newline `%}` prints `111`; MATLAB prints nothing. Cycle 04 claims block comments | 04 |
-| `error` misreads its arguments (QA D9) | `error('100% sure')` reports `100ure`; with one argument MATLAB applies no format or escape processing, so the message is `100% sure` (the `error` page). `error('MyPkg:myId', 'Value %d too big', 7)` reports `MyPkg:myId`; MATLAB reports `Value 7 too big` and attaches the identifier. `error('')` followed by `disp(2)` exits 1; "If all inputs to error are empty, MATLAB does not throw an error", so `2` prints. Cycle 04 owns `error('id:x', fmt, …)` | 04 |
-| Command syntax is unsupported (QA D31) | `x = 1; clear x` is a parse error, and so are `clear all`, `format long` and `disp hello`. A newcomer hits it in the first minute. Cycle 04 claims command syntax | 04 |
-| `inv` and `A^-1` of a singular matrix are errors (QA D26) | `inv([1 2; 2 4])` exits 1 with "Matrix is singular to working precision."; MATLAB prints that text as a warning and returns `Inf Inf; Inf Inf`, and `inv(0)` is `Inf` (Octave the same). It needs `warning` from cycle 04, and goes with the backslash deviation | 08 |
+| `inv` and `A^-1` of a singular matrix are errors (QA D26) | `inv([1 2; 2 4])` exits 1 with "Matrix is singular to working precision."; MATLAB prints that text as a warning and returns `Inf Inf; Inf Inf`, and `inv(0)` is `Inf` (Octave the same). It needs `warning`, which cycle 04 added, and goes with the backslash deviation | 08 |
 | `printf` conversions and flags differ from MATLAB (QA D16) | (a) `%E` and `%G` print a lower-case `e`. (b) `%s` of a non-integer uses `%g`: `sprintf('%s', pi)` is `3.14159` where the MATLAB `sprintf` page's own example gives `3.141593e+00`. (c) The `#` flag is ignored: `sprintf('%#.0f', 3)` is `3`, MATLAB `3.`. (d) The `0` flag pads a non-finite value: `sprintf('%05d', -Inf)` is `-0Inf`, MATLAB and C ` -Inf`. (e) The escapes `\xN`, `\N` (octal), `\a`, `\b`, `\f` and `\v` are not processed. (f) `%x`, `%X`, `%o` and a `*` width or precision are errors; MATLAB gives `ff` for `sprintf('%x', 255)` and `    3` for `sprintf('%*d', 5, 3)`. (g) An invalid conversion or a trailing `%` is an error; MATLAB "prints all text up to the invalid operator ... and discards the rest", so `sprintf('abc%q', 1)` is `abc`. Cycle 01d's Out of scope moved this row to 11: it is cosmetic, and cycle 11 rewrites `printf` for file output anyway. 01d kept the panics and the hang, which are not cosmetic | 11 |
 | `num2str` of a matrix gives one row in column-major order (QA D13) | `num2str([1 2; 3 4])` is the 1x10 `'1  3  2  4'`; MATLAB gives the 2x4 char `'1  2'` / `'3  4'`. `num2str([1 -2 300])` spaces its columns differently too. It needed a multi-row char, which cycle 02 provides | 11 |
-| `fprintf` rejects a file id and cannot return a byte count (QA D25) | `fprintf(1, 'hi\n')` is "The first argument must be a format string."; MATLAB writes `hi`, and `fprintf(2, ...)` writes to stderr. `n = fprintf('hi\n')` prints `hi` then "Too many output arguments."; MATLAB sets `n = 3`. Cycle 11 owns `fprintf(fid, ...)`; a file id of 2 needs the stderr sink that cycle 04's `warning` introduces | 11 |
+| `fprintf` rejects a file id and cannot return a byte count (QA D25) | `fprintf(1, 'hi\n')` is "The first argument must be a format string."; MATLAB writes `hi`, and `fprintf(2, ...)` writes to stderr. `n = fprintf('hi\n')` prints `hi` then "Too many output arguments."; MATLAB sets `n = 3`. Cycle 11 owns `fprintf(fid, ...)`; a file id of 2 writes to `Interp.err`, the second sink cycle 04 added for `warning` | 11 |
 | `clc` writes raw terminal escapes to stdout | `clc` emits `ESC[2J ESC[H` through the normal output sink, so a script that calls it and is piped or redirected has those bytes in its captured output. MATLAB's `clc` affects the command window, not the program's output stream. Found while writing the handbook | 13 |
 | `exit` and `quit` work only as bare REPL lines (QA D28) | A script ending in `exit` fails with "Unrecognized function or variable 'exit'." In the REPL, `exit;`, `quit;`, `exit(3)` and an `exit` inside a block are not recognised, and the final exit code is always 0. MATLAB's `exit` ends the session, and `exit(3)` exits with code 3. Cycle 13 claims `exit` | 13 |
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | An unexpected character is echoed raw into the message | `unexpected character '<c>'` writes the character itself, so a control character reaches stderr as a raw byte: running `01e-display-and-parser/err_utf16_file.m` writes a literal NUL between the quotes. A control character should be named, for instance as `U+0000`. Found while rebuilding the test inventory after cycle U0 | later, low impact |
+| Most builtins refuse an `MException` | `isa(e, 'MException')`, the usual MATLAB check, is an error, and so are `size(e)`, `isempty(e)` and `ischar(e)`; `who` and the protocol's `workspace` already show it as `1x1 MException`. Cycle 04's Scope named only `class`, `rethrow` and the two fields. Found by cycle 04's review | 07, with the other non-matrix values |
+| Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
 
 **The process-killing family.** The two panics that used to head this list,
 `num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a

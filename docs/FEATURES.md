@@ -13,6 +13,8 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Double-quoted strings | 00 | `strings` | Treated as char; MATLAB has a separate string class |
 | A char element is a UTF-16 code unit | 02 | `char_utf16_units` | `length('😀')` is `2` and `double('😀')` is `55357 56832`, as in MATLAB; `disp` and `%s` decode the units back to UTF-8, so the pair prints as one character (QA D37) |
 | `%` comments | 00 | every case | |
+| Block comments `%{ ... %}` | 04 | `block_comment`, `block_comment_skips_code`, `block_comment_deep` | `%{` and `%}` each alone on its line, surrounding whitespace allowed; they nest, counted rather than recursed into. A marker with anything else on its line is an ordinary comment. An unterminated `%{` runs to the end of a script as a comment, and keeps the REPL reading. The lines between them used to execute (QA D7) |
+| Command syntax | 04 | `command_disp_word`, `command_clear_two_words`, `command_variable_expression`, `err_command_clear_one`, `err_command_clear_all`, `err_command_hold_unrecognized`, `err_command_format_unrecognized` | MATLAB's rule: a statement that starts with a name that is not a variable, then whitespace, then a word that is not an operator followed by whitespace, calls the name with each word as a char argument. Quotes group words; the command ends at a newline, `,`, `;` or `%` outside quotes. `clear x y`, `clear all` and `disp hello` work; `x -1` with `x` a variable stays `x - 1`. Whether a name is a variable is decided before the source runs, from the workspace and the names it has assigned so far. `hold on` and `format long` are the unrecognized-name error until cycles 12 and 13. It used to be a parse error (QA D31) |
 | `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
 | `...` separates elements inside brackets | 01b | `continuation_bracket_element` | `[1 ...` newline `-2]` is two elements, like `[1 -2]` |
 | `;` suppresses display, `,` and newline show | 00 | `indexing` | |
@@ -81,16 +83,19 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `while` | 00 | `control_flow` | |
 | `break` and `continue` | 00 | `control_flow` | |
 | `break` or `continue` outside a loop is an error | 01e | `err_break_outside_loop`, `err_continue_outside_loop` | It used to unwind out of the whole script, so the statements after it never ran and the process still exited 0 (QA D8). Raised when the statement runs, not when it parses, so the output before it is still printed |
+| `switch` / `case` / `otherwise` | 04 | `switch_otherwise`, `switch_char_case`, `switch_cell_case`, `switch_break_in_for`, `err_switch_not_scalar`, `err_nesting_switch`, `err_switch_stray_statement`, `err_case_without_switch` | The first matching `case` runs, with no fall-through. A number matches a number of equal value whatever its class; a char matches a char of the same text and never a number by its code. `case {a, b}` matches any of its values, and is syntax rather than a cell until cycle 07. `break` and `continue` inside act on the enclosing loop. A subject that is neither a scalar nor a character vector is `SWITCH expression must be a scalar or a character vector.` |
+| `try` / `catch` | 04 | `try_catch_message`, `try_catch_identifier`, `try_catch_undefined`, `try_rethrow_nested`, `rethrow_keeps_identifier`, `err_rethrow_uncaught`, `exception_class`, `err_exception_stack`, `err_exception_arithmetic`, `err_rethrow_not_exception`, `err_nesting_try` | Every runtime error inside `try` is caught, a builtin's included. `catch e` on the same line binds a minimal `MException`: `e.message`, `e.identifier`, `class(e)` is `'MException'`, and any other field is the Dot error until cycle 05's `e.stack`. `catch` followed by a comma or a newline binds nothing, and a `try` with no `catch` ignores the error. `break` and `continue` pass through. `rethrow(e)` raises it again unchanged, line included |
 | A `for` that does not run still assigns its variable | 01d | `for_zero_iterations_assigns_empty` | After `k = 7; for k = []; end`, `k` is the empty; a name that did not exist comes into existence. The exact empty shape MATLAB gives is unsettled, so no case asserts it |
 
 ## Builtins
 
-88 names, each an ordinary function in `src/builtins/` registered by name in
+93 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
 cases in `01-registry-and-builtins`. Cycle 01 counted 81. Cycle 02 added the
-eight class builtins. Cycle 01c removed `e`, which
+eight class builtins, and cycle 04 five: `rethrow`, `lasterr`, `warning`,
+`assert` and `isequal`, each exercised by the `04-switch-try-commands` cases. Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -108,8 +113,10 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Classes | `class islogical ischar isnumeric isa logical char double` | 02 | `core.rs` |
 | Linear algebra | `transpose inv det trace diag norm dot` | 00 | `linalg.rs` |
 | Search and sort | `find sort` | 00 | `linalg.rs` |
-| Output | `disp fprintf sprintf num2str error` | 00 | `core.rs` |
-| Workspace | `clear clc who whos` | 00 | `core.rs` |
+| Output | `disp fprintf sprintf num2str` | 00 | `core.rs` |
+| Errors and warnings | `error rethrow lasterr warning assert` | 00, 04 | `core.rs` |
+| Comparison | `isequal` | 04 | `core.rs` |
+| Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04 |
 | Timing | `tic toc` | 01 | `core.rs` |
 
 Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
@@ -210,6 +217,11 @@ implements the ones MATLAB code actually uses. Cases are in
 | `%d` prints an integer past 2^63 in full | 01d | `printf_d_past_64_bits` | `fprintf('%d', 1e30)` used to print the `i64` clamp `9223372036854775807` |
 | `%.Ns` truncates before it pads | 01d | `printf_s_precision_truncates` | `[%5.2s]` of `'abcdef'` is `[   ab]`, as in C and MATLAB |
 | An empty `trace` is `+0` | 01d | `trace_empty_is_positive_zero` | `fprintf('%.4f', trace([]))` printed `-0.0000`; `trace` now goes through `math::sum0` like the other reductions |
+| `error`'s argument rules | 04 | `err_error_percent_literal`, `err_error_escape_literal`, `error_empty_no_throw`, `err_error_format`, `err_error_identifier` | From the MATLAB `error` page (QA D9). One argument is literal, with no format or escape processing: `error('100% sure')` says `100% sure`, and used to say `100ure`. When every input is empty nothing is thrown. With more arguments, a first argument with a colon and no whitespace is the identifier and the rest the format and its values: `error('MyPkg:myid', 'Value %d bad', 7)` says `Value 7 bad` |
+| `warning` | 04 | `warning_to_stderr`, `warning_in_protocol_out` | `Warning: <msg>` on the second sink, `Interp.err`, by `error`'s argument rules; the script goes on and exits 0. It is stderr in a script and at the REPL, with stdout flushed first so the two stay in order on one terminal; under `--protocol` and `--ui` it is the same capture as `out`, so nothing reaches stderr there |
+| `assert` | 04 | `err_assert_message`, `err_assert_no_message` | `assert(cond)` is `Assertion failed.` when `cond` fails the test `if` uses; `assert(cond, fmt, ...)` raises that message, read by `error`'s rules |
+| `isequal` | 04 | `isequal_logical` | Two or more arguments; true when every one has the first's size and values. The class is not compared, so `isequal('a', 97)` is true; a `NaN` equals nothing |
+| `lasterr` | 04 | `lasterr_message` | The message of the last error, caught or not; `''` before the first |
 | MATLAB-style error messages | 00 | the seven `err_*` cases | Every message text is defined in `src/error.rs` and nowhere else |
 | `Error: Line N: <msg>` in script mode | 01b | `err_line_runtime`, `err_line_parse` | Runtime, parse and lex errors alike; stdout is still flushed first |
 | An error in a block body names the body's line | 01b | `err_line_in_for_body` | `MError::at` keeps the innermost line |
@@ -218,7 +230,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | The message text follows MATLAB R2020a | 01e | `err_undefined_wording` | `Unrecognized function or variable 'x'.`, the wording of R2020a and later; it used to be `Undefined ...`. See the policy in `docs/modules/01e-display-and-parser.md`, including the two messages deliberately kept because they say more than MATLAB's |
 | The REPL reports errors without a line, and survives them | 01b | `repl_error_has_no_line` | One line per entry, so a number would be noise |
 | REPL diagnostics go to stderr | 01e | `repl_error_to_stderr` | Script mode already did, so a piped session can now separate diagnostics from output too |
-| An unterminated block at end of input is reported | 01e | `err_repl_unterminated_block` | Piping `for k = 1:3` and `disp(k)` with no `end` printed nothing and exited 0 (QA D36); it now exits 1 and says why |
+| An unterminated block at end of input is reported | 01e | `err_repl_unterminated_block`, `err_repl_unterminated_switch` | Piping `for k = 1:3` and `disp(k)` with no `end` printed nothing and exited 0 (QA D36); it now exits 1 and says why |
 
 ## Evaluation protocol
 
@@ -230,7 +242,8 @@ implements the ones MATLAB code actually uses. Cases are in
 | `splatcrab --protocol`, JSON Lines over one session | U0 | `eval_display_and_session`, `err_eval_answer_session_survives`, `handbook_protocol_example` | One JSON request per line on stdin, one JSON response per line on stdout, flushed after each. Blank lines and a trailing `\r` are skipped. Exits 0 at end of input whatever the requests did, and writes nothing to stderr |
 | Request ids | U0 | `string_id_echoed`, `workspace_sorted_with_class` | A number or a string `id` is echoed as the response's first key; none, or `null`, is answered `"id":null` |
 | `eval` | U0 | `eval_display_and_session`, `err_eval_answer_session_survives`, `err_eval_keeps_earlier_assignments`, `err_eval_unclosed_block` | Runs `code` as a REPL entry, output captured into `out`. An error adds `error: {message, line}`: the message as the REPL prints it, the line one-based within `code`. Variables assigned before an error survive it. Code with an open block is run as sent and fails, rather than waiting for more |
-| `complete` | U0 | `complete_open_and_closed` | Whether `code` is a finished entry: `syntax::is_complete`, the same function the REPL asks |
+| `complete` | U0 | `complete_open_and_closed`, `complete_switch_try_comment`, `complete_try_open_switch_closed` | Whether `code` is a finished entry: `syntax::is_complete`, the same function the REPL asks. Since cycle 04 it counts `switch` and `try` as block openers and an open `%{` as unfinished |
+| A warning is part of `out` | 04 | `warning_in_protocol_out` | `eval` points both of the interpreter's sinks at one capture, so a warning sits in `out` in the order it was raised and nothing reaches stderr |
 | `workspace` | U0 | `workspace_sorted_with_class` | `{name, size, class}` per variable, sorted by name |
 | `completions` | U0 | `completions_builtins_and_variables`, `completions_shadow_listed_once` | Every variable and builtin starting with `prefix`, sorted by byte order, a shadowed builtin listed once: `env::completions` |
 | Malformed requests are answers | U0 | `err_malformed_not_json`, `err_malformed_not_object`, `err_malformed_no_op`, `err_malformed_eval_no_code`, `err_malformed_field_not_string`, `err_malformed_bad_id`, `err_unknown_operation` | `"ok":false` with `Malformed request: <what>.` or `Unknown operation '<op>'.` and `"line":null`, then the next line is read |

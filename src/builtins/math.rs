@@ -232,14 +232,22 @@ fn reduce_all(m: &Matrix, f: impl Fn(&[f64]) -> f64) -> Matrix {
 /// output arguments.".
 fn extremum(args: &[Value], name: &str, is_max: bool, nargout: usize) -> R<Vec<Value>> {
     let out = extremum_value(args, name, is_max)?;
-    let logical = |i: usize| args.get(i).is_some_and(|v| v.mat().class == Class::Logical);
+    let logical = |i: usize| {
+        args.get(i)
+            .is_some_and(|v| matches!(v.mat(), Ok(m) if m.class == Class::Logical))
+    };
     let keep = if args.len() == 2 {
         logical(0) && logical(1)
     } else {
         logical(0)
     };
     let class = if keep { Class::Logical } else { Class::Double };
-    let value = out.into_iter().next().unwrap().into_mat().with_class(class);
+    let value = out
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_mat()?
+        .with_class(class);
     if nargout < 2 || args.len() == 2 {
         return one_as(value);
     }
@@ -749,7 +757,7 @@ mod tests {
     }
 
     fn call(args: &[Value], name: &str, kind: Red) -> R<Matrix> {
-        Ok(reduction(args, name, kind)?[0].clone().into_mat())
+        Ok(reduction(args, name, kind)?[0].clone().into_mat().unwrap())
     }
 
     fn val(m: Matrix) -> Value {
@@ -836,11 +844,16 @@ mod tests {
         assert_eq!(e, Matrix::scalar(0.0));
         let e = call(&[val(Matrix::empty()), all.clone()], "prod", Red::Prod).unwrap();
         assert_eq!(e, Matrix::scalar(1.0));
-        let max = |a: &[Value]| extremum(a, "max", true, 1).unwrap()[0].clone().into_mat();
+        let max = |a: &[Value]| {
+            extremum(a, "max", true, 1).unwrap()[0]
+                .clone()
+                .into_mat()
+                .unwrap()
+        };
         let none = val(Matrix::empty());
         assert_eq!(max(&[a.clone(), none.clone(), all.clone()]).data, [4.0]);
         let min = extremum(&[a.clone(), none.clone(), all.clone()], "min", false, 1).unwrap();
-        assert_eq!(min[0].clone().into_mat().data, [1.0]);
+        assert_eq!(min[0].clone().into_mat().unwrap().data, [1.0]);
         // max has no identity element, so an empty stays the empty.
         let e = max(&[none.clone(), none.clone(), all]);
         assert_eq!((e.rows, e.cols), (0, 0));
@@ -865,7 +878,8 @@ mod tests {
             }
             let r = extremum(&args, "max", is_max, 1).unwrap()[0]
                 .clone()
-                .into_mat();
+                .into_mat()
+                .unwrap();
             (r.rows, r.cols)
         };
         let z = |r, c| Matrix::filled(r, c, 0.0);
@@ -945,7 +959,7 @@ mod tests {
     fn round_checks_its_digit_count_and_type() {
         let num = |v: f64| val(Matrix::scalar(v));
         let pi = std::f64::consts::PI;
-        let r = |a: &[Value]| round(a).map(|v| v[0].clone().into_mat().data[0]);
+        let r = |a: &[Value]| round(a).map(|v| v[0].clone().into_mat().unwrap().data[0]);
         assert!(close(r(&[num(pi), num(2.0)]).unwrap(), 314.0 / 100.0));
         assert!(close(
             r(&[num(pi), num(2.0), text("decimals")]).unwrap(),
@@ -988,7 +1002,8 @@ mod tests {
         ])
         .unwrap()[0]
             .clone()
-            .into_mat();
+            .into_mat()
+            .unwrap();
         assert_eq!((v.rows, v.cols), (1, 3));
         assert_eq!(v.data[0], 1300.0);
     }
@@ -1010,8 +1025,8 @@ mod tests {
     fn two(args: &[Value], is_max: bool) -> (Matrix, Matrix) {
         let mut out = extremum(args, if is_max { "max" } else { "min" }, is_max, 2).unwrap();
         assert_eq!(out.len(), 2);
-        let i = out.pop().unwrap().into_mat();
-        (out.pop().unwrap().into_mat(), i)
+        let i = out.pop().unwrap().into_mat().unwrap();
+        (out.pop().unwrap().into_mat().unwrap(), i)
     }
 
     #[test]

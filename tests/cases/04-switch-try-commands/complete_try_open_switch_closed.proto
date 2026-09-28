@@ -1,0 +1,4 @@
+% covers: 18 - the other half of each rule: an open try is unfinished, and a closed switch and a closed block comment are finished
+{"id":1,"op":"complete","code":"try\nx = 1;"}
+{"id":2,"op":"complete","code":"switch x\ncase 1\nend"}
+{"id":3,"op":"complete","code":"%{\nnot yet\n%}"}

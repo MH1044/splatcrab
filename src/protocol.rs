@@ -19,9 +19,9 @@
 //! script, and neither a failed evaluation nor a malformed line ends it.
 //!
 //! Nothing here writes anywhere but the writer it is handed. The interpreter
-//! is built over a sink, and `eval` swaps its `out` for a buffer for the
-//! length of the call, so evaluation output reaches the client only inside a
-//! response.
+//! is built over two sinks, and `eval` swaps its `out` and its `err` for one
+//! buffer for the length of the call, so evaluation output and warnings reach
+//! the client only inside a response, in the order they were written.
 
 use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
@@ -39,7 +39,7 @@ use crate::syntax;
 /// the input or writing a response fails, which is the transport failing
 /// rather than a request.
 pub fn serve(input: impl BufRead, output: impl Write) -> io::Result<()> {
-    let mut it = Interp::with_output(Box::new(io::sink()));
+    let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
     serve_with(&mut it, input, output)
 }
 
@@ -166,9 +166,14 @@ impl Write for Capture {
 /// answer, not a wait for more input, and a client asks `complete` first.
 fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
     let buf = Rc::new(RefCell::new(Vec::new()));
+    // Both sinks write into the one buffer, so a warning sits in `out` where
+    // it was raised, between the output before it and the output after, and
+    // nothing reaches stderr.
     let saved = std::mem::replace(&mut it.out, Box::new(Capture(buf.clone())));
+    let saved_err = std::mem::replace(&mut it.err, Box::new(Capture(buf.clone())));
     let result = it.run(code);
     it.out = saved;
+    it.err = saved_err;
     let out = Json::String(String::from_utf8_lossy(&buf.borrow()).into_owned());
     match result {
         Ok(()) => Json::object([("id", id), ("ok", Json::Bool(true)), ("out", out)]),
@@ -188,17 +193,15 @@ fn workspace(it: &Interp, id: Json) -> Json {
     let vars = names
         .into_iter()
         .map(|name| {
-            let m = it.vars[name].mat();
+            let v = &it.vars[name];
+            let (rows, cols) = v.dims();
             Json::object([
                 ("name", Json::String(name.clone())),
                 (
                     "size",
-                    Json::Array(vec![
-                        Json::Number(m.rows as f64),
-                        Json::Number(m.cols as f64),
-                    ]),
+                    Json::Array(vec![Json::Number(rows as f64), Json::Number(cols as f64)]),
                 ),
-                ("class", Json::String(m.class.name().to_string())),
+                ("class", Json::String(v.class_name().to_string())),
             ])
         })
         .collect();
@@ -280,6 +283,22 @@ mod tests {
             "{\"id\":16,\"ok\":false,\"out\":\"\",\"error\":{\"message\":\
              \"expected 'end' but found end of input\",\"line\":1}}"
         );
+    }
+
+    /// Cycle 04's acceptance test 17: a warning is part of `out`, where it
+    /// was raised, and the error sink is put back afterwards.
+    #[test]
+    fn a_warning_is_captured_in_out_in_order() {
+        let got = one("{\"id\":1,\"op\":\"eval\",\"code\":\"disp(0); warning('w'); disp(1)\"}");
+        assert_eq!(
+            got,
+            "{\"id\":1,\"ok\":true,\"out\":\"     0\\nWarning: w\\n     1\\n\"}"
+        );
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        let r = respond(&mut it, "{\"op\":\"eval\",\"code\":\"warning('a')\"}");
+        assert_eq!(r.get("out"), Some(&Json::String("Warning: a\n".into())));
+        let r = respond(&mut it, "{\"op\":\"eval\",\"code\":\"disp(2)\"}");
+        assert_eq!(r.get("out"), Some(&Json::String("     2\n".into())));
     }
 
     #[test]

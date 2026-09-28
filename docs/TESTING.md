@@ -196,8 +196,9 @@ Unit tests compare floats with a tolerance, never with `==`.
 Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 
 - `lexer.rs`: token streams. The whitespace rule inside brackets, quote versus
-  transpose, numbers such as `2.*x` where the dot must not be swallowed, and
-  identical output for CRLF and LF input.
+  transpose, numbers such as `2.*x` where the dot must not be swallowed,
+  identical output for CRLF and LF input, and since cycle 04 block comments
+  and the command-syntax rule, variables known and unknown.
 - `parser.rs`: tree shapes and precedence. `Expr`, `Stmt`, `BinOp` and `Token`
   all derive `PartialEq`, so trees can be compared directly.
 - `value.rs`: numerics with tolerances. Broadcasting, matmul shapes, `solve`
@@ -216,8 +217,9 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 - `json.rs`: a round trip of every value kind, each escape the writer makes
   and the parser reads, surrogate pairs, rejection of trailing garbage and of
   malformed numbers and strings, and the depth limit at and past its bound.
-- `syntax.rs`: `is_complete` on open and closed blocks, brackets, an index's
-  `end`, and text that does not lex.
+- `syntax.rs`: `is_complete` on open and closed blocks (`switch` and `try`
+  included), brackets, an index's `end`, an open `%{`, and text that does not
+  lex.
 - `env.rs`: `completions` ordering, the merge of variables and builtins, and
   a shadowed builtin listed once.
 - `protocol.rs`: `serve` driven with an in-memory reader and writer, through

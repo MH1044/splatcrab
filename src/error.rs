@@ -23,6 +23,10 @@ use crate::lexer::Token;
 pub struct MError {
     pub msg: String,
     pub line: Option<u32>,
+    /// The identifier `error('MyPkg:myid', ...)` attached, which a `catch`
+    /// reads back as `e.identifier`. Empty for every error the interpreter
+    /// raises itself, and for `error` called without one (cycle 04).
+    pub identifier: String,
 }
 
 /// Every fallible path in the interpreter returns this.
@@ -34,7 +38,15 @@ impl MError {
         MError {
             msg: msg.into(),
             line: None,
+            identifier: String::new(),
         }
+    }
+
+    /// The same error carrying `identifier`, as `error('id:x', fmt, ...)`
+    /// raises it.
+    pub fn with_identifier(mut self, identifier: impl Into<String>) -> MError {
+        self.identifier = identifier.into();
+        self
     }
 
     /// Records `line`, unless a line is already known.
@@ -121,7 +133,17 @@ pub fn unexpected_in_expression(found: &Token) -> MError {
 }
 
 pub fn expected_end_of_if(found: &Token) -> MError {
-    MError::new(format!("expected 'end' to close 'if', found {}", found))
+    expected_end_of("if", found)
+}
+
+/// A block keyword that its statement does not allow where it was found:
+/// `if` without its `end`, or anything but `case`, `otherwise` or `end`
+/// between the arms of a `switch` (cycle 04).
+pub fn expected_end_of(keyword: &str, found: &Token) -> MError {
+    MError::new(format!(
+        "expected 'end' to close '{}', found {}",
+        keyword, found
+    ))
 }
 
 pub fn expected_loop_variable(found: &Token) -> MError {
@@ -443,14 +465,51 @@ pub fn size_vector_not_row(name: &str) -> MError {
 
 // ---- builtins --------------------------------------------------------
 
-/// `error('...')` with a message the user composed.
-pub fn raised(msg: String) -> MError {
-    MError::new(msg)
+/// `error('...')` with a message the user composed, and the identifier it
+/// named, empty when it named none.
+pub fn raised(msg: String, identifier: String) -> MError {
+    MError::new(msg).with_identifier(identifier)
+}
+
+/// `warning('...')`: the line written to the error sink. `Warning: ` and the
+/// message, MATLAB's form; the identifier is not shown.
+pub fn warning_line(msg: &str) -> String {
+    format!("Warning: {}\n", msg)
 }
 
 /// `error(x)` with no format string: MATLAB's bare fallback text.
 pub fn raised_default() -> MError {
     MError::new("error")
+}
+
+/// MATLAB's wording: `assert(cond)` with a false condition and no message.
+pub fn assertion_failed() -> MError {
+    MError::new("Assertion failed.")
+}
+
+/// MATLAB's wording: `switch [1 2]`, a switch on a value that is neither a
+/// scalar nor a character vector (cycle 04).
+pub fn switch_expression() -> MError {
+    MError::new("SWITCH expression must be a scalar or a character vector.")
+}
+
+/// MATLAB's wording for a function that has no method for its argument's
+/// class: `rethrow(5)`, which takes an `MException` only.
+pub fn no_method(name: &str, class: &str) -> MError {
+    MError::new(format!(
+        "Undefined function '{}' for input arguments of type '{}'.",
+        name, class
+    ))
+}
+
+/// A value that is not an array where an array is needed: an `MException`
+/// used in arithmetic, indexed, or handed to a numeric builtin. SplatCrab's
+/// own wording; MATLAB names the operator or function in each case.
+pub fn not_an_array(class: &str) -> MError {
+    MError::new(format!(
+        "This operation is not supported for a value of class '{}'.",
+        class
+    ))
 }
 
 pub fn format_not_a_string() -> MError {

@@ -69,6 +69,11 @@ pub enum Token {
     While,
     Break,
     Continue,
+    Switch,
+    Case,
+    Otherwise,
+    Try,
+    Catch,
 
     Eof,
 }
@@ -142,6 +147,11 @@ impl fmt::Display for Token {
             Token::While => "while",
             Token::Break => "break",
             Token::Continue => "continue",
+            Token::Switch => "switch",
+            Token::Case => "case",
+            Token::Otherwise => "otherwise",
+            Token::Try => "try",
+            Token::Catch => "catch",
         };
         write!(f, "'{}'", word)
     }
@@ -183,6 +193,10 @@ pub struct Lexed {
     /// `lines[k]` is the 1-based source line `tokens[k]` starts on. Always the
     /// same length as `tokens`.
     pub lines: Vec<u32>,
+    /// True when a `%{` block comment was still open at the end of the
+    /// source. A script takes the rest of the file as the comment; the REPL
+    /// and the protocol's `complete` read it as an unfinished entry.
+    pub open_comment: bool,
 }
 
 /// Tokens and their lines, pushed together so the two can never drift.
@@ -200,6 +214,10 @@ impl Out {
     fn last(&self) -> Option<&Token> {
         self.tokens.last()
     }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
+    }
 }
 
 /// The token stream alone, for callers that have no use for the lines: the
@@ -208,13 +226,173 @@ pub fn lex(src: &str) -> R<Vec<Token>> {
     Ok(scan(src)?.tokens)
 }
 
+/// [`scan_known`] with no variables known beforehand: a script, which starts
+/// from an empty workspace, and the questions `syntax.rs` answers.
+pub fn scan(src: &str) -> R<Lexed> {
+    scan_known(src, &|_| false)
+}
+
+/// True when the line holding position `i` is `mark` and nothing else but
+/// whitespace: how `%{` and `%}` are told from ordinary comments.
+fn line_is(chars: &[char], i: usize, mark: &str) -> bool {
+    let start = chars[..i]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |k| k + 1);
+    let end = chars[i..]
+        .iter()
+        .position(|&c| c == '\n')
+        .map_or(chars.len(), |k| i + k);
+    let text: String = chars[start..end].iter().collect();
+    text.trim_matches(|c| matches!(c, ' ' | '\t' | '\r')) == mark
+}
+
+/// The index of the newline ending the line that holds `i`, or the length.
+fn line_end(chars: &[char], i: usize) -> usize {
+    chars[i..]
+        .iter()
+        .position(|&c| c == '\n')
+        .map_or(chars.len(), |k| i + k)
+}
+
+/// The length of the operator starting at `k`, if one does: what MATLAB's
+/// command-syntax rule looks for after the first word.
+fn operator_len(chars: &[char], k: usize) -> Option<usize> {
+    const TWO: [&str; 10] = ["==", "~=", "<=", ">=", "&&", "||", ".*", "./", ".\\", ".^"];
+    let pair: String = chars[k..chars.len().min(k + 2)].iter().collect();
+    if TWO.contains(&pair.as_str()) {
+        return Some(2);
+    }
+    "+-*/\\^<>&|:=".contains(chars[k]).then_some(1)
+}
+
+/// Whether the name ending at `i`, first on its statement and not a
+/// variable, is a command: `clear x`, `disp hello`, `hold on`.
+///
+/// MATLAB's rule, from its "Command vs. Function Syntax" page: whitespace
+/// after the name, then a word that is not an operator followed by
+/// whitespace. So `disp hello` and `x -1` are commands, while `x - 1`,
+/// `x = 1`, `x == 1` and `disp (1)` are not, and neither is a name alone
+/// or followed by a comment, a separator or a continuation.
+fn is_command(chars: &[char], i: usize) -> bool {
+    let n = chars.len();
+    if !matches!(chars.get(i), Some(' ' | '\t')) {
+        return false;
+    }
+    let mut k = i;
+    while k < n && matches!(chars[k], ' ' | '\t') {
+        k += 1;
+    }
+    if k >= n || matches!(chars[k], '\n' | '\r' | ',' | ';' | '%' | '(') {
+        return false;
+    }
+    if is_continuation(chars, k) {
+        return false;
+    }
+    // A lone `=` is an assignment, spaced or not: `x =1` assigns.
+    if chars[k] == '=' && chars.get(k + 1) != Some(&'=') {
+        return false;
+    }
+    match operator_len(chars, k) {
+        Some(len) => !matches!(chars.get(k + len), None | Some(' ' | '\t' | '\r' | '\n')),
+        None => true,
+    }
+}
+
+/// The arguments of a command from `k`, and where they end: each word is one
+/// argument, a quoted part of a word may hold spaces (`disp 'a b'`, with `''`
+/// for a quote), and the command ends at a newline, a comma, a semicolon or
+/// a comment outside quotes.
+fn command_words(chars: &[char], mut k: usize, line: u32) -> R<(Vec<String>, usize)> {
+    let n = chars.len();
+    let ends = |c: char| matches!(c, '\n' | ',' | ';' | '%');
+    let mut words = Vec::new();
+    loop {
+        while k < n && matches!(chars[k], ' ' | '\t' | '\r') {
+            k += 1;
+        }
+        if k >= n || ends(chars[k]) {
+            return Ok((words, k));
+        }
+        let mut w = String::new();
+        while k < n && !ends(chars[k]) && !matches!(chars[k], ' ' | '\t' | '\r') {
+            if chars[k] != '\'' {
+                w.push(chars[k]);
+                k += 1;
+                continue;
+            }
+            k += 1;
+            loop {
+                if k >= n || chars[k] == '\n' {
+                    bail!(error::unterminated_string().at(line));
+                }
+                if chars[k] == '\'' {
+                    if chars.get(k + 1) == Some(&'\'') {
+                        w.push('\'');
+                        k += 2;
+                        continue;
+                    }
+                    k += 1;
+                    break;
+                }
+                w.push(chars[k]);
+                k += 1;
+            }
+        }
+        words.push(w);
+    }
+}
+
+/// The names a statement just assigned, found when its `=` is lexed:
+/// `x = ...` and `x(2) = ...` assign `x`, `for k = ...` assigns `k`, and
+/// `[a, ~, c] = ...` assigns every name the bracket lists. A later statement
+/// that starts with one of them is never command syntax.
+fn assigned_names(stmt: &[Token]) -> Vec<String> {
+    match stmt {
+        [Token::Ident(n), ..] | [Token::For, Token::Ident(n), ..] => vec![n.clone()],
+        [Token::LBracket, rest @ ..] => {
+            let mut names = Vec::new();
+            let mut depth = 0usize;
+            let mut prev = &Token::LBracket;
+            for t in rest {
+                match t {
+                    Token::LBracket | Token::LParen | Token::LBrace => depth += 1,
+                    Token::RBracket if depth == 0 => break,
+                    Token::RBracket | Token::RParen | Token::RBrace => {
+                        depth = depth.saturating_sub(1)
+                    }
+                    Token::Ident(n)
+                        if depth == 0 && matches!(prev, Token::LBracket | Token::Comma) =>
+                    {
+                        names.push(n.clone())
+                    }
+                    _ => {}
+                }
+                prev = t;
+            }
+            names
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// A UTF-8 byte-order mark, which a Windows editor or `Out-File` writes at the
 /// start of a file. It is an encoding marker, not source, and MATLAB and
 /// Octave both skip it; SplatCrab used to report
 /// `unexpected character '\u{feff}'` on line 1 (QA D29).
 const BOM: char = '\u{feff}';
 
-pub fn scan(src: &str) -> R<Lexed> {
+/// Tokens and their lines, with `known` saying which names are variables
+/// already, which is what decides command syntax for a name the source has
+/// not assigned itself: `x -1` is `x - 1` when `x` is a variable and the
+/// command `x('-1')` when it is not.
+///
+/// Whether a name is a variable is judged here, before anything runs, from
+/// the workspace the source starts in and the names the source assigned
+/// earlier, as MATLAB judges it in a file. A command is desugared on the
+/// spot into the call it means, `name('word', ...)`, so the parser never
+/// sees command syntax at all.
+pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
     // Only a *leading* mark is skipped. One in the middle of a file is a real
     // stray character and still reported as one.
     let src = src.strip_prefix(BOM).unwrap_or(src);
@@ -227,11 +405,64 @@ pub fn scan(src: &str) -> R<Lexed> {
         lines: Vec::new(),
     };
     // Stack of open delimiters so we know whether the innermost one is `[`.
+    // `C` is the brace of a `case {...}` list, which separates its values
+    // the way a bracket separates elements.
     let mut open: Vec<char> = Vec::new();
+    // Where the statement being lexed began, as a token index: a name there
+    // is where command syntax can start.
+    let mut stmt_start = 0;
+    // Names this source has assigned so far.
+    let mut assigned: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The statement whose assigned names were last collected.
+    let mut named_at: Option<usize> = None;
+    let mut open_comment = false;
 
     while i < n {
         let c = chars[i];
-        let in_bracket = open.last() == Some(&'[');
+        let in_bracket = matches!(open.last(), Some('[' | 'C'));
+        // A statement starts after a separator outside every bracket, and
+        // after the keywords that a statement may follow on the same line.
+        // A comma last with nothing open was pushed with nothing open,
+        // since closing a bracket pushes a token of its own.
+        if open.is_empty()
+            && toks.last().is_none_or(|t| {
+                matches!(
+                    t,
+                    Token::Newline
+                        | Token::Semi
+                        | Token::Comma
+                        | Token::Else
+                        | Token::Try
+                        | Token::Otherwise
+                )
+            })
+        {
+            stmt_start = toks.len();
+        }
+
+        // A block comment: `%{` alone on its line, through the matching
+        // `%}` alone on its line. They nest, and they are counted rather
+        // than recursed into. Left open, it runs to the end of the source.
+        if c == '%' && line_is(&chars, i, "%{") {
+            let mut depth = 1usize;
+            i = line_end(&chars, i);
+            while depth > 0 {
+                if i >= n {
+                    open_comment = true;
+                    break;
+                }
+                // `i` is on a newline: step onto the next line.
+                i += 1;
+                line += 1;
+                if i < n && line_is(&chars, i, "%{") {
+                    depth += 1;
+                } else if i < n && line_is(&chars, i, "%}") {
+                    depth -= 1;
+                }
+                i = line_end(&chars, i.min(n));
+            }
+            continue;
+        }
 
         // Comment to end of line.
         if c == '%' {
@@ -361,8 +592,37 @@ pub fn scan(src: &str) -> R<Lexed> {
                 "while" => Token::While,
                 "break" => Token::Break,
                 "continue" => Token::Continue,
+                "switch" => Token::Switch,
+                "case" => Token::Case,
+                "otherwise" => Token::Otherwise,
+                "try" => Token::Try,
+                "catch" => Token::Catch,
                 _ => Token::Ident(word),
             };
+            if let Token::Ident(name) = &tok {
+                // `catch e` binds `e`.
+                if toks.last() == Some(&Token::Catch) {
+                    assigned.insert(name.clone());
+                } else if toks.len() == stmt_start
+                    && open.is_empty()
+                    && !known(name)
+                    && !assigned.contains(name)
+                    && is_command(&chars, i)
+                {
+                    let (words, end) = command_words(&chars, i, line)?;
+                    toks.push(tok, line);
+                    toks.push(Token::LParen, line);
+                    for (k, w) in words.into_iter().enumerate() {
+                        if k > 0 {
+                            toks.push(Token::Comma, line);
+                        }
+                        toks.push(Token::Str(w), line);
+                    }
+                    toks.push(Token::RParen, line);
+                    i = end;
+                    continue;
+                }
+            }
             toks.push(tok, line);
             continue;
         }
@@ -466,8 +726,14 @@ pub fn scan(src: &str) -> R<Lexed> {
             // inside the braces, that it is not directly inside `[`: the
             // whitespace rule belongs to the bracket alone. Whether it also
             // applies directly inside a cell literal `{1 -2}` is cycle 07's.
+            // The brace of a `case {2 3}` list does separate its values by
+            // whitespace, as a bracket does.
             ('{', _) => {
-                open.push('{');
+                open.push(if toks.last() == Some(&Token::Case) {
+                    'C'
+                } else {
+                    '{'
+                });
                 (Token::LBrace, 1)
             }
             ('}', _) => {
@@ -484,6 +750,11 @@ pub fn scan(src: &str) -> R<Lexed> {
             ('@', _) => (Token::At, 1),
             _ => bail!(error::unexpected_char(c).at(line)),
         };
+        // Once per statement, so that `a = b = c = ...` stays linear.
+        if tok == Token::Assign && open.is_empty() && named_at != Some(stmt_start) {
+            named_at = Some(stmt_start);
+            assigned.extend(assigned_names(&toks.tokens[stmt_start.min(toks.len())..]));
+        }
         toks.push(tok, line);
         i += len;
     }
@@ -492,6 +763,7 @@ pub fn scan(src: &str) -> R<Lexed> {
     Ok(Lexed {
         tokens: toks.tokens,
         lines: toks.lines,
+        open_comment,
     })
 }
 
@@ -1034,7 +1306,8 @@ mod tests {
 
     #[test]
     fn unexpected_character_is_an_error() {
-        assert!(lex("a # b").is_err());
+        // Not `a # b`, which is the command `a('#', 'b')` since cycle 04.
+        assert!(lex("x = a # b").is_err());
         assert!(lex("#").is_err());
         assert!(lex("$").is_err());
     }
@@ -1280,5 +1553,272 @@ mod tests {
         assert_eq!(Token::RBrace.to_string(), "'}'");
         assert_eq!(Token::Dot.to_string(), "'.'");
         assert_eq!(Token::At.to_string(), "'@'");
+    }
+
+    // ---- switch, try, block comments and commands (cycle 04) -----------
+
+    #[test]
+    fn switch_and_try_keywords_are_their_own_tokens() {
+        assert_eq!(
+            lx("switch case otherwise try catch"),
+            vec![
+                Token::Switch,
+                Token::Case,
+                Token::Otherwise,
+                Token::Try,
+                Token::Catch,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(lx("switches"), vec![id("switches"), Token::Eof]);
+        assert_eq!(lx("catcher"), vec![id("catcher"), Token::Eof]);
+        assert_eq!(Token::Otherwise.to_string(), "'otherwise'");
+        assert_eq!(Token::Catch.to_string(), "'catch'");
+    }
+
+    #[test]
+    fn a_block_comment_hides_its_lines_and_keeps_the_count() {
+        let l = scan("%{\ndisp(111)\n%}\nx = 1").unwrap();
+        assert_eq!(
+            l.tokens,
+            vec![
+                Token::Newline,
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Eof
+            ]
+        );
+        // The newline after `%}` is line 3's; `x` is on line 4.
+        assert_eq!(l.lines, vec![3, 4, 4, 4, 4]);
+        assert!(!l.open_comment);
+    }
+
+    #[test]
+    fn block_comment_markers_may_have_whitespace_and_nest() {
+        let src = "  %{ \t\n  %{\ny = 2\n  %}\nz = 3\n%}  \r\nx = 1";
+        let toks = lx(src);
+        assert_eq!(
+            toks,
+            vec![
+                Token::Newline,
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn a_marker_with_anything_else_on_its_line_is_an_ordinary_comment() {
+        assert_eq!(
+            lx("%{ not a block\nx = 1"),
+            vec![
+                Token::Newline,
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            lx("x = 1 %{\ny = 2"),
+            vec![
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Newline,
+                id("y"),
+                Token::Assign,
+                Token::Num(2.0),
+                Token::Eof,
+            ]
+        );
+        // A `%}` with no opener is a comment too.
+        assert_eq!(
+            lx("%}\n1"),
+            vec![Token::Newline, Token::Num(1.0), Token::Eof]
+        );
+    }
+
+    #[test]
+    fn an_unterminated_block_comment_runs_to_the_end() {
+        let l = scan("x = 1\n%{\ny = 2\n%{\n%}\n").unwrap();
+        assert_eq!(
+            l.tokens,
+            vec![
+                id("x"),
+                Token::Assign,
+                Token::Num(1.0),
+                Token::Newline,
+                Token::Eof
+            ]
+        );
+        assert!(l.open_comment);
+        // Deep nesting is a count, not a recursion.
+        let deep = "%{\n".repeat(200_000);
+        assert!(scan(&deep).unwrap().open_comment);
+        let closed = format!("{}{}", "%{\n".repeat(50_000), "%}\n".repeat(50_000));
+        assert!(!scan(&closed).unwrap().open_comment);
+    }
+
+    fn call_tokens(name: &str, words: &[&str]) -> Vec<Token> {
+        let mut t = vec![id(name), Token::LParen];
+        for (k, w) in words.iter().enumerate() {
+            if k > 0 {
+                t.push(Token::Comma);
+            }
+            t.push(st(w));
+        }
+        t.push(Token::RParen);
+        t
+    }
+
+    #[test]
+    fn a_command_becomes_the_call_it_means() {
+        let mut want = call_tokens("clear", &["x", "y"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("clear x y"), want);
+        let mut want = call_tokens("disp", &["hello"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("disp hello"), want);
+        // Quotes group words, and a doubled quote is a quote.
+        let mut want = call_tokens("disp", &["a b", "it's"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("disp 'a b' 'it''s'"), want);
+        // A word that starts with an operator not followed by space.
+        let mut want = call_tokens("x", &["-1"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("x -1"), want);
+    }
+
+    #[test]
+    fn a_command_ends_at_a_separator_or_a_comment() {
+        let mut want = call_tokens("hold", &["on"]);
+        want.extend([Token::Semi, id("y"), Token::Eof]);
+        assert_eq!(lx("hold on; y"), want);
+        let mut want = call_tokens("disp", &["a"]);
+        want.extend([Token::Comma, id("b"), Token::Eof]);
+        assert_eq!(lx("disp a, b"), want);
+        let mut want = call_tokens("disp", &["a"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("disp a % note"), want);
+        // Inside quotes a separator is text.
+        let mut want = call_tokens("disp", &["a;b,c%d"]);
+        want.push(Token::Eof);
+        assert_eq!(lx("disp 'a;b,c%d'"), want);
+        assert!(lex("disp 'open").is_err());
+    }
+
+    #[test]
+    fn what_is_not_a_command_lexes_as_before() {
+        let expr = |src: &str, want: Vec<Token>| assert_eq!(lx(src), want, "{src}");
+        expr(
+            "x - 1",
+            vec![id("x"), Token::Minus, Token::Num(1.0), Token::Eof],
+        );
+        expr(
+            "x = 1",
+            vec![id("x"), Token::Assign, Token::Num(1.0), Token::Eof],
+        );
+        expr(
+            "x =1",
+            vec![id("x"), Token::Assign, Token::Num(1.0), Token::Eof],
+        );
+        expr(
+            "x == 1",
+            vec![id("x"), Token::Eq, Token::Num(1.0), Token::Eof],
+        );
+        expr(
+            "disp (1)",
+            vec![
+                id("disp"),
+                Token::LParen,
+                Token::Num(1.0),
+                Token::RParen,
+                Token::Eof,
+            ],
+        );
+        expr("x ;", vec![id("x"), Token::Semi, Token::Eof]);
+        expr("x % c", vec![id("x"), Token::Eof]);
+        expr(
+            "x ...\n+ 1",
+            vec![id("x"), Token::Plus, Token::Num(1.0), Token::Eof],
+        );
+        // Only the first word of a statement: `f(a b)` and `[a -1]` are
+        // not statements that start with `a`.
+        expr(
+            "y = a -1",
+            vec![
+                id("y"),
+                Token::Assign,
+                id("a"),
+                Token::Minus,
+                Token::Num(1.0),
+                Token::Eof,
+            ],
+        );
+    }
+
+    #[test]
+    fn a_variable_is_never_a_command() {
+        let minus = vec![id("x"), Token::Minus, Token::Num(1.0), Token::Eof];
+        // Known to the workspace.
+        let known = scan_known("x -1", &|n| n == "x").unwrap().tokens;
+        assert_eq!(known, minus);
+        // Assigned earlier in the source, by each form of assignment.
+        for src in [
+            "x = 3; x -1",
+            "x(2) = 3; x -1",
+            "for x = 1:2, end, x -1",
+            "[a, x] = size(1); x -1",
+            "try, catch x, end, x -1",
+        ] {
+            let toks = lx(src);
+            let tail = &toks[toks.len() - 4..];
+            assert_eq!(tail, &minus[..], "{src}");
+        }
+    }
+
+    #[test]
+    fn a_command_can_start_any_statement() {
+        let toks = lx("if 1, disp hi, end");
+        assert!(toks.contains(&st("hi")), "{toks:?}");
+        let toks = lx("try\ndisp hi\ncatch\nend");
+        assert!(toks.contains(&st("hi")), "{toks:?}");
+        let toks = lx("try disp hi, end");
+        assert!(toks.contains(&st("hi")), "{toks:?}");
+        // Never the catch variable.
+        assert_eq!(lx("catch e"), vec![Token::Catch, id("e"), Token::Eof]);
+    }
+
+    #[test]
+    fn a_case_list_separates_its_values_by_whitespace() {
+        assert_eq!(
+            lx("case {2 3}"),
+            vec![
+                Token::Case,
+                Token::LBrace,
+                Token::Num(2.0),
+                Token::Comma,
+                Token::Num(3.0),
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
+        // A brace index keeps its old rule.
+        assert_eq!(
+            lx("c{1 -2}"),
+            vec![
+                id("c"),
+                Token::LBrace,
+                Token::Num(1.0),
+                Token::Minus,
+                Token::Num(2.0),
+                Token::RBrace,
+                Token::Eof,
+            ]
+        );
     }
 }

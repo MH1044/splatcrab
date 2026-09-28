@@ -93,8 +93,26 @@ pub enum Stmt {
     If(Vec<IfArm>, Option<Vec<Located>>),
     For(String, Expr, Vec<Located>),
     While(Expr, Vec<Located>),
+    /// `switch subject`, its `case` arms in order, and the `otherwise` body.
+    Switch(Expr, Vec<CaseArm>, Option<Vec<Located>>),
+    /// `try body catch var handler end`: the name a `catch` on the same line
+    /// binds, if any, and the handler, empty for a `try` with no `catch`.
+    Try(Vec<Located>, Option<String>, Vec<Located>),
     Break,
     Continue,
+}
+
+/// One `case` of a `switch`: the values it matches, the line the `case` is
+/// on, and the body to run.
+///
+/// `case {a, b}` is a list of two values and `case a` a list of one. The
+/// braces are syntax here, not a cell: cells arrive in cycle 07, and a case
+/// list is the one place a brace can open a value before then.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaseArm {
+    pub values: Vec<Expr>,
+    pub line: u32,
+    pub body: Vec<Located>,
 }
 
 /// One `if` or `elseif` arm: a condition, the line that condition is written
@@ -328,7 +346,72 @@ impl Parser {
                 self.end_stmt()?;
                 Ok(Stmt::Continue)
             }
-            Token::End | Token::Else | Token::ElseIf => {
+            Token::Switch => {
+                self.next();
+                let subject = self.parse_expr()?;
+                self.skip_terminators();
+                let mut arms = Vec::new();
+                let mut otherwise = None;
+                loop {
+                    let arm_line = self.line();
+                    match self.next() {
+                        Token::Case if otherwise.is_none() => {
+                            let values = if self.eat(&Token::LBrace) {
+                                self.case_list()?
+                            } else {
+                                vec![self.parse_expr()?]
+                            };
+                            let body =
+                                self.parse_block(&[Token::Case, Token::Otherwise, Token::End])?;
+                            arms.push(CaseArm {
+                                values,
+                                line: arm_line,
+                                body,
+                            });
+                        }
+                        Token::Otherwise if otherwise.is_none() => {
+                            otherwise = Some(self.parse_block(&[
+                                Token::Case,
+                                Token::Otherwise,
+                                Token::End,
+                            ])?);
+                        }
+                        Token::End => return Ok(Stmt::Switch(subject, arms, otherwise)),
+                        t => bail!(error::expected_end_of("switch", &t).at(arm_line)),
+                    }
+                }
+            }
+            Token::Try => {
+                self.next();
+                let body = self.parse_block(&[Token::Catch, Token::End])?;
+                let mut var = None;
+                let mut handler = Vec::new();
+                if self.eat(&Token::Catch) {
+                    // An identifier straight after `catch`, on its line, is
+                    // the name the error is bound to; a comma or a newline
+                    // first means there is none.
+                    if let Token::Ident(name) = self.peek().clone() {
+                        self.next();
+                        if !matches!(
+                            self.peek(),
+                            Token::Comma | Token::Semi | Token::Newline | Token::End | Token::Eof
+                        ) {
+                            let line = self.line();
+                            bail!(error::unexpected_token(self.peek()).at(line));
+                        }
+                        var = Some(name);
+                    }
+                    handler = self.parse_block(&[Token::End])?;
+                }
+                self.expect(Token::End)?;
+                Ok(Stmt::Try(body, var, handler))
+            }
+            Token::End
+            | Token::Else
+            | Token::ElseIf
+            | Token::Case
+            | Token::Otherwise
+            | Token::Catch => {
                 bail!(error::block_with_no_opener(self.peek()).at(line))
             }
             _ => {
@@ -359,6 +442,30 @@ impl Parser {
                     let show = self.end_stmt()?;
                     Ok(Stmt::Expr(e, show))
                 }
+            }
+        }
+    }
+
+    /// The values of `case {a, b; c}`, after the `{`, through the `}`. The
+    /// lexer treats these braces as it treats brackets, so whitespace, a
+    /// comma, a semicolon and a newline all separate values; every one of
+    /// them is a value to match, whatever the shape the separators give.
+    fn case_list(&mut self) -> R<Vec<Expr>> {
+        let mut values = Vec::new();
+        loop {
+            match self.peek() {
+                Token::RBrace => {
+                    self.next();
+                    return Ok(values);
+                }
+                Token::Comma | Token::Semi => {
+                    self.next();
+                }
+                Token::Eof => {
+                    let line = self.line();
+                    bail!(error::expected_token(&Token::RBrace, self.peek()).at(line))
+                }
+                _ => values.push(self.parse_expr()?),
             }
         }
     }
@@ -419,7 +526,13 @@ impl Parser {
                 self.next();
                 Ok(true)
             }
-            Token::Eof | Token::End | Token::Else | Token::ElseIf => Ok(true),
+            Token::Eof
+            | Token::End
+            | Token::Else
+            | Token::ElseIf
+            | Token::Case
+            | Token::Otherwise
+            | Token::Catch => Ok(true),
             _ => {
                 let line = self.line();
                 bail!(error::unexpected_token(self.peek()).at(line))
@@ -1593,5 +1706,166 @@ mod tests {
         assert_eq!(msg("[] = 2"), "invalid assignment target");
         assert_eq!(msg("[a + 1, b] = 2"), "invalid assignment target");
         assert_eq!(msg("[a, b"), "unterminated matrix literal: missing ']'");
+    }
+
+    // ---- switch and try (cycle 04) --------------------------------------
+
+    fn show(e: Expr) -> Stmt {
+        Stmt::Expr(call("disp", vec![e]), true)
+    }
+
+    #[test]
+    fn a_switch_has_its_cases_in_order_and_an_otherwise() {
+        assert_eq!(
+            parse("switch x\ncase 1\ndisp(1)\ncase {2, 3}\ndisp(2)\notherwise\ndisp(0)\nend"),
+            vec![at(
+                1,
+                Stmt::Switch(
+                    ident("x"),
+                    vec![
+                        CaseArm {
+                            values: vec![num(1.0)],
+                            line: 2,
+                            body: vec![at(3, show(num(1.0)))],
+                        },
+                        CaseArm {
+                            values: vec![num(2.0), num(3.0)],
+                            line: 4,
+                            body: vec![at(5, show(num(2.0)))],
+                        },
+                    ],
+                    Some(vec![at(7, show(num(0.0)))]),
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn a_switch_on_one_line_and_case_lists_of_every_spelling() {
+        let stmts = parse("switch s, case {'a' 'b'; 'c'}, x = 1; end");
+        match &stmts[0].stmt {
+            Stmt::Switch(subject, arms, None) => {
+                assert_eq!(*subject, ident("s"));
+                assert_eq!(arms.len(), 1);
+                assert_eq!(
+                    arms[0].values,
+                    vec![
+                        Expr::Str("a".into()),
+                        Expr::Str("b".into()),
+                        Expr::Str("c".into())
+                    ]
+                );
+                assert_eq!(
+                    arms[0].body,
+                    vec![at(1, Stmt::Assign(lv("x"), num(1.0), false))]
+                );
+            }
+            other => panic!("expected a switch, got {other:?}"),
+        }
+        // No arms at all is a switch that does nothing.
+        assert_eq!(
+            parse("switch x\nend"),
+            vec![at(1, Stmt::Switch(ident("x"), vec![], None))]
+        );
+    }
+
+    #[test]
+    fn a_switch_refuses_what_its_arms_cannot_hold() {
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(
+            msg("switch x\ndisp(1)\nend"),
+            "expected 'end' to close 'switch', found 'disp'"
+        );
+        assert_eq!(
+            msg("switch x\notherwise\ncase 1\nend"),
+            "expected 'end' to close 'switch', found 'case'"
+        );
+        assert_eq!(
+            msg("switch x\notherwise\notherwise\nend"),
+            "expected 'end' to close 'switch', found 'otherwise'"
+        );
+        // A newline inside the braces separates values, as in a bracket, so
+        // the `end` is read as one.
+        assert_eq!(
+            msg("switch x\ncase {1, 2\nend"),
+            "unexpected 'end' in expression"
+        );
+        assert_eq!(
+            msg("switch x\ncase {1, 2"),
+            "expected '}' but found end of input"
+        );
+        assert_eq!(msg("case 1"), "unexpected 'case' with no matching block");
+        assert_eq!(
+            msg("otherwise"),
+            "unexpected 'otherwise' with no matching block"
+        );
+        assert_eq!(msg("catch"), "unexpected 'catch' with no matching block");
+    }
+
+    #[test]
+    fn a_catch_on_its_line_binds_an_identifier() {
+        let body = vec![at(2, show(num(1.0)))];
+        let handler = vec![at(4, show(ident("e")))];
+        assert_eq!(
+            parse("try\ndisp(1)\ncatch e\ndisp(e)\nend"),
+            vec![at(
+                1,
+                Stmt::Try(body.clone(), Some("e".into()), handler.clone())
+            )]
+        );
+        // A newline or a comma after `catch` binds nothing, and what follows
+        // is the handler's first statement.
+        assert_eq!(
+            parse("try\ndisp(1)\ncatch\ne\nend"),
+            vec![at(
+                1,
+                Stmt::Try(
+                    body.clone(),
+                    None,
+                    vec![at(4, Stmt::Expr(ident("e"), true))]
+                )
+            )]
+        );
+        assert_eq!(
+            parse("try, x = 1; catch, disp(2), end"),
+            vec![at(
+                1,
+                Stmt::Try(
+                    vec![at(1, Stmt::Assign(lv("x"), num(1.0), false))],
+                    None,
+                    vec![at(1, show(num(2.0)))]
+                )
+            )]
+        );
+        // A `try` with no `catch` has an empty handler.
+        assert_eq!(
+            parse("try, x = 1; end"),
+            vec![at(
+                1,
+                Stmt::Try(
+                    vec![at(1, Stmt::Assign(lv("x"), num(1.0), false))],
+                    None,
+                    vec![]
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn try_holds_any_statement_a_multi_assign_included() {
+        let stmts = parse("try\n[a, ~] = size(x);\ncatch err\n[b] = f(err);\nend");
+        match &stmts[0].stmt {
+            Stmt::Try(body, Some(name), handler) => {
+                assert_eq!(name, "err");
+                assert!(matches!(body[0].stmt, Stmt::MultiAssign(ref t, _, false) if t.len() == 2));
+                assert!(
+                    matches!(handler[0].stmt, Stmt::MultiAssign(ref t, _, false) if t.len() == 1)
+                );
+            }
+            other => panic!("expected a try, got {other:?}"),
+        }
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("try\nx = 1;"), "expected 'end' but found end of input");
+        assert_eq!(msg("try, catch e f, end"), "unexpected 'f'");
     }
 }

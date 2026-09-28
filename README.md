@@ -24,8 +24,9 @@ x =
 ```
 
 SplatCrab is early software (version 0.1.0). The core language works:
-matrices, the double, logical and char classes, indexing, control flow,
-formatted output and 88 builtins. User functions, cells, structs, complex
+matrices, the double, logical and char classes, indexing, control flow with
+`switch` and `try`/`catch`, command syntax, formatted output and 93
+builtins. User functions, cells, structs, complex
 numbers and plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
@@ -62,9 +63,9 @@ There are no prebuilt binaries yet.
 ## Use
 
 **REPL.** Run `splatcrab` with no arguments. Type MATLAB expressions at the
-`>>` prompt; a line ending in `;` assigns without printing. A `for`, `if` or
-`while` block, or an unclosed bracket, keeps the prompt open until it is
-closed. Type `exit` or `quit` to leave.
+`>>` prompt; a line ending in `;` assigns without printing. A `for`, `if`,
+`while`, `switch` or `try` block, an unclosed bracket, or an open `%{` block
+comment keeps the prompt open until it is closed. Type `exit` or `quit` to leave.
 
 ```
 $ splatcrab
@@ -88,8 +89,8 @@ SplatCrab 0.1.0  (type 'exit' to quit)
 splatcrab examples/demo.m
 ```
 
-Output goes to stdout. If a statement fails, the message goes to stderr as
-`Error: Line N: <message>` and the exit code is 1, so scripts behave well in
+Output goes to stdout, and a `warning` to stderr. If a statement fails, the
+message goes to stderr as `Error: Line N: <message>` and the exit code is 1, so scripts behave well in
 shell pipelines and CI. The bundled `examples/demo.m` walks through matrix
 arithmetic, indexing, growth on assignment, loops and formatted printing.
 
@@ -148,9 +149,12 @@ z
 
 ## What works today
 
-- Numbers, strings, variables, `ans`, comments, line continuation. A `...`
-  separates elements inside brackets just as a space does, so `[1 ...` newline
-  `-2]` is two elements
+- Numbers, strings, variables, `ans`, comments, `%{ ... %}` block comments
+  (nestable), line continuation. A `...` separates elements inside brackets
+  just as a space does, so `[1 ...` newline `-2]` is two elements
+- Command syntax by MATLAB's rule: `clear x y`, `clear all` and `disp hello`
+  call the name with char arguments, while `x -1` with `x` a variable stays
+  an expression
 - Matrix literals, ranges `a:b`, `a:s:b`, and chains of them: `1:2:3:4` reads
   as `(1:2:3):4`, the way MATLAB reads it. Ranges are capped, so `1:1e15` is a
   clean error rather than an allocator abort; one lands exactly on its end
@@ -192,6 +196,10 @@ z
   `break`, `continue`. A `for` that runs zero times still assigns the empty to
   its loop variable, as MATLAB does, and a `break` with no loop around it is
   an error rather than a silent end to the script
+- `switch` / `case` / `otherwise` on numbers and text, with `case {a, b}`
+  lists; `try` / `catch e`, where `e` is a minimal `MException` with
+  `e.message` and `e.identifier`; `error('id:x', fmt, ...)` with MATLAB's
+  argument rules, `rethrow`, `lasterr`, `warning`, `assert` and `isequal`
 - Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts
@@ -200,7 +208,7 @@ z
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
   means
-- 88 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 93 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
   `min`, `sort`, `size` and `find` answer with more than one value when asked
@@ -251,8 +259,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-User functions, function handles, `switch`, `try`, cells, structs, N-D
-arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+User functions, function handles, cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -263,7 +270,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 88 builtins,
+                                         builtins/    the 93 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text
