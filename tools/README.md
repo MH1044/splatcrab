@@ -42,3 +42,15 @@ It handles exactly the constructs the handbook uses, which is two heading
 levels, fenced `matlab` and output pairs, tables, bullets, and inline code,
 bold and links. It is not a general markdown renderer and will quietly ignore
 anything else, so check the output if you add a new construct.
+
+## `linkcheck.py`
+
+Reports any markdown link pointing at a file the repository does not track.
+
+```
+python tools/linkcheck.py
+```
+
+A link to a file that exists only on one machine resolves fine for its author
+and is broken for everyone else, which is how `docs/ROADMAP.md` came to cite a
+document that was never published. Run it before a docs push.
