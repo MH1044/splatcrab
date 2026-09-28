@@ -3,9 +3,10 @@
 How to use SplatCrab, for someone who already knows MATLAB.
 
 SplatCrab is a MATLAB-compatible numerical language written in Rust. It runs
-`.m` scripts and gives you a REPL. Everything is a double-precision matrix
-stored column-major, exactly as MATLAB stores it, so linear indexing,
-`reshape` and `(:)` agree with MATLAB element for element.
+`.m` scripts and gives you a REPL. Every value is a matrix stored
+column-major, exactly as MATLAB stores it, so linear indexing, `reshape` and
+`(:)` agree with MATLAB element for element. A matrix is of class `double`,
+`logical` or `char`, as in MATLAB.
 
 This handbook is a reference to scan. Every example below was run against the
 binary and the output blocks are the bytes it produced. Where SplatCrab
@@ -109,7 +110,7 @@ z =
 
 w =
 
-    0.0010
+   1.0000e-03
 
 v =
 
@@ -118,8 +119,10 @@ v =
 ```
 
 Every number is an IEEE 754 double. There are no integer classes, no `single`,
-and no complex numbers yet. Note `w`: MATLAB prints `1.0000e-03` there;
-SplatCrab's scalar display does not yet switch to exponential form.
+and no complex numbers yet. Note `w`: a scalar that is not a whole number
+switches to short exponential form below 0.01 and from 1000 up, as MATLAB's
+does. [`disp` and automatic display](#disp-and-automatic-display) gives the
+rules.
 
 ### Strings
 
@@ -174,11 +177,15 @@ d = s + 0
 ```
 a =
 
-     1     1     1
+  1×3 logical array
+
+   1   1   1
 
 b =
 
-     1     1     0
+  1×3 logical array
+
+   1   1   0
 
 c =
 
@@ -190,9 +197,10 @@ d =
 
 ```
 
-Arithmetic on a char gives numbers, as in MATLAB. The reverse does not hold:
-several operations silently lose the char class. See
-[Differences](#differences-from-matlab).
+A comparison gives a `logical` array, shown under its `1×3 logical array`
+header. Arithmetic on a char gives numbers, as in MATLAB, while indexing,
+indexed assignment and the rearrangement builtins keep it a char. See
+[Classes](#classes).
 
 ### Variables and `ans`
 
@@ -273,6 +281,156 @@ c =
      7
 
 ```
+
+### Classes
+
+Every array has a class: `double` for numbers, `logical` for true and false,
+`char` for text. `class` names it. Comparisons, `&`, `|`, `~`, `&&` and `||`
+give a logical, and so do `true`, `false` and the predicates such as
+`isempty` and `isnan`. Arithmetic always gives a double, so `m + 0` turns a
+logical into numbers.
+
+```matlab
+a = class(5)
+b = class('hi')
+c = class(3 > 2)
+t = true
+m = [1 2 3] > 1
+n = m + 0
+```
+
+```
+a =
+
+    'double'
+
+b =
+
+    'char'
+
+c =
+
+    'logical'
+
+t =
+
+  logical
+
+   1
+
+m =
+
+  1×3 logical array
+
+   0   1   1
+
+n =
+
+     0     1     1
+
+```
+
+A logical displays in four-wide columns under a `logical` header; `disp` of a
+logical has the same width. `islogical`, `ischar` and `isnumeric` test the
+class, and `isa(x, name)` takes a class name or the group `'numeric'`, which
+holds `double` alone, since there are no integer classes yet. `logical`,
+`double` and `char` convert:
+
+```matlab
+disp(islogical(true))
+disp(ischar('a'))
+disp(isnumeric(true))
+disp(isa(2, 'numeric'))
+x = logical([2 0 -1])
+y = double('AB')
+z = char([72 105])
+```
+
+```
+   1
+   1
+   0
+   1
+x =
+
+  1×3 logical array
+
+   1   0   1
+
+y =
+
+    65    66
+
+z =
+
+    'Hi'
+
+```
+
+A char element is one UTF-16 code unit, as in MATLAB, so `length('😀')` is 2
+and `double('😀')` is `55357 56832`; output turns the units back into text.
+Indexed assignment and growth keep the left-hand side's class, so a character
+assigned into a char stays a character, and a concatenation is a char if any
+part is one. Unary plus, like any arithmetic, gives a double. A char with
+more than one row, or none, displays under a header:
+
+```matlab
+s = 'abc';
+s(1) = 'X'
+t = fliplr(s)
+u = [s 'def']
+v = s + 1
+w = +'a'
+c = ['ab'; 'cd']
+e = ''
+```
+
+```
+s =
+
+    'Xbc'
+
+t =
+
+    'cbX'
+
+u =
+
+    'Xbcdef'
+
+v =
+
+    89    99   100
+
+w =
+
+    97
+
+c =
+
+  2×2 char array
+
+    'ab'
+    'cd'
+
+e =
+
+  0×0 empty char array
+
+```
+
+`NaN` has no logical value, so converting one is an error, as in MATLAB:
+
+```matlab
+b = logical(NaN)
+```
+
+```
+Error: Line 1: NaN's cannot be converted to logicals.
+```
+
+A logical mask cannot index yet: `x(x > 0)` is a clean error until cycle 03.
+See [Logical values](#logical-values).
 
 ## Matrices
 
@@ -421,18 +579,19 @@ t =
 
 u =
 
-    0.0000    0.2500    0.5000    0.7500    1.0000
+         0    0.2500    0.5000    0.7500    1.0000
 
 v =
 
-     []
+  1×0 empty double row vector
 
 ```
 
-Two caveats. A fractional-step range does not land exactly on its end point
-the way MATLAB's does (`x = 0:0.1:0.3; x(end) == 0.3` is `0` here, `1` in
-MATLAB), and an infinite end point such as `0:Inf` gives an empty where MATLAB
-refuses it. Both are in [Differences](#differences-from-matlab).
+An exact zero in a fixed-point row prints as a bare `0`, and an empty range
+shows its typed header, `1×0 empty double row vector`, as in MATLAB. A
+fractional-step range lands exactly on its end point, so
+`x = 0:0.1:0.3; x(end) == 0.3` is true, and an infinite end point such as
+`0:Inf` is an error.
 
 ### Concatenation
 
@@ -505,13 +664,16 @@ d =
 
 e =
 
-   1024
+        1024
 
 f =
 
     0.5000
 
 ```
+
+`e` is twelve wide: from 1000 up, an integer column takes MATLAB's wider
+layout.
 
 ### Matrix versus elementwise
 
@@ -611,10 +773,13 @@ y =
 
 I =
 
-    1.0000    0.0000
+    1.0000         0
     0.0000    1.0000
 
 ```
+
+`I` shows the difference between an exact zero, which prints as a bare `0`,
+and the roundoff residue below it, which is not zero and so keeps `0.0000`.
 
 Transpose is `'`, and `.'` is the same thing since there are no complex
 numbers. The lexer decides between transpose and a string delimiter by what
@@ -650,10 +815,10 @@ w =
 
 ### Comparison
 
-`==  ~=  <  <=  >  >=` compare element by element and return 0/1. They return
-**doubles**, not logicals — the logical class arrives in cycle 02 — which has
-a real consequence for masking, described in
-[Differences](#differences-from-matlab).
+`==  ~=  <  <=  >  >=` compare element by element and return a `logical`
+array, displayed under its `logical array` header in four-wide columns. Using
+one as a mask, `x(x > 0)`, is a clean error until cycle 03; see
+[Logical values](#logical-values).
 
 ```matlab
 v = [1 5 3];
@@ -666,19 +831,27 @@ d = v <= 3
 ```
 a =
 
-     0     1     1
+  1×3 logical array
+
+   0   1   1
 
 b =
 
-     0     0     1
+  1×3 logical array
+
+   0   0   1
 
 c =
 
-     1     1     0
+  1×3 logical array
+
+   1   1   0
 
 d =
 
-     1     0     1
+  1×3 logical array
+
+   1   0   1
 
 ```
 
@@ -697,29 +870,39 @@ e = (1 > 2) || (3 > 2)
 ```
 a =
 
-     1     0     0
+  1×3 logical array
+
+   1   0   0
 
 b =
 
-     1     0     1
+  1×3 logical array
+
+   1   0   1
 
 c =
 
-     0     1     0
+  1×3 logical array
+
+   0   1   0
 
 d =
 
-     1
+  logical
+
+   1
 
 e =
 
-     1
+  logical
+
+   1
 
 ```
 
-Short-circuiting itself is correct, but `&&` and `||` currently accept
-non-scalar and empty operands instead of erroring, and `NaN` converts silently
-to true. See [Differences](#differences-from-matlab).
+All five give a logical. `&&` and `||` refuse a non-scalar or empty operand,
+and every logical operator refuses `NaN`, as MATLAB does. See
+[Logical values](#logical-values).
 
 ### Precedence
 
@@ -765,11 +948,15 @@ f =
 
 g =
 
-     1
+  logical
+
+   1
 
 h =
 
-     1
+  logical
+
+   1
 
 ```
 
@@ -988,10 +1175,9 @@ A =
 
 ```
 
-Two forms are **not** available yet: logical indexing (`x(x > 0)` is read as a
-list of numeric indices and gives the wrong answer — see
-[Differences](#differences-from-matlab)) and deletion (`v(2) = []` is a clean
-error).
+Two forms are **not** available yet, and both are clean errors: logical
+indexing (`x(x > 0)`, until cycle 03 — see
+[Logical values](#logical-values)) and deletion (`v(2) = []`).
 
 ## Control flow
 
@@ -1099,12 +1285,11 @@ empty false
 string true
 ```
 
-`NaN` is the exception to MATLAB agreement: `if NaN` is true here, where
-MATLAB refuses the conversion.
+`if NaN` is an error, as in MATLAB: `NaN's cannot be converted to logicals.`
 
 ## Builtins
 
-80 names, each an ordinary function registered by name. Every one rejects
+88 names, each an ordinary function registered by name. Every one rejects
 arguments it does not understand with `Too many input arguments.` rather than
 ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 `clear`, `who`, bare `tic`, bare `toc`) is legal as a statement and is
@@ -1112,8 +1297,8 @@ ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 
 ### Constants
 
-`pi Inf inf NaN nan eps true false`. `true` and `false` are 0/1 doubles for
-now; `eps` alone is the spacing at 1.
+`pi Inf inf NaN nan eps true false`. `true` and `false` are logicals; `eps`
+alone is the spacing at 1.
 
 ```matlab
 a = pi
@@ -1148,11 +1333,16 @@ e =
 
 f =
 
-     1
+  logical
+
+   1
 
 g =
 
-     0
+  logical
+
+   0
+
 ```
 
 There is no `e` constant: MATLAB does not have one, so write `exp(1)`. `e` is
@@ -1192,10 +1382,10 @@ I =
 
 L =
 
-    0.0000    0.2500    0.5000    0.7500    1.0000
+         0    0.2500    0.5000    0.7500    1.0000
 
      2     2
-     1
+   1
 ```
 
 `rand` is a deterministic built-in generator seeded the same way every run;
@@ -1243,19 +1433,27 @@ l =
 
 e1 =
 
-     0
+  logical
+
+   0
 
 e2 =
 
-     1
+  logical
+
+   1
 
 sc =
 
-     1
+  logical
+
+   1
 
 vv =
 
-     1
+  logical
+
+   1
 
 ```
 
@@ -1297,7 +1495,9 @@ U =
 
 ```
 
-These four lose the char class: `fliplr('abc')` gives numbers, not `'cba'`.
+These four, transpose and `sort` keep the class, so `fliplr('abc')` is
+`'cba'`. `diag` and the colon do not: `diag('ab')` and `'a':'c'` are doubles,
+where MATLAB keeps a char.
 
 ### Reductions
 
@@ -1338,11 +1538,15 @@ d =
 
 e =
 
-     1
+  logical
+
+   1
 
 f =
 
-     0
+  logical
+
+   0
 
 g =
 
@@ -1515,12 +1719,14 @@ n =
 ```
 
 `round` breaks ties away from zero, as MATLAB does. Anything whose real answer
-would be complex — `sqrt(-4)`, `log(-1)`, `asin(2)` — gives `NaN` and exit 0,
-which is wrong; see [Differences](#differences-from-matlab).
+would be complex — `sqrt(-4)`, `log(-1)`, `asin(2)` — is a clean error until
+complex numbers arrive in cycle 10; see [Numerics](#numerics).
 
 ### Predicates
 
-`isnan isinf isfinite`.
+`isnan isinf isfinite`, beside the shape queries `isempty isscalar isvector`
+and the class tests `islogical ischar isnumeric isa`. Every one returns a
+logical.
 
 ```matlab
 a = isnan([1 NaN Inf])
@@ -1531,15 +1737,21 @@ c = isfinite([1 NaN Inf])
 ```
 a =
 
-     0     1     0
+  1×3 logical array
+
+   0   1   0
 
 b =
 
-     0     0     1
+  1×3 logical array
+
+   0   0   1
 
 c =
 
-     1     0     0
+  1×3 logical array
+
+   1   0   0
 
 ```
 
@@ -1575,7 +1787,7 @@ d =
 
 e =
 
-   1024
+        1024
 
 ```
 
@@ -1856,17 +2068,22 @@ N =
 
 T =
 
-     1     1
-     1     1
+  2×2 logical array
+
+   1   1
+   1   1
 
 F =
 
-     0     0     0
+  1×3 logical array
+
+   0   0   0
 
 E =
 
      1     0     0
      0     1     0
+
 ```
 
 `pi(2)` stays an error, as in MATLAB. A trailing size of `1` is dropped, so
@@ -2122,7 +2339,7 @@ e =
 
 f =
 
-   12300
+       12300
 
 g =
 
@@ -2130,7 +2347,7 @@ g =
 
 h =
 
-   12000
+       12000
 
 ```
 
@@ -2165,11 +2382,15 @@ b =
 
 c =
 
-     1
+  logical
+
+   1
 
 d =
 
-     1
+  logical
+
+   1
 
 e =
 
@@ -2192,7 +2413,7 @@ rather than a silent reduction along dimension 120.
 ### `eps(x)`
 
 The spacing at `abs(x)`, elementwise. `eps('double')` is plain `eps`;
-`eps('single')` waits for the classes of cycle 02.
+`eps('single')` waits for a `single` class, which no cycle schedules yet.
 
 ```matlab
 a = eps
@@ -2227,11 +2448,14 @@ e =
 
 f =
 
-   2.2204e-16   1.1369e-13
+   1.0e-13 *
+
+    0.0022    1.1369
 
 g =
 
    NaN
+
 ```
 
 ### Smaller argument fixes
@@ -2294,19 +2518,27 @@ b =
 
 c =
 
-     0
+  logical
+
+   0
 
 d =
 
-     1
+  logical
+
+   1
 
 e =
 
-     1
+  logical
+
+   1
 
 f =
 
-     0
+  logical
+
+   0
 
 g =
 
@@ -2346,10 +2578,69 @@ y =
 
 ```
 
-An all-integer matrix prints in integer columns; anything else prints in fixed
-point with four decimals. There is no `format long` or `format short`, and no
-common scale factor (`1.0e+03 *`). Wide matrices do wrap into MATLAB's
-`Columns N through M` blocks, at 80 columns.
+An all-integer matrix prints in integer columns, twelve wide once a value
+reaches 1000. Anything else prints in fixed point with four decimals when its
+largest magnitude is from 0.01 up to 1000, with an exact zero shown as a bare
+`0`. Outside that range a scalar switches to short exponential form and a
+matrix is printed under a common scale factor such as `1.0e+03 *`. An empty
+shows its typed header, except the 0x0 `[]`. Wide matrices wrap into MATLAB's
+`Columns N through M` blocks, at 80 columns. There is no `format long` or
+`format short` yet.
+
+```matlab
+a = 1000
+b = [1 1000]
+c = [0 1.5]
+d = [1.5 1000.5]
+e = [0.001 0.002]
+f = 1234.5
+g = 1e10
+h = zeros(0, 3)
+```
+
+```
+a =
+
+        1000
+
+b =
+
+           1        1000
+
+c =
+
+         0    1.5000
+
+d =
+
+   1.0e+03 *
+
+    0.0015    1.0005
+
+e =
+
+   1.0e-03 *
+
+    1.0000    2.0000
+
+f =
+
+   1.2345e+03
+
+g =
+
+   1.0000e+10
+
+h =
+
+  0×3 empty double matrix
+
+```
+
+A logical displays four wide under a `logical` or `R×C logical array` header,
+and a char with other than one row under `R×C char array`; see
+[Classes](#classes). The `×` in a header is U+00D7, and on Windows SplatCrab
+switches the console to UTF-8 so that it renders.
 
 ### `fprintf` conversions
 
@@ -2622,10 +2913,13 @@ likely to hit.
 
 ### Display
 
-An exact zero prints as `0.0000` inside a fixed-point row, empties print as
-`[]`, integer columns are too narrow at 1000 and above, there is no common
-scale factor, `det` of an integer matrix prints as an integer, and scalar
-display never switches to exponential form.
+Cycle 02 brought the display in line with MATLAB's rules: a bare `0`, typed
+empties, wide integer columns, the common scale factor and short exponential
+form, shown under [`disp` and automatic display](#disp-and-automatic-display).
+Those rules were written from recorded MATLAB output rather than from a run of
+MATLAB, so a case they do not cover may still differ. One known difference is
+left, and it is in the value rather than the display: `det` of this integer
+matrix lands exactly on `-2`.
 
 ```matlab
 a = [0 1.5]
@@ -2641,7 +2935,7 @@ h = 1e10
 ```
 a =
 
-    0.0000    1.5000
+         0    1.5000
 
 b =
 
@@ -2649,11 +2943,13 @@ b =
 
 c =
 
-   1000   2000
+        1000        2000
 
 d =
 
- 1000.5000 2000.5000
+   1.0e+03 *
+
+    1.0005    2.0005
 
 e =
 
@@ -2661,21 +2957,21 @@ e =
 
 f =
 
- 1234.5000
+   1.2345e+03
 
 g =
 
-    0.0010
+   1.0000e-03
 
 h =
 
-   10000000000
+   1.0000e+10
 
 ```
 
-MATLAB gives `0 1.5000`, `1x0 empty double row vector`, wider integer columns,
-`1.0e+03 *` with a scaled row, `-2.0000`, `1.2345e+03`, `1.0000e-03` and
-`1.0000e+10`.
+MATLAB gives `-2.0000` for `e`: its determinant is a roundoff away from `-2`,
+and a value that is not a whole number prints with decimals here too. Cycle 08
+rewrites `det`.
 
 A `NaN` or `Inf` in a row keeps MATLAB's integer columns, which it did not
 before cycle 01e:
@@ -2690,8 +2986,8 @@ disp(NaN)
    NaN
 ```
 
-MATLAB gives `     1     2   NaN` and `   NaN`: it keeps integer columns when
-the only non-integer entries are non-finite. Cycle 01e owns this.
+MATLAB gives the same: it keeps integer columns when the only non-integer
+entries are non-finite.
 
 The colon operator used to miss its end point here, so `0:0.1:0.3` did not
 finish on `0.3`, and `0:Inf` gave an empty rather than being refused. Both are
@@ -2700,32 +2996,27 @@ an infinite end point is an error.
 
 ### Logical values
 
-Comparisons return doubles, not logicals, which breaks masking in the most
-dangerous possible way — quietly:
+Comparisons return logicals, but a logical cannot index yet. Before cycle 02
+a mask was a double of ones and zeros and `x(x > 0)` read it as a list of
+positions, giving `5 5 5` with no error. It is now a clean error, in reading
+and in assignment alike, until cycle 03 implements logical indexing. Use
+`find` meanwhile, which returns the positions as doubles:
 
 ```matlab
-disp(3 > 1)
 x = [5 6 7];
-y = x(x > 0)
-x(x > 0) = 0
+y = x(find(x > 0))
+z = x(x > 0)
 ```
 
 ```
-     1
 y =
 
-     5     5     5
+     5     6     7
 
-x =
-
-     0     6     7
-
+Error: Line 3: Logical indexing is not supported yet.
 ```
 
-MATLAB gives `   1`, `5 6 7` and `0 0 0`. The mask `[1 1 1]` is being read as
-the index list "element 1, element 1, element 1". **Do not use logical
-indexing yet.** Use `find` instead. Cycle 02 makes comparisons logical and
-cycle 03 implements the indexing.
+MATLAB gives `5 6 7` for `z`, and `x(x > 0) = 0` sets every element to `0`.
 
 `NaN` cannot be converted to a logical, and `&&` and `||` require an operand
 convertible to a logical scalar. Both refuse, as MATLAB does:
@@ -2784,34 +3075,30 @@ fprintf('%d\n', 1e30);
 
 ### Char class
 
-Indexed assignment into a char silently makes it numeric, and the
-rearrangement builtins lose the class. `+'a'` keeps it where MATLAB gives 97.
+Indexed assignment, growth, concatenation and the rearrangement builtins keep
+a char, and unary plus gives a double, as in MATLAB; see [Classes](#classes).
+Two builtins still lose the class, because cycle 02 named only the
+rearrangements:
 
 ```matlab
-s = 'abc';
-s(1) = 'X'
-t = fliplr('abc')
-u = +'a'
+r = 'a':'c'
+d = diag('ab')
 ```
 
 ```
-s =
+r =
 
-    88    98    99
+    97    98    99
 
-t =
+d =
 
-    99    98    97
-
-u =
-
-    'a'
+    97     0
+     0    98
 
 ```
 
-MATLAB gives `'Xbc'`, `'cba'` and `97`. Plain concatenation of two chars does
-keep the class (`['ab' 'cd']` is `'abcd'`); it is concatenation with a numeric
-empty that loses it (`s = []; s = [s 'abc']` gives `97 98 99`).
+MATLAB gives `'abc'` and a 2x2 char. `logical('a')` and `char(true)` convert
+here, where MATLAB is understood to refuse both.
 
 ### Syntax not recognised
 
@@ -2830,10 +3117,10 @@ disp(222)
 ```
 
 Command syntax is a parse error, so `clear x`, `format long` and `disp hello`
-all fail; use `clear('x')`. Chained ranges now parse as MATLAB reads them (`1:2:3:4` is
-`unexpected Colon`, MATLAB reads it as `(1:2:3):4`). Hex literals (`0x1F`) are
-rejected. A UTF-8 BOM at the start of a file is rejected, which a Windows
-editor or PowerShell can easily produce.
+all fail; use `clear('x')`. Chained ranges parse as MATLAB reads them,
+`1:2:3:4` as `(1:2:3):4`, but a colon operand that is not a scalar is then an
+error. Hex literals (`0x1F`) are rejected. A UTF-8 byte-order mark at the
+start of a file is skipped; a UTF-16 file is not read.
 
 A `break` or `continue` outside a loop is an error, as in MATLAB. It used to
 end the script silently with exit 0:
@@ -2849,7 +3136,7 @@ disp(2)
 Error: Line 2: 'break' is only valid inside a loop.
 ```
 
-`2` never prints and the exit code is 0.
+`2` never prints and the exit code is 1.
 
 ### Builtin behaviour
 
@@ -2934,7 +3221,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 | Missing | Arrives in |
 |---|---|
-| Logical indexing `x(x > 0)`, and the logical class | 02, 03 |
+| Logical indexing `x(x > 0)` | 03 |
 | Element deletion `x(i) = []` | 03 |
 | Multiple assignment `[r, c] = size(A)` | 03 |
 | Trailing singleton subscripts `A(2, 1, 1)` | 03 |
@@ -2957,8 +3244,8 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | `exit` in a script, `exit(code)`, `format`, `help`, `eval` | 13 |
 | Integer classes and `single` | not scheduled |
 
-Hitting one of these gives a parse error or
-`Undefined function or variable`, never a wrong answer:
+Hitting one of these gives a parse error or another clean error, never a
+wrong answer:
 
 ```matlab
 f = @(x) x + 1

@@ -21,6 +21,9 @@ pub enum Expr {
     /// `name(args)` — indexing if `name` is a variable, otherwise a call.
     Index(String, Vec<Expr>),
     Neg(Box<Expr>),
+    /// Unary plus. It is not a no-op: it is arithmetic, so `+'a'` is the
+    /// double `97` and `+true` the double `1`.
+    Pos(Box<Expr>),
     Not(Box<Expr>),
     Transpose(Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
@@ -507,7 +510,7 @@ impl Parser {
             Token::Plus => {
                 self.deepen()?;
                 self.next();
-                let e = self.parse_unary()?;
+                let e = Expr::Pos(Box::new(self.parse_unary()?));
                 self.depth -= 1;
                 Ok(e)
             }
@@ -553,7 +556,7 @@ impl Parser {
             Token::Plus => {
                 self.deepen()?;
                 self.next();
-                let e = self.parse_power_operand()?;
+                let e = Expr::Pos(Box::new(self.parse_power_operand()?));
                 self.depth -= 1;
                 Ok(e)
             }
@@ -715,7 +718,10 @@ mod tests {
     #[test]
     fn unary_sign_is_allowed_in_the_exponent() {
         assert_eq!(parse_expr("2^-1"), bin(BinOp::Pow, num(2.0), neg(num(1.0))));
-        assert_eq!(parse_expr("2^+1"), bin(BinOp::Pow, num(2.0), num(1.0)));
+        assert_eq!(
+            parse_expr("2^+1"),
+            bin(BinOp::Pow, num(2.0), Expr::Pos(Box::new(num(1.0))))
+        );
     }
 
     #[test]

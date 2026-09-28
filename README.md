@@ -24,8 +24,9 @@ x =
 ```
 
 SplatCrab is early software (version 0.1.0). The core language works:
-matrices, indexing, control flow, formatted output and 80 builtins. User
-functions, cells, structs, complex numbers and plotting are not there yet. See
+matrices, the double, logical and char classes, indexing, control flow,
+formatted output and 88 builtins. User functions, cells, structs, complex
+numbers and plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -128,8 +129,22 @@ z
   aborting the process. A `NaN` is refused wherever a logical is wanted, as
   MATLAB refuses it, and `&&` and `||` need an operand convertible to a
   logical scalar, so `[1 1] && 1` is an error rather than `1`
+- Three classes, as in MATLAB: `double`, `logical` and `char`. Arithmetic
+  gives a double (`true + true` is `2`, `'a' + 1` is `98`), comparisons and
+  `& | ~ && ||` give a logical, and concatenation gives a char if any operand
+  is one: `['a' 66]` is `'aB'`. Indexed assignment keeps the left-hand
+  side's class, so `s = 'abc'; s(1) = 'X'` is `'Xbc'`, and rearranging a char
+  (`fliplr`, `sort`, `reshape`, transpose) keeps it a char. `class`,
+  `islogical`, `ischar`, `isnumeric`, `isa`, `logical`, `char` and `double`,
+  and `true`, `false`, `any`, `all`, `isnan` and the other predicates return
+  logicals
+- A char element is a UTF-16 code unit, as in MATLAB, so `length('😀')` is
+  `2`, and output decodes it back to UTF-8. On Windows the console is switched
+  to UTF-8, so the `×` in a `2×3 char array` header renders
 - Indexing `A(i)`, `A(i,j)`, `v(2:4)`, `A(:,1)`, `A(end)`, and growth on
-  indexed assignment such as `z(end+1) = x`
+  indexed assignment such as `z(end+1) = x`. A logical index such as
+  `x(x > 0)` is a clean error until cycle 03, rather than the wrong answer it
+  used to give in silence
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`. A `for` that runs zero times still assigns the empty to
   its loop variable, as MATLAB does, and a `break` with no loop around it is
@@ -142,8 +157,8 @@ z
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
   means
-- 80 builtins in a registry, from `zeros` and `linspace` through `sum` and
-  `cumsum` to `fprintf`, `sprintf` and `tic`/`toc`. Each is an ordinary
+- 88 builtins in a registry, from `zeros` and `linspace` through `sum` and
+  `cumsum` to `fprintf`, `sprintf`, `class` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`
 - The argument forms MATLAB code uses: size vectors such as
   `zeros(size(A))` and `reshape(A, [], 2)`, `true(n)` and `eps(x)`,
@@ -161,9 +176,15 @@ z
 - A builtin that produces no value, such as `disp`, is legal as a statement
   and is "Too many output arguments." in an expression; every builtin rejects
   extra arguments with "Too many input arguments."
-- Display that follows MATLAB's: a matrix too wide for the 80-column window
-  wraps into `Columns N through M` blocks, integer columns survive a `NaN` or
-  an `Inf` beside them, and `disp([])` prints nothing at all
+- Display that follows MATLAB's: a logical shows under a `logical` or
+  `1×3 logical array` header in four-wide columns, a char keeps its quotes, a
+  multi-row char has a `2×3 char array` header, and an empty says what it is
+  (`0×3 empty double matrix`). Integers of 1000 and above get wider columns,
+  a matrix outside the fixed-point range shares a `1.0e+03 *` scale factor, a
+  scalar outside it is `1.2345e+03`, and an exact zero among decimals prints
+  as a bare `0`. A matrix too wide for the 80-column window wraps into
+  `Columns N through M` blocks, integer columns survive a `NaN` or an `Inf`
+  beside them, and `disp([])` prints nothing at all
 - Errors that say where they happened: a script prints
   `Error: Line N: <msg>` on stderr and exits 1, reporting the line of the
   statement that raised it, including inside a loop, an `if` body or an
@@ -180,8 +201,8 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 ## Not yet
 
 User functions, multiple return values, logical indexing, element deletion,
-`switch`, `try`, cells, structs, logical and char classes, complex numbers,
-and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+`switch`, `try`, cells, structs, integer classes, complex numbers, and
+plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -190,8 +211,9 @@ time.
  .m source ──► lexer.rs ──► parser.rs ──► interp.rs ──► value.rs
               tokens       Stmt / Expr   tree-walking   column-major
               + lines      + lines       evaluator      f64 matrices
+                                                            + a class tag
                                               │
-                                         builtins/    the 80 builtins,
+                                         builtins/    the 88 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

@@ -1,9 +1,36 @@
-//! Runtime values: a column-major double matrix (as in MATLAB) and char strings.
+//! Runtime values: a column-major matrix of doubles carrying a class tag.
+//!
+//! MATLAB's `double`, `logical` and `char` are one storage type here, an
+//! `f64` per element, told apart by [`Class`]. A logical element is `0` or
+//! `1`; a char element is one UTF-16 code unit, `0` to `65535`, as in MATLAB,
+//! so `length('😀')` is `2`.
 
 use std::fmt::Write as _;
 
 use crate::bail;
 use crate::error::{self, R};
+
+/// The class of an array. Storage is the same for all three; the tag decides
+/// how the array displays, what `class` says, and how an operation classes
+/// its result. Only the constructors of results decide it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Class {
+    #[default]
+    Double,
+    Logical,
+    Char,
+}
+
+impl Class {
+    /// The name `class` returns.
+    pub fn name(self) -> &'static str {
+        match self {
+            Class::Double => "double",
+            Class::Logical => "logical",
+            Class::Char => "char",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Matrix {
@@ -11,35 +38,68 @@ pub struct Matrix {
     pub cols: usize,
     /// Column-major: element (r, c) lives at data[c * rows + r].
     pub data: Vec<f64>,
+    /// How the elements are to be read. Every constructor below makes a
+    /// `Double`; a result of another class says so with [`Matrix::with_class`]
+    /// or [`Matrix::to_class`].
+    pub class: Class,
 }
 
+/// A value the interpreter can hold. Cycle 02 removed `Str`: text is a
+/// `Char` matrix. Containers join in cycle 07.
 #[derive(Clone, Debug)]
 pub enum Value {
     Mat(Matrix),
-    Str(String),
 }
 
 impl Value {
-    /// Strings become row vectors of character codes when used numerically.
-    ///
-    /// The empty string is the exception: `''` is `0x0` in MATLAB, not the
-    /// `1x0` a row of no elements would be, so `size('')` is `0 0`. Every
-    /// shape query goes through here, which is why the fix lives here and not
-    /// in `size`.
     pub fn into_mat(self) -> Matrix {
         match self {
             Value::Mat(m) => m,
-            Value::Str(s) if s.is_empty() => Matrix::empty(),
-            Value::Str(s) => Matrix::row(s.chars().map(|c| c as u32 as f64).collect()),
         }
     }
 
-    pub fn display(&self, name: &str) -> String {
+    pub fn mat(&self) -> &Matrix {
         match self {
-            Value::Str(s) => format!("{} =\n\n    '{}'\n\n", name, s),
-            Value::Mat(m) => format!("{} =\n\n{}\n", name, m.format()),
+            Value::Mat(m) => m,
         }
     }
+
+    /// A char row holding `s` as UTF-16 code units; see [`Matrix::char_row`].
+    pub fn str(s: &str) -> Value {
+        Value::Mat(Matrix::char_row(s))
+    }
+
+    pub fn is_char(&self) -> bool {
+        self.mat().class == Class::Char
+    }
+
+    /// The text of a char value, and `None` for any other class.
+    pub fn text(&self) -> Option<String> {
+        let m = self.mat();
+        (m.class == Class::Char).then(|| m.text())
+    }
+
+    /// `name =`, a blank line, the display body and a closing blank line.
+    pub fn display(&self, name: &str) -> String {
+        format!("{} =\n\n{}\n", name, self.mat().display_body())
+    }
+}
+
+/// A value as the UTF-16 code unit a char array stores for it: a `NaN` is
+/// `0`, anything out of range is clamped to it, and a fraction is rounded.
+pub fn code_unit(v: f64) -> f64 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.round().clamp(0.0, 65535.0)
+    }
+}
+
+/// Decodes code units back to text. An unpaired surrogate becomes U+FFFD,
+/// which is what "lossy" means here; a valid pair becomes its one character.
+pub fn decode_units(units: impl Iterator<Item = f64>) -> String {
+    let units: Vec<u16> = units.map(|v| code_unit(v) as u16).collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn broadcast_dim(a: usize, b: usize) -> Option<usize> {
@@ -57,7 +117,78 @@ fn broadcast_dim(a: usize, b: usize) -> Option<usize> {
 impl Matrix {
     pub fn new(rows: usize, cols: usize, data: Vec<f64>) -> Matrix {
         debug_assert_eq!(rows * cols, data.len());
-        Matrix { rows, cols, data }
+        Matrix {
+            rows,
+            cols,
+            data,
+            class: Class::Double,
+        }
+    }
+
+    /// This matrix with its class tag set, leaving the elements alone. The
+    /// caller vouches that they are valid for `class`; [`to_class`] is the
+    /// converting form.
+    ///
+    /// [`to_class`]: Matrix::to_class
+    pub fn with_class(mut self, class: Class) -> Matrix {
+        self.class = class;
+        self
+    }
+
+    /// A logical scalar.
+    pub fn from_bool(b: bool) -> Matrix {
+        Matrix::scalar(b as u8 as f64).with_class(Class::Logical)
+    }
+
+    /// `s` as a 1-row char of UTF-16 code units. `''` is `0x0`, as in MATLAB,
+    /// not the `1x0` a row of no units would be, so `size('')` is `0 0`.
+    pub fn char_row(s: &str) -> Matrix {
+        let units: Vec<f64> = s.encode_utf16().map(f64::from).collect();
+        let m = if units.is_empty() {
+            Matrix::empty()
+        } else {
+            Matrix::row(units)
+        };
+        m.with_class(Class::Char)
+    }
+
+    /// This matrix converted to `class`: a logical is every element tested
+    /// against zero, which refuses a `NaN` exactly as `if NaN` does; a char is
+    /// every element as a [`code_unit`]; a double keeps the values.
+    pub fn to_class(self, class: Class) -> R<Matrix> {
+        let data = match class {
+            Class::Double => self.data,
+            Class::Logical if self.class == Class::Logical => self.data,
+            Class::Logical => {
+                let mut out = Vec::with_capacity(self.data.len());
+                for v in &self.data {
+                    out.push(Matrix::logical_element(*v)? as u8 as f64);
+                }
+                out
+            }
+            Class::Char => self.data.into_iter().map(code_unit).collect(),
+        };
+        Ok(Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data,
+            class,
+        })
+    }
+
+    pub fn is_char(&self) -> bool {
+        self.class == Class::Char
+    }
+
+    /// Every element, in column-major order, decoded as UTF-16. This is how
+    /// `fprintf('%s', A)` reads a char matrix, and it is the text of a row.
+    pub fn text(&self) -> String {
+        decode_units(self.data.iter().copied())
+    }
+
+    /// Row `r` of a char matrix as text.
+    pub fn row_text(&self, r: usize) -> String {
+        decode_units((0..self.cols).map(|c| self.get(r, c)))
     }
 
     pub fn scalar(v: f64) -> Matrix {
@@ -221,7 +352,8 @@ impl Matrix {
                 data.push(self.get(r, c));
             }
         }
-        Matrix::new(self.cols, self.rows, data)
+        // Rearrangement keeps the class: `'ab'.'` is a char column.
+        Matrix::new(self.cols, self.rows, data).with_class(self.class)
     }
 
     /// Matrix product. The result shape comes from the operands, so it goes
@@ -395,27 +527,39 @@ impl Matrix {
         Ok(det)
     }
 
-    /// One rendered cell per element, column-major like `data`, and the column
-    /// width they are all padded to.
+    /// One rendered cell per element, column-major like `data`, the column
+    /// width they are all padded to, and the common scale factor line that
+    /// heads the display when there is one.
     ///
-    /// A `NaN` or an `Inf` no longer forces the whole matrix onto the
-    /// four-decimal path. MATLAB keeps the integer column format for
-    /// `[1 2 NaN]` and prints `     1     2   NaN`; a non-finite value is not
-    /// a reason to stop using integer columns, it simply has no digits of its
-    /// own.
+    /// A logical is `0` or `1` in four-wide columns, whatever its size, so
+    /// `disp(3 > 1)` is `   1` (QA D38). A double takes one of three layouts:
     ///
-    /// Having no digits is also why it does not widen the column: the width
-    /// is the widest *number* plus three, so `[NaN Inf -Inf 1]` is four
-    /// six-wide columns, `   NaN   Inf  -Inf     1`, and `-Inf` fits in six
-    /// without asking for a seventh. A matrix of nothing but non-finite
-    /// values falls back to one digit, which is what makes `disp(NaN)` the
-    /// `   NaN` MATLAB prints.
-    fn cells(&self) -> (Vec<String>, usize) {
-        let all_int = self
-            .data
-            .iter()
-            .all(|v| !v.is_finite() || (v.fract() == 0.0 && v.abs() < 1e15));
-        if all_int {
+    /// - **Integers.** Every finite element whole and below `1e9` in
+    ///   magnitude. Up to 999 the column is the widest number plus three, at
+    ///   least six, as it always was; from 1000 on it is twelve, which is what
+    ///   `x = 1000` (`        1000`) and `x = [1 1000]` record.
+    /// - **Fixed point.** Four decimals in ten-wide columns, when the largest
+    ///   magnitude `M` has `floor(log10(M))` between -2 and 2, so from `0.01`
+    ///   up to below `1000`. An exact zero prints as a bare `0`.
+    /// - **Outside that range**, a scalar is short `e` format
+    ///   (`   1.2345e+03`) and an array is the fixed-point layout of
+    ///   `A / 10^k`, headed once by `   1.0e+0k *`, with `k = floor(log10(M))`.
+    ///
+    /// A `NaN` or an `Inf` has no digits of its own, so it neither changes the
+    /// layout nor widens a column: `[1 2 NaN]` is `     1     2   NaN`, and a
+    /// matrix of nothing but non-finite values is six-wide integer columns.
+    fn cells(&self) -> (Vec<String>, usize, Option<String>) {
+        if self.class == Class::Logical {
+            let texts = self
+                .data
+                .iter()
+                .map(|v| if *v != 0.0 { "1" } else { "0" }.to_string())
+                .collect();
+            return (texts, 4, None);
+        }
+        let finite = || self.data.iter().copied().filter(|v| v.is_finite());
+        let max_abs = finite().map(f64::abs).fold(0.0_f64, f64::max);
+        if finite().all(|v| v.fract() == 0.0) && max_abs < INT_LIMIT {
             let texts: Vec<String> = self
                 .data
                 .iter()
@@ -435,47 +579,61 @@ impl Matrix {
                 .map(|(_, s)| s.len())
                 .max()
                 .unwrap_or(1);
-            return (texts, (digits + 3).max(6));
+            let width = if max_abs < 1000.0 {
+                (digits + 3).max(6)
+            } else {
+                (digits + 2).max(12)
+            };
+            return (texts, width, None);
         }
-        let max_abs = self
-            .data
-            .iter()
-            .filter(|v| v.is_finite())
-            .map(|v| v.abs())
-            .fold(0.0_f64, f64::max);
-        let sci = max_abs >= 1e5 || (max_abs > 0.0 && max_abs < 1e-3);
-        let texts: Vec<String> = self
-            .data
+        let exp = max_abs.log10().floor() as i32;
+        if (-2..=2).contains(&exp) {
+            return (self.fixed_texts(1.0), 10, None);
+        }
+        if self.is_scalar() {
+            let v = self.data[0];
+            return (vec![crate::interp::fmt_e(v, 4)], 13, None);
+        }
+        let scale: f64 = format!("1e{exp}").parse().unwrap_or(1.0);
+        let header = format!("   1.0e{:+03} *\n\n", exp);
+        (self.fixed_texts(scale), 10, Some(header))
+    }
+
+    /// Every element divided by `scale` in four decimals, with an exact zero
+    /// as a bare `0` and a non-finite value as its name.
+    fn fixed_texts(&self, scale: f64) -> Vec<String> {
+        self.data
             .iter()
             .map(|v| {
                 if !v.is_finite() {
                     nonfinite(*v)
-                } else if sci {
-                    crate::interp::fmt_e(*v, 4)
+                } else if *v == 0.0 {
+                    "0".to_string()
                 } else {
-                    format!("{:.4}", v)
+                    format!("{:.4}", v / scale)
                 }
             })
-            .collect();
-        (texts, if sci { 13 } else { 10 })
+            .collect()
     }
 
-    /// MATLAB-like display body (no name header).
+    /// The numeric display body, with no name and no class header: what
+    /// `disp` prints for a non-empty double or logical.
     ///
     /// A matrix too wide for [`TERM_WIDTH`] is split into blocks of whole
     /// columns, each headed by the columns it holds, which is what MATLAB
     /// does; `linspace(1, 2)` used to print about 1300 characters on one line.
+    /// A common scale factor is printed once, above the first block.
     pub fn format(&self) -> String {
         if self.is_empty() {
             return "     []\n".to_string();
         }
-        let (texts, width) = self.cells();
+        let (texts, width, scale) = self.cells();
         // At least one column per block, however wide a single column is:
         // wrapping every element onto its own line is still better than a
         // block with no columns in it, which would never terminate.
         let per = (TERM_WIDTH / width).max(1);
         let wrapped = self.cols > per;
-        let mut out = String::new();
+        let mut out = scale.unwrap_or_default();
         let mut c0 = 0;
         while c0 < self.cols {
             let c1 = (c0 + per).min(self.cols);
@@ -497,7 +655,66 @@ impl Matrix {
         }
         out
     }
+
+    /// What `disp` prints. A char is bare text, one line per row, and `''`
+    /// is still one empty line; any other empty prints nothing at all.
+    pub fn disp_text(&self) -> String {
+        if self.class == Class::Char {
+            if self.rows == 0 {
+                return "\n".to_string();
+            }
+            return (0..self.rows)
+                .map(|r| format!("{}\n", self.row_text(r)))
+                .collect();
+        }
+        if self.is_empty() {
+            return String::new();
+        }
+        self.format()
+    }
+
+    /// What follows `x =` and its blank line in a named display.
+    ///
+    /// A logical carries a `  logical` or `  1×3 logical array` header and a
+    /// char of more than one row a `  2×3 char array` header, each followed by
+    /// a blank line. A 1-row char is its text quoted, as MATLAB has shown it
+    /// since R2018a. An empty says what it is, `  0×3 empty double matrix`,
+    /// except the 0x0 double, which is still `     []`.
+    pub fn display_body(&self) -> String {
+        let (r, c) = (self.rows, self.cols);
+        if self.is_empty() {
+            return match self.class {
+                Class::Char => format!("  {r}×{c} empty char array\n"),
+                Class::Logical => format!("  {r}×{c} empty logical array\n"),
+                Class::Double if r == 0 && c == 0 => "     []\n".to_string(),
+                Class::Double if r == 1 => format!("  1×{c} empty double row vector\n"),
+                Class::Double if c == 1 => format!("  {r}×1 empty double column vector\n"),
+                Class::Double => format!("  {r}×{c} empty double matrix\n"),
+            };
+        }
+        match self.class {
+            Class::Char => {
+                let header = if r == 1 {
+                    String::new()
+                } else {
+                    format!("  {r}×{c} char array\n\n")
+                };
+                let rows: String = (0..r)
+                    .map(|k| format!("    '{}'\n", self.row_text(k)))
+                    .collect();
+                header + &rows
+            }
+            Class::Logical if self.is_scalar() => format!("  logical\n\n{}", self.format()),
+            Class::Logical => format!("  {r}×{c} logical array\n\n{}", self.format()),
+            Class::Double => self.format(),
+        }
+    }
 }
+
+/// The magnitude from which a whole number no longer displays as one. A
+/// matrix reaching it takes the scale factor, and a scalar the `e` format:
+/// `x = 1e10` is `   1.0000e+10`.
+const INT_LIMIT: f64 = 1e9;
 
 /// The width of the display MATLAB assumes, in characters.
 ///
@@ -618,13 +835,13 @@ mod tests {
 
     #[test]
     fn value_conversions() {
-        let m = Value::Str("AB".to_string()).into_mat();
+        let m = Value::str("AB").into_mat();
         assert_eq!((m.rows, m.cols), (1, 2));
         assert_eq!(m.data, [65.0, 66.0]);
-        assert_eq!(
-            Value::Str("hi".to_string()).display("s"),
-            "s =\n\n    'hi'\n\n"
-        );
+        assert_eq!(m.class, Class::Char);
+        assert_eq!(Value::str("hi").display("s"), "s =\n\n    'hi'\n\n");
+        assert_eq!(Value::str("hi").text().as_deref(), Some("hi"));
+        assert_eq!(Value::Mat(Matrix::scalar(3.0)).text(), None);
         assert_eq!(
             Value::Mat(Matrix::scalar(3.0)).display("x"),
             "x =\n\n     3\n\n"
@@ -1000,15 +1217,33 @@ mod tests {
             "     1    10   100\n"
         );
         assert_eq!(Matrix::scalar(0.0).format(), "     0\n");
+        assert_eq!(Matrix::scalar(-0.0).format(), "     0\n");
         assert_eq!(Matrix::row(vec![-1.0, 2.0]).format(), "    -1     2\n");
-        assert_eq!(
-            Matrix::row(vec![-123456.0, 1.0]).format(),
-            "   -123456         1\n"
-        );
         assert_eq!(
             rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]).format(),
             "     1     2\n     3     4\n"
         );
+    }
+
+    /// Acceptance test 10: from 1000 on, an integer column is twelve wide.
+    #[test]
+    fn integers_of_1000_and_above_take_twelve_wide_columns() {
+        assert_eq!(Matrix::scalar(1000.0).format(), "        1000\n");
+        assert_eq!(
+            Matrix::row(vec![1.0, 1000.0]).format(),
+            "           1        1000\n"
+        );
+        assert_eq!(
+            Matrix::row(vec![-123456.0, 1.0]).format(),
+            "     -123456           1\n"
+        );
+        // 999 is still the six-wide column it always was.
+        assert_eq!(Matrix::row(vec![1.0, 999.0]).format(), "     1   999\n");
+        // Six columns of twelve fit in 80; the seventh wraps.
+        let wide = Matrix::row(vec![1000.0; 7]).format();
+        assert!(wide.starts_with("  Columns 1 through 6\n\n"), "{wide}");
+        // From 1e9 a whole number is no longer shown as one.
+        assert_eq!(Matrix::scalar(1e10).format(), "   1.0000e+10\n");
     }
 
     #[test]
@@ -1018,20 +1253,73 @@ mod tests {
             "    1.5000    2.2500\n"
         );
         assert_eq!(Matrix::scalar(-0.5).format(), "   -0.5000\n");
-        // 1e-3 itself is on the fixed side of the scientific threshold.
-        assert_eq!(Matrix::scalar(0.001).format(), "    0.0010\n");
+        assert_eq!(Matrix::scalar(999.5).format(), "  999.5000\n");
+        assert_eq!(Matrix::scalar(0.05).format(), "    0.0500\n");
+        // A value a rounding error away from an integer is not one: this is
+        // MATLAB's det([1 2; 3 4]), which displays as `-2.0000`.
+        let near = -2.0 - 4.0 * f64::EPSILON / 2.0;
+        assert_eq!(Matrix::scalar(near).format(), "   -2.0000\n");
     }
 
+    /// Acceptance test 10: an exact zero in a fixed-point row is a bare `0`.
     #[test]
-    fn format_scientific_thresholds() {
-        // max |x| >= 1e5 switches the whole matrix to scientific.
+    fn an_exact_zero_in_a_fixed_point_row_is_bare() {
+        assert_eq!(
+            Matrix::row(vec![0.0, 1.5]).format(),
+            "         0    1.5000\n"
+        );
+        // A value that only rounds to zero keeps its decimals.
+        assert_eq!(
+            Matrix::row(vec![0.00001, 1.5]).format(),
+            "    0.0000    1.5000\n"
+        );
+    }
+
+    /// QA D20: a scalar outside the fixed-point range is short `e` format.
+    #[test]
+    fn a_scalar_outside_the_fixed_point_range_is_e_format() {
+        assert_eq!(Matrix::scalar(1234.5).format(), "   1.2345e+03\n");
+        assert_eq!(Matrix::scalar(12345.6).format(), "   1.2346e+04\n");
+        assert_eq!(Matrix::scalar(0.001).format(), "   1.0000e-03\n");
         assert_eq!(Matrix::scalar(123456.7).format(), "   1.2346e+05\n");
+        assert_eq!(Matrix::scalar(0.00012).format(), "   1.2000e-04\n");
+        assert_eq!(Matrix::scalar(-1234.5).format(), "  -1.2345e+03\n");
+    }
+
+    /// Acceptance test 10: an array outside the range is scaled by a common
+    /// factor, printed once above it.
+    #[test]
+    fn an_array_outside_the_fixed_point_range_takes_a_scale_factor() {
+        assert_eq!(
+            Matrix::row(vec![1.5, 1000.5]).format(),
+            "   1.0e+03 *\n\n    0.0015    1.0005\n"
+        );
+        assert_eq!(
+            Matrix::row(vec![0.001, 0.002]).format(),
+            "   1.0e-03 *\n\n    1.0000    2.0000\n"
+        );
         assert_eq!(
             Matrix::row(vec![1e5, 0.5]).format(),
-            "   1.0000e+05   5.0000e-01\n"
+            "   1.0e+05 *\n\n    1.0000    0.0000\n"
         );
-        // ... and so does max |x| < 1e-3.
-        assert_eq!(Matrix::scalar(0.00012).format(), "   1.2000e-04\n");
+        // A zero stays bare under the factor, and NaN keeps its name.
+        assert_eq!(
+            Matrix::row(vec![0.0, 1500.5, f64::NAN]).format(),
+            "   1.0e+03 *\n\n         0    1.5005       NaN\n"
+        );
+        // A whole number too large for integer columns scales too.
+        assert_eq!(
+            Matrix::row(vec![1.0, 1e10]).format(),
+            "   1.0e+10 *\n\n    0.0000    1.0000\n"
+        );
+        // A wide matrix prints the factor once, above the first block.
+        let wide = Matrix::row((1..=9).map(|k| k as f64 * 1000.5).collect()).format();
+        assert!(
+            wide.starts_with("   1.0e+03 *\n\n  Columns 1 through 8\n\n"),
+            "{wide}"
+        );
+        assert_eq!(wide.matches("1.0e+03").count(), 1);
+        assert!(wide.contains("  Column 9\n"), "{wide}");
     }
 
     #[test]
@@ -1043,7 +1331,6 @@ mod tests {
             "   NaN   Inf  -Inf\n"
         );
         assert_eq!(Matrix::empty().format(), "     []\n");
-        assert_eq!(Matrix::new(1, 0, Vec::new()).format(), "     []\n");
         assert_eq!(nonfinite(f64::NAN), "NaN");
         assert_eq!(nonfinite(f64::INFINITY), "Inf");
         assert_eq!(nonfinite(f64::NEG_INFINITY), "-Inf");
@@ -1079,7 +1366,146 @@ mod tests {
         // A number that does need the room still gets it.
         assert_eq!(
             Matrix::row(vec![-12345.0, f64::NAN]).format(),
-            "   -12345      NaN\n"
+            "      -12345         NaN\n"
+        );
+    }
+
+    // ---- classes and their display -----------------------------------
+
+    fn logical(rows: usize, cols: usize, row_major: &[f64]) -> Matrix {
+        rmat(rows, cols, row_major).with_class(Class::Logical)
+    }
+
+    /// Acceptance tests 1 and 2 (QA D38): four-wide logical columns, and
+    /// the `logical` headers of a named display.
+    #[test]
+    fn a_logical_displays_in_four_wide_columns_under_its_header() {
+        let t = Matrix::from_bool(true);
+        assert_eq!(t.format(), "   1\n");
+        assert_eq!(t.disp_text(), "   1\n");
+        assert_eq!(Value::Mat(t).display("x"), "x =\n\n  logical\n\n   1\n\n");
+        let m = logical(1, 3, &[0.0, 1.0, 1.0]);
+        assert_eq!(m.disp_text(), "   0   1   1\n");
+        assert_eq!(
+            Value::Mat(m).display("x"),
+            "x =\n\n  1×3 logical array\n\n   0   1   1\n\n"
+        );
+        // Twenty four-wide columns fit in 80.
+        let wide = Matrix::filled(1, 21, 1.0)
+            .with_class(Class::Logical)
+            .format();
+        assert!(wide.starts_with("  Columns 1 through 20\n\n"), "{wide}");
+    }
+
+    /// Acceptance test 14: a 1-row char is quoted, a multi-row char has a
+    /// header and one quoted row per line; `disp` is bare either way.
+    #[test]
+    fn a_char_displays_quoted_and_disp_is_bare() {
+        let s = Matrix::char_row("abc");
+        assert_eq!(Value::Mat(s.clone()).display("s"), "s =\n\n    'abc'\n\n");
+        assert_eq!(s.disp_text(), "abc\n");
+        let c = rmat(2, 2, &[97.0, 98.0, 99.0, 100.0]).with_class(Class::Char);
+        assert_eq!(
+            Value::Mat(c.clone()).display("c"),
+            "c =\n\n  2×2 char array\n\n    'ab'\n    'cd'\n\n"
+        );
+        assert_eq!(c.disp_text(), "ab\ncd\n");
+        // A char column is one character per row.
+        let col = s.transpose();
+        assert_eq!(col.class, Class::Char);
+        assert_eq!(col.disp_text(), "a\nb\nc\n");
+        // `disp('')` is still one empty line.
+        assert_eq!(Matrix::char_row("").disp_text(), "\n");
+    }
+
+    /// Acceptance tests 9 and 19: an empty says what it is, except the 0x0
+    /// double, which is still `[]`.
+    #[test]
+    fn an_empty_displays_its_class_and_shape() {
+        let body = |m: Matrix| m.display_body();
+        assert_eq!(body(Matrix::empty()), "     []\n");
+        assert_eq!(
+            body(Matrix::new(0, 3, vec![])),
+            "  0×3 empty double matrix\n"
+        );
+        assert_eq!(
+            body(Matrix::new(1, 0, vec![])),
+            "  1×0 empty double row vector\n"
+        );
+        assert_eq!(
+            body(Matrix::new(0, 1, vec![])),
+            "  0×1 empty double column vector\n"
+        );
+        assert_eq!(body(Matrix::char_row("")), "  0×0 empty char array\n");
+        assert_eq!(
+            body(Matrix::new(0, 3, vec![]).with_class(Class::Logical)),
+            "  0×3 empty logical array\n"
+        );
+        assert_eq!(
+            Value::Mat(Matrix::new(0, 3, vec![])).display("x"),
+            "x =\n\n  0×3 empty double matrix\n\n"
+        );
+        // `disp` of any empty that is not a char prints nothing.
+        assert_eq!(Matrix::new(0, 3, vec![]).disp_text(), "");
+        assert_eq!(
+            Matrix::new(0, 3, vec![])
+                .with_class(Class::Logical)
+                .disp_text(),
+            ""
+        );
+    }
+
+    /// The class tag is a property of the array, and conversion is explicit.
+    #[test]
+    fn to_class_converts_and_with_class_only_retags() {
+        let m = Matrix::row(vec![2.0, 0.0, -1.0]);
+        let l = m.clone().to_class(Class::Logical).unwrap();
+        assert_eq!(l.class, Class::Logical);
+        assert_eq!(l.data, [1.0, 0.0, 1.0]);
+        assert_eq!(
+            Matrix::scalar(f64::NAN)
+                .to_class(Class::Logical)
+                .unwrap_err()
+                .msg,
+            "NaN's cannot be converted to logicals."
+        );
+        let c = Matrix::row(vec![72.0, 105.4, -3.0, 70000.0, f64::NAN])
+            .to_class(Class::Char)
+            .unwrap();
+        assert_eq!(c.data, [72.0, 105.0, 0.0, 65535.0, 0.0]);
+        let d = Matrix::char_row("A").to_class(Class::Double).unwrap();
+        assert_eq!((d.class, d.data.as_slice()), (Class::Double, &[65.0][..]));
+        // Every numeric constructor is a double; `with_class` changes only
+        // the tag.
+        assert_eq!(Matrix::scalar(1.0).class, Class::Double);
+        assert_eq!(m.with_class(Class::Char).data, [2.0, 0.0, -1.0]);
+        // Arithmetic helpers build doubles from any class.
+        let s = Matrix::char_row("ab");
+        assert_eq!(s.map(|x| x + 1.0).class, Class::Double);
+        assert_eq!(s.zip(&s, "+", |x, y| x + y).unwrap().class, Class::Double);
+        assert_eq!(Class::Logical.name(), "logical");
+    }
+
+    /// QA D37: a char element is a UTF-16 code unit, so a character outside
+    /// the Basic Multilingual Plane is two elements, and output puts the
+    /// pair back together.
+    #[test]
+    fn char_storage_is_utf16_code_units() {
+        let emoji = Matrix::char_row("😀");
+        assert_eq!((emoji.rows, emoji.cols), (1, 2));
+        assert_eq!(emoji.data, [55357.0, 56832.0]);
+        assert_eq!(emoji.text(), "😀");
+        assert_eq!(emoji.disp_text(), "😀\n");
+        let e = Matrix::char_row("é");
+        assert_eq!(e.data, [233.0]);
+        let mixed = "a😀é\u{10FFFF}z";
+        assert_eq!(Matrix::char_row(mixed).text(), mixed);
+        assert_eq!(Matrix::char_row(mixed).numel(), 7);
+        // A lone surrogate cannot be decoded and becomes U+FFFD.
+        assert_eq!(decode_units([55357.0].into_iter()), "\u{FFFD}");
+        assert_eq!(
+            decode_units([56832.0, 55357.0].into_iter()),
+            "\u{FFFD}\u{FFFD}"
         );
     }
 
@@ -1170,10 +1596,10 @@ mod tests {
     /// be, which is what made `size('')` report `1 0`.
     #[test]
     fn the_empty_string_is_zero_by_zero() {
-        let m = Value::Str(String::new()).into_mat();
-        assert_eq!((m.rows, m.cols), (0, 0));
+        let m = Value::str("").into_mat();
+        assert_eq!((m.rows, m.cols, m.class), (0, 0, Class::Char));
         // A non-empty string is still the row of codes it always was.
-        let ab = Value::Str("ab".to_string()).into_mat();
+        let ab = Value::str("ab").into_mat();
         assert_eq!((ab.rows, ab.cols), (1, 2));
     }
 }

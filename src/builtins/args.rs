@@ -35,7 +35,8 @@ pub fn at_most(args: &[Value], n: usize, _name: &str) -> R<()> {
     }
 }
 
-/// Argument `i` as a matrix. A string becomes its character codes.
+/// Argument `i` as a matrix, class and all. A char is its code units, so a
+/// numeric builtin reads `'a'` as `97`.
 pub fn mat(args: &[Value], i: usize, name: &str) -> R<Matrix> {
     args.get(i)
         .cloned()
@@ -57,7 +58,7 @@ pub fn scalar(args: &[Value], i: usize, name: &str) -> R<f64> {
 /// A char argument is never a dimension. `sum(A, 'x')` used to read `'x'` as
 /// its character code and reduce along dimension 120.
 pub fn dim(args: &[Value], i: usize, name: &str) -> R<usize> {
-    if let Some(Value::Str(_)) = args.get(i) {
+    if args.get(i).is_some_and(Value::is_char) {
         return Err(error::bad_dim_arg(name));
     }
     let v = scalar(args, i, name)?;
@@ -78,19 +79,16 @@ pub enum Along {
 /// Argument `i` as a dimension or the option `'all'`. Only the builtins that
 /// accept `'all'` call this; any other char is the ordinary dimension error.
 pub fn dim_or_all(args: &[Value], i: usize, name: &str) -> R<Along> {
-    match args.get(i) {
-        Some(Value::Str(s)) if s.eq_ignore_ascii_case("all") => Ok(Along::All),
+    match option(args, i) {
+        Some(s) if s.eq_ignore_ascii_case("all") => Ok(Along::All),
         _ => dim(args, i, name).map(Along::Dim),
     }
 }
 
 /// Argument `i` when it is a char option such as `'descend'`, and `None` when
 /// it is numeric or missing. The caller decides which options it knows.
-pub fn option(args: &[Value], i: usize) -> Option<&str> {
-    match args.get(i) {
-        Some(Value::Str(s)) => Some(s),
-        _ => None,
-    }
+pub fn option(args: &[Value], i: usize) -> Option<String> {
+    args.get(i).and_then(Value::text)
 }
 
 /// One requested size: a non-negative integer, where a negative value is `0`
@@ -107,17 +105,17 @@ pub fn size_value(v: f64, name: &str) -> R<f64> {
 /// Argument `i` as one requested size; see [`size_value`]. A char is never a
 /// size.
 pub fn size_arg(args: &[Value], i: usize, name: &str) -> R<f64> {
-    if let Some(Value::Str(_)) = args.get(i) {
+    if args.get(i).is_some_and(Value::is_char) {
         return Err(error::bad_size_arg(name));
     }
     size_value(scalar(args, i, name)?, name)
 }
 
-/// Argument `i` as a character vector.
+/// Argument `i` as text: a char, decoded from its UTF-16 code units in
+/// column-major order. Any other class is refused.
 pub fn string(args: &[Value], i: usize, name: &str) -> R<String> {
     match args.get(i) {
-        Some(Value::Str(s)) => Ok(s.clone()),
-        Some(Value::Mat(_)) => Err(error::arg_not_a_string(i + 1, name)),
+        Some(v) => v.text().ok_or_else(|| error::arg_not_a_string(i + 1, name)),
         None => Err(error::not_enough_args(name)),
     }
 }
@@ -135,10 +133,10 @@ pub fn string(args: &[Value], i: usize, name: &str) -> R<String> {
 pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<Option<f64>>> {
     let rest = args.get(from..).unwrap_or(&[]);
     if let [one] = rest {
-        let m = match one {
-            Value::Str(_) => return Err(error::bad_size_arg(name)),
-            Value::Mat(m) => m,
-        };
+        if one.is_char() {
+            return Err(error::bad_size_arg(name));
+        }
+        let m = one.mat();
         if let Some(n) = m.scalar_value() {
             let n = size_value(n, name)?;
             return Ok(vec![Some(n), Some(n)]);
@@ -157,11 +155,11 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
     }
     rest.iter()
         .enumerate()
-        .map(|(k, a)| match a {
-            Value::Str(_) => Err(error::bad_size_arg(name)),
-            Value::Mat(m) if m.is_scalar() => size_value(m.data[0], name).map(Some),
-            Value::Mat(m) if auto && m.is_empty() => Ok(None),
-            Value::Mat(_) => Err(error::arg_not_a_scalar(from + k + 1, name)),
+        .map(|(k, a)| match a.mat() {
+            m if m.is_char() => Err(error::bad_size_arg(name)),
+            m if m.is_scalar() => size_value(m.data[0], name).map(Some),
+            m if auto && m.is_empty() => Ok(None),
+            _ => Err(error::arg_not_a_scalar(from + k + 1, name)),
         })
         .collect()
 }
@@ -282,7 +280,7 @@ mod tests {
 
     #[test]
     fn mat_converts_a_string_to_character_codes() {
-        let a = [Value::Str("AB".to_string())];
+        let a = [Value::str("AB")];
         assert_eq!(mat(&a, 0, "abs").unwrap().data, [65.0, 66.0]);
         assert_eq!(string(&a, 0, "clear").unwrap(), "AB");
         assert!(string(&[num(1.0)], 0, "clear").is_err());
@@ -301,23 +299,23 @@ mod tests {
     fn dim_never_reads_a_char_as_its_character_code() {
         // 'x' is the scalar 120 once converted; it must not become dimension
         // 120, which is what made sum(A, 'x') return A unchanged.
-        let a = [num(1.0), Value::Str("x".to_string())];
+        let a = [num(1.0), Value::str("x")];
         let e = dim(&a, 1, "sum").unwrap_err().msg;
         assert_eq!(
             e,
             "Dimension argument to 'sum' must be a positive integer scalar."
         );
-        let all = [num(1.0), Value::Str("all".to_string())];
+        let all = [num(1.0), Value::str("all")];
         assert!(dim(&all, 1, "sum").is_err());
         assert_eq!(dim_or_all(&all, 1, "sum").unwrap(), Along::All);
-        let upper = [num(1.0), Value::Str("ALL".to_string())];
+        let upper = [num(1.0), Value::str("ALL")];
         assert_eq!(dim_or_all(&upper, 1, "sum").unwrap(), Along::All);
         assert_eq!(
             dim_or_all(&[num(1.0), num(2.0)], 1, "sum").unwrap(),
             Along::Dim(2)
         );
         assert!(dim_or_all(&a, 1, "sum").is_err());
-        assert_eq!(option(&all, 1), Some("all"));
+        assert_eq!(option(&all, 1).as_deref(), Some("all"));
         assert_eq!(option(&all, 0), None);
         assert_eq!(option(&all, 5), None);
     }
@@ -330,9 +328,7 @@ mod tests {
         // A size past usize is kept as asked, for check_shape to name.
         assert_eq!(size_arg(&[num(1e300)], 0, "zeros").unwrap(), 1e300);
         assert_eq!(
-            size_arg(&[Value::Str("a".to_string())], 0, "zeros")
-                .unwrap_err()
-                .msg,
+            size_arg(&[Value::str("a")], 0, "zeros").unwrap_err().msg,
             size_msg()
         );
         assert_eq!(
@@ -381,9 +377,7 @@ mod tests {
             "Argument 2 to 'zeros' must be a scalar."
         );
         assert_eq!(
-            sizes(&[num(2.0), Value::Str("a".to_string())])
-                .unwrap_err()
-                .msg,
+            sizes(&[num(2.0), Value::str("a")]).unwrap_err().msg,
             size_msg()
         );
         assert_eq!(sizes(&[row(&[2.0, 1.5])]).unwrap_err().msg, size_msg());

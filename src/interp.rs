@@ -10,7 +10,7 @@ use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::scan;
 use crate::parser::{BinOp, Expr, Located, MAX_DEPTH, Parser, Stmt};
-use crate::value::{Matrix, Value, nonfinite};
+use crate::value::{Class, Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
 /// `error.rs`; the re-export is what let cycle 01b swap `String` for `MError`
@@ -210,7 +210,7 @@ impl Interp {
                 // the shapes Octave assigns. MATLAB's exact shape is
                 // unsettled, so no golden case asserts it.
                 if m.cols == 0 {
-                    let empty = Matrix::new(m.rows, 0, Vec::new());
+                    let empty = Matrix::new(m.rows, 0, Vec::new()).with_class(m.class);
                     self.vars.insert(name.clone(), Value::Mat(empty));
                 }
                 self.loop_depth += 1;
@@ -244,11 +244,13 @@ impl Interp {
     fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<()> {
         for c in 0..m.cols {
             let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
+            // Each column keeps the class, so `for k = 'abc'` iterates chars.
             let v = if m.rows == 1 {
                 Matrix::scalar(column[0])
             } else {
                 Matrix::col(column)
-            };
+            }
+            .with_class(m.class);
             self.vars.insert(name.to_string(), Value::Mat(v));
             if let Flow::Break = self.exec_block(body)? {
                 break;
@@ -280,7 +282,8 @@ impl Interp {
     fn eval_node(&mut self, e: &Expr) -> R<Value> {
         match e {
             Expr::Num(v) => Ok(Value::Mat(Matrix::scalar(*v))),
-            Expr::Str(s) => Ok(Value::Str(s.clone())),
+            // A string literal is a 1-row char of UTF-16 code units.
+            Expr::Str(s) => Ok(Value::str(s)),
             Expr::Ident(n) => {
                 if let Some(v) = self.vars.get(n) {
                     return Ok(v.clone());
@@ -295,14 +298,16 @@ impl Interp {
             Expr::Colon => Err(error::colon_outside_index()),
             Expr::Index(n, args) => self.index(n, args),
             Expr::Matrix(rows) => self.build_matrix(rows),
+            // Both signs are arithmetic, so both give a double: `+'a'` is 97.
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
+            Expr::Pos(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| x))),
             // `~` converts each element to a logical first, so `~NaN` is the
             // same refusal as `if NaN` rather than the `0` it used to give.
-            Expr::Not(a) => {
-                Ok(Value::Mat(self.eval_mat(a)?.try_map(|x| {
-                    Ok(!Matrix::logical_element(x)? as u8 as f64)
-                })?))
-            }
+            Expr::Not(a) => Ok(Value::Mat(
+                self.eval_mat(a)?
+                    .try_map(|x| Ok(!Matrix::logical_element(x)? as u8 as f64))?
+                    .with_class(Class::Logical),
+            )),
             Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
             Expr::Range(a, step, b) => {
                 let a = self.eval_scalar(a, "range start")?;
@@ -340,12 +345,12 @@ impl Interp {
             BinOp::AndAnd => {
                 let l = self.eval_mat(a)?.logical_scalar()?;
                 let v = l && self.eval_mat(b)?.logical_scalar()?;
-                return Ok(Value::Mat(Matrix::scalar(v as u8 as f64)));
+                return Ok(Value::Mat(Matrix::from_bool(v)));
             }
             BinOp::OrOr => {
                 let l = self.eval_mat(a)?.logical_scalar()?;
                 let v = l || self.eval_mat(b)?.logical_scalar()?;
-                return Ok(Value::Mat(Matrix::scalar(v as u8 as f64)));
+                return Ok(Value::Mat(Matrix::from_bool(v)));
             }
             _ => {}
         }
@@ -413,7 +418,21 @@ impl Interp {
             })?,
             BinOp::AndAnd | BinOp::OrOr => unreachable!(),
         };
-        Ok(Value::Mat(r))
+        // Arithmetic is always a double, whatever its operands were:
+        // `true + true` is `2` and `'a' + 1` is `98`. Comparisons and the
+        // element-wise logical operators are logical.
+        let class = match op {
+            BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+            | BinOp::And
+            | BinOp::Or => Class::Logical,
+            _ => Class::Double,
+        };
+        Ok(Value::Mat(r.with_class(class)))
     }
 
     fn build_matrix(&mut self, rows: &[Vec<Expr>]) -> R<Value> {
@@ -438,28 +457,11 @@ impl Interp {
                 return self.call_for_value(name, a);
             }
         };
-        let (m, is_str) = match var {
-            Value::Str(s) => (Value::Str(s).into_mat(), true),
-            Value::Mat(m) => (m, false),
-        };
+        let m = var.into_mat();
         let sel = self.eval_index_args(&m, args)?;
-        let out = index_read(&m, &sel)?;
-        // A `Value::Str` is a row of characters and has nowhere to record any
-        // other shape, so only a result that is one row can stay a string.
-        // `s(:)` is a column in MATLAB, and giving back a row would be the
-        // wrong shape rather than merely the wrong class; the column comes
-        // back as its character codes until cycle 02's `Char` class can carry
-        // a shape of its own (QA D17).
-        if is_str && out.rows <= 1 {
-            Ok(Value::Str(
-                out.data
-                    .iter()
-                    .map(|c| char::from_u32(*c as u32).unwrap_or('?'))
-                    .collect(),
-            ))
-        } else {
-            Ok(Value::Mat(out))
-        }
+        // Indexing keeps the class, so `s(2)` of a char is a char and `s(:)`
+        // is a char column (QA D17).
+        Ok(Value::Mat(index_read(&m, &sel)?))
     }
 
     fn eval_index_args(&mut self, m: &Matrix, args: &[Expr]) -> R<Vec<Sel>> {
@@ -483,6 +485,12 @@ impl Interp {
             let v = self.eval_mat(a);
             self.end_stack.pop();
             let v = v?;
+            // A mask such as `x > 0` must never be read as a list of
+            // positions, which made `x(x > 0)` give `5 5 5` (QA D6). Cycle 03
+            // replaces this refusal with logical indexing itself.
+            if v.class == Class::Logical {
+                bail!(error::logical_indexing_unsupported());
+            }
             let mut idx = Vec::with_capacity(v.numel());
             for x in &v.data {
                 if x.fract() != 0.0 || *x < 1.0 {
@@ -500,10 +508,19 @@ impl Interp {
         if rhs.is_empty() {
             bail!(error::deletion_unsupported());
         }
+        // The left-hand side keeps its class, so `s(1) = 'X'` of a char stays
+        // a char and `y(2) = 'a'` of a double stores `97`. A variable that
+        // does not exist yet, or is the 0x0 double `[]`, takes the class of
+        // what is assigned into it, which is how `s = []; s(1) = 'a'` builds
+        // a char.
         let mut m = match self.vars.get(name) {
             Some(v) => v.clone().into_mat(),
             None => Matrix::empty(),
         };
+        if m.class == Class::Double && m.rows == 0 && m.cols == 0 {
+            m.class = rhs.class;
+        }
+        let rhs = rhs.to_class(m.class)?;
         let sel = self.eval_index_args(&m, args)?;
         if sel.len() == 1 {
             let idx: Vec<usize> = match &sel[0] {
@@ -514,7 +531,7 @@ impl Interp {
             if need > m.numel() {
                 crate::builtins::args::check_size(1, need)?;
                 if m.is_empty() {
-                    m = Matrix::filled(1, need, 0.0);
+                    m = Matrix::filled(1, need, 0.0).with_class(m.class);
                 } else if m.rows == 1 {
                     m.data.resize(need, 0.0);
                     m.cols = need;
@@ -548,7 +565,7 @@ impl Interp {
             let nc = cols.iter().max().map_or(m.cols, |x| (x + 1).max(m.cols));
             if nr != m.rows || nc != m.cols {
                 crate::builtins::args::check_size(nr, nc)?;
-                let mut grown = Matrix::filled(nr, nc, 0.0);
+                let mut grown = Matrix::filled(nr, nc, 0.0).with_class(m.class);
                 for c in 0..m.cols {
                     for r in 0..m.rows {
                         grown.set(r, c, m.get(r, c));
@@ -708,7 +725,12 @@ fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
     Ok(result)
 }
 
+/// `m(sel)`, keeping `m`'s class.
 fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
+    Ok(index_values(m, sel)?.with_class(m.class))
+}
+
+fn index_values(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
     if sel.len() == 1 {
         match &sel[0] {
             Sel::All => Ok(Matrix::col(m.data.clone())),
@@ -764,26 +786,35 @@ fn index_read(m: &Matrix, sel: &[Sel]) -> R<Matrix> {
     }
 }
 
+/// The class of a concatenation: `Char` if any operand is a char, else
+/// `Logical` if every operand is a logical, else `Double`.
+///
+/// A 0x0 double takes no part in the vote, so `[[] 'abc']` is a char and
+/// `s = []; s = [s 'abc']` builds one (QA D17). It is what `[]` is, and it
+/// contributes no elements. Only when every operand is one does the vote
+/// fall back to all of them, which makes `[[] []]` the double it always was.
+fn concat_class(mats: &[Matrix]) -> Class {
+    let is_blank = |m: &&Matrix| m.class == Class::Double && m.rows == 0 && m.cols == 0;
+    let voters: Vec<&Matrix> = if mats.iter().all(|m| is_blank(&m)) {
+        mats.iter().collect()
+    } else {
+        mats.iter().filter(|m| !is_blank(m)).collect()
+    };
+    if voters.iter().any(|m| m.class == Class::Char) {
+        Class::Char
+    } else if !voters.is_empty() && voters.iter().all(|m| m.class == Class::Logical) {
+        Class::Logical
+    } else {
+        Class::Double
+    }
+}
+
 fn hcat(vals: Vec<Value>) -> R<Value> {
-    if vals.is_empty() {
-        return Ok(Value::Mat(Matrix::empty()));
-    }
-    if vals.iter().all(|v| matches!(v, Value::Str(_))) {
-        let mut s = String::new();
-        for v in vals {
-            if let Value::Str(t) = v {
-                s.push_str(&t);
-            }
-        }
-        return Ok(Value::Str(s));
-    }
-    let mats: Vec<Matrix> = vals
-        .into_iter()
-        .map(|v| v.into_mat())
-        .filter(|m| !m.is_empty())
-        .collect();
+    let all: Vec<Matrix> = vals.into_iter().map(|v| v.into_mat()).collect();
+    let class = concat_class(&all);
+    let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
-        return Ok(Value::Mat(Matrix::empty()));
+        return Ok(Value::Mat(Matrix::empty().with_class(class)));
     }
     let rows = mats[0].rows;
     if mats.iter().any(|m| m.rows != rows) {
@@ -795,20 +826,20 @@ fn hcat(vals: Vec<Value>) -> R<Value> {
         data.extend_from_slice(&m.data);
         cols += m.cols;
     }
-    Ok(Value::Mat(Matrix::new(rows, cols, data)))
+    // A number joining a char becomes the character with that code: `['a'
+    // 66]` is `'aB'`.
+    Ok(Value::Mat(Matrix::new(rows, cols, data).to_class(class)?))
 }
 
 fn vcat(vals: Vec<Value>) -> R<Value> {
     if vals.len() == 1 {
         return Ok(vals.into_iter().next().unwrap());
     }
-    let mats: Vec<Matrix> = vals
-        .into_iter()
-        .map(|v| v.into_mat())
-        .filter(|m| !m.is_empty())
-        .collect();
+    let all: Vec<Matrix> = vals.into_iter().map(|v| v.into_mat()).collect();
+    let class = concat_class(&all);
+    let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
-        return Ok(Value::Mat(Matrix::empty()));
+        return Ok(Value::Mat(Matrix::empty().with_class(class)));
     }
     let cols = mats[0].cols;
     if mats.iter().any(|m| m.cols != cols) {
@@ -825,7 +856,7 @@ fn vcat(vals: Vec<Value>) -> R<Value> {
         }
         r0 += m.rows;
     }
-    Ok(Value::Mat(out))
+    Ok(Value::Mat(out.to_class(class)?))
 }
 
 // ---- number formatting -----------------------------------------------
@@ -1073,10 +1104,10 @@ mod tests {
         // ... but it still assigns its loop variable, as MATLAB does. The
         // variable used to be left undefined, and a name that already held a
         // value kept it.
-        assert_eq!(ok_out("for k = []\nend\ndisp(isempty(k))"), "     1\n");
+        assert_eq!(ok_out("for k = []\nend\ndisp(isempty(k))"), "   1\n");
         assert_eq!(
             ok_out("k = 7;\nfor k = []\nend\ndisp(isempty(k))"),
-            "     1\n"
+            "   1\n"
         );
         // The empty assigned is the column the loop would have taken next,
         // which is Octave's shape for both of these. MATLAB's own shape is
@@ -1117,13 +1148,13 @@ mod tests {
     #[test]
     fn logical_operators_short_circuit() {
         // The right-hand side must not be evaluated at all.
-        assert_eq!(ok_out("x = 0 && undefined_fn();\ndisp(x)"), "     0\n");
-        assert_eq!(ok_out("y = 1 || undefined_fn();\ndisp(y)"), "     1\n");
+        assert_eq!(ok_out("x = 0 && undefined_fn();\ndisp(x)"), "   0\n");
+        assert_eq!(ok_out("y = 1 || undefined_fn();\ndisp(y)"), "   1\n");
         // ... and it really would have failed.
         assert!(err_msg("disp(undefined_fn())").contains("Unrecognized function or variable"));
-        assert_eq!(ok_out("disp(1 && 1)"), "     1\n");
-        assert_eq!(ok_out("disp(0 || 0)"), "     0\n");
-        assert_eq!(ok_out("disp(1 && 0)"), "     0\n");
+        assert_eq!(ok_out("disp(1 && 1)"), "   1\n");
+        assert_eq!(ok_out("disp(0 || 0)"), "   0\n");
+        assert_eq!(ok_out("disp(1 && 0)"), "   0\n");
     }
 
     // ---- error line numbers ------------------------------------------
@@ -1234,8 +1265,8 @@ mod tests {
 
     #[test]
     fn tic_and_toc_see_nargout() {
-        assert_eq!(ok_out("t = tic; disp(toc(t) >= 0)"), "     1\n");
-        assert_eq!(ok_out("tic; disp(toc >= 0)"), "     1\n");
+        assert_eq!(ok_out("t = tic; disp(toc(t) >= 0)"), "   1\n");
+        assert_eq!(ok_out("tic; disp(toc >= 0)"), "   1\n");
         // As a statement, tic prints nothing and toc reports the time.
         assert_eq!(ok_out("tic;"), "");
         let out = ok_out("tic\ntoc");
@@ -1460,8 +1491,8 @@ mod tests {
         assert_eq!(err_msg("x = toc;"), msg);
         // A handle from `t = tic` is not a bare tic.
         assert_eq!(err_msg("t = tic; x = toc;"), msg);
-        assert_eq!(ok_out("t = tic; disp(toc(t) >= 0)"), "     1\n");
-        assert_eq!(ok_out("tic; x = toc; disp(x >= 0)"), "     1\n");
+        assert_eq!(ok_out("t = tic; disp(toc(t) >= 0)"), "   1\n");
+        assert_eq!(ok_out("tic; x = toc; disp(x >= 0)"), "   1\n");
     }
 
     #[test]
@@ -1632,13 +1663,13 @@ mod tests {
         }
         // A short-circuit that never reaches the `NaN` never converts it,
         // which is how MATLAB behaves too: the operand is not evaluated.
-        assert_eq!(ok_out("disp(1 || NaN)"), "     1\n");
-        assert_eq!(ok_out("disp(0 && NaN)"), "     0\n");
+        assert_eq!(ok_out("disp(1 || NaN)"), "   1\n");
+        assert_eq!(ok_out("disp(0 && NaN)"), "   0\n");
         // Everything else converts as it always did.
         assert_eq!(ok_out("if Inf, disp(1), end"), "     1\n");
-        assert_eq!(ok_out("disp(~0)"), "     1\n");
-        assert_eq!(ok_out("disp([1 0] & [1 1])"), "     1     0\n");
-        assert_eq!(ok_out("disp(isnan(NaN))"), "     1\n");
+        assert_eq!(ok_out("disp(~0)"), "   1\n");
+        assert_eq!(ok_out("disp([1 0] & [1 1])"), "   1   0\n");
+        assert_eq!(ok_out("disp(isnan(NaN))"), "   1\n");
     }
 
     /// Acceptance test 13: `&&` and `||` need one value to branch on.
@@ -1657,8 +1688,8 @@ mod tests {
         }
         // Short-circuiting still stops before the second operand, so a
         // right-hand side that would be refused is never reached.
-        assert_eq!(ok_out("disp(0 && [1 1])"), "     0\n");
-        assert_eq!(ok_out("disp(1 || [])"), "     1\n");
+        assert_eq!(ok_out("disp(0 && [1 1])"), "   0\n");
+        assert_eq!(ok_out("disp(1 || [])"), "   1\n");
         // `if` is unaffected: it takes an array and an empty.
         assert_eq!(ok_out("if [1 1], disp(1), end"), "     1\n");
         assert_eq!(ok_out("n = 0;\nif [], n = 1; end\ndisp(n)"), "     0\n");
@@ -1714,12 +1745,14 @@ mod tests {
     }
 
     /// `s(:)` is a column in MATLAB. It used to come back as a row, because a
-    /// `Value::Str` is a row of characters and has nowhere to put any other
-    /// shape; the codes are what a column can carry until cycle 02's `Char`
-    /// class (QA D17).
+    /// `Value::Str` was a row of characters with nowhere to put any other
+    /// shape, and then as a column of codes; since cycle 02 it is a char
+    /// column (QA D17).
     #[test]
     fn a_colon_index_of_a_char_is_a_column() {
         assert_eq!(ok_out("s = 'abc'; disp(size(s(:)))"), "     3     1\n");
+        assert_eq!(ok_out("s = 'abc'; disp(s(:))"), "a\nb\nc\n");
+        assert_eq!(ok_out("s = 'abc'; disp(class(s(:)))"), "char\n");
         // Every other index of a char is still a char.
         assert_eq!(ok_out("s = 'abc'; disp(s(2))"), "b\n");
         assert_eq!(ok_out("s = 'abc'; disp(s([3 1]))"), "ca\n");
@@ -1737,6 +1770,210 @@ mod tests {
         // Only a leading one. A mark in the middle is a real stray character.
         let e = err_msg("disp(1)\n\u{feff}disp(2)");
         assert!(e.contains("unexpected character"), "{e}");
+    }
+
+    // ---- classes -----------------------------------------------------
+
+    /// The class of the value `src` leaves in `ans`.
+    fn class_of(src: &str) -> Class {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut it = Interp::with_output(Box::new(Shared(buf)));
+        it.run(&format!("{src};")).unwrap();
+        it.vars["ans"].mat().class
+    }
+
+    /// The propagation table: arithmetic is double, comparisons and logical
+    /// operators are logical, whatever the operands' classes were.
+    #[test]
+    fn operators_class_their_results_by_the_propagation_table() {
+        use Class::*;
+        for (src, want) in [
+            ("1 + 2", Double),
+            ("true + true", Double),
+            ("'a' + 1", Double),
+            ("-true", Double),
+            ("+'a'", Double),
+            ("'ab' * 2", Double),
+            ("true * [1 2]", Double),
+            ("2 ^ true", Double),
+            ("1 < 2", Logical),
+            ("'a' == 'a'", Logical),
+            ("[1 2] ~= 2", Logical),
+            ("~1", Logical),
+            ("~'a'", Logical),
+            ("[1 0] & 1", Logical),
+            ("[1 0] | 0", Logical),
+            ("1 && 1", Logical),
+            ("0 || 0", Logical),
+            ("true'", Logical),
+            ("('ab')'", Char),
+            ("1:3", Double),
+        ] {
+            assert_eq!(class_of(src), want, "{src}");
+        }
+        assert_eq!(ok_out("disp(+'a')"), "    97\n");
+    }
+
+    /// Concatenation: char if any operand is, else logical if all are, else
+    /// double; a 0x0 double takes no part in the vote.
+    #[test]
+    fn concatenation_classes_its_result() {
+        use Class::*;
+        for (src, want) in [
+            ("['a' 66]", Char),
+            ("[65 'a']", Char),
+            ("['a' true]", Char),
+            ("[true false]", Logical),
+            ("[true; false]", Logical),
+            ("[true 2]", Double),
+            ("[[] 'abc']", Char),
+            ("['abc' []]", Char),
+            ("[[] true]", Logical),
+            ("[[] []]", Double),
+            ("['' '']", Char),
+            ("['ab'; 'cd']", Char),
+            ("[1 2]", Double),
+        ] {
+            assert_eq!(class_of(src), want, "{src}");
+        }
+        assert_eq!(ok_out("disp(['a' 66])"), "aB\n");
+        assert_eq!(ok_out("s = []; s = [s 'abc']; disp(s)"), "abc\n");
+        assert_eq!(ok_out("disp(['ab'; 'cd'])"), "ab\ncd\n");
+        let e = err_msg("x = ['ab'; 'c'];");
+        assert!(e.contains("Dimensions"), "{e}");
+    }
+
+    /// Indexing keeps the class; indexed assignment keeps the left-hand
+    /// side's, converting what is stored into it.
+    #[test]
+    fn indexed_assignment_keeps_the_left_hand_class() {
+        assert_eq!(ok_out("s = 'abc'; s(1) = 'X'; disp(s)"), "Xbc\n");
+        assert_eq!(
+            ok_out("s = 'abc'; s(2) = 'Z'; disp(s + 0)"),
+            "    97    90    99\n"
+        );
+        // Growth pads a char with the code unit 0 and stays a char.
+        assert_eq!(
+            ok_out("s = 'abc'; s(5) = 'e'; disp(double(s))"),
+            "    97    98    99     0   101\n"
+        );
+        assert_eq!(ok_out("s = 'abc'; s(5) = 'e'; disp(class(s))"), "char\n");
+        // A double target stores the numeric value of a char.
+        assert_eq!(
+            ok_out("y = [1 2 3]; y(2) = 'a'; disp(y)"),
+            "     1    97     3\n"
+        );
+        // A logical target stores logical(value), refusing NaN as ever.
+        assert_eq!(ok_out("x = true(1,3); x(2) = 5; disp(x)"), "   1   1   1\n");
+        assert_eq!(
+            ok_out("x = false(1,2); x(2) = 5; disp(class(x))"),
+            "logical\n"
+        );
+        assert_eq!(
+            err_msg("x = true(1,2); x(1) = NaN;"),
+            "NaN's cannot be converted to logicals."
+        );
+        // A new variable, or the 0x0 double `[]`, takes the class assigned.
+        assert_eq!(ok_out("n(3) = 'c'; disp(class(n))"), "char\n");
+        assert_eq!(ok_out("s = []; s(1) = 'a'; s(2) = 'b'; disp(s)"), "ab\n");
+        assert_eq!(ok_out("t = []; t(2) = true; disp(class(t))"), "logical\n");
+        // Two subscripts, and growth in two dimensions, keep it too.
+        assert_eq!(
+            ok_out("c = ['ab'; 'cd']; c(2, 1) = 'X'; disp(c)"),
+            "ab\nXd\n"
+        );
+        assert_eq!(ok_out("c = 'ab'; c(2, 2) = 'Y'; disp(class(c))"), "char\n");
+        // Reading keeps the class of what is read.
+        assert_eq!(
+            ok_out("x = [true false true]; disp(class(x(2)))"),
+            "logical\n"
+        );
+        assert_eq!(ok_out("s = 'abc'; disp(class(s([3 1])))"), "char\n");
+    }
+
+    /// `for` over a char iterates chars, and `if` takes a char's truth.
+    #[test]
+    fn a_char_drives_for_and_if() {
+        assert_eq!(
+            ok_out("for k = 'abc', fprintf('%s:%s ', class(k), k); end"),
+            "char:a char:b char:c "
+        );
+        assert_eq!(ok_out("for c = ['ab'; 'cd'], disp(c'), end"), "ac\nbd\n");
+        assert_eq!(
+            ok_out("if 'abc', disp(1), end; if [], disp(2), end; if [1 0], disp(3), end"),
+            "     1\n"
+        );
+        assert_eq!(
+            ok_out("for k = true(1, 2), disp(class(k)), end"),
+            "logical\nlogical\n"
+        );
+    }
+
+    /// QA D6: an index of class logical is refused, reading and assigning,
+    /// rather than read as positions. Cycle 03 implements it.
+    #[test]
+    fn a_logical_index_is_refused_until_cycle_03() {
+        let want = "Logical indexing is not supported yet.";
+        for src in [
+            "x = [5 6 7]; x(x > 0)",
+            "x = [5 6 7]; y = x(x > 5);",
+            "x = [5 6 7]; x(x > 0) = 0;",
+            "x = [5 6 7]; x(true)",
+            "A = [1 2; 3 4]; A(1, [true false])",
+            "A = [1 2; 3 4]; A(true, 1) = 9;",
+            "x = [5 6 7]; x(isnan(x))",
+        ] {
+            assert_eq!(err_msg(src), want, "{src}");
+        }
+        // A double of ones and zeros is still a list of positions, and a
+        // char index is its codes, as in MATLAB.
+        assert_eq!(ok_out("x = [5 6 7]; disp(x([1 1]))"), "     5     5\n");
+        assert_eq!(
+            ok_out("x = [5 6 7]; disp(x(double(x > 5) + 1))"),
+            "     5     6     6\n"
+        );
+    }
+
+    /// QA D37: a char is UTF-16 code units from the literal to the output.
+    #[test]
+    fn a_string_literal_is_utf16_and_prints_back_as_utf8() {
+        assert_eq!(ok_out("disp(length('😀'))"), "     2\n");
+        assert_eq!(ok_out("fprintf('%d %d\\n', double('😀'))"), "55357 56832\n");
+        assert_eq!(ok_out("disp('😀')"), "😀\n");
+        assert_eq!(ok_out("disp(length('é'))"), "     1\n");
+        assert_eq!(ok_out("s = 'a😀b'; disp(s(2:3))"), "😀\n");
+        assert_eq!(ok_out("fprintf('%s|\\n', 'x😀')"), "x😀|\n");
+        assert_eq!(
+            ok_out("x = sprintf('%s', '😀'); disp(size(x))"),
+            "     1     2\n"
+        );
+        assert_eq!(ok_out("s = '😀'"), "s =\n\n    '😀'\n\n");
+        // Half a pair cannot be decoded alone.
+        assert_eq!(ok_out("s = '😀'; disp(s(1))"), "\u{FFFD}\n");
+    }
+
+    /// The named display of each class, through the interpreter.
+    #[test]
+    fn a_named_display_carries_the_class_header() {
+        assert_eq!(ok_out("x = 5 > 3"), "x =\n\n  logical\n\n   1\n\n");
+        assert_eq!(
+            ok_out("x = [1 2 3] > 1"),
+            "x =\n\n  1×3 logical array\n\n   0   1   1\n\n"
+        );
+        assert_eq!(ok_out("x = ''"), "x =\n\n  0×0 empty char array\n\n");
+        assert_eq!(
+            ok_out("x = zeros(0, 3)"),
+            "x =\n\n  0×3 empty double matrix\n\n"
+        );
+        assert_eq!(
+            ok_out("y = 1:0"),
+            "y =\n\n  1×0 empty double row vector\n\n"
+        );
+        assert_eq!(ok_out("x = []"), "x =\n\n     []\n\n");
+        assert_eq!(
+            ok_out("c = ['ab'; 'cd']"),
+            "c =\n\n  2×2 char array\n\n    'ab'\n    'cd'\n\n"
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 % covers: 17 - zeros, ones, eye, rand, NaN, Inf, true and false accept a row vector of sizes (QA D21)
 % NOTE: all returns a logical in MATLAB, and disp of a logical is four
-% NOTE: characters wide ("   1"). SplatCrab has no logical class until cycle 02
-% NOTE: and prints six wide. Adding 0 makes the value a double in both, so the
-% NOTE: expected "     1" below is MATLAB's own output, and stays so after 02.
+% NOTE: characters wide ("   1"), as it has been here since cycle 02. Adding 0
+% NOTE: makes the value a double, so the expected "     1" below is the double
+% NOTE: width, in MATLAB and here alike.
 A = ones(2, 3);
 disp(size(zeros(size(A))))
 disp(size(ones([3 1])))

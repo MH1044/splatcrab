@@ -6,7 +6,7 @@ use super::args::{
     at_most, check_shape, dim, fmt_dim, mat, need, option, shape, size_list, trailing_ones,
 };
 use super::math::{reduce, sum0};
-use super::{Registry, add, one_mat};
+use super::{Registry, add, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R};
 use crate::value::{Matrix, Value};
@@ -38,7 +38,7 @@ pub fn register(r: &mut Registry) {
 
 fn transpose(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "transpose")?;
-    one_mat(mat(a, 0, "transpose")?.transpose())
+    one_as(mat(a, 0, "transpose")?.transpose())
 }
 
 fn inv(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -270,7 +270,8 @@ fn reshape(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     if r * c != total {
         return Err(error::reshape_numel(total, r, c));
     }
-    one_mat(Matrix::new(r, c, m.data))
+    // Rearrangement keeps the class, here and in the next three.
+    one_as(Matrix::new(r, c, m.data).with_class(m.class))
 }
 
 /// `repmat(A, n)`, `repmat(A, r, c, ...)` and `repmat(A, sz)`, through the
@@ -284,13 +285,13 @@ fn repmat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     // `repmat([1 2], 1e10, 1e10)`, naming an intermediate instead of the
     // 10000000000x20000000000 array requested.
     let (rows, cols) = check_shape(m.rows as f64 * r, m.cols as f64 * c)?;
-    let mut out = Matrix::filled(rows, cols, 0.0);
+    let mut out = Matrix::filled(rows, cols, 0.0).with_class(m.class);
     for j in 0..out.cols {
         for i in 0..out.rows {
             out.set(i, j, m.get(i % m.rows.max(1), j % m.cols.max(1)));
         }
     }
-    one_mat(out)
+    one_as(out)
 }
 
 fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -302,7 +303,7 @@ fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
             out.set(r, m.cols - 1 - c, m.get(r, c));
         }
     }
-    one_mat(out)
+    one_as(out)
 }
 
 fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -314,7 +315,7 @@ fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
             out.set(m.rows - 1 - r, c, m.get(r, c));
         }
     }
-    one_mat(out)
+    one_as(out)
 }
 
 // ---- search and sort -------------------------------------------------
@@ -418,7 +419,8 @@ fn sort(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
             out.data.sort_by(sort_cmp);
         }
     }
-    one_mat(out)
+    // A sorted char is a char: `sort('cab')` is `'abc'`.
+    one_as(out)
 }
 
 #[cfg(test)]
@@ -541,7 +543,7 @@ mod tests {
     }
 
     fn text(s: &str) -> Value {
-        Value::Str(s.to_string())
+        Value::str(s)
     }
 
     fn col(v: &[f64]) -> Value {

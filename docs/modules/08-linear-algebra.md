@@ -21,6 +21,13 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
   singular matrix (QA D26), which return `Inf` matrices as MATLAB and Octave
   do: `inv([1 2; 2 4])` is `Inf Inf; Inf Inf`, and `inv(0)` is `Inf`
 
+- Verify first: `det([1 2; 3 4])` is exactly `-2` here and displays `    -2`,
+  where cycle 02's acceptance item 10 records MATLAB's `   -2.0000`. Cycle 02
+  fixed the display half and left this value half to the LU rewrite, which
+  decides the operation order. Settle it at this cycle's planning from a
+  source, not by choosing an order that happens to give `-2.0000000000000004`;
+  see the Known deviations row in `docs/ARCHITECTURE.md`
+
 Two bullets that stood here, `matmul` swallowing `Inf` and `NaN` through its
 sparsity shortcut and the absolute pivot tolerance in `solve`, were fixed by
 cycle 01d and removed from this Scope in the same commit. The LU rewrite

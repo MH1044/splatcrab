@@ -23,7 +23,7 @@ pub mod math;
 use std::collections::HashMap;
 
 use crate::interp::{Interp, R};
-use crate::value::{Matrix, Value};
+use crate::value::{Class, Matrix, Value};
 
 /// The one shape every builtin has. The `usize` is `nargout`.
 pub type BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>;
@@ -52,8 +52,19 @@ fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
     debug_assert!(clash.is_none(), "builtin '{name}' registered twice");
 }
 
-/// A builtin that produced one matrix.
+/// A builtin that produced one numeric matrix. The result is a double
+/// whatever the argument was, which is MATLAB's rule for every numeric
+/// builtin: `abs(true)`, `cumsum('abc')` and `sum(true, 3)` are doubles. It
+/// is enforced here rather than trusted to each builtin, because several of
+/// them hand back a clone of their argument on some path.
 fn one_mat(m: Matrix) -> R<Vec<Value>> {
+    Ok(vec![Value::Mat(m.with_class(Class::Double))])
+}
+
+/// A builtin that produced one matrix whose class it decided itself: the
+/// rearrangements, which keep their argument's, and the predicates and
+/// conversions, which name theirs.
+fn one_as(m: Matrix) -> R<Vec<Value>> {
     Ok(vec![Value::Mat(m)])
 }
 
@@ -72,8 +83,10 @@ mod tests {
     use super::*;
 
     /// The 79 builtins that existed before cycle 01, plus `tic` and `toc`,
-    /// less `e`, which cycle 01c removed: MATLAB has no `e` constant.
-    const EXPECTED: usize = 80;
+    /// less `e`, which cycle 01c removed: MATLAB has no `e` constant. Cycle
+    /// 02 added the eight class builtins: `class`, `islogical`, `ischar`,
+    /// `isnumeric`, `isa`, `logical`, `char` and `double`.
+    const EXPECTED: usize = 88;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -162,6 +175,14 @@ mod tests {
             "whos",
             "tic",
             "toc",
+            "class",
+            "islogical",
+            "ischar",
+            "isnumeric",
+            "isa",
+            "logical",
+            "char",
+            "double",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

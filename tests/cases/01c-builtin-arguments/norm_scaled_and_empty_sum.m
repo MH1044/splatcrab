@@ -1,8 +1,8 @@
 % covers: 6 - norm scales by the largest magnitude (QA D12), and a sum of no elements is +0, not -0
 % NOTE: A comparison is a logical in MATLAB, and disp of a logical is four
-% NOTE: characters wide ("   1"). SplatCrab has no logical class until cycle 02
-% NOTE: and prints six wide. Adding 0 makes the value a double in both, so the
-% NOTE: expected "     1" below is MATLAB's own output, and stays so after 02.
+% NOTE: characters wide ("   1"), as it has been here since cycle 02. Adding 0
+% NOTE: makes the value a double, so the expected "     1" below is the double
+% NOTE: width, in MATLAB and here alike.
 % NOTE: 1 / x tells +0 from -0: it is Inf for +0 and -Inf for -0.
 fprintf('%g %g %g\n', norm([1e200 1e200]), norm([1e-200 1e-200]), norm([1e200 1e200], 3));
 fprintf('%.4f %.4f %.4f\n', norm([]), sum([]), dot([], []));

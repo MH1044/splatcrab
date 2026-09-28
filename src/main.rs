@@ -24,8 +24,31 @@ fn main() {
     std::process::exit(code);
 }
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Sets the code page the console decodes output bytes with. It is a
+    /// raw declaration rather than a crate, because the project has none.
+    fn SetConsoleOutputCP(code_page: u32) -> i32;
+}
+
+/// Makes a Windows console read what this program writes as UTF-8, so the
+/// `×` of a `2×3 char array` header and any non-ASCII char text render
+/// rather than arriving as code-page mojibake. Everything written is UTF-8
+/// already; only the console's reading of it changes. When the output is a
+/// pipe or a file there is no console, the call fails, and that is harmless,
+/// so its result is ignored. Elsewhere terminals are UTF-8 by default.
+fn console_utf8() {
+    #[cfg(windows)]
+    // SAFETY: a plain Win32 call with an integer argument and no pointers.
+    unsafe {
+        SetConsoleOutputCP(65001);
+    }
+}
+
 /// Runs the CLI and returns the process exit code.
 fn run() -> i32 {
+    console_utf8();
     let args: Vec<String> = std::env::args().collect();
     let mut it = interp::Interp::new();
 

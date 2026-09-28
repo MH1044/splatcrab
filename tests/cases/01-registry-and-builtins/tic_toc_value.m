@@ -1,7 +1,8 @@
 % covers: 6 - bare toc returns a value, so it is usable in an expression
-% NOTE: the class() form in the spec bullet waits for cycle 13. Asking for a
-% NOTE: value is enough: a builtin that returned nothing would raise
-% NOTE: "Too many output arguments." on either line below.
+% NOTE: this asks for a value rather than the spec bullet's class() form, which
+% NOTE: did not exist when the case was written. Asking for a value is enough:
+% NOTE: a builtin that returned nothing would raise "Too many output
+% NOTE: arguments." on either line below.
 % NOTE: toc is never run as a bare statement here, because MATLAB prints
 % NOTE: "Elapsed time is ... seconds." for that form and the number varies.
 tic;

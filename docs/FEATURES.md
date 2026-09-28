@@ -9,8 +9,9 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
 | Numbers `12`, `1.5`, `.5`, `1e-3`, `2.5E+2` | 00 | `display_formats` | |
-| Single-quoted strings, `''` escape | 00 | `strings` | `s = 'abc'` displays `'abc'` with quotes, as MATLAB R2018a+ does; `disp('abc')` is bare |
+| Single-quoted strings, `''` escape | 00 | `strings` | A 1-row `char`, and `''` is a 0x0 char. `s = 'abc'` displays `'abc'` with quotes, as MATLAB R2018a+ does; `disp('abc')` is bare |
 | Double-quoted strings | 00 | `strings` | Treated as char; MATLAB has a separate string class |
+| A char element is a UTF-16 code unit | 02 | `char_utf16_units` | `length('😀')` is `2` and `double('😀')` is `55357 56832`, as in MATLAB; `disp` and `%s` decode the units back to UTF-8, so the pair prints as one character (QA D37) |
 | `%` comments | 00 | every case | |
 | `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
 | `...` separates elements inside brackets | 01b | `continuation_bracket_element` | `[1 ...` newline `-2]` is two elements, like `[1 -2]` |
@@ -36,9 +37,10 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `.* ./ .^` elementwise | 00 | `matrix_ops` | |
 | `.\` elementwise left divide | 01b | `eldiv_vector`, `eldiv_after_number` | `a.\b` is `b./a`; `2.\x` no longer means `2 \ x` |
 | Transpose `'` and `.'` | 00 | `matrix_ops` | |
-| `== ~= < <= > >=` | 00 | `logical_ops` | Results are 0/1 doubles until cycle 02 |
-| `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | |
-| `~` negation | 00 | `logical_ops` | |
+| `== ~= < <= > >=` | 00 | `logical_ops` | Results are `logical`, since 02; they were 0/1 doubles |
+| `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | `logical` results, since 02 |
+| `~` negation | 00 | `logical_ops` | A `logical` result, since 02 |
+| The class-propagation table | 02 | `class_propagation`, `concat_class` | Arithmetic, unary minus and unary plus give a double whatever their operands: `true + true` is `2`, `'a' + 1` is `98`, `+'a'` is `97`. Comparisons and the logical operators give a logical. Concatenation gives a char if any operand is one, else a logical only if every operand is: `['a' 66]` is `'aB'`, `[true 2]` a double. A 0x0 `[]` takes no part, so `[[] 'abc']` is a char |
 | `&&` and `\|\|` need a logical scalar | 01e | `err_and_non_scalar`, `err_or_empty` | `[1 1] && 1` gave `1` and `[] \|\| 1` gave `1`; MATLAB errors, because the operators need one value to branch on. Short-circuiting is unchanged, so `0 && [1 1]` is still `0` and never looks at the right-hand side |
 | A `NaN` cannot become a logical | 01e | `err_if_nan`, `err_and_nan`, `err_not_nan` | `if NaN` was taken as true, `NaN & 1` was `1` and `~NaN` was `0`. MATLAB and Octave both refuse: `NaN's cannot be converted to logicals.` The same conversion serves `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` |
 | Scalar and row/column broadcasting | 00 | `builtins_sample` | |
@@ -55,8 +57,10 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Colon `A(:,1)`, `A(2,:)`, `A(:)` | 00 | `indexing` | |
 | `end` anywhere in an index | 00 | `indexing` | Including arithmetic such as `end-1` |
 | Indexed assignment with growth | 00 | `growth` | Vector and two-dimensional |
-| String indexing | 00 | `strings` | Returns a string. A char **variable** only: `'abc'(2)` is a parse error, as indexing any literal is |
-| `s(:)` of a char is a column | 01e | `empty_result_shapes` | `size(s(:))` is `3 1`, not `1 3`. A `Value::Str` is a row of characters with nowhere to record another shape, so the column comes back as character codes until cycle 02's `Char` class can carry a shape (QA D17) |
+| String indexing | 00 | `strings` | Returns a char. A char **variable** only: `'abc'(2)` is a parse error, as indexing any literal is |
+| `s(:)` of a char is a char column | 01e | `empty_result_shapes` | `size(s(:))` is `3 1`, not `1 3`, since 01e; since 02 the column is a char rather than character codes (QA D17) |
+| Indexing keeps the class; indexed assignment keeps the left-hand side's | 02 | `indexed_assign_keeps_class`, `char_arith_and_assign` | `s = 'abc'; s(2) = 'Z'` is `'aZc'`, not `97 90 99`, and growth stays a char too. A logical target stores `logical(value)`, so `x = true(1,3); x(2) = 5` stays logical; a double target stores a char's code, so `y(2) = 'a'` stores `97`. A new variable, or the 0x0 `[]`, takes the class assigned into it |
+| A logical index is a clean error | 02 | `err_logical_index` | `x(x > 0)` used to give `5 5 5` in silence, reading the mask as positions (QA D6). Now `Logical indexing is not supported yet.`, reading or assigning, until cycle 03 |
 | Logical indexing | 03 | | Planned |
 | Deletion `x(i) = []` | 03 | `err_delete_unsupported` | Currently an error |
 
@@ -67,6 +71,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `if` / `elseif` / `else` | 00 | `control_flow` | |
 | `for` over a range | 00 | `control_flow` | |
 | `for` over matrix columns | 00 | `control_flow` | |
+| `for` over a char, and `if` on a char | 02 | `for_over_char`, `if_condition_classes` | `for k = 'abc'` iterates one char at a time, each a `char`; `if 'abc'` is true, as a non-empty array with no zero is |
 | `while` | 00 | `control_flow` | |
 | `break` and `continue` | 00 | `control_flow` | |
 | `break` or `continue` outside a loop is an error | 01e | `err_break_outside_loop`, `err_continue_outside_loop` | It used to unwind out of the whole script, so the statements after it never ran and the process still exited 0 (QA D8). Raised when the statement runs, not when it parses, so the output before it is still printed |
@@ -74,10 +79,12 @@ What SplatCrab does today, with the golden case that proves each area works.
 
 ## Builtins
 
-80 names, each an ordinary function in `src/builtins/` registered by name in
+88 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
-`demo_smoke`; the shared-arm groups also by the `*_shared_arm` cases in
-`01-registry-and-builtins`. Cycle 01 counted 81. Cycle 01c removed `e`, which
+`demo_smoke`, or for the class builtins by the cases in
+`02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
+cases in `01-registry-and-builtins`. Cycle 01 counted 81. Cycle 02 added the
+eight class builtins. Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -92,6 +99,7 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Elementwise math | `abs sqrt exp log log2 log10 sin cos tan asin acos atan sinh cosh tanh floor ceil round fix sign` | 00 | `math.rs` |
 | Predicates | `isnan isinf isfinite` | 00 | `math.rs` |
 | Two-argument math | `mod rem atan2 hypot power` | 00 | `math.rs` |
+| Classes | `class islogical ischar isnumeric isa logical char double` | 02 | `core.rs` |
 | Linear algebra | `transpose inv det trace diag norm dot` | 00 | `linalg.rs` |
 | Search and sort | `find sort` | 00 | `linalg.rs` |
 | Output | `disp fprintf sprintf num2str error` | 00 | `core.rs` |
@@ -103,7 +111,17 @@ a dimension past the array's returns the input unchanged and `0` is an error.
 `sum`, `prod`, `mean`, `any` and `all` also take `'all'`, and so do `max` and
 `min` as their third argument. `max` and `min` also take two arrays. `norm` and
 `sort` accept vectors only, until cycles 08 and 09. `sort` puts `NaN` last
-when ascending and first when descending. The argument forms each builtin
+when ascending and first when descending.
+
+Every numeric builtin returns a double, whatever its argument's class:
+`abs(true)` and `cumsum('abc')` are doubles. The exceptions, since cycle 02,
+are the ones MATLAB makes. The rearrangements `transpose`, `fliplr`, `flipud`,
+`repmat`, `reshape` and `sort` keep the class, so `fliplr('abc')` is `'cba'`
+(QA D17). `max` and `min` of a logical stay logical. `true` and `false`, and
+the predicates `any`, `all`, `isnan`, `isinf`, `isfinite`, `isempty`,
+`isscalar`, `isvector`, `islogical`, `ischar`, `isnumeric` and `isa`, return
+logicals (`predicates_return_logical`), which is what will let cycle 03's
+`x(isnan(x))` select. The argument forms each builtin
 takes are in [Builtin arguments](#builtin-arguments).
 
 ### Calling convention
@@ -128,8 +146,10 @@ implements the ones MATLAB code actually uses. Cases are in
 
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
-| `true(n)`, `true(r,c)`, `true(sz)`, and the same for `false` | 01c | `constants_true_false_sizes` | Doubles until cycle 02 gives them the logical class. `pi(2)` stays an error, as in MATLAB (`err_pi_takes_no_size`) |
-| `eps(x)`, element-wise, and `eps('double')` | 01c | `eps_spacing`, `err_eps_class_name` | The spacing at `abs(x)`, from the exponent field: `eps(1e308)` is `2^971`, `eps(0)` is `2^-1074`, `eps(Inf)` is `NaN`. `eps('single')` waits for cycle 02 |
+| `true(n)`, `true(r,c)`, `true(sz)`, and the same for `false` | 01c | `constants_true_false_sizes` | Logical in every size form since cycle 02; doubles before it. `pi(2)` stays an error, as in MATLAB (`err_pi_takes_no_size`) |
+| `eps(x)`, element-wise, and `eps('double')` | 01c | `eps_spacing`, `err_eps_class_name` | The spacing at `abs(x)`, from the exponent field: `eps(1e308)` is `2^971`, `eps(0)` is `2^-1074`, `eps(Inf)` is `NaN`. `eps('single')` is refused: there is no single class |
+| `class`, `islogical`, `ischar`, `isnumeric`, `isa` | 02 | `class_propagation`, `class_predicates` | `isnumeric` is true of a double only, since MATLAB counts neither logical nor char. `isa(A, 'numeric')` and `isa(A, 'float')` hold `double`, and `isa(A, 'integer')` nothing, since no integer class exists yet |
+| `logical`, `char`, `double` | 02 | `conversion_builtins`, `err_logical_nan` | `double('A')` is `65`, `char([72 105])` is `'Hi'`, `logical([2 0 -1])` is `1 0 1`. `logical(NaN)` is `NaN's cannot be converted to logicals.` |
 | Size vectors: `zeros(size(A))` | 01c | `size_vectors_constructors`, `err_size_vector_column` | `zeros`, `ones`, `eye`, `rand`, `NaN`, `Inf`, `true`, `false`. The vector must be a row |
 | `reshape(A, sz)`, `reshape(A, r, [])`, `repmat(A, sz)` | 01c | `size_vectors_reshape_repmat`, `err_reshape_placeholder_divisible`, `err_reshape_two_placeholders` | One `[]` placeholder, for the size that makes the count come out |
 | Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_third_size`, `err_nd_zero_third_size`, `err_nd_fourth_size`, `err_nd_size_vector`, `err_nd_reshape` | `zeros(2, 3, 1)` is 2x3. Any other third size, `0` included, is "N-D arrays are not supported."; N-D arrays are not built yet. `eye` still takes two sizes |
@@ -154,11 +174,19 @@ implements the ones MATLAB code actually uses. Cases are in
 
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
-| Integer, fixed and scientific display | 00 | `display_formats` | Column widths differ from MATLAB above 1000 |
+| Integer, fixed and scientific display | 00 | `display_formats` | |
+| Integer columns widen from 1000 | 02 | `display_integer_widths` | `x = 1000` is `        1000` and `x = [1 1000]` is `           1        1000`: twelve-wide columns from 1000 on, six-wide below it as before. A whole number of `1e9` or more is displayed as a non-integer is |
+| The common scale factor | 02 | `display_scale_factor` | A matrix whose largest magnitude is outside `[0.01, 1000)` is printed as `A / 10^k` under one `   1.0e+03 *` line, once above any column blocks: `[1.5 1000.5]` is `0.0015 1.0005` under `1.0e+03 *` |
+| An exact zero in a fixed-point row is `0` | 02 | `display_scale_factor` | `[0 1.5]` is `         0    1.5000`; it used to print `0.0000` |
+| A scalar outside the fixed-point range is `e` format | 02 | `display_scalar_range` | `x = 1234.5` is `   1.2345e+03`, `x = 0.001` is `   1.0000e-03` and `x = 1e10` is `   1.0000e+10` (QA D20) |
+| Logical display | 02 | `logical_scalar_display`, `logical_row_display` | `x = 5 > 3` shows `  logical` and `   1`; an array shows `  1×3 logical array`. Logical columns are four wide, so `disp(3 > 1)` is `   1` (QA D38) |
+| Char display | 02 | `char_display` | A 1-row char is quoted, `    'abc'`; a multi-row char has a `  2×2 char array` header and one quoted row per line. `disp` is bare, one line per row |
 | `Inf`, `-Inf`, `NaN` | 00 | `display_formats` | |
 | A non-finite element keeps the integer columns | 01e | `disp_nonfinite_keeps_integers` | `disp([1 2 NaN])` is `     1     2   NaN`; it used to force the whole row to four decimals. A non-finite value has no digits, so it neither changes the format nor widens the column: `[NaN Inf -Inf 1]` is four six-wide columns |
 | A wide matrix wraps into column blocks | 01e | `wide_matrix_wraps` | 80 characters, whether the output is a terminal or a pipe, giving 8 fixed-point columns or 13 integer ones per block under a `Columns N through M` heading. `linspace(1, 2)` printed about 1300 characters on one line |
-| Empty display | 00 | `display_formats` | `x = []` prints `[]`; MATLAB prints a typed header |
+| Empty display | 00 | `display_formats` | `x = []` still prints `     []`, as MATLAB does for a 0x0 double |
+| Typed empty headers | 02 | `typed_empty_display`, `empty_char_display` | `zeros(0,3)` shows `  0×3 empty double matrix`, `1:0` `  1×0 empty double row vector`, `zeros(0,1)` `  0×1 empty double column vector` and `''` `  0×0 empty char array`; a logical empty follows the pattern with `logical array` |
+| `who` and `whos` show the class | 02 | | A logical is `logical` and a char has its real shape, `2x2 char`; they used to be `double` and `1xN char` |
 | `disp([])` prints nothing | 01e | `empty_result_shapes` | It used to print `     []`. `disp('')` is still a line with nothing on it |
 | Empty results have MATLAB's shapes | 01e | `empty_result_shapes` | `find([])` and `diag([])` are `0x0`, not `0x1`; `size('')` is `0 0`, not `1 0`, and `num2str([])` follows it. A shape with an orientation to keep still keeps it: `find([0 0])` is `1x0` |
 | `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %e %g %c %s`, flags, width, precision |
@@ -186,5 +214,6 @@ implements the ones MATLAB code actually uses. Cases are in
 |---|---|---|
 | REPL with block and bracket continuation | 00 | `exit` and `quit` leave |
 | Script runner, exit code 1 on error | 00 | stdout is flushed before the error |
+| The Windows console reads output as UTF-8 | 02 | `SetConsoleOutputCP(65001)`, a raw `extern "system"` declaration in `src/main.rs` rather than a crate, so `×` and non-ASCII text render. A pipe or a file is unaffected |
 | Golden-file test harness | 00 | `tests/golden.rs`, no dependencies |
 | Zero dependencies | 00 | And zero dev-dependencies |

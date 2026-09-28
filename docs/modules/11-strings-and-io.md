@@ -26,8 +26,6 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
   sink cycle 04's `warning` introduces, and `n = fprintf(...)` returns the
   number of bytes written. Today the first two are "The first argument must be
   a format string." and the third is "Too many output arguments."
-- A char element is a UTF-16 code unit, as in MATLAB (QA D37):
-  `length('😀')` is `2`
 - `save` and `load` for uncompressed MAT version 5, plus `-ascii`
 - `printf` conversions and flags (QA D16), which cycle 01d's Out of scope
   moved here rather than leave half a `printf` rewrite in a bug-fix cycle:
@@ -45,6 +43,10 @@ precision at `core::MAX_FIELD`; the rewrite here needs a bound of its own,
 because the panics it prevents are in Rust's formatter and do not go away.
 
 ## Out of scope
+
+- A char element as a UTF-16 code unit (QA D37). Cycle 02 chose that storage
+  when it added the char class and took the row, `length('😀')` being `2`, with
+  it; it and its acceptance test left this spec in 02's commit.
 
 - Anything not listed in Scope. Features named in a later module's Goal belong
   to that module; if this cycle needs one of them, shrink this spec instead of
@@ -82,7 +84,6 @@ Every new error message needs an `err_*` case.
 11. `disp(regexprep('abc123', '\d', '')); [tok, rest] = strtok('hello world'); disp(tok); disp(rest)` → `abc\nhello\n world`
 12. `s = num2str([1 2; 3 4]); disp(size(s)); disp(s); disp(num2str([1; 22]))` → `     2     4\n1  2\n3  4\n 1\n22`
 13. `fprintf(1, 'hi\n'); n = fprintf('ab\n')` → `hi\nab\nn =\n\n     3\n`; `fprintf(2, 'to stderr\n')` writes `to stderr` to stderr and nothing to stdout; `fprintf(7, 'x')` with no such file open → err `Invalid file identifier.`
-14. `disp(length('😀'))` → `     2`
 
 ## Status
 

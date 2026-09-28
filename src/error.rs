@@ -527,6 +527,13 @@ pub fn toc_without_tic() -> MError {
     )
 }
 
+/// An index of class logical, until cycle 03 implements logical indexing
+/// (QA D6). Refusing it is what stops `x(x > 0)` reading a mask of ones as
+/// the position `1` repeated.
+pub fn logical_indexing_unsupported() -> MError {
+    MError::new("Logical indexing is not supported yet.")
+}
+
 pub fn eps_class() -> MError {
     MError::new("Only 'double' is supported as a class name for 'eps'.")
 }

@@ -16,6 +16,9 @@ HB = os.path.join(REPO, "docs", "HANDBOOK.md")
 BIN = os.path.join(REPO, "target", "debug", "splatcrab.exe")
 WORK = os.path.join(REPO, "target", "hbcheck")
 os.makedirs(WORK, exist_ok=True)
+# Diffs hold the handbook's non-ASCII text (the U+00D7 of a size header);
+# a cp1252 console cannot encode all of it.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 text = io.open(HB, encoding="utf-8").read()
 lines = text.split("\n")
@@ -77,7 +80,10 @@ for n, (script, expected, ln) in enumerate(pairs):
     p = os.path.join(WORK, "case%03d.m" % n)
     io.open(p, "w", encoding="utf-8", newline="\n").write(script + "\n")
     try:
-        r = subprocess.run([BIN, p], capture_output=True, text=True, timeout=20)
+        # The binary writes UTF-8 whatever the platform; decoding with the
+        # locale's code page (cp1252 on Windows) garbles every non-ASCII byte.
+        r = subprocess.run([BIN, p], capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=20)
     except subprocess.TimeoutExpired:
         bad.append((ln, script, expected, "<<TIMED OUT>>"))
         continue

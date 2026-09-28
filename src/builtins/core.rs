@@ -3,10 +3,10 @@
 use std::f64::consts::PI;
 
 use super::args::{at_most, check_shape, dim, mat, need, scalar, shape, string};
-use super::{Registry, add, none, one, one_mat};
+use super::{Registry, add, none, one, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R, fmt_e, fmt_g};
-use crate::value::{Matrix, Value, nonfinite};
+use crate::value::{Class, Matrix, Value, decode_units, nonfinite};
 
 /// The registration table is one line per builtin on purpose: it is the index
 /// of the library, and rustfmt would otherwise spread each entry over five
@@ -20,8 +20,8 @@ pub fn register(r: &mut Registry) {
     add(r, "NaN", nan, "NaN, NaN(n), NaN(r,c), NaN(sz) - not-a-number.");
     add(r, "nan", nan, "nan, nan(n), nan(r,c), nan(sz) - not-a-number.");
     add(r, "eps", eps, "eps, eps(x), eps('double') - spacing of doubles, at 1 or at abs(x).");
-    add(r, "true", tru, "true, true(n), true(r,c), true(sz) - ones; doubles until the logical class.");
-    add(r, "false", fls, "false, false(n), false(r,c), false(sz) - zeros; doubles until the logical class.");
+    add(r, "true", tru, "true, true(n), true(r,c), true(sz) - logical ones.");
+    add(r, "false", fls, "false, false(n), false(r,c), false(sz) - logical zeros.");
 
     // ---- constructors ------------------------------------------------
     add(r, "zeros", zeros, "zeros(n), zeros(r,c), zeros(sz) - a matrix of zeros.");
@@ -37,6 +37,16 @@ pub fn register(r: &mut Registry) {
     add(r, "isempty", isempty, "isempty(A) - true when A has no elements.");
     add(r, "isscalar", isscalar, "isscalar(A) - true when A is 1x1.");
     add(r, "isvector", isvector, "isvector(A) - true when A is 1-by-N or N-by-1, N >= 0.");
+
+    // ---- classes -----------------------------------------------------
+    add(r, "class", class, "class(A) - the class of A: 'double', 'logical' or 'char'.");
+    add(r, "islogical", islogical, "islogical(A) - true when A is logical.");
+    add(r, "ischar", ischar, "ischar(A) - true when A is a char array.");
+    add(r, "isnumeric", isnumeric, "isnumeric(A) - true when A is numeric; logical and char are not.");
+    add(r, "isa", isa, "isa(A,'name') - true when A is of class name, or of the group 'numeric' or 'float'.");
+    add(r, "logical", logical, "logical(A) - convert to logical: non-zero is true; NaN is an error.");
+    add(r, "char", char_fn, "char(A) - convert to char: each element becomes the UTF-16 code unit it names.");
+    add(r, "double", double, "double(A) - convert to double: a char becomes its code units.");
 
     // ---- output ------------------------------------------------------
     add(r, "disp", disp, "disp(X) - display X without printing its name.");
@@ -66,10 +76,10 @@ fn constant(args: &[Value], name: &str, v: f64) -> R<Vec<Value>> {
 
 /// A constant that fills a matrix when given a size, as `NaN(2)` does. It
 /// takes every size form a constructor does, trailing ones included.
-fn filled_constant(args: &[Value], name: &str, v: f64) -> R<Vec<Value>> {
+fn filled_constant(args: &[Value], name: &str, v: f64, class: Class) -> R<Vec<Value>> {
     let (r, c) = shape(args, 0, name, usize::MAX)?;
     let (r, c) = check_shape(r, c)?;
-    one_mat(Matrix::filled(r, c, v))
+    one_as(Matrix::filled(r, c, v).with_class(class))
 }
 
 fn pi(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -82,11 +92,11 @@ fn eps(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "eps")?;
     match a.first() {
         None => one_mat(Matrix::scalar(f64::EPSILON)),
-        Some(Value::Str(s)) if s.eq_ignore_ascii_case("double") => {
-            one_mat(Matrix::scalar(f64::EPSILON))
-        }
-        Some(Value::Str(_)) => Err(error::eps_class()),
-        Some(Value::Mat(m)) => one_mat(m.map(eps_at)),
+        Some(v) => match v.text() {
+            Some(s) if s.eq_ignore_ascii_case("double") => one_mat(Matrix::scalar(f64::EPSILON)),
+            Some(_) => Err(error::eps_class()),
+            None => one_mat(v.mat().map(eps_at)),
+        },
     }
 }
 
@@ -115,22 +125,22 @@ fn pow2(k: i32) -> f64 {
     }
 }
 
-/// `true` and `false` fill like `NaN` and `Inf`. They return doubles until
-/// cycle 02 gives them the logical class.
+/// `true` and `false` fill like `NaN` and `Inf`, in every size form, and
+/// are logical, as they have been since cycle 02 (they were doubles before).
 fn tru(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    filled_constant(a, "true", 1.0)
+    filled_constant(a, "true", 1.0, Class::Logical)
 }
 
 fn fls(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    filled_constant(a, "false", 0.0)
+    filled_constant(a, "false", 0.0, Class::Logical)
 }
 
 fn inf(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    filled_constant(a, "Inf", f64::INFINITY)
+    filled_constant(a, "Inf", f64::INFINITY, Class::Double)
 }
 
 fn nan(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    filled_constant(a, "NaN", f64::NAN)
+    filled_constant(a, "NaN", f64::NAN, Class::Double)
 }
 
 // ---- constructors ----------------------------------------------------
@@ -194,7 +204,7 @@ fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     let a = scalar(args, 0, "linspace")?;
     let b = scalar(args, 1, "linspace")?;
     let n = if args.len() >= 3 {
-        if let Some(Value::Str(_)) = args.get(2) {
+        if args.get(2).is_some_and(Value::is_char) {
             return Err(error::bad_size_arg("linspace"));
         }
         let n = scalar(args, 2, "linspace")?.floor();
@@ -251,44 +261,93 @@ fn length(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     one_mat(Matrix::scalar(n as f64))
 }
 
+/// A predicate on one argument, answered with a logical scalar, as every
+/// MATLAB `is*` function answers.
+fn predicate(args: &[Value], name: &str, test: impl Fn(&Matrix) -> bool) -> R<Vec<Value>> {
+    at_most(args, 1, name)?;
+    one_as(Matrix::from_bool(test(&mat(args, 0, name)?)))
+}
+
 fn isempty(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(args, 1, "isempty")?;
-    one_mat(Matrix::scalar(
-        mat(args, 0, "isempty")?.is_empty() as u8 as f64
-    ))
+    predicate(args, "isempty", Matrix::is_empty)
 }
 
 fn isscalar(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(args, 1, "isscalar")?;
-    one_mat(Matrix::scalar(
-        mat(args, 0, "isscalar")?.is_scalar() as u8 as f64
-    ))
+    predicate(args, "isscalar", Matrix::is_scalar)
 }
 
 fn isvector(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(args, 1, "isvector")?;
-    one_mat(Matrix::scalar(
-        mat(args, 0, "isvector")?.is_vector() as u8 as f64
-    ))
+    predicate(args, "isvector", Matrix::is_vector)
+}
+
+// ---- classes ---------------------------------------------------------
+
+fn class(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "class")?;
+    one(Value::str(mat(args, 0, "class")?.class.name()))
+}
+
+fn islogical(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    predicate(args, "islogical", |m| m.class == Class::Logical)
+}
+
+fn ischar(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    predicate(args, "ischar", |m| m.class == Class::Char)
+}
+
+/// Only `double` is numeric of the three classes; MATLAB counts neither
+/// logical nor char, so `isnumeric(true)` is false.
+fn isnumeric(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    predicate(args, "isnumeric", |m| m.class == Class::Double)
+}
+
+/// `isa(A, name)`: `name` is a class name or one of MATLAB's groups.
+/// `'numeric'` and `'float'` both hold `double` alone here, since the
+/// integer and single classes do not exist; `'integer'` therefore holds
+/// nothing. The name is matched exactly, as MATLAB matches it.
+fn isa(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 2, "isa")?;
+    let m = mat(args, 0, "isa")?;
+    let name = string(args, 1, "isa")?;
+    let yes = match name.as_str() {
+        "numeric" | "float" => m.class == Class::Double,
+        n => n == m.class.name(),
+    };
+    one_as(Matrix::from_bool(yes))
+}
+
+/// `logical(A)`: non-zero is true. A `NaN` is refused with MATLAB's text,
+/// the same refusal `if NaN` makes.
+fn logical(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "logical")?;
+    one_as(mat(args, 0, "logical")?.to_class(Class::Logical)?)
+}
+
+/// `char(A)`: each element becomes the UTF-16 code unit it names, so
+/// `char([72 105])` is `'Hi'`. A char comes back as it was.
+fn char_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "char")?;
+    one_as(mat(args, 0, "char")?.to_class(Class::Char)?)
+}
+
+/// `double(A)`: the same elements as doubles, so `double('A')` is `65`.
+fn double(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "double")?;
+    one_mat(mat(args, 0, "double")?)
 }
 
 // ---- output ----------------------------------------------------------
 
-/// `disp(x)`: the value's display body with no `x =` header.
+/// `disp(x)`: the value's display body with no `x =` header and no class
+/// header. A char is its bare text, one line per row.
 ///
 /// An empty matrix prints nothing at all, as in MATLAB; it used to print
 /// `     []`. `disp('')` still prints its empty line, because an empty char
-/// is a line with no characters on it rather than no output. The `[]` body
-/// itself is unchanged for the named display `x = []`, which is a separate
-/// deviation scheduled to cycle 02.
+/// is a line with no characters on it rather than no output.
 fn disp(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "disp")?;
     need(args, 1, "disp")?;
-    let text = match &args[0] {
-        Value::Str(s) => format!("{s}\n"),
-        Value::Mat(m) if m.is_empty() => String::new(),
-        Value::Mat(m) => m.format(),
-    };
+    let text = args[0].mat().disp_text();
     it.emit(&text)?;
     none()
 }
@@ -302,7 +361,7 @@ fn fprintf(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 fn sprintf(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 1, "sprintf")?;
-    one(Value::Str(format_printf(args)?))
+    one(Value::str(&format_printf(args)?))
 }
 
 /// `num2str(x)`, `num2str(x, n)` and `num2str(x, formatSpec)`. A char input
@@ -312,25 +371,25 @@ fn sprintf(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 fn num2str_fn(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 2, "num2str")?;
     need(args, 1, "num2str")?;
-    let m = match &args[0] {
-        Value::Str(s) => return one(Value::Str(s.clone())),
-        Value::Mat(m) => m,
-    };
+    if args[0].is_char() {
+        return one(args[0].clone());
+    }
+    let m = args[0].mat();
     let s = match args.get(1) {
         None => join_elements(m, num2str),
-        Some(Value::Str(fmt)) => {
+        Some(fmt) if fmt.is_char() => {
             // sprintf(formatSpec, x), with the leading spaces trimmed even
             // when the format asked for them: num2str(42.67, '% 10.2f') is
             // '42.67' on the MATLAB page.
-            let text = format_printf(&[Value::Str(fmt.clone()), Value::Mat(m.clone())])?;
+            let text = format_printf(&[fmt.clone(), Value::Mat(m.clone())])?;
             text.trim_start().to_string()
         }
-        Some(Value::Mat(p)) => {
-            let n = num2str_precision(p)?;
+        Some(p) => {
+            let n = num2str_precision(p.mat())?;
             join_elements(m, |v| fmt_g(v, n))
         }
     };
-    one(Value::Str(s))
+    one(Value::str(&s))
 }
 
 /// The precision of `num2str(x, n)`: a positive integer. Any `n` past 800 is
@@ -349,7 +408,7 @@ fn join_elements(m: &Matrix, f: impl Fn(f64) -> String) -> String {
 
 fn error(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     match args.first() {
-        Some(Value::Str(_)) => Err(error::raised(format_printf(args)?)),
+        Some(v) if v.is_char() => Err(error::raised(format_printf(args)?)),
         _ => Err(error::raised_default()),
     }
 }
@@ -385,10 +444,8 @@ fn who(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     }
     let mut text = String::from("Your variables are:\n\n");
     for n in &names {
-        let row = match &it.vars[n] {
-            Value::Mat(m) => format!("  {:<12} {}x{} double\n", n, m.rows, m.cols),
-            Value::Str(s) => format!("  {:<12} 1x{} char\n", n, s.chars().count()),
-        };
+        let m = it.vars[n].mat();
+        let row = format!("  {:<12} {}x{} {}\n", n, m.rows, m.cols, m.class.name());
         text.push_str(&row);
     }
     text.push('\n');
@@ -453,10 +510,11 @@ fn num2str(v: f64) -> String {
 #[derive(Clone, Copy)]
 enum PArg {
     Num(f64),
-    /// One character of a char argument, tagged with the argument it came
-    /// from. MATLAB expands a char array to one argument per character, so
+    /// One UTF-16 code unit of a char argument, tagged with the argument it
+    /// came from. MATLAB expands a char array to one argument per element, so
     /// `fprintf('%d %d', 'AB')` prints `65 66`; the tag is what lets a later
-    /// `%s` put the run back together and print `AB`.
+    /// `%s` put the run back together and print `AB`, decoding a surrogate
+    /// pair back into its one character.
     Chr(f64, usize),
 }
 
@@ -580,15 +638,17 @@ fn field(digits: &str, absent: usize) -> R<usize> {
 /// Shared implementation of fprintf / sprintf. Cycles the format over the
 /// flattened arguments like MATLAB does.
 pub fn format_printf(args: &[Value]) -> R<String> {
-    let fmt = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
-        _ => return Err(error::format_not_a_string()),
+    let fmt = match args.first().and_then(Value::text) {
+        Some(s) => s,
+        None => return Err(error::format_not_a_string()),
     };
     let mut flat: Vec<PArg> = Vec::new();
     for (group, a) in args[1..].iter().enumerate() {
-        match a {
-            Value::Str(s) => flat.extend(s.chars().map(|c| PArg::Chr(c as u32 as f64, group))),
-            Value::Mat(m) => flat.extend(m.data.iter().map(|v| PArg::Num(*v))),
+        let m = a.mat();
+        if m.is_char() {
+            flat.extend(m.data.iter().map(|v| PArg::Chr(*v, group)));
+        } else {
+            flat.extend(m.data.iter().map(|v| PArg::Num(*v)));
         }
     }
     let has_args = !flat.is_empty();
@@ -687,15 +747,16 @@ pub fn format_printf(args: &[Value]) -> R<String> {
                 }
                 ('s', Some(PArg::Chr(v, group))) => {
                     numeric = false;
-                    // %s takes the whole char argument, not one character.
-                    let mut s = String::from(char_of(v));
+                    // %s takes the whole char argument, not one element.
+                    let mut units = vec![v];
                     while let Some(PArg::Chr(next, g)) = flat.get(ai).copied() {
                         if g != group {
                             break;
                         }
-                        s.push(char_of(next));
+                        units.push(next);
                         ai += 1;
                     }
+                    let s = decode_units(units.into_iter());
                     // The whole argument is still consumed; only the text
                     // printed is cut, and it is cut before the width pads.
                     truncate(&s, prec)
@@ -755,7 +816,6 @@ mod tests {
     fn shape_of(f: super::super::BuiltinFn, args: &[Value]) -> (usize, usize) {
         match &call(f, args, 1).unwrap()[0] {
             Value::Mat(m) => (m.rows, m.cols),
-            Value::Str(_) => panic!("expected a matrix"),
         }
     }
 
@@ -769,7 +829,6 @@ mod tests {
         assert_eq!(shape_of(rand, &[num(2.0), num(2.0)]), (2, 2));
         match &call(eye, &[num(2.0)], 1).unwrap()[0] {
             Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0]),
-            Value::Str(_) => panic!("expected a matrix"),
         }
         // No arguments at all is a 1x1, as in MATLAB.
         assert_eq!(shape_of(zeros, &[]), (1, 1));
@@ -798,7 +857,6 @@ mod tests {
         assert_eq!(shape_of(inf, &[num(2.0), num(3.0)]), (2, 3));
         match &call(nan, &[num(2.0)], 1).unwrap()[0] {
             Value::Mat(m) => assert!(m.data.iter().all(|v| v.is_nan())),
-            Value::Str(_) => panic!("expected a matrix"),
         }
         assert_eq!(shape_of(inf, &[]), (1, 1));
         // pi has the single syntax `p = pi` on the MATLAB page.
@@ -866,12 +924,10 @@ mod tests {
         let m = mat_of(eps, &[row(&[1.0, 4.0])]);
         assert_eq!((m.rows, m.cols), (1, 2));
         assert_eq!(m.data, [f64::EPSILON, 4.0 * f64::EPSILON]);
-        let double = Value::Str("double".to_string());
+        let double = Value::str("double");
         assert_eq!(mat_of(eps, &[double]).data, [f64::EPSILON]);
         assert_eq!(
-            call(eps, &[Value::Str("single".to_string())], 1)
-                .unwrap_err()
-                .msg,
+            call(eps, &[Value::str("single")], 1).unwrap_err().msg,
             "Only 'double' is supported as a class name for 'eps'."
         );
         assert!(call(eps, &[num(1.0), num(2.0)], 1).is_err());
@@ -890,7 +946,6 @@ mod tests {
         );
         match &call(eye, &[row(&[2.0, 3.0])], 1).unwrap()[0] {
             Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-            Value::Str(_) => panic!("expected a matrix"),
         }
         let nd = "N-D arrays are not supported.";
         assert_eq!(
@@ -913,7 +968,7 @@ mod tests {
             "Size vector for 'zeros' must be a row vector."
         );
         // A char is never read as its character codes.
-        assert!(call(zeros, &[Value::Str("a".to_string())], 1).is_err());
+        assert!(call(zeros, &[Value::str("a")], 1).is_err());
     }
 
     #[test]
@@ -1011,11 +1066,11 @@ mod tests {
         let mut it = Interp::with_output(Box::new(std::io::sink()));
         it.vars.insert("a".to_string(), num(1.0));
         it.vars.insert("b".to_string(), num(2.0));
-        clear(&mut it, &[Value::Str("a".to_string())], 0).unwrap();
+        clear(&mut it, &[Value::str("a")], 0).unwrap();
         assert!(!it.vars.contains_key("a"));
         assert!(it.vars.contains_key("b"));
         // Clearing a name that is not there is not an error.
-        clear(&mut it, &[Value::Str("nope".to_string())], 0).unwrap();
+        clear(&mut it, &[Value::str("nope")], 0).unwrap();
         // With no arguments it still clears everything.
         clear(&mut it, &[], 0).unwrap();
         assert!(it.vars.is_empty());
@@ -1059,10 +1114,9 @@ mod tests {
     }
 
     fn n2s(args: &[Value]) -> R<String> {
-        match &call(num2str_fn, args, 1)?[0] {
-            Value::Str(s) => Ok(s.clone()),
-            Value::Mat(_) => panic!("expected a string"),
-        }
+        Ok(call(num2str_fn, args, 1)?[0]
+            .text()
+            .expect("expected a string"))
     }
 
     #[test]
@@ -1092,13 +1146,13 @@ mod tests {
 
     #[test]
     fn num2str_with_a_format_is_sprintf_with_leading_spaces_trimmed() {
-        let f = |x: f64, fmt: &str| n2s(&[num(x), Value::Str(fmt.to_string())]).unwrap();
+        let f = |x: f64, fmt: &str| n2s(&[num(x), Value::str(fmt)]).unwrap();
         assert_eq!(f(std::f64::consts::PI, "%10.4f"), "3.1416");
         // The MATLAB page's own example: even a space flag is trimmed.
         assert_eq!(f(42.67, "% 10.2f"), "42.67");
         assert_eq!(f(5.0, "%d apples"), "5 apples");
         // A char input comes back unchanged.
-        let s = Value::Str("abc".to_string());
+        let s = Value::str("abc");
         assert_eq!(n2s(&[s, num(3.0)]).unwrap(), "abc");
         assert!(n2s(&[num(1.0), num(2.0), num(3.0)]).is_err());
     }
@@ -1106,7 +1160,7 @@ mod tests {
     // ---- printf ------------------------------------------------------
 
     fn pf(fmt: &str, nums: &[f64]) -> String {
-        let mut args = vec![Value::Str(fmt.to_string())];
+        let mut args = vec![Value::str(fmt)];
         if !nums.is_empty() {
             args.push(Value::Mat(Matrix::row(nums.to_vec())));
         }
@@ -1139,9 +1193,8 @@ mod tests {
             "The width or precision in a format specifier must be at most {}.",
             MAX_FIELD
         );
-        let try_fmt = |fmt: &str, v: f64| {
-            format_printf(&[Value::Str(fmt.to_string()), Value::Mat(Matrix::scalar(v))])
-        };
+        let try_fmt =
+            |fmt: &str, v: f64| format_printf(&[Value::str(fmt), Value::Mat(Matrix::scalar(v))]);
         // `%s` of pi falls back to `%g`, `%d` of pi to `%e`; both used to
         // reach the same panic through the fallback rather than the
         // conversion itself.
@@ -1232,9 +1285,8 @@ mod tests {
     /// pads. The precision used to be parsed and then ignored.
     #[test]
     fn printf_truncates_a_string_to_its_precision() {
-        let s = |fmt: &str, text: &str| {
-            format_printf(&[Value::Str(fmt.to_string()), Value::Str(text.to_string())]).unwrap()
-        };
+        let s =
+            |fmt: &str, text: &str| format_printf(&[Value::str(fmt), Value::str(text)]).unwrap();
         assert_eq!(s("[%5.2s]", "abcdef"), "[   ab]");
         assert_eq!(s("[%-5.2s]", "abcdef"), "[ab   ]");
         assert_eq!(s("[%.2s]", "abcdef"), "[ab]");
@@ -1284,23 +1336,16 @@ mod tests {
 
     #[test]
     fn a_char_argument_expands_one_argument_per_character() {
-        let args = [
-            Value::Str("[%d %d]".to_string()),
-            Value::Str("AB".to_string()),
-        ];
+        let args = [Value::str("[%d %d]"), Value::str("AB")];
         assert_eq!(format_printf(&args).unwrap(), "[65 66]");
         // ... but %s still takes the whole char argument.
-        let args = [Value::Str("[%s]".to_string()), Value::Str("AB".to_string())];
+        let args = [Value::str("[%s]"), Value::str("AB")];
         assert_eq!(format_printf(&args).unwrap(), "[AB]");
         // Mixed: the char array is one %s, the number is one %d.
-        let args = [
-            Value::Str("%s=%d".to_string()),
-            Value::Str("ab".to_string()),
-            num(5.0),
-        ];
+        let args = [Value::str("%s=%d"), Value::str("ab"), num(5.0)];
         assert_eq!(format_printf(&args).unwrap(), "ab=5");
         // A numeric conversion consumes one character, leaving the rest.
-        let args = [Value::Str("%d%s".to_string()), Value::Str("AB".to_string())];
+        let args = [Value::str("%d%s"), Value::str("AB")];
         assert_eq!(format_printf(&args).unwrap(), "65B");
     }
 
@@ -1325,6 +1370,136 @@ mod tests {
         assert_eq!(pf("%d-", &[1.0, 2.0, 3.0]), "1-2-3-");
         assert_eq!(pf("hi", &[1.0, 2.0]), "hi");
         assert!(format_printf(&[Value::Mat(Matrix::scalar(1.0))]).is_err());
-        assert!(format_printf(&[Value::Str("%q".to_string()), num(1.0)]).is_err());
+        assert!(format_printf(&[Value::str("%q"), num(1.0)]).is_err());
+    }
+
+    // ---- classes -----------------------------------------------------
+
+    fn class_name(f: super::super::BuiltinFn, args: &[Value]) -> &'static str {
+        mat_of(f, args).class.name()
+    }
+
+    #[test]
+    fn class_names_the_class_and_the_predicates_are_logical() {
+        let text_of = |args: &[Value]| call(class, args, 1).unwrap()[0].text().unwrap();
+        assert_eq!(text_of(&[num(5.0)]), "double");
+        assert_eq!(text_of(&[Value::str("a")]), "char");
+        assert_eq!(text_of(&[Value::Mat(Matrix::from_bool(true))]), "logical");
+        // Every predicate answers with a logical scalar.
+        for f in [isempty, isscalar, isvector, islogical, ischar, isnumeric] {
+            assert_eq!(class_name(f, &[num(1.0)]), "logical");
+        }
+        let yes = |f: super::super::BuiltinFn, v: Value| mat_of(f, &[v]).data[0] == 1.0;
+        assert!(yes(islogical, Value::Mat(Matrix::from_bool(false))));
+        assert!(!yes(islogical, num(1.0)));
+        assert!(yes(ischar, Value::str("a")));
+        assert!(yes(ischar, Value::str("")));
+        assert!(!yes(ischar, num(97.0)));
+        assert!(yes(isnumeric, num(2.0)));
+        assert!(!yes(isnumeric, Value::str("a")));
+        assert!(!yes(isnumeric, Value::Mat(Matrix::from_bool(true))));
+    }
+
+    #[test]
+    fn isa_matches_a_class_name_or_a_group() {
+        let isa_of = |v: Value, name: &str| mat_of(isa, &[v, Value::str(name)]);
+        let t = || Value::Mat(Matrix::from_bool(true));
+        for (v, name, want) in [
+            (num(2.0), "double", true),
+            (num(2.0), "numeric", true),
+            (num(2.0), "float", true),
+            (num(2.0), "integer", false),
+            (num(2.0), "char", false),
+            (t(), "logical", true),
+            (t(), "numeric", false),
+            (Value::str("a"), "char", true),
+            (Value::str("a"), "numeric", false),
+        ] {
+            let got = isa_of(v, name);
+            assert_eq!(got.class, Class::Logical);
+            assert_eq!(got.data[0] == 1.0, want, "{name}");
+        }
+        assert!(call(isa, &[num(1.0), num(2.0)], 1).is_err());
+        assert!(call(isa, &[num(1.0)], 1).is_err());
+    }
+
+    #[test]
+    fn logical_char_and_double_convert() {
+        let l = mat_of(logical, &[row(&[2.0, 0.0, -1.0])]);
+        assert_eq!(
+            (l.class, l.data.as_slice()),
+            (Class::Logical, &[1.0, 0.0, 1.0][..])
+        );
+        assert_eq!(
+            call(logical, &[num(f64::NAN)], 1).unwrap_err().msg,
+            "NaN's cannot be converted to logicals."
+        );
+        let c = mat_of(char_fn, &[row(&[72.0, 105.0])]);
+        assert_eq!(c.class, Class::Char);
+        assert_eq!(c.text(), "Hi");
+        // A char stays itself, code units and all.
+        assert_eq!(mat_of(char_fn, &[Value::str("😀")]).text(), "😀");
+        let d = mat_of(double, &[Value::str("A")]);
+        assert_eq!((d.class, d.data.as_slice()), (Class::Double, &[65.0][..]));
+        assert_eq!(
+            class_name(double, &[Value::Mat(Matrix::from_bool(true))]),
+            "double"
+        );
+        for f in [logical, char_fn, double] {
+            assert!(call(f, &[num(1.0), num(2.0)], 1).is_err());
+        }
+    }
+
+    #[test]
+    fn true_and_false_are_logical_in_every_size_form() {
+        for args in [
+            vec![],
+            vec![num(2.0)],
+            vec![num(2.0), num(3.0)],
+            vec![row(&[1.0, 4.0])],
+        ] {
+            assert_eq!(class_name(tru, &args), "logical");
+            assert_eq!(class_name(fls, &args), "logical");
+        }
+        // The other filled constants stay double.
+        assert_eq!(class_name(nan, &[num(2.0)]), "double");
+        assert_eq!(class_name(inf, &[]), "double");
+    }
+
+    /// `who` names each variable's class.
+    #[test]
+    fn who_shows_the_class_column() {
+        let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut it = Interp::with_output(Box::new(Shared(buf.clone())));
+        it.run("c = ['ab'; 'cd']; t = true(1, 3); x = 1;").unwrap();
+        who(&mut it, &[], 0).unwrap();
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(out.contains("  c            2x2 char\n"), "{out}");
+        assert!(out.contains("  t            1x3 logical\n"), "{out}");
+        assert!(out.contains("  x            1x1 double\n"), "{out}");
+    }
+
+    /// `%s` decodes a char argument's code units, joining a surrogate pair.
+    #[test]
+    fn printf_decodes_utf16_code_units() {
+        let s =
+            |fmt: &str, text: &str| format_printf(&[Value::str(fmt), Value::str(text)]).unwrap();
+        assert_eq!(s("[%s]", "😀"), "[😀]");
+        assert_eq!(s("😀%s", "é"), "😀é");
+        assert_eq!(s("%d %d", "😀"), "55357 56832");
+        // A multi-row char is read in column-major order.
+        let two =
+            Value::Mat(Matrix::new(2, 2, vec![97.0, 99.0, 98.0, 100.0]).with_class(Class::Char));
+        assert_eq!(format_printf(&[Value::str("%s"), two]).unwrap(), "acbd");
     }
 }

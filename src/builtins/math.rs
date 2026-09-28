@@ -1,10 +1,10 @@
 //! Reductions, element-wise math and the two-argument numeric functions.
 
 use super::args::{Along, at_most, check_shape, dim, dim_or_all, mat, need, option};
-use super::{Registry, add, one_mat};
+use super::{Registry, add, one_as, one_mat};
 use crate::error;
 use crate::interp::R;
-use crate::value::{Matrix, Value};
+use crate::value::{Class, Matrix, Value};
 
 /// One line per builtin; see the note on `core::register`.
 #[rustfmt::skip]
@@ -43,9 +43,9 @@ pub fn register(r: &mut Registry) {
     add(r, "sign", |_, a, _| unary(a, "sign", sign_of), "sign(X) - -1, 0 or 1 by sign; NaN stays NaN.");
 
     // ---- predicates --------------------------------------------------
-    add(r, "isnan", |_, a, _| unary(a, "isnan", |x| x.is_nan() as u8 as f64), "isnan(X) - true where X is NaN.");
-    add(r, "isinf", |_, a, _| unary(a, "isinf", |x| x.is_infinite() as u8 as f64), "isinf(X) - true where X is infinite.");
-    add(r, "isfinite", |_, a, _| unary(a, "isfinite", |x| x.is_finite() as u8 as f64), "isfinite(X) - true where X is finite.");
+    add(r, "isnan", |_, a, _| mask(a, "isnan", f64::is_nan), "isnan(X) - true where X is NaN.");
+    add(r, "isinf", |_, a, _| mask(a, "isinf", f64::is_infinite), "isinf(X) - true where X is infinite.");
+    add(r, "isfinite", |_, a, _| mask(a, "isfinite", f64::is_finite), "isfinite(X) - true where X is finite.");
 
     // ---- two-argument math -------------------------------------------
     add(r, "mod", |_, a, _| binary(a, "mod", modulo), "mod(X,Y) - remainder after division, signed like Y.");
@@ -123,6 +123,15 @@ fn unary(args: &[Value], name: &str, f: fn(f64) -> f64) -> R<Vec<Value>> {
     one_mat(mat(args, 0, name)?.map(f))
 }
 
+/// An element-wise test, answered with a logical array the shape of its
+/// argument. `isnan` returns a mask, which is what lets cycle 03's
+/// `x(isnan(x))` select rather than read ones and zeros as positions.
+fn mask(args: &[Value], name: &str, test: fn(f64) -> bool) -> R<Vec<Value>> {
+    at_most(args, 1, name)?;
+    let m = mat(args, 0, name)?.map(|x| test(x) as u8 as f64);
+    one_as(m.with_class(Class::Logical))
+}
+
 /// [`unary`] for a function with a real domain smaller than the line. The
 /// whole argument is judged before any of it is mapped, so one complex
 /// element refuses the call rather than seeding the result with a `NaN`.
@@ -190,11 +199,18 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
         Red::Any => |xs| xs.iter().any(|v| *v != 0.0 && !v.is_nan()) as u8 as f64,
         Red::All => |xs| xs.iter().all(|v| *v != 0.0) as u8 as f64,
     };
-    one_mat(match along {
+    let out = match along {
         None => reduce(&m, None, f)?,
         Some(Along::Dim(d)) => reduce(&m, Some(d), f)?,
         Some(Along::All) => reduce_all(&m, f),
-    })
+    };
+    // `any` and `all` answer with a logical, as MATLAB's do. A dimension
+    // past the array's hands back the argument itself, which is converted
+    // then: `any([2 0], 3)` is the logical `1 0`.
+    match kind {
+        Red::Any | Red::All => one_as(out.to_class(Class::Logical)?),
+        _ => one_mat(out),
+    }
 }
 
 /// The reduction over `A(:)`, which is what `'all'` means: one 1x1 answer
@@ -204,7 +220,22 @@ fn reduce_all(m: &Matrix, f: impl Fn(&[f64]) -> f64) -> Matrix {
     Matrix::scalar(f(&m.data))
 }
 
+/// `max` and `min`. Of a logical they stay logical, as MATLAB's do: the
+/// largest of some trues and falses is itself a true or a false. Any other
+/// argument, a char included, gives a double.
 fn extremum(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
+    let out = extremum_value(args, name, is_max)?;
+    let logical = |i: usize| args.get(i).is_some_and(|v| v.mat().class == Class::Logical);
+    let keep = if args.len() == 2 {
+        logical(0) && logical(1)
+    } else {
+        logical(0)
+    };
+    let class = if keep { Class::Logical } else { Class::Double };
+    one_as(out.into_iter().next().unwrap().into_mat().with_class(class))
+}
+
+fn extremum_value(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
     at_most(args, 3, name)?;
     let m = mat(args, 0, name)?;
     if args.len() == 2 {
@@ -664,7 +695,7 @@ mod tests {
     }
 
     fn text(s: &str) -> Value {
-        Value::Str(s.to_string())
+        Value::str(s)
     }
 
     #[test]
@@ -694,7 +725,10 @@ mod tests {
         assert_eq!(all(&[f64::NAN]).data, [1.0]);
         let m = rmat(2, 2, &[f64::NAN, 0.0, 0.0, 2.0]);
         let by_row = call(&[val(m), val(Matrix::scalar(2.0))], "any", Red::Any).unwrap();
-        assert_eq!(by_row, Matrix::col(vec![0.0, 1.0]));
+        assert_eq!(
+            by_row,
+            Matrix::col(vec![0.0, 1.0]).with_class(Class::Logical)
+        );
     }
 
     #[test]
