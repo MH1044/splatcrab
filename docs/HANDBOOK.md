@@ -2018,6 +2018,86 @@ Error: Line 2: inner failed with 1
   in outer (line 5)
 ```
 
+An anonymous function in the trace is named by its `func2str` text, as in
+`  in @(n)g(n)`; MATLAB's form there is not settled, and SplatCrab's is its
+own.
+
+### Function handles
+
+`@name` is a handle to a named function and `@(x) body` an anonymous
+function. Calling the variable that holds one calls it. An anonymous
+function captures, when it is made, the value of every variable its body
+reads, so changing the variable afterwards does not change the function; a
+name that is not a variable then is looked up as a function when the body
+runs. A handle displays under MATLAB's header:
+
+```matlab
+sq = @(x) x.^2;
+disp(sq([1 2 3]))
+a = 10;
+f = @(x) x + a;
+a = 0;
+disp(f(1))
+g = @abs;
+disp(g(-4))
+f
+```
+
+```
+     1     4     9
+    11
+     4
+f =
+
+  function_handle with value:
+
+    @(x)x+a
+
+```
+
+`@name` binds where it is made: a handle to a local function keeps calling
+that function when it is passed to a file where the name means something
+else, or nothing. An anonymous function runs in a workspace of its own
+holding its parameters and what it captured, and counts against the
+recursion limit like any call. A body that is a single call passes on the
+number of outputs asked for, so `[m, i] = f(v)` works for `f = @(v) max(v)`.
+
+`feval`, `arrayfun`, `func2str`, `str2func`, and `class` and `isa` with
+`'function_handle'`:
+
+```matlab
+disp(arrayfun(@(x) x * 2, [1 2 3]))
+disp(arrayfun(@(a, b) a * b, [1 2], [3 4]))
+disp(feval(@(x) x + 1, 1))
+f = @(v) max(v);
+[m, i] = f([1 5 2]);
+disp(i)
+disp(func2str(@(x) [x 1] * 2))
+h = str2func('@(x) x*3');
+disp(h(2))
+disp(isa(h, 'function_handle'))
+```
+
+```
+     2     4     6
+     3     8
+     2
+     2
+@(x)[x,1]*2
+     6
+   1
+```
+
+`func2str` renders the function from its parse tree: no spaces around
+operators and a comma between the elements of a bracket, so `[x 1]` comes
+back as `[x,1]` and still means two elements. MATLAB keeps the text as
+written; only the forms without brackets or spacing choices are known to
+agree. `arrayfun` needs every result to be a scalar; `'UniformOutput',
+false`, which returns a cell, arrives with cells in cycle 07. A handle is
+one function and not an array, so `[f g]` is refused, and so is
+`[@(x) x+1]` in the source. `str2func` of an `'@(...)'` text captures
+nothing, since it cannot see the workspace it is called from.
+
 ### Function files, scripts and the path
 
 A file `name.m` in the current folder, or in a folder `addpath` added, is
@@ -2070,7 +2150,7 @@ supported in this context.` Define functions in a script or a function file.
 
 ## Builtins
 
-99 names, each an ordinary function registered by name. Every one rejects
+102 names, each an ordinary function registered by name. Every one rejects
 arguments it does not understand with `Too many input arguments.` rather than
 ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 `clear`, `who`, bare `tic`, bare `toc`) is legal as a statement and is
@@ -2919,7 +2999,8 @@ the same thing. `clear x`, without parentheses, is
 
 ### Functions and the path
 
-`nargin nargout exist feval addpath rmpath`, described with user functions
+`nargin nargout exist feval addpath rmpath`, and `arrayfun func2str str2func`
+for handles, described with user functions
 under [Functions](#functions).
 
 ### Timing
@@ -4208,7 +4289,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 |---|---|
 | `e.stack` of a caught error | 07 |
 | `varargin`, `varargout`, `global`, `persistent`, nested functions | 07 and later |
-| Function handles and anonymous functions `@(x) ...` | 06 |
+| `arrayfun(..., 'UniformOutput', false)` and `cellfun` | 07 |
 | Cell arrays `{...}` | 07 |
 | Structs `s.field` | 07 |
 | Matrix `norm`, least squares, `\` of a non-square system | 08 |
@@ -4225,11 +4306,11 @@ Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-f = @(x) x + 1
+c = {1, 2}
 ```
 
 ```
-Error: Line 1: unexpected '@' in expression
+Error: Line 1: unexpected '{' in expression
 ```
 
 ```matlab

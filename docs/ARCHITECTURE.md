@@ -85,6 +85,15 @@ transpose. Braces go on the delimiter stack like brackets, so that inside
 `[c{1 -2} 3]` the whitespace rule applies to the bracket and not within the
 braces; inside brackets a `{` or an `@` after a space starts a new element.
 
+Since cycle 06 the lexer knows an anonymous function's shape, for the same
+reason: whitespace inside its body separates nothing. The `(` straight after
+an `@` goes on the delimiter stack as `P`, and when its `)` closes it with a
+bracket or a brace directly around, an `A` goes on for the body, which the
+whitespace rule does not treat as a bracket. The `,`, `;`, newline or closer
+that ends the element pops it, so `{@(x) x + 1, 2}` is two elements and
+`[@(x) x+1]` one. A quote straight after that `)` opens a string rather than
+a transpose, so `@() 'hi'` is a function returning text.
+
 **`parser.rs`** is recursive descent with MATLAB's precedence, loosest first:
 `||`, `&&`, `|`, `&`, comparison, `:`, `+ -`, `* / \ .* ./ .\`, unary `- ~`,
 `^ .^`, transpose. `end` and a bare `:` are only accepted inside an index
@@ -104,9 +113,21 @@ An assignment target is an `LValue`, a name and a chain, so `x = v`,
 `[a, ~, c] = rhs` is `Stmt::MultiAssign(Vec<Option<LValue>>, Expr, bool)`,
 with `None` for a `~`: `try_targets` reads a bracket as a target list when it
 holds only targets and placeholders and is followed by `=`, and otherwise
-rewinds so that the bracket parses as the matrix literal it always was. A bare
-`@`, and a `{` where a value should start, are parse errors until cycles 06
-and 07.
+rewinds so that the bracket parses as the matrix literal it always was. A `{`
+where a value should start is a parse error until cycle 07.
+
+Cycle 06 added the two handle forms, `Expr::FuncHandle(name)` for `@name` and
+`Expr::AnonFn(Rc<AnonFn>)` for `@(params) body`. The body is one expression,
+parsed with `in_index` cleared, since it is not an index argument even inside
+one. `AnonFn::new` records the body's free names, every name it reads that is
+not a parameter, once at parse time, because every evaluation of the `@(...)`
+captures those of them that are variables. A handle as an element of a
+bracket, `[@(x) x+1]` or `[1 @sin]`, is refused here. `parser::render` turns
+an expression back into source text for `func2str`: no spaces around binary
+operators, commas between bracket elements, and parentheses only where the
+precedence needs them, since the tree keeps none; a rendered body parses back
+to the same tree. `Parser::parse_handle` reads a `str2func` text, one handle
+form and nothing after it.
 
 Cycle 04 added `Stmt::Switch(subject, Vec<CaseArm>, otherwise)` and
 `Stmt::Try(body, Option<String>, handler)`. A `CaseArm` carries its values
@@ -157,7 +178,9 @@ code unit. `value.rs` also owns the display: `format` for the numeric body,
 display. Since cycle 04 `Value` has a second variant, `Exception`, the
 `MException` a `catch` binds; `Value::mat` and `Value::into_mat` return an
 `R`, refusing it with `This operation is not supported for a value of class
-'MException'.`
+'MException'.` Since cycle 06 there is a third, `Func(Rc<Func>)`, a function
+handle, refused the same way with its class `function_handle`; see "Add a
+value type".
 
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
 `name` is a variable and as a call otherwise, and grows arrays on indexed
@@ -169,6 +192,20 @@ the `addpath` folders) through a lookup cache and a file cache that a
 generation counter keeps honest. `run` runs a script, local functions
 allowed; `run_command` is the REPL's and the protocol's, and refuses a
 definition. It no longer knows what any individual builtin does.
+
+Since cycle 06 it makes and calls function handles. `named_handle` binds
+`@name` to the local function the name resolves to where the handle is made,
+or to nothing, in which case the call resolves the name against the path and
+the builtins (`call_global`, the half of `call_function` after the local
+functions). `anon_handle` snapshots the free names that are variables of the
+running frame, and the frame's `unit`. `call_handle` calls either kind, and
+`call_anon` runs an anonymous function in a frame of its own holding the
+captures and the parameters, counted against `MAX_RECURSION`, the body run
+through `eval_request`. `eval_request` is what a statement, a multiple
+assignment and an anonymous body share: a call, by name or of a handle
+variable with one `(...)`, is asked for exactly the outputs wanted, and any
+other expression is its one value, which is how `nargout` passes through a
+body that is a single call.
 Reading, assignment and deletion share one index pipeline since cycle 03:
 `eval_index_args` turns the subscripts into zero-based `Sel`s (a logical
 subscript becomes the positions `find` would give), `resolve_read`,
@@ -325,6 +362,14 @@ UTF-16 code units back into a Rust `String`. `dim` reads a dimension argument
 (a positive integer, never a char), and `dim_or_all` also accepts `'all'`,
 for the reductions that take it.
 
+**A builtin that calls a function goes through `Interp::call_nested`**, with
+a `Callee::Name` or a `Callee::Handle`, never through `call_function` or
+`call_handle` directly: `call_nested` counts the call as one level of the
+nesting budget every frame shares, which is what bounds a function that calls
+a builtin that calls the function (cycle 05's review found `feval` re-entering
+uncounted and overflowing the stack). `feval` and `arrayfun` do so since
+cycle 06; `cellfun` in cycle 07 must too.
+
 A shape the user asks for goes through the size helpers and stays `f64` until
 it is judged, so that an oversized request is named as asked. `shape` reads a
 constructor's sizes: none (1x1), a scalar `n` (n x n), a row size vector, or
@@ -380,6 +425,19 @@ operation reaches a matrix through `Value::mat` or `Value::into_mat`, which
 return an `R` and refuse any other variant, so a new variant is refused
 everywhere by default and each operation that should accept it says so; a
 `match` on `Value` makes the compiler list the sites that must decide.
+
+Cycle 06 added the third variant that way. `Value::Func(Rc<Func>)` is a
+function handle: `Func::Named { name, local }`, with `local` the local
+function and its file that `@name` resolved to where it was made, or
+`Func::Anon { def, captured, unit }`, the parsed `AnonFn`, the snapshot of
+the variables it captured and the file it was made in. It sits behind an
+`Rc`, because reading a variable clones its value and a handle's captured
+workspace should not be copied each time. It answers `class_name`
+(`function_handle`), `dims` (1x1), `display_body` (`  function_handle with
+value:`, a blank line, `    @(x)x+1`) and `disp_text` (`@(x)x+1`, `@sin`)
+itself. The operations that accept it: a call through a variable or a chain,
+`feval`, `arrayfun`, `func2str`, `class` and `isa`; `hcat` refuses it with
+the concatenation message rather than the generic one.
 
 ## Key designs to preserve
 
@@ -472,6 +530,12 @@ and a stale file is reused only if its modification time and length are
 unchanged. At most 500 calls run at once (`MAX_RECURSION`), and every frame
 shares the one nesting budget of `MAX_DEPTH`; the Design notes of
 `docs/modules/05-functions-and-scoping.md` have the stack measurements.
+Since cycle 06 an anonymous function's call is a frame too, with no
+`func_name` (so `nargin` inside one is the outside-a-function error), the
+file the handle was made in as its `unit`, and its own `end_stack`; it counts
+against `MAX_RECURSION` like a user call. An error leaving it gains a trace
+entry named by its `func2str` text, `  in @(n)g(n)`, with no line, since an
+expression has none.
 
 **Containers (cycle 07).** `CellArray` and `StructArray` as separate types that
 reuse index-resolution helpers factored out of `Matrix`, rather than making
@@ -499,6 +563,7 @@ cycle named:
 | The trace names a function alone, `  in g3 (line 8)`, where MATLAB writes `Error in script>g3 (line 8)`; the spec fixes SplatCrab's form | by design |
 | Functions are more permissive than MATLAB's in three ways, none of which changes what a file MATLAB accepts means: a function in a file on the path can call a local function of the script being run (invariant 4 reads the script's local functions after the running file's, where MATLAB keeps local functions private to their file); a file may mix functions that end with `end` and functions that do not; and a script's local functions may go without `end`. Calling a script with arguments or for a value is `Too many input arguments.` or `Too many output arguments.`, where MATLAB names the script | later |
 | Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
+| Function handles, cycle 06: `func2str` renders an anonymous function from its parse tree, so `@(x) (x)` reads back `@(x)x` where MATLAB keeps the text as written; the trace names an anonymous function `  in @(n)g(n)` with no line; an anonymous call counts against the recursion limit of 500; `str2func` of a text that is not a name makes a handle that fails only when called. The Design notes of `docs/modules/06-function-handles.md` have each | by design (verify first) |
 | `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `hold on` and `format long` are the unrecognized-name error | `hold` 12, `format` 13, warning state later |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
@@ -579,7 +644,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | An unexpected character is echoed raw into the message | `unexpected character '<c>'` writes the character itself, so a control character reaches stderr as a raw byte: running `01e-display-and-parser/err_utf16_file.m` writes a literal NUL between the quotes. A control character should be named, for instance as `U+0000`. Found while rebuilding the test inventory after cycle U0 | later, low impact |
-| Most builtins refuse an `MException` | `isa(e, 'MException')`, the usual MATLAB check, is an error, and so are `size(e)`, `isempty(e)` and `ischar(e)`; `who` and the protocol's `workspace` already show it as `1x1 MException`. Cycle 04's Scope named only `class`, `rethrow` and the two fields. Found by cycle 04's review | 07, with the other non-matrix values |
+| Most builtins refuse an `MException` | `isa(e, 'MException')`, the usual MATLAB check, is an error, and so are `size(e)`, `isempty(e)` and `ischar(e)`; `who` and the protocol's `workspace` already show it as `1x1 MException`. Cycle 04's Scope named only `class`, `rethrow` and the two fields. Found by cycle 04's review. A function handle, since cycle 06, is the same apart from `isa`: `size(f)`, `isempty(f)` and `isequal(f, f)` refuse it or answer false, where MATLAB answers each (verify the values first) | 07, with the other non-matrix values |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
 
 **The process-killing family.** The two panics that used to head this list,

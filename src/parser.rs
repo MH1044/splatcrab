@@ -3,9 +3,121 @@
 //! Precedence (loosest to tightest), following MATLAB:
 //!   ||   &&   |   &   comparison   :   + -   * / \ .* ./ .\   unary - ~   ^ .^   transpose
 
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+
 use crate::bail;
 use crate::error::{self, R};
 use crate::lexer::{Lexed, Token};
+
+/// `@(params) body`, an anonymous function as written (cycle 06).
+///
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnonFn {
+    /// The parameter names in order, `~` kept as `"~"`, as a function's are.
+    pub params: Vec<String>,
+    pub body: Expr,
+}
+
+impl AnonFn {
+    pub fn new(params: Vec<String>, body: Expr) -> AnonFn {
+        AnonFn { params, body }
+    }
+
+    /// Every name the body reads that no enclosing parameter list binds, in
+    /// the order first read and without repeats: what is captured when the
+    /// function is made, those of them that are variables at that moment.
+    ///
+    /// It is one walk of the tree, linear in its size, and nothing is kept.
+    /// It used to be a list stored on every `AnonFn` and built from the
+    /// lists of the functions nested in it, with repeats found by rescanning
+    /// the list: quadratic in the names a body reads and, nested, a full copy
+    /// per level, so 3,000 nested `@()` around 3,000 names took minutes
+    /// (cycle 06's review). The walk recurses once per level of the tree,
+    /// which the parser has already bounded by [`MAX_DEPTH`].
+    pub fn free_names(&self) -> Vec<String> {
+        let mut w = FreeNames::default();
+        w.scope(&self.params, &self.body);
+        w.out
+    }
+
+    /// `func2str`'s text: `@(x,y)` and the body rendered by [`render`].
+    pub fn text(&self) -> String {
+        let mut s = format!("@({})", self.params.join(","));
+        render_into(&self.body, &mut s);
+        s
+    }
+}
+
+/// The state of [`AnonFn::free_names`]'s walk: how many enclosing
+/// parameter lists bind each name, the names already reported, and the
+/// report itself.
+#[derive(Default)]
+struct FreeNames<'a> {
+    bound: HashMap<&'a str, usize>,
+    seen: HashSet<&'a str>,
+    out: Vec<String>,
+}
+
+impl<'a> FreeNames<'a> {
+    /// Walks `body` with `params` bound, and unbinds them after.
+    fn scope(&mut self, params: &'a [String], body: &'a Expr) {
+        for p in params {
+            *self.bound.entry(p.as_str()).or_insert(0) += 1;
+        }
+        self.walk(body);
+        for p in params {
+            if let Some(n) = self.bound.get_mut(p.as_str()) {
+                *n -= 1;
+                if *n == 0 {
+                    self.bound.remove(p.as_str());
+                }
+            }
+        }
+    }
+
+    /// A name read: reported the first time it is read while unbound.
+    fn read(&mut self, n: &'a str) {
+        if !self.bound.contains_key(n) && self.seen.insert(n) {
+            self.out.push(n.to_string());
+        }
+    }
+
+    /// Every name `e` reads: a bare name, the name an access chain starts
+    /// from, and the names inside its arguments. A field name is not a name.
+    fn walk(&mut self, e: &'a Expr) {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::End | Expr::Colon | Expr::FuncHandle(_) => {}
+            Expr::Ident(n) => self.read(n),
+            Expr::Access(n, chain) => {
+                self.read(n);
+                for a in chain {
+                    match a {
+                        Access::Paren(args) | Access::Brace(args) => {
+                            args.iter().for_each(|x| self.walk(x))
+                        }
+                        Access::Field(_) => {}
+                        Access::DynField(x) => self.walk(x),
+                    }
+                }
+            }
+            Expr::Matrix(rows) => rows.iter().flatten().for_each(|x| self.walk(x)),
+            Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::Transpose(a) => self.walk(a),
+            Expr::Binary(_, a, b) => {
+                self.walk(a);
+                self.walk(b);
+            }
+            Expr::Range(a, s, b) => {
+                self.walk(a);
+                if let Some(s) = s {
+                    self.walk(s);
+                }
+                self.walk(b);
+            }
+            Expr::AnonFn(f) => self.scope(&f.params, &f.body),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -32,6 +144,217 @@ pub enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `a:b` or `a:s:b`
     Range(Box<Expr>, Option<Box<Expr>>, Box<Expr>),
+    /// `@name`, a handle to a named function (cycle 06).
+    FuncHandle(String),
+    /// `@(params) body` (cycle 06). Shared, since every evaluation of it
+    /// makes a function value that holds the definition.
+    AnonFn(Rc<AnonFn>),
+}
+
+/// How tightly each form binds, loosest first, following the parser's
+/// precedence ladder: what [`render`] compares to decide on parentheses.
+fn prec(e: &Expr) -> u8 {
+    match e {
+        // An anonymous function's body runs to the end of the expression,
+        // so it binds loosest of all.
+        Expr::AnonFn(_) => 0,
+        Expr::Binary(op, ..) => binop_prec(*op),
+        Expr::Range(..) => 6,
+        Expr::Neg(_) | Expr::Pos(_) | Expr::Not(_) => 9,
+        Expr::Transpose(_) => 11,
+        _ => 12,
+    }
+}
+
+fn binop_prec(op: BinOp) -> u8 {
+    match op {
+        BinOp::OrOr => 1,
+        BinOp::AndAnd => 2,
+        BinOp::Or => 3,
+        BinOp::And => 4,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => 5,
+        BinOp::Add | BinOp::Sub => 7,
+        BinOp::Mul | BinOp::Div | BinOp::LDiv | BinOp::EMul | BinOp::EDiv | BinOp::ELDiv => 8,
+        BinOp::Pow | BinOp::EPow => 10,
+    }
+}
+
+fn binop_text(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::LDiv => "\\",
+        BinOp::Pow => "^",
+        BinOp::EMul => ".*",
+        BinOp::EDiv => "./",
+        BinOp::ELDiv => ".\\",
+        BinOp::EPow => ".^",
+        BinOp::Eq => "==",
+        BinOp::Ne => "~=",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "&",
+        BinOp::Or => "|",
+        BinOp::AndAnd => "&&",
+        BinOp::OrOr => "||",
+    }
+}
+
+/// `e` as source text, rendered from the tree: what `func2str` shows of an
+/// anonymous function's body (cycle 06).
+///
+/// No space around a binary operator, a comma between the elements of a
+/// bracket and a semicolon between its rows, so `[x 1]` comes back as
+/// `[x,1]` and still has two elements. The tree keeps no parentheses, so
+/// they are put back only where the precedence needs them: `(x+1)*2`, but
+/// `x+1*2`. Numbers are written in the shortest form that reads back as the
+/// same value; a string in single quotes with its quotes doubled.
+pub fn render(e: &Expr) -> String {
+    let mut s = String::new();
+    render_into(e, &mut s);
+    s
+}
+
+fn render_into(e: &Expr, s: &mut String) {
+    // A child that binds looser than `min` is parenthesised.
+    fn child(e: &Expr, min: u8, s: &mut String) {
+        if prec(e) < min {
+            s.push('(');
+            render_into(e, s);
+            s.push(')');
+        } else {
+            render_into(e, s);
+        }
+    }
+    // The exponent may be a signed operand without parentheses, `2^-1`,
+    // as long as what the sign applies to is itself a postfix operand.
+    fn exponent_ok(e: &Expr) -> bool {
+        match e {
+            Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) => exponent_ok(a),
+            e => prec(e) >= 11,
+        }
+    }
+    fn list(args: &[Expr], s: &mut String) {
+        for (k, a) in args.iter().enumerate() {
+            if k > 0 {
+                s.push(',');
+            }
+            render_into(a, s);
+        }
+    }
+    match e {
+        Expr::Num(v) => s.push_str(&number_text(*v)),
+        Expr::Str(t) => {
+            s.push('\'');
+            s.push_str(&t.replace('\'', "''"));
+            s.push('\'');
+        }
+        Expr::Ident(n) => s.push_str(n),
+        Expr::End => s.push_str("end"),
+        Expr::Colon => s.push(':'),
+        Expr::Matrix(rows) => {
+            s.push('[');
+            for (k, row) in rows.iter().enumerate() {
+                if k > 0 {
+                    s.push(';');
+                }
+                list(row, s);
+            }
+            s.push(']');
+        }
+        Expr::Access(n, chain) => {
+            s.push_str(n);
+            for a in chain {
+                match a {
+                    Access::Paren(args) => {
+                        s.push('(');
+                        list(args, s);
+                        s.push(')');
+                    }
+                    Access::Brace(args) => {
+                        s.push('{');
+                        list(args, s);
+                        s.push('}');
+                    }
+                    Access::Field(f) => {
+                        s.push('.');
+                        s.push_str(f);
+                    }
+                    Access::DynField(x) => {
+                        s.push_str(".(");
+                        render_into(x, s);
+                        s.push(')');
+                    }
+                }
+            }
+        }
+        Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) => {
+            s.push(match e {
+                Expr::Neg(_) => '-',
+                Expr::Pos(_) => '+',
+                _ => '~',
+            });
+            child(a, 9, s);
+        }
+        Expr::Transpose(a) => {
+            child(a, 11, s);
+            s.push('\'');
+        }
+        Expr::Binary(op, a, b) => {
+            let p = binop_prec(*op);
+            // Every binary operator folds to the left, so the left operand
+            // may be the same operator and the right one may not.
+            child(a, p, s);
+            s.push_str(binop_text(*op));
+            if p == 10 && exponent_ok(b) {
+                render_into(b, s);
+            } else {
+                child(b, p + 1, s);
+            }
+        }
+        Expr::Range(a, step, b) => {
+            // `1:2:3:4` is `(1:2:3):4`, so a stepped range reads back on
+            // the left unparenthesised; `(1:2):3` must keep its brackets or
+            // it would read back as the stepped `1:2:3`.
+            match &**a {
+                Expr::Range(_, Some(_), _) => render_into(a, s),
+                a => child(a, 7, s),
+            }
+            if let Some(st) = step {
+                s.push(':');
+                child(st, 7, s);
+            }
+            s.push(':');
+            child(b, 7, s);
+        }
+        Expr::FuncHandle(n) => {
+            s.push('@');
+            s.push_str(n);
+        }
+        Expr::AnonFn(f) => s.push_str(&f.text()),
+    }
+}
+
+/// A number literal as it reads back: the shortest round-tripping decimal,
+/// in exponent form outside `1e-5 <= |v| < 1e15`.
+fn number_text(v: f64) -> String {
+    if !v.is_finite() {
+        return crate::value::nonfinite(v);
+    }
+    let a = v.abs();
+    if a == 0.0 || (1e-5..1e15).contains(&a) {
+        return format!("{}", v);
+    }
+    let t = format!("{:e}", v);
+    match t.split_once('e') {
+        Some((m, e)) if e.starts_with('-') => format!("{}e{}", m, e),
+        Some((m, e)) => format!("{}e+{}", m, e),
+        None => t,
+    }
 }
 
 /// One link of an access chain, in the order written.
@@ -953,10 +1276,59 @@ impl Parser {
                     Ok(Expr::Access(name, chain))
                 }
             }
-            // A bare `@`, a `{` opening a cell literal, and anything else
-            // that cannot start a value. Function handles are cycle 06's and
-            // cell literals cycle 07's.
+            Token::At => self.parse_handle_rest(line),
+            // A `{` opening a cell literal, which is cycle 07's, and anything
+            // else that cannot start a value.
             t => bail!(error::unexpected_in_expression(&t).at(line)),
+        }
+    }
+
+    /// After an `@`: `@name`, or `@(params) body` (cycle 06). The body is
+    /// one expression and runs as far as an expression can, so in
+    /// `arrayfun(@(x) x * 2, v)` it stops at the comma. It is not an index
+    /// argument even inside one, so `end` and a bare `:` mean nothing in it
+    /// until an index of its own opens.
+    fn parse_handle_rest(&mut self, line: u32) -> R<Expr> {
+        match self.next() {
+            Token::Ident(name) => Ok(Expr::FuncHandle(name)),
+            Token::LParen => {
+                let mut params = Vec::new();
+                loop {
+                    match self.next() {
+                        Token::RParen if params.is_empty() => break,
+                        Token::Ident(n) => params.push(n),
+                        Token::Not => params.push("~".to_string()),
+                        t => bail!(error::unexpected_token(&t).at(line)),
+                    }
+                    match self.next() {
+                        Token::RParen => break,
+                        Token::Comma => {}
+                        t => bail!(error::unexpected_token(&t).at(line)),
+                    }
+                }
+                let in_index = std::mem::take(&mut self.in_index);
+                let body = self.parse_expr();
+                self.in_index = in_index;
+                Ok(Expr::AnonFn(Rc::new(AnonFn::new(params, body?))))
+            }
+            // An `@` followed by neither is the `@`'s error, as a bare `@`
+            // was before handles existed.
+            _ => bail!(error::unexpected_in_expression(&Token::At).at(line)),
+        }
+    }
+
+    /// The whole of a `str2func` text that starts with `@`: one handle
+    /// form and nothing after it (cycle 06).
+    pub fn parse_handle(&mut self) -> R<Expr> {
+        let line = self.line();
+        self.expect(Token::At)?;
+        let e = self.parse_handle_rest(line)?;
+        match self.peek() {
+            Token::Eof => Ok(e),
+            t => {
+                let line = self.line();
+                bail!(error::unexpected_token(t).at(line))
+            }
         }
     }
 
@@ -1049,7 +1421,17 @@ impl Parser {
                     let line = self.line();
                     bail!(error::unterminated_matrix().at(line))
                 }
-                _ => row.push(self.parse_expr()?),
+                _ => {
+                    let line = self.line();
+                    let e = self.parse_expr()?;
+                    // A handle is one function, never an element of an
+                    // array: `[@(x) x+1]` and `[@sin 1]` are refused here,
+                    // where the source says so (cycle 06).
+                    if matches!(e, Expr::AnonFn(_) | Expr::FuncHandle(_)) {
+                        bail!(error::handle_concatenation().at(line));
+                    }
+                    row.push(e)
+                }
             }
         }
     }
@@ -1741,11 +2123,13 @@ mod tests {
         assert_eq!(msg("s.end"), "unexpected 'end' in expression");
     }
 
-    /// Until cycle 06 an `@` is a clean parse error wherever it appears.
+    /// An `@` that starts no handle is a clean parse error naming it; since
+    /// cycle 06, `@name` and `@(x) body` are handles.
     #[test]
     fn a_bare_at_is_a_parse_error() {
         let msg = |src: &str| parse_result(src).unwrap_err().msg;
-        assert_eq!(msg("f = @sin"), "unexpected '@' in expression");
+        assert_eq!(msg("f = @"), "unexpected '@' in expression");
+        assert_eq!(msg("f = @3"), "unexpected '@' in expression");
         assert_eq!(msg("@"), "unexpected '@' in expression");
         assert_eq!(msg("x = 1 @ 2"), "unexpected '@'");
         // A brace cannot open a value either, until cycle 07's cells.
@@ -2127,6 +2511,192 @@ mod tests {
         assert_eq!(
             program("function y = f(x) y").unwrap_err().msg,
             "unexpected 'y'"
+        );
+    }
+
+    // ---- function handles (cycle 06) ----------------------------------
+
+    fn anon(params: &[&str], body: Expr) -> Expr {
+        Expr::AnonFn(Rc::new(AnonFn::new(
+            params.iter().map(|p| p.to_string()).collect(),
+            body,
+        )))
+    }
+
+    #[test]
+    fn the_two_handle_forms_parse() {
+        assert_eq!(parse_expr("@sin"), Expr::FuncHandle("sin".to_string()));
+        assert_eq!(
+            parse_expr("@(x, y) x + y"),
+            anon(&["x", "y"], bin(BinOp::Add, ident("x"), ident("y")))
+        );
+        assert_eq!(parse_expr("@() 42"), anon(&[], num(42.0)));
+        assert_eq!(parse_expr("@(~, y) y"), anon(&["~", "y"], ident("y")));
+        // The body runs to the end of the expression, so a nested handle is
+        // the whole body of the outer one.
+        assert_eq!(
+            parse_expr("@(a) @(b) a + b"),
+            anon(
+                &["a"],
+                anon(&["b"], bin(BinOp::Add, ident("a"), ident("b")))
+            )
+        );
+        // In an argument list the body stops at the comma.
+        assert_eq!(
+            parse_expr("arrayfun(@(x) x * 2, [1 2 3])"),
+            call(
+                "arrayfun",
+                vec![
+                    anon(&["x"], bin(BinOp::Mul, ident("x"), num(2.0))),
+                    Expr::Matrix(vec![vec![num(1.0), num(2.0), num(3.0)]]),
+                ]
+            )
+        );
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("f = @(x"), "unexpected end of input");
+        assert_eq!(msg("f = @(1) 2"), "unexpected '1'");
+        assert_eq!(msg("f = @(x,) 2"), "unexpected ')'");
+    }
+
+    /// `end` and a bare `:` belong to an index: a body inside an index
+    /// argument is not one until it opens its own.
+    #[test]
+    fn an_anonymous_body_is_not_an_index_argument() {
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("y = x(@() end)"), "unexpected 'end' in expression");
+        assert_eq!(
+            parse_expr("@() x(end)"),
+            anon(
+                &[],
+                Expr::Access("x".to_string(), vec![Access::Paren(vec![Expr::End])])
+            )
+        );
+    }
+
+    /// Acceptance test 12, the parser half: in a brace list, an anonymous
+    /// function and the value after it are two elements; in a bracket, a
+    /// handle is refused.
+    #[test]
+    fn a_handle_in_braces_is_one_element_and_in_brackets_an_error() {
+        let two = vec![
+            anon(&["x"], bin(BinOp::Add, ident("x"), num(1.0))),
+            num(2.0),
+        ];
+        // The list of a brace, as a cell literal will read it in cycle 07.
+        let mut p = Parser::new(lex("{@(x) x + 1, 2}").unwrap());
+        assert_eq!(p.next(), Token::LBrace);
+        assert_eq!(p.parse_args(Token::RBrace).unwrap(), two);
+        assert_eq!(p.peek(), &Token::Eof);
+        // The one brace list that evaluates today, a `case`'s.
+        let prog = parse("switch 1\ncase {@(x) x + 1, 2}\nend");
+        match &prog[0].stmt {
+            Stmt::Switch(_, arms, _) => assert_eq!(arms[0].values, two),
+            s => panic!("not a switch: {s:?}"),
+        }
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        let concat =
+            "Nonscalar arrays of function handles are not allowed; use cell arrays instead.";
+        for src in [
+            "[@(x) x+1]",
+            "y = [@(x) x + 1, 2]",
+            "y = [1 @sin]",
+            "y = [1; @sin]",
+        ] {
+            assert_eq!(msg(src), concat, "{src}");
+        }
+        // Where the body swallows a space, what is left is not an operator.
+        assert_eq!(msg("y = {@(x) x 1}"), "unexpected '{' in expression");
+    }
+
+    /// The names a body reads that are not its parameters: what is
+    /// captured when the function is made.
+    #[test]
+    fn an_anonymous_function_knows_the_names_it_reads() {
+        let free = |src: &str| match parse_expr(src) {
+            Expr::AnonFn(f) => f.free_names(),
+            e => panic!("not a handle: {e:?}"),
+        };
+        assert_eq!(free("@(x) x + a + max(b, a)"), ["a", "max", "b"]);
+        assert_eq!(free("@(x) s.f(k).g"), ["s", "k"]);
+        assert_eq!(free("@(a) @(b) a + b + c"), ["c"]);
+        assert_eq!(free("@() @sin"), Vec::<String>::new());
+        assert_eq!(free("@(x) [x y; -z 1:n]"), ["y", "z", "n"]);
+    }
+
+    /// `func2str`'s rendering: the forms the spec records, then brackets,
+    /// unary minus and the parentheses precedence needs.
+    #[test]
+    fn func2str_renders_from_the_tree() {
+        let text = |src: &str| match parse_expr(src) {
+            Expr::AnonFn(f) => f.text(),
+            e => panic!("not a handle: {e:?}"),
+        };
+        // Recorded in the spec (acceptance tests 6 and 7).
+        assert_eq!(text("@(x) x.^2 + 1"), "@(x)x.^2+1");
+        assert_eq!(text("@(x) x + 1"), "@(x)x+1");
+        assert_eq!(text("@(x) x*3"), "@(x)x*3");
+        // Brackets keep their elements apart with commas.
+        assert_eq!(text("@(x) [x 1]"), "@(x)[x,1]");
+        assert_eq!(text("@(x) [x 1; 2 -x]"), "@(x)[x,1;2,-x]");
+        assert_eq!(text("@() []"), "@()[]");
+        // Unary minus, and where it needs its operand bracketed.
+        assert_eq!(text("@(x) -x"), "@(x)-x");
+        assert_eq!(text("@(x) -(x + 1)"), "@(x)-(x+1)");
+        assert_eq!(text("@(x) -x^2"), "@(x)-x^2");
+        assert_eq!(text("@(x) (-x)^2"), "@(x)(-x)^2");
+        assert_eq!(text("@(x) 2^-x"), "@(x)2^-x");
+        assert_eq!(text("@(x) ~x & x"), "@(x)~x&x");
+        // Precedence and association.
+        assert_eq!(text("@(x) (x + 1) * 2"), "@(x)(x+1)*2");
+        assert_eq!(text("@(x) x + 1 * 2"), "@(x)x+1*2");
+        assert_eq!(text("@(x) x - (1 - x)"), "@(x)x-(1-x)");
+        assert_eq!(text("@(x) (x - 1) - x"), "@(x)x-1-x");
+        assert_eq!(text("@(x) x' * (x')'"), "@(x)x'*x''");
+        assert_eq!(text("@(x) (x + 1)'"), "@(x)(x+1)'");
+        assert_eq!(text("@(a, b) a == b || ~a"), "@(a,b)a==b||~a");
+        // Ranges: a stepped range reads back on the left, a plain one not.
+        assert_eq!(text("@() 1:2:3:4"), "@()1:2:3:4");
+        assert_eq!(text("@() (1:2):3"), "@()(1:2):3");
+        assert_eq!(text("@(n) 1:n+1"), "@(n)1:n+1");
+        // Indexing, fields, strings, numbers, handles.
+        assert_eq!(text("@(x) x(:, end)"), "@(x)x(:,end)");
+        assert_eq!(text("@(s) s.a.(k)"), "@(s)s.a.(k)");
+        assert_eq!(text("@() 'it''s'"), "@()'it''s'");
+        assert_eq!(text("@() 0.5 + 1e-20 + 1e20 + 3"), "@()0.5+1e-20+1e+20+3");
+        assert_eq!(text("@(f) f(@sin)"), "@(f)f(@sin)");
+        assert_eq!(text("@(a) @(b) a + b"), "@(a)@(b)a+b");
+    }
+
+    /// What `func2str` renders parses back to the same tree.
+    #[test]
+    fn a_rendered_body_parses_back_to_itself() {
+        for src in [
+            "@(x) [x 1; -x (x + 1) * 2]",
+            "@(x, y) -x.^-y' + (x - y) / 2 \\ 3",
+            "@(v) v(end - 1:end, :)'",
+            "@() (1:2:3):4:5",
+            "@(a) a & ~(a | a) || a && a",
+            "@(s) s.b{2}.(n)(1)",
+            "@(q) ((q))",
+        ] {
+            let e = parse_expr(src);
+            assert_eq!(parse_expr(&render(&e)), e, "{src} -> {}", render(&e));
+        }
+    }
+
+    /// `str2func`'s parse: one handle form, and nothing after it.
+    #[test]
+    fn a_str2func_text_is_one_handle() {
+        let handle = |src: &str| Parser::new(lex(src).unwrap()).parse_handle();
+        assert_eq!(
+            handle("@(x) x*3").unwrap(),
+            anon(&["x"], bin(BinOp::Mul, ident("x"), num(3.0)))
+        );
+        assert_eq!(handle("@sin").unwrap(), Expr::FuncHandle("sin".to_string()));
+        assert_eq!(handle("@sin + 1").unwrap_err().msg, "unexpected '+'");
+        assert_eq!(
+            handle("sin").unwrap_err().msg,
+            "expected '@' but found 'sin'"
         );
     }
 }

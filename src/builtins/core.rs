@@ -5,8 +5,8 @@ use std::f64::consts::PI;
 use super::args::{at_most, check_shape, dim, mat, need, scalar, shape, string};
 use super::{Registry, add, none, one, one_as, one_mat};
 use crate::error;
-use crate::interp::{Interp, R, fmt_e, fmt_g};
-use crate::value::{Class, Matrix, Value, decode_units, nonfinite};
+use crate::interp::{Callee, Interp, R, fmt_e, fmt_g};
+use crate::value::{Class, FUNC_CLASS, Func, Matrix, Value, decode_units, nonfinite};
 
 /// The registration table is one line per builtin on purpose: it is the index
 /// of the library, and rustfmt would otherwise spread each entry over five
@@ -39,7 +39,7 @@ pub fn register(r: &mut Registry) {
     add(r, "isvector", isvector, "isvector(A) - true when A is 1-by-N or N-by-1, N >= 0.");
 
     // ---- classes -----------------------------------------------------
-    add(r, "class", class, "class(A) - the class of A: 'double', 'logical' or 'char'.");
+    add(r, "class", class, "class(A) - the class of A: 'double', 'logical', 'char', 'function_handle' or 'MException'.");
     add(r, "islogical", islogical, "islogical(A) - true when A is logical.");
     add(r, "ischar", ischar, "ischar(A) - true when A is a char array.");
     add(r, "isnumeric", isnumeric, "isnumeric(A) - true when A is numeric; logical and char are not.");
@@ -70,9 +70,14 @@ pub fn register(r: &mut Registry) {
     add(r, "nargin", nargin, "nargin - how many arguments the running function was called with.");
     add(r, "nargout", nargout, "nargout - how many outputs the running function was asked for.");
     add(r, "exist", exist, "exist(name) - 1 for a variable, 2 for a file on the path, 5 for a builtin, 0 otherwise.");
-    add(r, "feval", feval, "feval(name,...) - call the function name with the other arguments.");
+    add(r, "feval", feval, "feval(f,...) - call the function handle or function name f with the other arguments.");
     add(r, "addpath", addpath, "addpath(d1,...) - put folders at the front of the search path.");
     add(r, "rmpath", rmpath, "rmpath(d1,...) - take folders off the search path.");
+
+    // ---- function handles (cycle 06) ---------------------------------
+    add(r, "arrayfun", arrayfun, "arrayfun(f,A,...) - call f on each element of A, ..., and collect the scalar results in A's shape.");
+    add(r, "func2str", func2str, "func2str(f) - the text of a function handle: its name, or @(x)... .");
+    add(r, "str2func", str2func, "str2func(s) - a function handle from a name or an '@(x) ...' text.");
 
     // ---- timing ------------------------------------------------------
     add(r, "tic", tic, "tic - start a stopwatch; t = tic returns a handle.");
@@ -329,8 +334,15 @@ fn isnumeric(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 /// `'numeric'` and `'float'` both hold `double` alone here, since the
 /// integer and single classes do not exist; `'integer'` therefore holds
 /// nothing. The name is matched exactly, as MATLAB matches it.
+///
+/// A function handle is of the class `'function_handle'` and of no group
+/// (cycle 06), which is MATLAB's check for one: `isa(f, 'function_handle')`.
 fn isa(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 2, "isa")?;
+    if let Some(Value::Func(_)) = args.first() {
+        let name = string(args, 1, "isa")?;
+        return one_as(Matrix::from_bool(name == FUNC_CLASS));
+    }
     let m = mat(args, 0, "isa")?;
     let name = string(args, 1, "isa")?;
     let yes = match name.as_str() {
@@ -627,25 +639,125 @@ fn exist(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     one_mat(Matrix::scalar(it.exist(&name)))
 }
 
-/// `feval('name', args...)`: calls `name` as a call written in the source
-/// would, variables excepted, and passes the caller's `nargout` on.
+/// `feval(f, args...)`: calls the function handle `f`, or the function
+/// named `f` as a call written in the source would, variables excepted,
+/// and passes the caller's `nargout` on.
 ///
-/// A run of leading `'feval'` names that reach this builtin is peeled off
-/// first, so `feval('feval', 'feval', 'f', x)` is one call of `f`: without
-/// it every name re-entered the interpreter and copied the rest of the
-/// arguments, quadratic in the length of the run. The call itself goes
-/// through `call_nested`, which counts it against the nesting budget.
+/// A run of leading `'feval'` names, or unbound `@feval` handles, that
+/// reach this builtin is peeled off first, so `feval('feval', @feval, 'f',
+/// x)` is one call of `f`: without it every one re-entered the interpreter
+/// and copied the rest of the arguments, quadratic in the length of the
+/// run. The call itself goes through `call_nested`, which counts it
+/// against the nesting budget.
 fn feval(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     need(args, 1, "feval")?;
+    let is_feval = |v: &Value| match v {
+        Value::Func(f) => matches!(&**f, Func::Named { name, local: None } if name == "feval"),
+        v => v.text().is_some_and(|t| t == "feval"),
+    };
     let mut first = 0;
-    let mut name = string(args, first, "feval")?;
-    if name == "feval" && it.reaches_builtin("feval") {
-        while name == "feval" && first + 1 < args.len() {
+    if is_feval(&args[0]) && it.reaches_builtin("feval") {
+        while is_feval(&args[first]) && first + 1 < args.len() {
             first += 1;
-            name = string(args, first, "feval")?;
         }
     }
-    it.call_nested(&name, args[first + 1..].to_vec(), nargout)
+    let rest = args[first + 1..].to_vec();
+    match &args[first] {
+        Value::Func(f) => it.call_nested(Callee::Handle(f), rest, nargout),
+        _ => {
+            let name = string(args, first, "feval")?;
+            it.call_nested(Callee::Name(&name), rest, nargout)
+        }
+    }
+}
+
+// ---- function handles (cycle 06) -------------------------------------
+
+/// Argument `i` as a function handle.
+fn handle(args: &[Value], i: usize, name: &str) -> R<std::rc::Rc<Func>> {
+    match args.get(i) {
+        Some(Value::Func(f)) => Ok(f.clone()),
+        Some(_) => Err(error::arg_not_a_handle(i + 1, name)),
+        None => Err(error::not_enough_args(name)),
+    }
+}
+
+/// `arrayfun(f, A1, ..., An)`: `f` called on the elements of the arrays at
+/// each position in turn, in column-major order, and asked for as many
+/// outputs as `arrayfun` was. Every array must have the first one's size,
+/// and every result must be a scalar; the outputs are arrays of that size,
+/// each of the results' class when they all share one and double
+/// otherwise. Asked for no output, as a statement asks, `f` is asked for
+/// none too, and a result it gives anyway becomes the one output.
+///
+/// Each call goes through `call_nested`, so a handle that calls `arrayfun`
+/// that calls the handle stays bounded. `'UniformOutput', false` returns a
+/// cell and is cycle 07's.
+fn arrayfun(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
+    need(args, 2, "arrayfun")?;
+    let f = handle(args, 0, "arrayfun")?;
+    let arrays: Vec<&Matrix> = args[1..].iter().map(Value::mat).collect::<R<_>>()?;
+    let (rows, cols) = (arrays[0].rows, arrays[0].cols);
+    if arrays.iter().any(|m| m.rows != rows || m.cols != cols) {
+        return Err(error::arrayfun_size());
+    }
+    let outs = nargout.max(1);
+    let mut data: Vec<Vec<f64>> = vec![Vec::with_capacity(rows * cols); outs];
+    let mut classes: Vec<Option<Class>> = vec![None; outs];
+    // Whether `f` gives values; a statement's `arrayfun` finds out from the
+    // first call.
+    let mut gives = nargout > 0;
+    for k in 0..rows * cols {
+        let elems = arrays
+            .iter()
+            .map(|m| Value::Mat(Matrix::scalar(m.data[k]).with_class(m.class)))
+            .collect();
+        let vals = it.call_nested(Callee::Handle(&f), elems, nargout)?;
+        if k == 0 && nargout == 0 {
+            gives = !vals.is_empty();
+        }
+        if !gives {
+            continue;
+        }
+        if vals.len() < outs {
+            return Err(error::too_many_outputs());
+        }
+        for (o, v) in vals.iter().take(outs).enumerate() {
+            let m = v.mat()?;
+            let x = m
+                .scalar_value()
+                .ok_or_else(|| error::arrayfun_nonscalar(k + 1, o + 1))?;
+            data[o].push(x);
+            classes[o] = match classes[o] {
+                None => Some(m.class),
+                Some(c) if c == m.class => Some(c),
+                Some(_) => Some(Class::Double),
+            };
+        }
+    }
+    if !gives && rows * cols > 0 {
+        return none();
+    }
+    Ok(data
+        .into_iter()
+        .zip(classes)
+        .map(|(d, c)| Value::Mat(Matrix::new(rows, cols, d).with_class(c.unwrap_or_default())))
+        .collect())
+}
+
+/// `func2str(f)`: a named handle's name, or an anonymous function's text
+/// rendered from its tree, `@(x)x.^2+1`.
+fn func2str(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "func2str")?;
+    let f = handle(args, 0, "func2str")?;
+    one(Value::str(&f.text()))
+}
+
+/// `str2func(s)`: see `Interp::str2func`.
+fn str2func(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "str2func")?;
+    let text = string(args, 0, "str2func")?;
+    one(it.str2func(&text)?)
 }
 
 /// The folder arguments of `addpath` and `rmpath`.

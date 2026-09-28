@@ -12,9 +12,10 @@ use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::{scan, scan_known};
 use crate::parser::{
-    Access, BinOp, CaseArm, Expr, Function, LValue, Located, MAX_DEPTH, Parser, Program, Stmt,
+    Access, AnonFn, BinOp, CaseArm, Expr, Function, LValue, Located, MAX_DEPTH, Parser, Program,
+    Stmt,
 };
-use crate::value::{Class, Matrix, Value, nonfinite};
+use crate::value::{Class, Func, Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
 /// `error.rs`; the re-export is what let cycle 01b swap `String` for `MError`
@@ -63,8 +64,9 @@ impl Frame {
 }
 
 /// One parsed source text: a script (the code `run` was given, or a script
-/// file on the path) or a function file.
-#[derive(Default)]
+/// file on the path) or a function file. A function handle made in it holds
+/// it (cycle 06), which is why it is public and `Debug`.
+#[derive(Default, Debug)]
 pub struct Unit {
     /// The script's statements; empty for a function file.
     stmts: Vec<Located>,
@@ -163,6 +165,13 @@ enum Flow {
     Continue,
     /// `return`: ends the running function or script.
     Return,
+}
+
+/// What a builtin asks [`Interp::call_nested`] to call: a function by name,
+/// as `feval('sin', 0)` names one, or a function handle.
+pub(crate) enum Callee<'a> {
+    Name(&'a str),
+    Handle(&'a Func),
 }
 
 /// What a `switch` compares its cases against.
@@ -460,14 +469,8 @@ impl Interp {
             Stmt::Expr(e, show) => {
                 // A statement asks for no values, so a builtin that produces
                 // none (disp, fprintf, tic, ...) is legal here and returns an
-                // empty Vec. Nothing else calls a builtin in this cycle.
-                let result = match self.call_form(e) {
-                    Some((n, args)) => {
-                        let a = self.eval_args(args)?;
-                        self.call_function(n, a, 0)?
-                    }
-                    None => vec![self.eval(e)?],
-                };
+                // empty Vec, and so is a handle whose body is such a call.
+                let (result, _) = self.eval_request(e, 0)?;
                 if let Some(v) = result.into_iter().next() {
                     let name = match e {
                         Expr::Ident(n) if self.vars().contains_key(n) => n.clone(),
@@ -720,7 +723,42 @@ impl Interp {
                 Ok(Value::Mat(range(a, s, b)?))
             }
             Expr::Binary(op, a, b) => self.binary(*op, a, b),
+            Expr::FuncHandle(name) => Ok(self.named_handle(name)),
+            Expr::AnonFn(def) => Ok(self.anon_handle(def, true)),
         }
+    }
+
+    /// `@name`, bound where it is made (cycle 06): to the local function
+    /// the name resolves to here by invariant 4's order, if there is one.
+    /// A variable of the name plays no part, as `@` names a function.
+    pub(crate) fn named_handle(&self, name: &str) -> Value {
+        let local = self.local_function(name);
+        Value::Func(Rc::new(Func::Named {
+            name: name.to_string(),
+            local,
+        }))
+    }
+
+    /// `@(params) body`, made here (cycle 06). With `capture`, every name
+    /// the body reads that is a variable of the running frame now is
+    /// snapshotted with its value, so `a = 10; f = @(x) x + a; a = 0`
+    /// leaves `f` adding 10. A name that is not a variable now is looked up
+    /// as a function when the body runs, never as a variable of wherever
+    /// the handle is called from. `str2func` captures nothing.
+    pub(crate) fn anon_handle(&self, def: &Rc<AnonFn>, capture: bool) -> Value {
+        let captured = if capture {
+            def.free_names()
+                .into_iter()
+                .filter_map(|n| self.vars().get(&n).map(|v| (n.clone(), v.clone())))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Value::Func(Rc::new(Func::Anon {
+            def: def.clone(),
+            captured,
+            unit: self.frame().unit.clone(),
+        }))
     }
 
     fn eval_mat(&mut self, e: &Expr) -> R<Matrix> {
@@ -873,23 +911,46 @@ impl Interp {
     /// The expression is evaluated either way, so an error inside it is
     /// reported first.
     fn eval_outputs(&mut self, e: &Expr, n: usize) -> R<Vec<Value>> {
-        let values = match self.call_form(e) {
-            Some((name, args)) => {
-                let a = self.eval_args(args)?;
-                self.call_function(name, a, n)?
-            }
-            None => {
-                let v = self.eval(e)?;
-                if n > 1 {
-                    bail!(error::insufficient_outputs());
-                }
-                vec![v]
-            }
-        };
+        let (values, called) = self.eval_request(e, n)?;
+        if !called && n > 1 {
+            bail!(error::insufficient_outputs());
+        }
         if values.len() < n {
             bail!(error::too_many_outputs());
         }
         Ok(values)
+    }
+
+    /// `e` asked for `nargout` values: a call (a function by name, or a
+    /// handle variable called with one `(...)`) is asked for exactly that
+    /// many and may give fewer, for the caller to judge; anything else is
+    /// evaluated to its one value. The flag says whether it was a call.
+    ///
+    /// This is also how an anonymous function's body runs (cycle 06), which
+    /// is what carries `nargout` through a body that is a single call:
+    /// `f = @(v) max(v); [m, i] = f(v)` asks `max` for two.
+    fn eval_request(&mut self, e: &Expr, nargout: usize) -> R<(Vec<Value>, bool)> {
+        if let Some((name, args)) = self.call_form(e) {
+            let a = self.eval_args(args)?;
+            return Ok((self.call_function(name, a, nargout)?, true));
+        }
+        if let Some((f, args)) = self.handle_form(e) {
+            let a = self.eval_args(args)?;
+            return Ok((self.call_handle(&f, a, nargout)?, true));
+        }
+        Ok((vec![self.eval(e)?], false))
+    }
+
+    /// The handle an expression calls, if it is `f(args)` with `f` a
+    /// variable holding a function handle and nothing after the `(...)`.
+    fn handle_form<'e>(&self, e: &'e Expr) -> Option<(Rc<Func>, &'e [Expr])> {
+        match e {
+            Expr::Access(n, chain) => match (self.vars().get(n), chain.as_slice()) {
+                (Some(Value::Func(f)), [Access::Paren(args)]) => Some((f.clone(), args)),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Shows a variable under its own name, after an assignment to it.
@@ -916,6 +977,12 @@ impl Interp {
             match (var, first) {
                 (Value::Mat(_), Access::Paren(args)) => self.index_var(name, args)?,
                 (Value::Mat(_), other) => bail!(container_access(other)),
+                // A handle variable's `(...)` is a call of the handle.
+                (Value::Func(f), Access::Paren(args)) => {
+                    let f = f.clone();
+                    let a = self.eval_args(args)?;
+                    self.call_handle_for_value(&f, a)?
+                }
                 // Not an array, so not read in place: an `MException` is
                 // small, and its fields are the only thing it offers.
                 (var, other) => {
@@ -951,6 +1018,12 @@ impl Interp {
                 None => Err(error::dot_indexing_unsupported()),
             },
             (Value::Exception(_), Access::Brace(_)) => Err(error::brace_indexing_unsupported()),
+            // A handle a chain produced, `add(3)(4)`, is called, as chained
+            // indexing reads each link in turn.
+            (Value::Func(f), Access::Paren(args)) => {
+                let a = self.eval_args(args)?;
+                self.call_handle_for_value(&f, a)
+            }
             (v, Access::Paren(args)) => {
                 let m = v.into_mat()?;
                 let sel = self.eval_index_args(m.rows, m.cols, args)?;
@@ -1180,6 +1253,12 @@ impl Interp {
         if let Some((unit, f)) = self.local_function(name) {
             return self.call_user(unit, f, name, args, nargout);
         }
+        self.call_global(name, args, nargout)
+    }
+
+    /// Invariant 4 past the local functions: a file on the path, then a
+    /// builtin. What a named handle with no local binding calls (cycle 06).
+    fn call_global(&mut self, name: &str, args: Vec<Value>, nargout: usize) -> R<Vec<Value>> {
         if let Some(path) = self.find_file(name) {
             let unit = self.load(&path, name)?;
             return match unit.entry.clone() {
@@ -1190,22 +1269,133 @@ impl Interp {
         self.call_builtin(name, args, nargout)
     }
 
-    /// A builtin's call back into the interpreter, `feval`'s today and
-    /// `arrayfun`'s later, counted as one level of the nesting budget that
-    /// every frame shares. Without it a chain of such calls re-entered the
-    /// evaluator with nothing counting, and 499 frames each running a
+    /// A builtin's call back into the interpreter, counted as one level of
+    /// the nesting budget that every frame shares. **Every builtin that
+    /// calls a function goes through here**: `feval` of a name or a handle,
+    /// and `arrayfun` (cycle 06). Without it a chain of such calls re-entered
+    /// the evaluator with nothing counting, and 499 frames each running a
     /// 600-deep `feval` chain overflowed the stack (cycle 05's review): the
     /// one kind of recursion invariant 6 had not yet bounded.
     pub(crate) fn call_nested(
         &mut self,
-        name: &str,
+        callee: Callee,
         args: Vec<Value>,
         nargout: usize,
     ) -> R<Vec<Value>> {
         self.deepen()?;
-        let r = self.call_function(name, args, nargout);
+        let r = match callee {
+            Callee::Name(name) => self.call_function(name, args, nargout),
+            Callee::Handle(f) => self.call_handle(f, args, nargout),
+        };
         self.depth -= 1;
         r
+    }
+
+    /// Calls a function handle, asking it for `nargout` values (cycle 06).
+    ///
+    /// A named handle bound to a local function calls it, wherever it is
+    /// called from; one with no binding resolves its name against the path
+    /// and the builtins now. An anonymous function runs in a frame of its
+    /// own; see [`Interp::call_anon`].
+    pub(crate) fn call_handle(
+        &mut self,
+        f: &Func,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        match f {
+            Func::Named {
+                name,
+                local: Some((unit, func)),
+            } => self.call_user(unit.clone(), func.clone(), name, args, nargout),
+            Func::Named { name, local: None } => self.call_global(name, args, nargout),
+            Func::Anon {
+                def,
+                captured,
+                unit,
+            } => self.call_anon(f, def, captured, unit, args, nargout),
+        }
+    }
+
+    /// The single value an expression wants from a handle call.
+    fn call_handle_for_value(&mut self, f: &Func, args: Vec<Value>) -> R<Value> {
+        self.call_handle(f, args, 1)?
+            .into_iter()
+            .next()
+            .ok_or_else(error::too_many_outputs)
+    }
+
+    /// Runs an anonymous function in a frame of its own (cycle 06).
+    ///
+    /// More arguments than parameters is refused before anything runs, as
+    /// for a user function, and so carries no trace entry. The frame holds
+    /// the captured variables and then the parameters, and has its own
+    /// `end` stack; its code resolves functions against the file the handle
+    /// was made in. It counts against the recursion limit like any call.
+    /// The body is asked for `nargout` values: a body that is one call
+    /// passes the request on, and any other body is its one value. An error
+    /// leaving the body gains a trace entry named by the function's
+    /// `func2str` text.
+    fn call_anon(
+        &mut self,
+        f: &Func,
+        def: &AnonFn,
+        captured: &[(String, Value)],
+        unit: &Rc<Unit>,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        if args.len() > def.params.len() {
+            bail!(error::too_many_args());
+        }
+        self.enter()?;
+        let mut frame = Frame::new(unit.clone(), None);
+        frame.nargin = args.len();
+        frame.nargout = nargout;
+        for (n, v) in captured {
+            frame.vars.insert(n.clone(), v.clone());
+        }
+        for (p, v) in def.params.iter().zip(args) {
+            if p != "~" {
+                frame.vars.insert(p.clone(), v);
+            }
+        }
+        self.frames.push(frame);
+        let result = self.eval_request(&def.body, nargout);
+        self.frames.pop();
+        self.calls -= 1;
+        let (values, _) = result.map_err(|e| e.leaving(&f.text()))?;
+        Ok(values)
+    }
+
+    /// `str2func(text)` (cycle 06): a text that starts with `@` is parsed
+    /// as one handle form with the ordinary parser, counting its nesting
+    /// from where the evaluator is, as a file parsed at a call does; any
+    /// other text is a function name. The handle is made here, so a name
+    /// binds as `@name` written here would, and an anonymous function
+    /// captures nothing, since `str2func` has no access to the workspace
+    /// it is called from. A parse error carries no line of its own, since
+    /// the line would be the text's and not the program's.
+    pub(crate) fn str2func(&mut self, text: &str) -> R<Value> {
+        let src = text.trim();
+        if !src.starts_with('@') {
+            return Ok(self.named_handle(src));
+        }
+        let unlined = |mut e: error::MError| {
+            e.line = None;
+            e
+        };
+        let lexed = scan(src).map_err(unlined)?;
+        let e = Parser::with_lines(lexed)
+            .at_depth(self.depth)
+            .parse_handle()
+            .map_err(unlined)?;
+        // `parse_handle` returns nothing else; the last arm is never taken.
+        match e {
+            Expr::AnonFn(def) => Ok(self.anon_handle(&def, false)),
+            Expr::FuncHandle(name) => Ok(self.named_handle(&name)),
+            _ => Err(error::arg_not_a_handle(1, "str2func")),
+        }
     }
 
     /// True when a call to `name` reaches the builtin of that name: no local
@@ -1987,6 +2177,11 @@ fn concat_class(mats: &[Matrix]) -> Class {
 }
 
 fn hcat(vals: Vec<Value>) -> R<Value> {
+    // A handle is one function, not an element (cycle 06): `[f 1]`, and
+    // `[f]` too, which is a bracket of one.
+    if vals.iter().any(|v| matches!(v, Value::Func(_))) {
+        bail!(error::handle_concatenation());
+    }
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
@@ -4424,6 +4619,385 @@ mod tests {
         assert_eq!(
             ok_out("disp(f(5))\nfunction r = f(a)\nr = a -1;\nend"),
             "     4\n"
+        );
+    }
+
+    // ---- function handles (cycle 06) -----------------------------------
+
+    #[test]
+    fn a_handle_is_called_through_its_variable() {
+        assert_eq!(
+            ok_out(
+                "f = @(x) x.^2; disp(f(4)); g = @(x, y) x + y; disp(g(1, 2)); z = @() 42; disp(z())"
+            ),
+            "    16\n     3\n    42\n"
+        );
+        // A bare handle name is the handle, not a call.
+        assert_eq!(ok_out("z = @() 42; w = z; disp(w())"), "    42\n");
+        // A handle a call returned is called by the next link.
+        assert_eq!(ok_out("add = @(a) @(b) a + b; disp(add(3)(4))"), "     7\n");
+        // At statement level the value becomes `ans`.
+        assert_eq!(ok_out("f = @(x) x + 1; f(2)"), "ans =\n\n     3\n\n");
+        assert_eq!(err_msg("f = @(x) x; f(1, 2)"), "Too many input arguments.");
+        // Fewer arguments than parameters is fine until one is read.
+        assert_eq!(ok_out("f = @(x, y) x; disp(f(5))"), "     5\n");
+    }
+
+    /// Capture happens when the handle is made: a snapshot of each name the
+    /// body reads that is a variable then. A name that is not one then is
+    /// a function when the body runs, never the caller's variable.
+    #[test]
+    fn capture_is_a_snapshot_at_creation() {
+        assert_eq!(
+            ok_out("a = 10; f = @(x) x + a; a = 0; disp(f(1))"),
+            "    11\n"
+        );
+        assert_eq!(
+            ok_out("v = [1 2 3]; f = @(k) v(k); v(2) = 50; disp(f(2))"),
+            "     2\n"
+        );
+        assert_eq!(
+            ok_out("add = @(a) @(b) a + b; add3 = add(3); disp(add3(4))"),
+            "     7\n"
+        );
+        assert_eq!(
+            err_msg("g = @(n) g(n); g(1)"),
+            "Unrecognized function or variable 'g'."
+        );
+        // Created before `b` exists, the body cannot see it later.
+        assert_eq!(
+            err_msg("f = @() b; b = 1; f()"),
+            "Unrecognized function or variable 'b'."
+        );
+        // Nor a variable of the frame it is called from.
+        assert_eq!(
+            err_msg("r = call(@() q)\nfunction r = call(f)\nq = 1;\nr = f();\nend"),
+            "Unrecognized function or variable 'q'."
+        );
+        // A name that was no variable resolves as a function of the file
+        // the handle was made in.
+        assert_eq!(
+            ok_out("f = @(x) sq(x); disp(f(3))\nfunction r = sq(x)\nr = x * x;\nend"),
+            "     9\n"
+        );
+        // Only the names the body reads are captured.
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("a = 1; b = 2; f = @(x) x + a;").unwrap();
+        match it.vars().get("f") {
+            Some(Value::Func(f)) => match &**f {
+                Func::Anon { captured, .. } => {
+                    let names: Vec<&str> = captured.iter().map(|(n, _)| n.as_str()).collect();
+                    assert_eq!(names, ["a"]);
+                }
+                f => panic!("not anonymous: {f:?}"),
+            },
+            v => panic!("not a handle: {v:?}"),
+        }
+    }
+
+    /// The body runs in a frame of its own: its `end` is its own, and what
+    /// it assigns through a script it calls stays in it.
+    #[test]
+    fn an_anonymous_call_has_a_frame_of_its_own() {
+        assert_eq!(ok_out("w = [1 2 3]; k = @() w(end); disp(k())"), "     3\n");
+        assert_eq!(
+            ok_out("x = [10 20 30]; f = @(n) n; disp(x(f(end)))"),
+            "    30\n"
+        );
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("f = @(x) x + 1; y = f(1);").unwrap();
+        assert_eq!(it.frames.len(), 1);
+        assert_eq!(it.calls, 0);
+        let mut names: Vec<&String> = it.vars().keys().collect();
+        names.sort();
+        assert_eq!(names, ["f", "y"]);
+        // `nargin` belongs to named functions.
+        assert_eq!(
+            err_msg("f = @() nargin; f()"),
+            "You can only call nargin/nargout from within a MATLAB function."
+        );
+    }
+
+    /// `nargout` passes through a body that is one call; any other body is
+    /// its one value.
+    #[test]
+    fn nargout_propagates_through_a_single_call_body() {
+        assert_eq!(
+            ok_out("f = @(v) max(v); [m, i] = f([1 5 2]); disp(i)"),
+            "     2\n"
+        );
+        assert_eq!(
+            ok_out(
+                "f = @(v) g(v); [a, b] = f(1); disp([a b])\nfunction [p, q] = g(x)\np = x; q = nargout;\nend"
+            ),
+            "     1     2\n"
+        );
+        // A handle held in a captured variable passes it on too.
+        assert_eq!(
+            ok_out("h = @(v) max(v); f = @(v) h(v); [m, i] = f([4 9]); disp(i)"),
+            "     2\n"
+        );
+        // As a statement the body is asked for nothing, so a call that
+        // gives nothing is legal and sets no `ans`.
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("q = @() disp(1); q()").unwrap();
+        assert!(!it.vars().contains_key("ans"));
+        assert_eq!(ok_out("q = @() disp(7); q()"), "     7\n");
+        assert_eq!(
+            err_msg("q = @() disp(7); x = q();"),
+            "Too many output arguments."
+        );
+        assert_eq!(
+            err_msg("f = @(x) x + 1; [a, b] = f(1)"),
+            "Too many output arguments."
+        );
+    }
+
+    /// `@name` binds where it is made: a handle to a local function keeps
+    /// calling it from a file where the name means something else.
+    #[test]
+    fn a_named_handle_keeps_its_binding() {
+        let dir = TempDir::new("handles");
+        dir.write(
+            "apply.m",
+            "function r = apply(f, v)\nr = f(v);\nend\nfunction r = sq(x)\nr = -1;\nend\n",
+        );
+        dir.write(
+            "getsub.m",
+            "function h = getsub()\nh = @inner;\nend\nfunction r = inner(x)\nr = 100 + x;\nend\n",
+        );
+        let (mut it, buf) = in_dir(&dir);
+        // The script's `sq`, not apply.m's own.
+        it.run("disp(apply(@sq, 3))\nfunction r = sq(x)\nr = x * x;\nend")
+            .unwrap();
+        assert_eq!(take(&buf), "     9\n");
+        // A subfunction's handle, called where its name resolves to nothing.
+        it.run("h = getsub(); disp(h(1)); disp(feval(h, 2))")
+            .unwrap();
+        assert_eq!(take(&buf), "   101\n   102\n");
+        // An unbound name resolves against the path and the builtins when
+        // called, never the local functions of wherever it has gone.
+        it.run("disp(apply(@abs, -3))").unwrap();
+        assert_eq!(take(&buf), "     3\n");
+        assert_eq!(
+            it.run("f = @nosuch; f(1)").unwrap_err().msg,
+            "Unrecognized function or variable 'nosuch'."
+        );
+    }
+
+    /// Recursion through a handle meets the limit a direct call meets, and
+    /// an anonymous call counts as a call.
+    #[test]
+    fn recursion_through_handles_is_bounded() {
+        on_the_interpreter_stack(|| {
+            let limit = "Maximum recursion limit of 500 reached.";
+            for src in [
+                "r = viah(1)\nfunction r = viah(n)\nh = @viah;\nr = h(n + 1);\nend",
+                "r = f(1)\nfunction r = f(n)\ng = @(k) f(k + 1);\nr = g(n);\nend",
+                "r = f(1)\nfunction r = f(n)\nr = feval(@f, n + 1);\nend",
+                "r = f(1)\nfunction r = f(n)\nr = arrayfun(@(k) f(k + 1), n);\nend",
+                "a = @(f, x) arrayfun(@(y) f(f, y + 1), x);\nr = a(a, 1);",
+                "h = @(g, n) feval(g, g, n + 1);\nx = h(h, 1);",
+            ] {
+                assert_eq!(err_msg(src), limit, "{src}");
+            }
+            // A long run of `@feval` handles is peeled, not recursed.
+            let src = format!("disp(feval({}@sin, 0))", "@feval, 'feval', ".repeat(3000));
+            assert_eq!(ok_out(&src), "     0\n");
+        });
+    }
+
+    /// A builtin's call back into the interpreter counts one level of the
+    /// shared nesting budget, a name or a handle alike, and gives it back.
+    #[test]
+    fn call_nested_counts_against_the_nesting_budget() {
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("f = @() pi;").unwrap();
+        let Some(Value::Func(f)) = it.vars().get("f").cloned() else {
+            panic!("no handle");
+        };
+        it.depth = MAX_DEPTH;
+        let e = it.call_nested(Callee::Handle(&f), vec![], 1).unwrap_err();
+        assert_eq!(e.msg, TOO_DEEP);
+        it.depth = MAX_DEPTH;
+        let e = it.call_nested(Callee::Name("pi"), vec![], 1).unwrap_err();
+        assert_eq!(e.msg, TOO_DEEP);
+        it.depth = MAX_DEPTH - 1;
+        assert!(it.call_nested(Callee::Name("pi"), vec![], 1).is_ok());
+        assert!(it.call_nested(Callee::Handle(&f), vec![], 1).is_ok());
+        assert_eq!(it.depth, MAX_DEPTH - 1);
+        // `feval` and `arrayfun` go through it: at the edge of the budget
+        // they are refused rather than recursing.
+        it.depth = MAX_DEPTH;
+        let args = vec![Value::Func(f.clone()), Value::Mat(Matrix::row(vec![1.0]))];
+        assert_eq!(
+            it.call_function("feval", vec![Value::Func(f.clone())], 1)
+                .unwrap_err()
+                .msg,
+            TOO_DEEP
+        );
+        assert_eq!(
+            it.call_function("arrayfun", args, 1).unwrap_err().msg,
+            TOO_DEEP
+        );
+    }
+
+    #[test]
+    fn feval_arrayfun_func2str_and_str2func() {
+        assert_eq!(
+            ok_out(
+                "disp(arrayfun(@(x) x * 2, [1 2 3])); disp(arrayfun(@(a, b) a * b, [1 2], [3 4]))"
+            ),
+            "     2     4     6\n     3     8\n"
+        );
+        // The shape is the input's, the class the results'.
+        assert_eq!(
+            ok_out("disp(size(arrayfun(@(x) x, ones(2, 3))))"),
+            "     2     3\n"
+        );
+        assert_eq!(
+            ok_out("disp(class(arrayfun(@(x) x > 1, [1 2])))"),
+            "logical\n"
+        );
+        assert_eq!(ok_out("disp(size(arrayfun(@(x) x, [])))"), "     0     0\n");
+        assert_eq!(
+            ok_out("[m, k] = arrayfun(@(x) max([x 5]), [1 7]); disp([m; k])"),
+            "     5     7\n     2     1\n"
+        );
+        // As a statement, a function that gives nothing is called for its
+        // effect.
+        assert_eq!(ok_out("arrayfun(@(x) disp(x), [1 2])"), "     1\n     2\n");
+        assert_eq!(
+            err_msg("arrayfun(@(a, b) a + b, [1 2], [1 2 3])"),
+            "All of the input arguments must be of the same size and shape."
+        );
+        assert_eq!(
+            err_msg("y = arrayfun(@(x) [x x], [1 2]);"),
+            "Non-scalar in Uniform output, at index 1, output 1. Set 'UniformOutput' to false."
+        );
+        assert_eq!(
+            err_msg("y = arrayfun(5, [1 2]);"),
+            "Argument 1 to 'arrayfun' must be a function handle."
+        );
+        assert_eq!(
+            ok_out("disp(feval(@(x) x + 1, 1)); disp(feval('sin', 0))"),
+            "     2\n     0\n"
+        );
+        assert_eq!(
+            ok_out(
+                "disp(func2str(@(x) x.^2 + 1)); f = str2func('@(x) x*3'); disp(f(2)); disp(func2str(@sin))"
+            ),
+            "@(x)x.^2+1\n     6\nsin\n"
+        );
+        assert_eq!(ok_out("g = str2func('abs'); disp(g(-2))"), "     2\n");
+        assert_eq!(
+            err_msg("disp(func2str(5))"),
+            "Argument 1 to 'func2str' must be a function handle."
+        );
+        // `str2func` captures nothing.
+        assert_eq!(
+            err_msg("a = 1; f = str2func('@() a'); f()"),
+            "Unrecognized function or variable 'a'."
+        );
+        // A text that does not parse is the parser's error, with no line of
+        // its own: the line reported is the program's.
+        let e = err("x = 1;\nf = str2func('@(x) x +');");
+        assert_eq!(
+            (e.msg.as_str(), e.line),
+            ("unexpected end of input in expression", Some(2))
+        );
+        assert_eq!(err_msg("f = str2func('@sin + 1');"), "unexpected '+'");
+    }
+
+    #[test]
+    fn a_handle_displays_and_answers_class_and_isa() {
+        assert_eq!(
+            ok_out("f = @(x) x + 1"),
+            "f =\n\n  function_handle with value:\n\n    @(x)x+1\n\n"
+        );
+        assert_eq!(
+            ok_out("g = @sin"),
+            "g =\n\n  function_handle with value:\n\n    @sin\n\n"
+        );
+        assert_eq!(
+            ok_out(
+                "f = @(x) x + 1; disp(class(f)); disp(isa(f, 'function_handle')); disp(isa(f, 'double'))"
+            ),
+            "function_handle\n   1\n   0\n"
+        );
+        assert_eq!(ok_out("disp(isa(1, 'function_handle'))"), "   0\n");
+        assert_eq!(ok_out("disp(@(x) x + 1); disp(@sin)"), "@(x)x+1\n@sin\n");
+        // A handle is one function, not an array.
+        let concat =
+            "Nonscalar arrays of function handles are not allowed; use cell arrays instead.";
+        assert_eq!(err_msg("f = @sin; x = [f 1];"), concat);
+        assert_eq!(err_msg("f = @sin; x = [f];"), concat);
+        assert_eq!(
+            err_msg("f = @sin; x = f + 1;"),
+            "This operation is not supported for a value of class 'function_handle'."
+        );
+    }
+
+    /// An error leaving an anonymous function names it by its `func2str`
+    /// text in the trace.
+    #[test]
+    fn the_trace_names_an_anonymous_function_by_its_text() {
+        let e = err("x = 1;\ng = @(n) g(n); g(1)");
+        assert_eq!(
+            (e.line, e.trace()),
+            (Some(2), "  in @(n)g(n)\n".to_string())
+        );
+        let e = err("f = @(x) bad(x); f(1)\nfunction r = bad(x)\nerror('boom');\nend");
+        assert_eq!(e.trace(), "  in bad (line 3)\n  in @(x)bad(x)\n");
+        // Refused before it runs, a call carries no entry.
+        assert!(err("f = @(x) x; f(1, 2)").stack().is_empty());
+    }
+
+    /// A chain of handles, each capturing the one before, is freed without
+    /// recursion. The test thread has Rust's default 2 MB stack, where the
+    /// old recursive drop overflowed long before 100,000 links; on the
+    /// interpreter's 256 MB thread it took about half a million (cycle 06's
+    /// review). Both the explicit `clear` and the drop at the end are
+    /// exercised.
+    #[test]
+    fn a_long_chain_of_captured_handles_is_freed_without_recursion() {
+        let chain = "h = @() 1; for k = 1:100000, h = @() h() + 1; end";
+        assert_eq!(ok_out(&format!("{chain}; clear h; disp(1)")), "     1\n");
+        assert_eq!(ok_out(&format!("{chain}; g = h; disp(2)")), "     2\n");
+    }
+
+    /// The names a body reads, through nesting: each is captured once, a
+    /// parameter binds only inside its own function, and a name bound by an
+    /// inner function is still free outside it. Speed is pinned by the golden
+    /// case `free_names_nested`, whose old cost, 174 s, was past the
+    /// harness's timeout; a unit test runs on a 2 MB thread, too shallow for
+    /// thousands of nested `@()`.
+    #[test]
+    fn free_names_through_nesting() {
+        let names: Vec<String> = (0..2000).map(|i| format!("v{i}")).collect();
+        let src = format!(
+            "{}; f = {}[{} {}]; disp(numel(f()()()()()()()()()()))",
+            names
+                .iter()
+                .map(|n| format!("{n} = 1"))
+                .collect::<Vec<_>>()
+                .join("; "),
+            "@() ".repeat(10),
+            names.join(" "),
+            names.join(" ")
+        );
+        assert_eq!(ok_out(&src), "        4000\n");
+        // `x` is f's parameter, so the outer function does not capture the
+        // script's `x`; the inner one captures f's `x` (10) when f runs.
+        // `y` did not exist when f was made and is no variable of f's frame,
+        // so the inner body looks it up as a function and finds none.
+        assert_eq!(
+            ok_out("x = 1; f = @(x) @() x * 2; g = f(10); disp(g())"),
+            "    20\n"
+        );
+        assert_eq!(
+            err_msg("f = @(x) @() x + y; y = 5; g = f(10); g()"),
+            "Unrecognized function or variable 'y'."
         );
     }
 }

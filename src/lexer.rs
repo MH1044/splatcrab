@@ -57,8 +57,8 @@ pub enum Token {
     /// operator (`.*`, `./`, `.\`, `.^`, `.'`), a number's decimal point and
     /// a `...` continuation are recognised before this is.
     Dot,
-    /// `@`, which cycle 06 gives function handles. Until then it lexes, and
-    /// the parser refuses it.
+    /// `@`, which starts a function handle, `@name` or `@(x) body`
+    /// (cycle 06).
     At,
 
     If,
@@ -431,8 +431,16 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
     };
     // Stack of open delimiters so we know whether the innermost one is `[`.
     // `C` is the brace of a `case {...}` list, which separates its values
-    // the way a bracket separates elements.
+    // the way a bracket separates elements. `P` is the parameter list of an
+    // `@(...)`, and `A` the body of an anonymous function written directly
+    // inside a bracket or a brace (cycle 06): the body is one expression,
+    // so whitespace inside it separates nothing, and it ends at the `,`,
+    // `;`, newline or closer that ends the element it is.
     let mut open: Vec<char> = Vec::new();
+    // The token index of the `)` that closed the last `@(...)` parameter
+    // list: a quote straight after it opens a string, `@() 'hi'`, where
+    // after any other `)` it would be a transpose.
+    let mut params_close: Option<usize> = None;
     // Where the statement being lexed began, as a token index: a name there
     // is where command syntax can start.
     let mut stmt_start = 0;
@@ -449,6 +457,12 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
 
     while i < n {
         let c = chars[i];
+        // What ends an element ends an anonymous function's body inside it.
+        if matches!(c, ',' | ';' | '\n' | ']' | '}' | ')') {
+            while open.last() == Some(&'A') {
+                open.pop();
+            }
+        }
         let in_bracket = matches!(open.last(), Some('[' | 'C'));
         // A statement starts after a separator outside every bracket, and
         // after the keywords that a statement may follow on the same line.
@@ -674,7 +688,8 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
 
         // Transpose or single-quoted string.
         if c == '\'' {
-            if toks.last().is_some_and(ends_value) {
+            let after_params = params_close.is_some_and(|k| k + 1 == toks.len());
+            if toks.last().is_some_and(ends_value) && !after_params {
                 i += 1;
                 toks.push(Token::Transpose, line);
                 continue;
@@ -752,11 +767,20 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
             ('|', _) => (Token::Or, 1),
             ('~', _) => (Token::Not, 1),
             ('(', _) => {
-                open.push('(');
+                open.push(if toks.last() == Some(&Token::At) {
+                    'P'
+                } else {
+                    '('
+                });
                 (Token::LParen, 1)
             }
             (')', _) => {
-                open.pop();
+                if open.pop() == Some('P') {
+                    params_close = Some(toks.len());
+                    if matches!(open.last(), Some('[' | 'C' | '{')) {
+                        open.push('A');
+                    }
+                }
                 (Token::RParen, 1)
             }
             ('[', _) => {
@@ -1911,5 +1935,116 @@ mod tests {
             .unwrap()
             .tokens;
         assert_eq!(&toks[toks.len() - 5..toks.len() - 1], &cmd[..]);
+    }
+
+    // ---- function handles (cycle 06) ---------------------------------
+
+    /// `@(x) x + 1` as the lexer gives it anywhere: no separator inside.
+    fn anon_x_plus_1() -> Vec<Token> {
+        vec![
+            Token::At,
+            Token::LParen,
+            id("x"),
+            Token::RParen,
+            id("x"),
+            Token::Plus,
+            Token::Num(1.0),
+        ]
+    }
+
+    /// Acceptance test 12, the lexer half: inside a brace or a bracket, the
+    /// whitespace of an anonymous function's body separates nothing, and
+    /// the comma after it is the one separator between the two elements.
+    #[test]
+    fn an_anonymous_body_in_braces_or_brackets_is_one_element() {
+        for (src, open, close) in [
+            ("{@(x) x + 1, 2}", Token::LBrace, Token::RBrace),
+            ("[@(x) x + 1, 2]", Token::LBracket, Token::RBracket),
+            ("case {@(x) x + 1, 2}", Token::LBrace, Token::RBrace),
+        ] {
+            let toks = lx(src);
+            let toks = &toks[toks.len() - 12..];
+            let mut want = vec![open];
+            want.extend(anon_x_plus_1());
+            want.extend([Token::Comma, Token::Num(2.0), close, Token::Eof]);
+            assert_eq!(toks, want, "{src}");
+        }
+        // Without spaces around the operator, the same.
+        let mut want = vec![Token::LBracket];
+        want.extend(anon_x_plus_1());
+        want.extend([Token::RBracket, Token::Eof]);
+        assert_eq!(lx("[@(x) x+1]"), want);
+        // A space inside the body separates nothing: `x 1` stays in it,
+        // for the parser to refuse.
+        assert!(!lx("[@(x) x 1]").contains(&Token::Comma));
+        // Inside parentheses within the body, a comma is the call's.
+        assert_eq!(
+            lx("[@(x) f(x, 1) 2]")
+                .iter()
+                .filter(|t| **t == Token::Comma)
+                .count(),
+            1
+        );
+    }
+
+    /// The body ends where its element does, so what follows is lexed by
+    /// the bracket's own rules again.
+    #[test]
+    fn an_anonymous_body_ends_with_its_element() {
+        assert_eq!(
+            lx("[@(x) x; 1 -2]")[6..],
+            [
+                Token::Semi,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Minus,
+                Token::Num(2.0),
+                Token::RBracket,
+                Token::Eof
+            ]
+        );
+        // A newline in a bracket is still a row break after a body.
+        assert_eq!(lx("[@(x) x\n2]")[6], Token::Semi);
+        // A named handle is an element like any other.
+        assert_eq!(
+            lx("[a @f]"),
+            vec![
+                Token::LBracket,
+                id("a"),
+                Token::Comma,
+                Token::At,
+                id("f"),
+                Token::RBracket,
+                Token::Eof
+            ]
+        );
+        // Outside every bracket nothing changes.
+        let mut want = anon_x_plus_1();
+        want.push(Token::Eof);
+        assert_eq!(lx("@(x) x + 1"), want);
+        // A parameter list's own whitespace separates nothing either.
+        assert!(
+            !lx("[@(a, b) a]")
+                .windows(2)
+                .any(|w| w == [Token::Comma, Token::Comma])
+        );
+    }
+
+    /// After a parameter list's `)`, a quote opens a string; after any
+    /// other `)` it is still a transpose.
+    #[test]
+    fn a_quote_after_a_parameter_list_is_a_string() {
+        assert_eq!(
+            lx("@() 'hi'"),
+            vec![
+                Token::At,
+                Token::LParen,
+                Token::RParen,
+                st("hi"),
+                Token::Eof
+            ]
+        );
+        assert_eq!(lx("(x)'")[3], Token::Transpose);
+        assert_eq!(lx("@(x) (x)'")[7], Token::Transpose);
     }
 }

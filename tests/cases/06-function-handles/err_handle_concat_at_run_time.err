@@ -1,0 +1,1 @@
+Error: Line 7: Nonscalar arrays of function handles are not allowed; use cell arrays instead.

@@ -1,0 +1,3 @@
+% covers: 7 - (Scope, workspace) the protocol's workspace lists a handle with class function_handle and size [1,1], in U0's vars shape, sorted by name
+{"id":1,"op":"eval","code":"f = @(x) x + 1; a = 2;"}
+{"id":2,"op":"workspace"}

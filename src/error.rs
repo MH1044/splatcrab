@@ -240,6 +240,14 @@ pub fn unterminated_matrix() -> MError {
     MError::new("unterminated matrix literal: missing ']'")
 }
 
+/// A function handle as an element of a bracket, `[@(x) x+1]` in the source
+/// or `[f 1]` at run time (cycle 06): a handle is one function, never an
+/// array of them. The wording is MATLAB's as recalled, for concatenating
+/// handles, not confirmed against a MathWorks source.
+pub fn handle_concatenation() -> MError {
+    MError::new("Nonscalar arrays of function handles are not allowed; use cell arrays instead.")
+}
+
 /// An expression or a block nested past [`crate::parser::MAX_DEPTH`].
 ///
 /// The parser and the evaluator raise the same message from the same limit:
@@ -545,6 +553,34 @@ pub fn too_many_args() -> MError {
 
 pub fn arg_not_a_scalar(pos: usize, name: &str) -> MError {
     MError::new(format!("Argument {} to '{}' must be a scalar.", pos, name))
+}
+
+/// `func2str(5)` or `arrayfun(5, v)`: an argument that must be a function
+/// handle (cycle 06). SplatCrab's wording, in the form of
+/// [`arg_not_a_string`].
+pub fn arg_not_a_handle(pos: usize, name: &str) -> MError {
+    MError::new(format!(
+        "Argument {} to '{}' must be a function handle.",
+        pos, name
+    ))
+}
+
+/// `arrayfun(f, A, B)` with `A` and `B` of different sizes (cycle 06).
+/// MATLAB's first sentence as recalled, not confirmed against a MathWorks
+/// source.
+pub fn arrayfun_size() -> MError {
+    MError::new("All of the input arguments must be of the same size and shape.")
+}
+
+/// A call inside `arrayfun` that returned something other than a scalar,
+/// which a uniform output cannot hold (cycle 06). `index` is the element,
+/// `output` the output, both one-based. MATLAB's two sentences as recalled,
+/// on one line, not confirmed against a MathWorks source.
+pub fn arrayfun_nonscalar(index: usize, output: usize) -> MError {
+    MError::new(format!(
+        "Non-scalar in Uniform output, at index {}, output {}. Set 'UniformOutput' to false.",
+        index, output
+    ))
 }
 
 pub fn arg_not_a_string(pos: usize, name: &str) -> MError {

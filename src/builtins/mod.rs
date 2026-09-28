@@ -88,8 +88,9 @@ mod tests {
     /// `isnumeric`, `isa`, `logical`, `char` and `double`. Cycle 04 added
     /// five: `rethrow`, `lasterr`, `warning`, `assert` and `isequal`. Cycle
     /// 05 added six: `nargin`, `nargout`, `exist`, `feval`, `addpath` and
-    /// `rmpath`.
-    const EXPECTED: usize = 99;
+    /// `rmpath`. Cycle 06 added three: `arrayfun`, `func2str` and
+    /// `str2func`.
+    const EXPECTED: usize = 102;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -197,6 +198,9 @@ mod tests {
             "feval",
             "addpath",
             "rmpath",
+            "arrayfun",
+            "func2str",
+            "str2func",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

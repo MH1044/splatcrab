@@ -26,8 +26,9 @@ x =
 SplatCrab is early software (version 0.1.0). The core language works:
 matrices, the double, logical and char classes, indexing, control flow with
 `switch` and `try`/`catch`, command syntax, user functions in scripts and in
-function files on a path, formatted output and 99 builtins. Function handles,
-cells, structs, complex numbers and plotting are not there yet. See
+function files on a path, function handles and anonymous functions,
+formatted output and 102 builtins. Cells, structs, complex numbers and
+plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -209,6 +210,13 @@ z
   then a builtin, so a file shadows a builtin of its name. `addpath`,
   `rmpath`, `exist` and `feval`. An error that leaves a function prints an
   `  in <fn> (line N)` trace after its message
+- Function handles: `@name`, bound to the function it names where it is
+  made, and anonymous functions `@(x) body`, which capture the variables
+  their body reads when they are made and run in a workspace of their own.
+  A body that is a single call passes `nargout` on, so `[m, i] = f(v)`
+  works for `f = @(v) max(v)`. `feval` of a handle, `arrayfun` with
+  uniform output, `func2str`, `str2func`, and `class` and `isa` with
+  `'function_handle'`
 - Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts
@@ -217,8 +225,9 @@ z
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
   means
-- 99 builtins in a registry, from `zeros` and `linspace` through `sum` and
-  `cumsum` to `fprintf`, `sprintf`, `class`, `feval` and `tic`/`toc`. Each is an ordinary
+- 102 builtins in a registry, from `zeros` and `linspace` through `sum` and
+  `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun` and
+  `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
   `min`, `sort`, `size` and `find` answer with more than one value when asked
 - The argument forms MATLAB code uses: size vectors such as
@@ -268,7 +277,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-Function handles, cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+Cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -279,7 +288,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 99 builtins,
+                                         builtins/    the 102 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

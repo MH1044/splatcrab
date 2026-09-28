@@ -6,9 +6,12 @@
 //! so `length('😀')` is `2`.
 
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use crate::bail;
 use crate::error::{self, R};
+use crate::interp::Unit;
+use crate::parser::{AnonFn, Function};
 
 /// The class of an array. Storage is the same for all three; the tag decides
 /// how the array displays, what `class` says, and how an operation classes
@@ -55,17 +58,110 @@ pub enum Value {
     /// `e.stack` waits for cycle 07, which has structs. It is a value of its own, not an array,
     /// so every array operation refuses it with [`error::not_an_array`].
     Exception(error::MError),
+    /// A function handle (cycle 06), shared: reading the variable that
+    /// holds one copies a pointer, not its captured workspace.
+    Func(Rc<Func>),
 }
 
 /// The class name an `MException` reports.
 pub const EXCEPTION_CLASS: &str = "MException";
+
+/// The class name a function handle reports.
+pub const FUNC_CLASS: &str = "function_handle";
+
+/// A function handle: what `@name` and `@(x) body` evaluate to (cycle 06).
+///
+/// Like an `MException` it is one object and not an array, so every array
+/// operation refuses it through [`Value::mat`]; calling it is the one thing
+/// it offers.
+#[derive(Debug)]
+pub enum Func {
+    /// `@name`. `local` is the local function the name resolved to where the
+    /// handle was made, by invariant 4's order (the running file's local
+    /// functions, then the script's), with the file it belongs to: such a
+    /// handle keeps calling that function wherever it is called from. With
+    /// no local function of the name, it is resolved when called, against
+    /// the path and then the builtins, never against the local functions
+    /// of wherever it has been passed to.
+    Named {
+        name: String,
+        local: Option<(Rc<Unit>, Rc<Function>)>,
+    },
+    /// `@(params) body`: the definition, the variables it captured when it
+    /// was made (a snapshot of each name the body reads that was a variable
+    /// then), and the file it was made in, whose local functions its body
+    /// calls first.
+    Anon {
+        def: Rc<AnonFn>,
+        captured: Vec<(String, Value)>,
+        unit: Rc<Unit>,
+    },
+}
+
+/// Frees a chain of handles with a worklist rather than by recursion.
+///
+/// An anonymous function holds the variables it captured, and one of them
+/// can be a handle holding its own captures, and so on: `for k = 1:500000,
+/// h = @() h() + 1; end` builds a chain half a million deep, and the default
+/// drop freed it one stack frame per link and overflowed the stack (exit 134,
+/// cycle 06's review). Here each captured handle this is the last owner of
+/// is taken out of its slot and freed from the worklist, with its own
+/// captured handles taken out first, so no drop ever recurses more than
+/// one level. A value kind that later holds handles, a cell array in cycle
+/// 07, must hand them to the same worklist.
+impl Drop for Func {
+    fn drop(&mut self) {
+        let mut pending = Vec::new();
+        take_handles(self, &mut pending);
+        while let Some(rc) = pending.pop() {
+            if let Ok(mut inner) = Rc::try_unwrap(rc) {
+                take_handles(&mut inner, &mut pending);
+                // `inner` now holds no handles, so dropping it here does not
+                // recurse.
+            }
+        }
+    }
+}
+
+/// Moves every handle `f` captured onto `pending`, leaving an empty matrix in
+/// its place.
+fn take_handles(f: &mut Func, pending: &mut Vec<Rc<Func>>) {
+    if let Func::Anon { captured, .. } = f {
+        for (_, v) in captured.iter_mut() {
+            if matches!(v, Value::Func(_)) {
+                if let Value::Func(rc) = std::mem::replace(v, Value::Mat(Matrix::empty())) {
+                    pending.push(rc);
+                }
+            }
+        }
+    }
+}
+
+impl Func {
+    /// What `func2str` returns: the name of a named handle, and the
+    /// rendered text of an anonymous one, `@(x)x+1`.
+    pub fn text(&self) -> String {
+        match self {
+            Func::Named { name, .. } => name.clone(),
+            Func::Anon { def, .. } => def.text(),
+        }
+    }
+
+    /// The handle as its display shows it: `@sin`, or `@(x)x+1`.
+    pub fn shown(&self) -> String {
+        match self {
+            Func::Named { name, .. } => format!("@{}", name),
+            Func::Anon { def, .. } => def.text(),
+        }
+    }
+}
 
 impl Value {
     /// The matrix this value is, or the refusal for a value that is not one.
     pub fn into_mat(self) -> R<Matrix> {
         match self {
             Value::Mat(m) => Ok(m),
-            Value::Exception(_) => Err(error::not_an_array(EXCEPTION_CLASS)),
+            v => Err(error::not_an_array(v.class_name())),
         }
     }
 
@@ -73,7 +169,7 @@ impl Value {
     pub fn mat(&self) -> R<&Matrix> {
         match self {
             Value::Mat(m) => Ok(m),
-            Value::Exception(_) => Err(error::not_an_array(EXCEPTION_CLASS)),
+            v => Err(error::not_an_array(v.class_name())),
         }
     }
 
@@ -99,14 +195,16 @@ impl Value {
         match self {
             Value::Mat(m) => m.class.name(),
             Value::Exception(_) => EXCEPTION_CLASS,
+            Value::Func(_) => FUNC_CLASS,
         }
     }
 
-    /// Rows and columns; an `MException` is one object, 1x1.
+    /// Rows and columns; an `MException` and a function handle are each
+    /// one object, 1x1.
     pub fn dims(&self) -> (usize, usize) {
         match self {
             Value::Mat(m) => (m.rows, m.cols),
-            Value::Exception(_) => (1, 1),
+            Value::Exception(_) | Value::Func(_) => (1, 1),
         }
     }
 
@@ -120,19 +218,27 @@ impl Value {
     /// An `MException` shows SplatCrab's own one-line form rather than
     /// MATLAB's property listing: `  MException: boom`, or
     /// `  MException (a:b): boom` when it has an identifier.
+    ///
+    /// A function handle shows MATLAB's header and then the handle,
+    /// indented four: `  function_handle with value:`, a blank line,
+    /// `    @(x)x+1` (cycle 06).
     pub fn display_body(&self) -> String {
         match self {
             Value::Mat(m) => m.display_body(),
             Value::Exception(e) => exception_line(e),
+            Value::Func(f) => format!("  {} with value:\n\n    {}\n", FUNC_CLASS, f.shown()),
         }
     }
 
-    /// What `disp` prints: a matrix's [`Matrix::disp_text`], and for an
-    /// `MException` the same line its named display shows.
+    /// What `disp` prints: a matrix's [`Matrix::disp_text`], for an
+    /// `MException` the same line its named display shows, and for a
+    /// function handle the handle as its display shows it, unindented:
+    /// `@(x)x+1`, which is its `func2str` text, and `@sin`.
     pub fn disp_text(&self) -> String {
         match self {
             Value::Mat(m) => m.disp_text(),
             Value::Exception(e) => exception_line(e),
+            Value::Func(f) => format!("{}\n", f.shown()),
         }
     }
 }

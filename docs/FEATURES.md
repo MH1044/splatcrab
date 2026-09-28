@@ -27,7 +27,8 @@ What SplatCrab does today, with the golden case that proves each area works.
 | An infinite range *step* follows the documented count | 01e | `range_infinite_step` | `1:Inf:5` is the 1x1 `1`: `fix((k-j)/i)` is `fix(4/Inf)`, which is `0`, and a count of `0` is one element. It used to be a 1x0. A range that runs against its step is still empty, `5:Inf:1` included |
 | Chained ranges `1:2:3:4` | 01e | `err_chained_range` | Reads as `(1:2:3):4`, as MATLAB reads it; `parse_range` took at most two colons and did not loop, so it was a parse error. Both spellings then meet the same refusal, since a colon start that is not a scalar is an error here (Known bugs) |
 | A leading UTF-8 byte-order mark is skipped | 01e | `bom_is_skipped` | The three bytes `EF BB BF` a Windows editor writes are an encoding marker, not source. A file that is not valid UTF-8 is now decoded leniently rather than refused, so a Windows-1252 comment runs; UTF-16 is still unread (Known bugs) |
-| The tokens `{ }`, the field `.` and `@` | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `c{1}`, `s.a` and `s.(n)` lex and parse, alone or chained (`c{1}(2).b`), without disturbing `1.5`, `.5`, `x.^2`, `x.*y`, `x./y`, `x.\y`, `x.'` or a `...` continuation. Inside brackets a brace or an `@` after a space starts an element. A bare `@` is `unexpected '@' in expression` until cycle 06's function handles, and a `{` opening a value is a parse error until cycle 07's cells |
+| The tokens `{ }`, the field `.` and `@` | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `c{1}`, `s.a` and `s.(n)` lex and parse, alone or chained (`c{1}(2).b`), without disturbing `1.5`, `.5`, `x.^2`, `x.*y`, `x./y`, `x.\y`, `x.'` or a `...` continuation. Inside brackets a brace or an `@` after a space starts an element. An `@` that starts no handle is `unexpected '@' in expression`, and a `{` opening a value is a parse error until cycle 07's cells |
+| An anonymous function's body inside `[]` or `{}` is one element | 06 | `err_handle_in_brackets` | The whitespace rule does not split the body: in `{@(x) x + 1, 2}` the body is `x + 1` and ends at the comma, as it would at a `;`, a newline or the closer. A quote straight after the parameter list opens a string, `@() 'hi'`. A handle cannot be an element of a bracket, so `[@(x) x+1]` is `Nonscalar arrays of function handles are not allowed; use cell arrays instead.`, as a parse error |
 | Nesting is bounded, not unbounded | 01e | `err_nesting_parens`, `err_nesting_brackets`, `err_nesting_calls`, `err_nesting_flat_sum` | 10,000 levels of parentheses, brackets, calls, indexes, blocks or chained operators. Past that, a clean error from the parser and the identical one from the evaluator; about 96,000 levels used to abort the process with exit 134 (QA D4) |
 
 ## Operators
@@ -106,10 +107,16 @@ Cases in `05-functions-and-scoping/`.
 | `addpath` and `rmpath` | 05 | `addpath_shadow`, `addpath_after_lookup`, `err_path_folder_warnings` | `addpath` puts folders at the front of the path, `rmpath` takes them off, both relative to `Interp::cwd`. A folder that does not exist, or is not on the path, is a warning. Each bumps the file cache's generation, so a lookup cached before is never used after |
 | `exist` and `feval` | 05 | `exist_kinds`, `exist_path_file`, `feval_local_function` | `exist` is `1` for a variable, `2` for a file on the path, `5` for a builtin, `0` otherwise. `feval('name', ...)` calls a function by name, variables excepted |
 | Definitions refused at the REPL, the protocol and the page | 05 | `err_repl_function_refused`, `err_repl_function_body_not_run`, `err_eval_function_refused`, `complete_function_block`, `err_eval_error_line_outermost` | `Function definitions are not supported in this context.` `syntax::is_complete` counts `function ... end` as a block, so the whole definition is read first and none of it runs. A protocol error inside a function keeps `line` the submitted code's own |
+| `@name` handles, bound where they are made | 06 | `named_handles`, `handle_local_from_path_file`, `handle_to_subfunction_returned`, `handle_passed_to_function` | `g = @sin; g(0)`. The name resolves when the handle is made, by invariant 4's order from there: a handle to a local function or a subfunction keeps calling it wherever it is called from. A name with no local function is looked up on the path and among the builtins when called |
+| Anonymous functions `@(x) body` | 06 | `anonymous_call`, `capture_at_creation`, `nested_anonymous`, `err_capture_before_exists`, `err_handle_too_many_inputs` | Capture happens when the function is made: every name the body reads that is a variable then is snapshotted with its value; any other name is a function when the body runs. The call runs in a workspace of its own holding the parameters and the captures, with its own `end`, and counts against the recursion limit. One argument too many is `Too many input arguments.` |
+| Calling a handle variable | 06 | `anonymous_call`, `handle_statement_ans`, `nargout_through_handle` | `f(args)`, `z()` with none; as a statement a value becomes `ans`. A body that is a single call is asked for the caller's `nargout`, so `f = @(v) max(v); [m, i] = f(v)` works and `@() disp(1)` is legal as a statement |
+| Recursion through a handle is bounded | 06 | `err_handle_recursion_limit`, `err_feval_handle_recursion_limit`, `err_arrayfun_recursion_limit`, `err_anonymous_self_application`, `err_anonymous_feval_self_application`, `err_anonymous_arrayfun_self_application` | The same `Maximum recursion limit of 500 reached.` as a direct call. `feval` and `arrayfun` call back through `Interp::call_nested`, which counts each call against the shared nesting budget |
+| A handle's display, `class` and `isa` | 06 | `handle_display`, `handle_class_isa`, `workspace_lists_handle` | `f = @(x) x + 1` shows `f =`, `  function_handle with value:` and `    @(x)x+1`; `disp(f)` prints `@(x)x+1`, and `disp(@sin)` prints `@sin`. `class` is `function_handle`, `isa(f, 'function_handle')` is a logical `1`, `who` and the protocol's `workspace` list it as `1x1 function_handle`. A handle is one function, not an array: `[@(x) x+1]` is a parse error (`err_handle_in_brackets`) and `[f 1]` a run-time one (`err_handle_concat_at_run_time`) |
+| `feval arrayfun func2str str2func` | 06 | `feval_handle_and_name`, `arrayfun_uniform`, `err_arrayfun_size_mismatch`, `err_arrayfun_nonscalar_result`, `err_arrayfun_not_a_handle`, `func2str_str2func`, `func2str_brackets_round_trip`, `err_func2str_not_a_handle` | `feval` takes a handle or a name. `arrayfun` calls a handle on each element of one or more equal-size arrays and collects scalar results in their shape; `'UniformOutput', false` is cycle 07's. `func2str` renders from the parse tree, with no spaces around operators and a comma between bracket elements, so `@(x) [x 1]` reads `@(x)[x,1]`. `str2func` takes a name or an `'@(...) ...'` text and captures nothing |
 
 ## Builtins
 
-99 names, each an ordinary function in `src/builtins/` registered by name in
+102 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -117,7 +124,9 @@ cases in `01-registry-and-builtins`. Cycle 01 counted 81. Cycle 02 added the
 eight class builtins, and cycle 04 five: `rethrow`, `lasterr`, `warning`,
 `assert` and `isequal`, each exercised by the `04-switch-try-commands` cases.
 Cycle 05 added six, `nargin`, `nargout`, `exist`, `feval`, `addpath` and
-`rmpath`, exercised by the `05-functions-and-scoping` cases. Cycle 01c removed `e`, which
+`rmpath`, exercised by the `05-functions-and-scoping` cases. Cycle 06 added three,
+`arrayfun`, `func2str` and `str2func`, exercised by the `06-function-handles`
+cases. Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -141,6 +150,7 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04 |
 | Timing | `tic toc` | 01 | `core.rs` |
 | Functions and the path | `nargin nargout exist feval addpath rmpath` | 05 | `core.rs` |
+| Function handles | `arrayfun func2str str2func` | 06 | `core.rs`; `feval` of a handle, `class` and `isa` of one since 06 |
 
 Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
 a dimension past the array's returns the input unchanged and `0` is an error.
