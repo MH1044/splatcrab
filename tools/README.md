@@ -4,32 +4,21 @@ Two optional development scripts. Neither is part of the build, neither is a
 crate, and nothing in CI depends on them. They need Python 3; the interpreter
 itself needs only Rust.
 
-## `verify_handbook.py`
+## The handbook verifier moved to `tests/handbook.rs`
 
-Extracts every example from `docs/HANDBOOK.md`, runs it through
-`target/debug/splatcrab`, and diffs the result against the output block printed
-beside it.
+`verify_handbook.py` used to live here. It is now the integration test
+`tests/handbook.rs`, with the same extraction rules, so `cargo test` runs it
+and CI enforces it on both platforms: the handbook can no longer rot between
+cycles because nobody remembered to run a script.
 
 ```
-cargo build
-python tools/verify_handbook.py
+cargo test --test handbook
 ```
 
-It reports `MATCH` and `MISMATCH` counts and prints a diff for each mismatch.
-**Run it after any cycle that changes behaviour the handbook documents.** That
-is what the handbook item in the Definition of Done is asking for, and it is
-how cycles 01d and 01e each caught the passages they had invalidated within
-seconds of landing.
-
-The output blocks it compares against are the real bytes the binary produced,
-not output written from MATLAB knowledge. That distinction matters: on this
-project, output written from recall rather than run has been wrong roughly one
-time in fifteen.
-
-**Worth doing when someone has the time:** rewrite this as a Rust integration
-test, `tests/handbook.rs`, using the same extraction logic. It needs no crate,
-it would run in CI on both platforms, and the handbook could then never rot
-between cycles. As a Python script it only runs when somebody remembers.
+A failure prints the handbook line, the script, the handbook's output and the
+binary's. The output blocks are the real bytes the binary produced, never
+output written from MATLAB knowledge: on this project, output written from
+recall rather than run has been wrong roughly one time in fifteen.
 
 ## `build_handbook.py`
 

@@ -8,6 +8,7 @@ the pieces that are awkward to reach from a script.
     cargo test                       # everything
     cargo test --lib                 # unit tests only
     cargo test --test golden         # golden cases only
+    cargo test --test handbook       # every docs/HANDBOOK.md example
 
     GOLDEN_FILTER=03-indexing cargo test --test golden     # one module
     UPDATE_GOLDEN=1 GOLDEN_FILTER=03-indexing cargo test --test golden
