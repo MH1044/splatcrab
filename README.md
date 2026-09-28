@@ -231,19 +231,9 @@ crate takes no dependencies.
 
 ## Licence
 
-Licensed under either of
+MIT. See [LICENSE](LICENSE).
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in SplatCrab by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.
+Contributions are accepted under the same licence.
 
 MATLAB is a registered trademark of The MathWorks, Inc. SplatCrab is an
 independent project and is not affiliated with or endorsed by The MathWorks.
