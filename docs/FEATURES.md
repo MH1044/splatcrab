@@ -21,6 +21,10 @@ What SplatCrab does today, with the golden case that proves each area works.
 | A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_size` |
 | A range lands exactly on its end point | 01d | `range_hits_end_point` | `x = 0:0.1:0.3; x(end) == 0.3` is `1`, and `-1:0.01:1` is symmetric: the upper half is computed from the right-hand end point, not by repeated addition |
 | An infinite range end point is refused | 01d | `err_range_end_inf`, `err_range_start_neg_inf` | `0:Inf` and `-Inf:1:0` report `1xInf` rather than quietly giving a 1x0. `1:NaN` is still an empty, and still in Known bugs |
+| An infinite range *step* follows the documented count | 01e | `range_infinite_step` | `1:Inf:5` is the 1x1 `1`: `fix((k-j)/i)` is `fix(4/Inf)`, which is `0`, and a count of `0` is one element. It used to be a 1x0. A range that runs against its step is still empty, `5:Inf:1` included |
+| Chained ranges `1:2:3:4` | 01e | `err_chained_range` | Reads as `(1:2:3):4`, as MATLAB reads it; `parse_range` took at most two colons and did not loop, so it was a parse error. Both spellings then meet the same refusal, since a colon start that is not a scalar is an error here (Known bugs) |
+| A leading UTF-8 byte-order mark is skipped | 01e | `bom_is_skipped` | The three bytes `EF BB BF` a Windows editor writes are an encoding marker, not source. A file that is not valid UTF-8 is now decoded leniently rather than refused, so a Windows-1252 comment runs; UTF-16 is still unread (Known bugs) |
+| Nesting is bounded, not unbounded | 01e | `err_nesting_parens`, `err_nesting_brackets`, `err_nesting_calls`, `err_nesting_flat_sum` | 10,000 levels of parentheses, brackets, calls, indexes, blocks or chained operators. Past that, a clean error from the parser and the identical one from the evaluator; about 96,000 levels used to abort the process with exit 134 (QA D4) |
 
 ## Operators
 
@@ -35,6 +39,8 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `== ~= < <= > >=` | 00 | `logical_ops` | Results are 0/1 doubles until cycle 02 |
 | `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | |
 | `~` negation | 00 | `logical_ops` | |
+| `&&` and `\|\|` need a logical scalar | 01e | `err_and_non_scalar`, `err_or_empty` | `[1 1] && 1` gave `1` and `[] \|\| 1` gave `1`; MATLAB errors, because the operators need one value to branch on. Short-circuiting is unchanged, so `0 && [1 1]` is still `0` and never looks at the right-hand side |
+| A `NaN` cannot become a logical | 01e | `err_if_nan`, `err_and_nan`, `err_not_nan` | `if NaN` was taken as true, `NaN & 1` was `1` and `~NaN` was `0`. MATLAB and Octave both refuse: `NaN's cannot be converted to logicals.` The same conversion serves `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` |
 | Scalar and row/column broadcasting | 00 | `builtins_sample` | |
 | A result too big to allocate is a clean error | 01d | `err_zip_result_size`, `err_matmul_result_size`, `err_matmul_size_wraps`, `err_index_result_size` | Broadcasting, `*`, a two-subscript read and a reduction all size their result from their operands, and all judge it before allocating. `ones(1e5,1) + ones(1,1e5)` used to abort the process, exit 134 |
 | `*` keeps `Inf` and `NaN` through a zero factor | 01d | `matmul_keeps_inf_and_nan` | `[Inf 0] * [0; 1]` is `NaN`, as in MATLAB. A sparsity shortcut used to skip the multiply and give `0` |
@@ -50,6 +56,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `end` anywhere in an index | 00 | `indexing` | Including arithmetic such as `end-1` |
 | Indexed assignment with growth | 00 | `growth` | Vector and two-dimensional |
 | String indexing | 00 | `strings` | Returns a string. A char **variable** only: `'abc'(2)` is a parse error, as indexing any literal is |
+| `s(:)` of a char is a column | 01e | `empty_result_shapes` | `size(s(:))` is `3 1`, not `1 3`. A `Value::Str` is a row of characters with nowhere to record another shape, so the column comes back as character codes until cycle 02's `Char` class can carry a shape (QA D17) |
 | Logical indexing | 03 | | Planned |
 | Deletion `x(i) = []` | 03 | `err_delete_unsupported` | Currently an error |
 
@@ -62,6 +69,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `for` over matrix columns | 00 | `control_flow` | |
 | `while` | 00 | `control_flow` | |
 | `break` and `continue` | 00 | `control_flow` | |
+| `break` or `continue` outside a loop is an error | 01e | `err_break_outside_loop`, `err_continue_outside_loop` | It used to unwind out of the whole script, so the statements after it never ran and the process still exited 0 (QA D8). Raised when the statement runs, not when it parses, so the output before it is still printed |
 | A `for` that does not run still assigns its variable | 01d | `for_zero_iterations_assigns_empty` | After `k = 7; for k = []; end`, `k` is the empty; a name that did not exist comes into existence. The exact empty shape MATLAB gives is unsettled, so no case asserts it |
 
 ## Builtins
@@ -110,7 +118,7 @@ takes are in [Builtin arguments](#builtin-arguments).
 | A size that would overflow is a clean error | 01 | `err_huge_size_*` | `zeros(1e10)` used to abort the process |
 | `NaN(n)` and `Inf(r,c)` fill a matrix | 01 | `nan_inf_constructors` | `true(n)` and `false(n)` too, since 01c |
 | `tic`, `toc` and `toc(t)` | 01 | `tic_toc_value`, `tic_toc_handle` | `t = tic` returns a handle; bare `toc` prints the elapsed time |
-| A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread. This holds below about 96,000 levels; deeper still aborts (Known bugs, cycle 01e) |
+| A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread, and since 01e the parser and the evaluator refuse anything past 10,000 levels, so the stack is never reached at all |
 
 ### Builtin arguments
 
@@ -148,7 +156,11 @@ implements the ones MATLAB code actually uses. Cases are in
 |---|---|---|---|
 | Integer, fixed and scientific display | 00 | `display_formats` | Column widths differ from MATLAB above 1000 |
 | `Inf`, `-Inf`, `NaN` | 00 | `display_formats` | |
-| Empty display | 00 | `display_formats` | Prints `[]`; MATLAB prints a typed header |
+| A non-finite element keeps the integer columns | 01e | `disp_nonfinite_keeps_integers` | `disp([1 2 NaN])` is `     1     2   NaN`; it used to force the whole row to four decimals. A non-finite value has no digits, so it neither changes the format nor widens the column: `[NaN Inf -Inf 1]` is four six-wide columns |
+| A wide matrix wraps into column blocks | 01e | `wide_matrix_wraps` | 80 characters, whether the output is a terminal or a pipe, giving 8 fixed-point columns or 13 integer ones per block under a `Columns N through M` heading. `linspace(1, 2)` printed about 1300 characters on one line |
+| Empty display | 00 | `display_formats` | `x = []` prints `[]`; MATLAB prints a typed header |
+| `disp([])` prints nothing | 01e | `empty_result_shapes` | It used to print `     []`. `disp('')` is still a line with nothing on it |
+| Empty results have MATLAB's shapes | 01e | `empty_result_shapes` | `find([])` and `diag([])` are `0x0`, not `0x1`; `size('')` is `0 0`, not `1 0`, and `num2str([])` follows it. A shape with an orientation to keep still keeps it: `find([0 0])` is `1x0` |
 | `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %e %g %c %s`, flags, width, precision |
 | Format cycling over all elements | 00 | `fprintf_vector` | |
 | The `+` and space flags, and precision on integers | 01 | `printf_plus_space_and_int_precision` | `%+d`, `% d`, `%.3d` |
@@ -161,7 +173,12 @@ implements the ones MATLAB code actually uses. Cases are in
 | MATLAB-style error messages | 00 | the seven `err_*` cases | Every message text is defined in `src/error.rs` and nowhere else |
 | `Error: Line N: <msg>` in script mode | 01b | `err_line_runtime`, `err_line_parse` | Runtime, parse and lex errors alike; stdout is still flushed first |
 | An error in a block body names the body's line | 01b | `err_line_in_for_body` | `MError::at` keeps the innermost line |
-| The REPL reports errors without a line, and survives them | 01b | `repl_error_has_no_line` | One line per entry, so a number would be noise. The only `.repl` case: it drives the prompt, not a script |
+| An error in an `elseif` condition names the `elseif` | 01e | `err_elseif_line` | It reported the `if`'s line, since the whole statement carried one line (QA D27). Each arm now carries its condition's own line |
+| A parse error names the token as it is written | 01e | `err_parse_token_semi`, `err_parse_token_ident`, `err_parse_token_number` | `y = x + ;` reports `unexpected ';' in expression`, not `unexpected Semi`. `Token` has a `Display` form that every parse message uses: a quoted spelling for everything with one, and `end of line` / `end of input` for the two without |
+| The message text follows MATLAB R2020a | 01e | `err_undefined_wording` | `Unrecognized function or variable 'x'.`, the wording of R2020a and later; it used to be `Undefined ...`. See the policy in `docs/modules/01e-display-and-parser.md`, including the two messages deliberately kept because they say more than MATLAB's |
+| The REPL reports errors without a line, and survives them | 01b | `repl_error_has_no_line` | One line per entry, so a number would be noise |
+| REPL diagnostics go to stderr | 01e | `repl_error_to_stderr` | Script mode already did, so a piped session can now separate diagnostics from output too |
+| An unterminated block at end of input is reported | 01e | `err_repl_unterminated_block` | Piping `for k = 1:3` and `disp(k)` with no `end` printed nothing and exited 0 (QA D36); it now exits 1 and says why |
 
 ## Tooling
 

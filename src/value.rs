@@ -21,9 +21,15 @@ pub enum Value {
 
 impl Value {
     /// Strings become row vectors of character codes when used numerically.
+    ///
+    /// The empty string is the exception: `''` is `0x0` in MATLAB, not the
+    /// `1x0` a row of no elements would be, so `size('')` is `0 0`. Every
+    /// shape query goes through here, which is why the fix lives here and not
+    /// in `size`.
     pub fn into_mat(self) -> Matrix {
         match self {
             Value::Mat(m) => m,
+            Value::Str(s) if s.is_empty() => Matrix::empty(),
             Value::Str(s) => Matrix::row(s.chars().map(|c| c as u32 as f64).collect()),
         }
     }
@@ -118,9 +124,40 @@ impl Matrix {
         }
     }
 
-    /// MATLAB truthiness: non-empty and every element non-zero.
-    pub fn is_true(&self) -> bool {
-        !self.data.is_empty() && self.data.iter().all(|v| *v != 0.0)
+    /// MATLAB truthiness for `if` and `while`: non-empty and every element
+    /// non-zero. `if []` is false, and takes no error with it.
+    ///
+    /// A `NaN` is neither: MATLAB and Octave both refuse to convert one, and
+    /// taking it as true (which `!= 0.0` does) is silent and wrong (QA D5).
+    /// That is the only way this fails, so an empty stays false rather than
+    /// becoming an error.
+    pub fn truth(&self) -> R<bool> {
+        if self.data.iter().any(|v| v.is_nan()) {
+            bail!(error::nan_to_logical());
+        }
+        Ok(!self.data.is_empty() && self.data.iter().all(|v| *v != 0.0))
+    }
+
+    /// The single value `&&` and `||` branch on.
+    ///
+    /// Stricter than [`truth`](Matrix::truth): those operators need one
+    /// logical value, so an array or an empty is an error rather than "all
+    /// non-zero". `[1 1] && 1` used to be `1` and `[] || 1` used to be `1`.
+    pub fn logical_scalar(&self) -> R<bool> {
+        match self.scalar_value() {
+            Some(v) if v.is_nan() => bail!(error::nan_to_logical()),
+            Some(v) => Ok(v != 0.0),
+            None => bail!(error::logical_scalar_operand()),
+        }
+    }
+
+    /// One element as a logical, for `&`, `|` and `~`, which convert element
+    /// by element and so refuse a `NaN` the same way.
+    pub fn logical_element(v: f64) -> R<bool> {
+        if v.is_nan() {
+            bail!(error::nan_to_logical());
+        }
+        Ok(v != 0.0)
     }
 
     pub fn map(&self, f: impl Fn(f64) -> f64) -> Matrix {
@@ -129,6 +166,17 @@ impl Matrix {
             self.cols,
             self.data.iter().map(|v| f(*v)).collect(),
         )
+    }
+
+    /// [`map`](Matrix::map) for an operation that may refuse an element, which
+    /// is what `~` needs now that a `NaN` cannot become a logical. The shape
+    /// comes from the operand, so there is nothing new to size-check.
+    pub fn try_map(&self, f: impl Fn(f64) -> R<f64>) -> R<Matrix> {
+        let mut data = Vec::with_capacity(self.numel());
+        for v in &self.data {
+            data.push(f(*v)?);
+        }
+        Ok(Matrix::new(self.rows, self.cols, data))
     }
 
     /// Element-wise combination with scalar / row / column broadcasting.
@@ -347,51 +395,127 @@ impl Matrix {
         Ok(det)
     }
 
+    /// One rendered cell per element, column-major like `data`, and the column
+    /// width they are all padded to.
+    ///
+    /// A `NaN` or an `Inf` no longer forces the whole matrix onto the
+    /// four-decimal path. MATLAB keeps the integer column format for
+    /// `[1 2 NaN]` and prints `     1     2   NaN`; a non-finite value is not
+    /// a reason to stop using integer columns, it simply has no digits of its
+    /// own.
+    ///
+    /// Having no digits is also why it does not widen the column: the width
+    /// is the widest *number* plus three, so `[NaN Inf -Inf 1]` is four
+    /// six-wide columns, `   NaN   Inf  -Inf     1`, and `-Inf` fits in six
+    /// without asking for a seventh. A matrix of nothing but non-finite
+    /// values falls back to one digit, which is what makes `disp(NaN)` the
+    /// `   NaN` MATLAB prints.
+    fn cells(&self) -> (Vec<String>, usize) {
+        let all_int = self
+            .data
+            .iter()
+            .all(|v| !v.is_finite() || (v.fract() == 0.0 && v.abs() < 1e15));
+        if all_int {
+            let texts: Vec<String> = self
+                .data
+                .iter()
+                .map(|v| {
+                    if v.is_finite() {
+                        format!("{}", *v as i64)
+                    } else {
+                        nonfinite(*v)
+                    }
+                })
+                .collect();
+            let digits = self
+                .data
+                .iter()
+                .zip(&texts)
+                .filter(|(v, _)| v.is_finite())
+                .map(|(_, s)| s.len())
+                .max()
+                .unwrap_or(1);
+            return (texts, (digits + 3).max(6));
+        }
+        let max_abs = self
+            .data
+            .iter()
+            .filter(|v| v.is_finite())
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        let sci = max_abs >= 1e5 || (max_abs > 0.0 && max_abs < 1e-3);
+        let texts: Vec<String> = self
+            .data
+            .iter()
+            .map(|v| {
+                if !v.is_finite() {
+                    nonfinite(*v)
+                } else if sci {
+                    crate::interp::fmt_e(*v, 4)
+                } else {
+                    format!("{:.4}", v)
+                }
+            })
+            .collect();
+        (texts, if sci { 13 } else { 10 })
+    }
+
     /// MATLAB-like display body (no name header).
+    ///
+    /// A matrix too wide for [`TERM_WIDTH`] is split into blocks of whole
+    /// columns, each headed by the columns it holds, which is what MATLAB
+    /// does; `linspace(1, 2)` used to print about 1300 characters on one line.
     pub fn format(&self) -> String {
         if self.is_empty() {
             return "     []\n".to_string();
         }
+        let (texts, width) = self.cells();
+        // At least one column per block, however wide a single column is:
+        // wrapping every element onto its own line is still better than a
+        // block with no columns in it, which would never terminate.
+        let per = (TERM_WIDTH / width).max(1);
+        let wrapped = self.cols > per;
         let mut out = String::new();
-        let all_int = self.data.iter().all(|v| v.fract() == 0.0 && v.abs() < 1e15);
-        if all_int {
-            let width = self
-                .data
-                .iter()
-                .map(|v| format!("{}", *v as i64).len())
-                .max()
-                .unwrap_or(1);
-            let width = (width + 3).max(6);
+        let mut c0 = 0;
+        while c0 < self.cols {
+            let c1 = (c0 + per).min(self.cols);
+            if wrapped {
+                out.push_str(&column_header(c0 + 1, c1));
+                // The header, then a blank line, then the block's rows.
+                out.push_str("\n\n");
+            }
             for r in 0..self.rows {
-                for c in 0..self.cols {
-                    let _ = write!(out, "{:>w$}", self.get(r, c) as i64, w = width);
+                for c in c0..c1 {
+                    let _ = write!(out, "{:>w$}", texts[c * self.rows + r], w = width);
                 }
                 out.push('\n');
             }
-        } else {
-            let max_abs = self
-                .data
-                .iter()
-                .filter(|v| v.is_finite())
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max);
-            let sci = max_abs >= 1e5 || (max_abs > 0.0 && max_abs < 1e-3);
-            for r in 0..self.rows {
-                for c in 0..self.cols {
-                    let v = self.get(r, c);
-                    let cell = if !v.is_finite() {
-                        nonfinite(v)
-                    } else if sci {
-                        crate::interp::fmt_e(v, 4)
-                    } else {
-                        format!("{:.4}", v)
-                    };
-                    let _ = write!(out, "{:>w$}", cell, w = if sci { 13 } else { 10 });
-                }
+            c0 = c1;
+            if wrapped && c0 < self.cols {
                 out.push('\n');
             }
         }
         out
+    }
+}
+
+/// The width of the display MATLAB assumes, in characters.
+///
+/// It is a constant rather than a terminal query on purpose: the output of a
+/// script must not depend on whether it was run at a prompt or piped into a
+/// file, or a golden case would pass on one machine and fail on another.
+/// MATLAB's own command window defaults to 80 and keeps using 80 when its
+/// output is captured, so 80 is both the compatible answer and the
+/// reproducible one.
+pub const TERM_WIDTH: usize = 80;
+
+/// `  Columns 1 through 13`, MATLAB's heading for one block of a wide matrix,
+/// with its singular and two-column spellings.
+fn column_header(first: usize, last: usize) -> String {
+    match last - first {
+        0 => format!("  Column {}", first),
+        1 => format!("  Columns {} and {}", first, last),
+        _ => format!("  Columns {} through {}", first, last),
     }
 }
 
@@ -487,9 +611,9 @@ mod tests {
         assert!(Matrix::scalar(1.0).is_vector());
         assert_eq!(Matrix::identity(2, 3).data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         // MATLAB truthiness: non-empty and every element non-zero.
-        assert!(Matrix::row(vec![1.0, 2.0]).is_true());
-        assert!(!Matrix::row(vec![1.0, 0.0]).is_true());
-        assert!(!Matrix::empty().is_true());
+        assert!(Matrix::row(vec![1.0, 2.0]).truth().unwrap());
+        assert!(!Matrix::row(vec![1.0, 0.0]).truth().unwrap());
+        assert!(!Matrix::empty().truth().unwrap());
     }
 
     #[test]
@@ -912,14 +1036,144 @@ mod tests {
 
     #[test]
     fn format_nonfinite_and_empty() {
+        // Integer columns. There is no finite value to take a digit count
+        // from, so the width falls back to one digit plus three.
         assert_eq!(
             Matrix::row(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY]).format(),
-            "       NaN       Inf      -Inf\n"
+            "   NaN   Inf  -Inf\n"
         );
         assert_eq!(Matrix::empty().format(), "     []\n");
         assert_eq!(Matrix::new(1, 0, Vec::new()).format(), "     []\n");
         assert_eq!(nonfinite(f64::NAN), "NaN");
         assert_eq!(nonfinite(f64::INFINITY), "Inf");
         assert_eq!(nonfinite(f64::NEG_INFINITY), "-Inf");
+    }
+
+    /// A `NaN` or an `Inf` no longer drags a row of whole numbers onto the
+    /// four-decimal path: `[1 2 NaN]` used to print
+    /// `    1.0000    2.0000       NaN`.
+    #[test]
+    fn a_non_finite_element_keeps_the_integer_columns() {
+        assert_eq!(
+            Matrix::row(vec![1.0, 2.0, f64::NAN]).format(),
+            "     1     2   NaN\n"
+        );
+        assert_eq!(
+            Matrix::row(vec![1.0, f64::INFINITY]).format(),
+            "     1   Inf\n"
+        );
+        // A scalar `NaN` is the same six-wide column, not the ten-wide one.
+        assert_eq!(Matrix::scalar(f64::NAN).format(), "   NaN\n");
+        // A genuinely fractional neighbour still moves the whole matrix to
+        // four decimals, and the non-finite element rides along in it.
+        assert_eq!(
+            Matrix::row(vec![1.5, f64::NAN]).format(),
+            "    1.5000       NaN\n"
+        );
+        // `-Inf` is four characters wide but has no digits, so it does not
+        // widen the column past what the numbers ask for.
+        assert_eq!(
+            Matrix::row(vec![1.0, f64::NEG_INFINITY]).format(),
+            "     1  -Inf\n"
+        );
+        // A number that does need the room still gets it.
+        assert_eq!(
+            Matrix::row(vec![-12345.0, f64::NAN]).format(),
+            "   -12345      NaN\n"
+        );
+    }
+
+    /// A matrix too wide for the display is split into blocks of columns, as
+    /// MATLAB does; it used to print on one unwrapped line.
+    #[test]
+    fn a_wide_matrix_wraps_into_column_blocks() {
+        // Integer columns are 6 wide, so 13 of them fit in 80 characters.
+        let x = Matrix::row((1..=20).map(f64::from).collect::<Vec<f64>>());
+        let out = x.format();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "  Columns 1 through 13");
+        assert_eq!(lines[1], "");
+        assert!(lines[2].starts_with("     1     2"), "{:?}", lines[2]);
+        assert!(lines[2].ends_with("    13"), "{:?}", lines[2]);
+        assert_eq!(lines[3], "");
+        assert_eq!(lines[4], "  Columns 14 through 20");
+        assert_eq!(lines[5], "");
+        assert!(lines[6].starts_with("    14"), "{:?}", lines[6]);
+        assert_eq!(lines.len(), 7);
+
+        // Exactly the width that fits is not wrapped at all, and so carries
+        // no heading.
+        let fits = Matrix::row(vec![1.0; 13]).format();
+        assert_eq!(fits.lines().count(), 1);
+        assert!(!fits.contains("Column"));
+
+        // Every row of a block is printed before the next block starts.
+        let two = Matrix::filled(2, 14, 7.0).format();
+        let lines: Vec<&str> = two.lines().collect();
+        assert_eq!(lines[0], "  Columns 1 through 13");
+        assert_eq!(lines.len(), 9);
+        assert_eq!(lines[5], "  Column 14");
+
+        // MATLAB's singular and two-column spellings of the heading.
+        assert_eq!(column_header(3, 3), "  Column 3");
+        assert_eq!(column_header(3, 4), "  Columns 3 and 4");
+        assert_eq!(column_header(3, 5), "  Columns 3 through 5");
+    }
+
+    /// A `NaN` is neither true nor false. It used to convert silently, so
+    /// `if NaN` was taken as true (QA D5).
+    #[test]
+    fn a_nan_cannot_become_a_logical() {
+        let nan = Matrix::scalar(f64::NAN);
+        for e in [
+            nan.truth().unwrap_err(),
+            nan.logical_scalar().unwrap_err(),
+            Matrix::logical_element(f64::NAN).unwrap_err(),
+            // One NaN anywhere is enough, as it is for MATLAB's own `if`.
+            Matrix::row(vec![1.0, f64::NAN]).truth().unwrap_err(),
+        ] {
+            assert_eq!(e.msg, "NaN's cannot be converted to logicals.");
+        }
+        // Every other value converts as it always did, `Inf` included.
+        assert!(Matrix::scalar(f64::INFINITY).logical_scalar().unwrap());
+        assert!(!Matrix::scalar(0.0).logical_scalar().unwrap());
+        assert!(Matrix::logical_element(-2.0).unwrap());
+    }
+
+    /// `&&` and `||` need one value to branch on, so an array or an empty is
+    /// an error. `truth`, which `if` uses, still accepts both.
+    #[test]
+    fn the_short_circuit_operators_need_a_logical_scalar() {
+        let want = "Operands to the logical AND (&&) and OR (||) operators \
+                    must be convertible to logical scalar values.";
+        assert_eq!(
+            Matrix::row(vec![1.0, 1.0])
+                .logical_scalar()
+                .unwrap_err()
+                .msg,
+            want
+        );
+        assert_eq!(Matrix::empty().logical_scalar().unwrap_err().msg, want);
+        assert_eq!(
+            Matrix::new(1, 0, Vec::new())
+                .logical_scalar()
+                .unwrap_err()
+                .msg,
+            want
+        );
+        // `if [1 1]` and `if []` are still legal, and still mean what they did.
+        assert!(Matrix::row(vec![1.0, 1.0]).truth().unwrap());
+        assert!(!Matrix::empty().truth().unwrap());
+    }
+
+    /// `''` is `0x0` in MATLAB, not the `1x0` a row of no characters would
+    /// be, which is what made `size('')` report `1 0`.
+    #[test]
+    fn the_empty_string_is_zero_by_zero() {
+        let m = Value::Str(String::new()).into_mat();
+        assert_eq!((m.rows, m.cols), (0, 0));
+        // A non-empty string is still the row of codes it always was.
+        let ab = Value::Str("ab".to_string()).into_mat();
+        assert_eq!((ab.rows, ab.cols), (1, 2));
     }
 }

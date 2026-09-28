@@ -1,0 +1,4 @@
+% covers: 7 - a REPL error goes to stderr, not stdout, and the session survives it
+zzz_undefined_name
+1 + 1
+exit

@@ -9,7 +9,7 @@ use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::scan;
-use crate::parser::{BinOp, Expr, Located, Parser, Stmt};
+use crate::parser::{BinOp, Expr, Located, MAX_DEPTH, Parser, Stmt};
 use crate::value::{Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -29,6 +29,14 @@ pub struct Interp {
     /// Nanoseconds since `start` at the last bare `tic`, and `None` before
     /// the first one: a bare `toc` then has nothing to measure from.
     pub(crate) tic_mark: Option<f64>,
+    /// How deeply nested the statement or expression being run is. The
+    /// evaluator recurses once per level just as the parser does, so it uses
+    /// the parser's `MAX_DEPTH`: anything the parser accepted, this can walk.
+    depth: usize,
+    /// How many `for` or `while` loops are running. `break` and `continue`
+    /// outside every one of them are errors rather than a silent end to the
+    /// script (QA D8).
+    loop_depth: usize,
     /// Everything the interpreter prints goes here. Nothing in this crate
     /// outside `main.rs` may use `print!`, so tests can capture output.
     pub out: Box<dyn Write>,
@@ -67,8 +75,22 @@ impl Interp {
             builtins: builtins::registry(),
             start: Instant::now(),
             tic_mark: None,
+            depth: 0,
+            loop_depth: 0,
             out,
         }
+    }
+
+    /// Counts one more level of evaluation, refusing anything past the
+    /// parser's [`MAX_DEPTH`]. The mirror of `Parser::deepen`: the two
+    /// recursions run to the same depth on the same tree, so they share the
+    /// one limit and the one message.
+    fn deepen(&mut self) -> R<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            bail!(error::nesting_too_deep(MAX_DEPTH));
+        }
+        Ok(())
     }
 
     /// The single place interpreter output leaves the evaluator.
@@ -77,6 +99,12 @@ impl Interp {
     }
 
     pub fn run(&mut self, src: &str) -> R<()> {
+        // An entry that failed part-way left its counters raised, and the
+        // REPL hands the same interpreter the next line. Without this, one
+        // over-deep expression would make every later statement too deep and
+        // a `break` left mid-loop would make a later top-level one legal.
+        self.depth = 0;
+        self.loop_depth = 0;
         let lexed = scan(src)?;
         let stmts = Parser::with_lines(lexed).parse_program()?;
         self.exec_block(&stmts)?;
@@ -93,7 +121,12 @@ impl Interp {
     /// not the line of the `for` that is unwinding around it.
     fn exec_block(&mut self, stmts: &[Located]) -> R<Flow> {
         for s in stmts {
-            match self.exec(&s.stmt).map_err(|e| e.at(s.line))? {
+            // A block inside a block recurses through here, so this is where
+            // statement nesting is counted, matching `Parser::parse_block`.
+            self.deepen()?;
+            let flow = self.exec(&s.stmt).map_err(|e| e.at(s.line));
+            self.depth -= 1;
+            match flow? {
                 Flow::Normal => {}
                 f => return Ok(f),
             }
@@ -149,9 +182,17 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::If(arms, otherwise) => {
-                for (cond, body) in arms {
-                    if self.eval_mat(cond)?.is_true() {
-                        return self.exec_block(body);
+                for a in arms {
+                    // The arm's own line, so an error in an `elseif`
+                    // condition names the `elseif` and not the `if` that
+                    // opened the statement (QA D27). `MError::at` keeps the
+                    // first line it is given, so this wins over the `if`'s.
+                    let cond = self
+                        .eval_mat(&a.cond)
+                        .and_then(|m| m.truth())
+                        .map_err(|e| e.at(a.line))?;
+                    if cond {
+                        return self.exec_block(&a.body);
                     }
                 }
                 if let Some(body) = otherwise {
@@ -172,36 +213,71 @@ impl Interp {
                     let empty = Matrix::new(m.rows, 0, Vec::new());
                     self.vars.insert(name.clone(), Value::Mat(empty));
                 }
-                for c in 0..m.cols {
-                    let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
-                    let v = if m.rows == 1 {
-                        Matrix::scalar(column[0])
-                    } else {
-                        Matrix::col(column)
-                    };
-                    self.vars.insert(name.clone(), Value::Mat(v));
-                    if let Flow::Break = self.exec_block(body)? {
-                        break;
-                    }
-                }
+                self.loop_depth += 1;
+                let flow = self.run_for(name, &m, body);
+                self.loop_depth -= 1;
+                flow?;
                 Ok(Flow::Normal)
             }
             Stmt::While(cond, body) => {
-                while self.eval_mat(cond)?.is_true() {
-                    if let Flow::Break = self.exec_block(body)? {
-                        break;
-                    }
-                }
+                self.loop_depth += 1;
+                let flow = self.run_while(cond, body);
+                self.loop_depth -= 1;
+                flow?;
                 Ok(Flow::Normal)
             }
+            // MATLAB errors on a `break` with no loop around it; Octave 8.4
+            // gives a parse error. It is raised here rather than in the
+            // parser so that everything the script printed first is still
+            // printed, which is what the script's own output shows.
+            Stmt::Break if self.loop_depth == 0 => Err(error::break_outside_loop()),
+            Stmt::Continue if self.loop_depth == 0 => Err(error::continue_outside_loop()),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
         }
     }
 
+    /// The iterations of a `for`, split out so the caller can put
+    /// `loop_depth` back however the body ends: normally, on a `break`, or on
+    /// an error unwinding through it. A `loop_depth` left raised would make a
+    /// later top-level `break` legal.
+    fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<()> {
+        for c in 0..m.cols {
+            let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
+            let v = if m.rows == 1 {
+                Matrix::scalar(column[0])
+            } else {
+                Matrix::col(column)
+            };
+            self.vars.insert(name.to_string(), Value::Mat(v));
+            if let Flow::Break = self.exec_block(body)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The iterations of a `while`; see [`run_for`](Interp::run_for).
+    fn run_while(&mut self, cond: &Expr, body: &[Located]) -> R<()> {
+        while self.eval_mat(cond)?.truth()? {
+            if let Flow::Break = self.exec_block(body)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // ---- expressions -------------------------------------------------
 
+    /// Evaluates one expression, counting its nesting against [`MAX_DEPTH`].
     fn eval(&mut self, e: &Expr) -> R<Value> {
+        self.deepen()?;
+        let v = self.eval_node(e);
+        self.depth -= 1;
+        v
+    }
+
+    fn eval_node(&mut self, e: &Expr) -> R<Value> {
         match e {
             Expr::Num(v) => Ok(Value::Mat(Matrix::scalar(*v))),
             Expr::Str(s) => Ok(Value::Str(s.clone())),
@@ -220,9 +296,13 @@ impl Interp {
             Expr::Index(n, args) => self.index(n, args),
             Expr::Matrix(rows) => self.build_matrix(rows),
             Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
-            Expr::Not(a) => Ok(Value::Mat(
-                self.eval_mat(a)?.map(|x| if x == 0.0 { 1.0 } else { 0.0 }),
-            )),
+            // `~` converts each element to a logical first, so `~NaN` is the
+            // same refusal as `if NaN` rather than the `0` it used to give.
+            Expr::Not(a) => {
+                Ok(Value::Mat(self.eval_mat(a)?.try_map(|x| {
+                    Ok(!Matrix::logical_element(x)? as u8 as f64)
+                })?))
+            }
             Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
             Expr::Range(a, step, b) => {
                 let a = self.eval_scalar(a, "range start")?;
@@ -252,16 +332,19 @@ impl Interp {
     }
 
     fn binary(&mut self, op: BinOp, a: &Expr, b: &Expr) -> R<Value> {
-        // Short-circuit logical operators.
+        // Short-circuit logical operators. Each operand must be convertible to
+        // one logical value, so `[1 1] && 1` and `[] || 1` are errors rather
+        // than `1`; the right-hand side is still not evaluated when the left
+        // already decides the answer, so `0 && undefined_fn()` is `0`.
         match op {
             BinOp::AndAnd => {
-                let l = self.eval_mat(a)?.is_true();
-                let v = l && self.eval_mat(b)?.is_true();
+                let l = self.eval_mat(a)?.logical_scalar()?;
+                let v = l && self.eval_mat(b)?.logical_scalar()?;
                 return Ok(Value::Mat(Matrix::scalar(v as u8 as f64)));
             }
             BinOp::OrOr => {
-                let l = self.eval_mat(a)?.is_true();
-                let v = l || self.eval_mat(b)?.is_true();
+                let l = self.eval_mat(a)?.logical_scalar()?;
+                let v = l || self.eval_mat(b)?.logical_scalar()?;
                 return Ok(Value::Mat(Matrix::scalar(v as u8 as f64)));
             }
             _ => {}
@@ -315,8 +398,19 @@ impl Interp {
             BinOp::Le => a.zip(&b, "<=", bool_op(|x, y| x <= y))?,
             BinOp::Gt => a.zip(&b, ">", bool_op(|x, y| x > y))?,
             BinOp::Ge => a.zip(&b, ">=", bool_op(|x, y| x >= y))?,
-            BinOp::And => a.zip(&b, "&", bool_op(|x, y| x != 0.0 && y != 0.0))?,
-            BinOp::Or => a.zip(&b, "|", bool_op(|x, y| x != 0.0 || y != 0.0))?,
+            // Element-wise `&` and `|` convert each pair to logicals first,
+            // so `NaN & 1` is a refusal rather than `1`.
+            // Both elements are converted before either is looked at, since
+            // the conversion is what can fail: `1 | NaN` is a refusal even
+            // though a short-circuit would never have read the `NaN`.
+            BinOp::And => a.try_zip(&b, "&", |x, y| {
+                let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
+                Ok((x && y) as u8 as f64)
+            })?,
+            BinOp::Or => a.try_zip(&b, "|", |x, y| {
+                let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
+                Ok((x || y) as u8 as f64)
+            })?,
             BinOp::AndAnd | BinOp::OrOr => unreachable!(),
         };
         Ok(Value::Mat(r))
@@ -350,7 +444,13 @@ impl Interp {
         };
         let sel = self.eval_index_args(&m, args)?;
         let out = index_read(&m, &sel)?;
-        if is_str {
+        // A `Value::Str` is a row of characters and has nowhere to record any
+        // other shape, so only a result that is one row can stay a string.
+        // `s(:)` is a column in MATLAB, and giving back a row would be the
+        // wrong shape rather than merely the wrong class; the column comes
+        // back as its character codes until cycle 02's `Char` class can carry
+        // a shape of its own (QA D17).
+        if is_str && out.rows <= 1 {
             Ok(Value::Str(
                 out.data
                     .iter()
@@ -531,12 +631,24 @@ impl Interp {
 /// `1x0` and exit 0; MATLAB and Octave both refuse them. A `NaN` still gives
 /// the empty: `1:NaN` stays as it was, and stays recorded in Known bugs,
 /// because Octave gives a `1x1` `NaN` there and MATLAB is unverified.
+///
+/// An infinite *step* is no longer an early empty either. Cycle 01d refused
+/// the end points and deliberately left the step alone; this is that
+/// remainder. `1:Inf:5` follows the documented count `fix((k - j) / i)`,
+/// which is `fix(4 / Inf)` and so `0`: a count of `0` is one element, the
+/// start, so the answer is the `1x1` `1` rather than a `1x0`.
 fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
     // How many times the step fits between the end points; the vector has one
     // more element than that. `1:NaN` and `Inf:Inf` both make it `NaN`, which
     // is neither negative nor a count.
     let steps = (b - a) / s;
-    if s == 0.0 || !s.is_finite() || steps.is_nan() || steps < 0.0 {
+    // Whether the range is asked to run against its own step, which is what
+    // makes `5:1` and `1:-1:5` empty. It is tested on the signs rather than
+    // on `steps < 0.0`, because an infinite step divides the gap down to a
+    // *signed zero*: `5:Inf:1` has `steps` of `-0.0`, which is not less than
+    // zero, and would otherwise have produced the element `5`.
+    let wrong_way = b != a && (b > a) != (s > 0.0);
+    if s == 0.0 || steps.is_nan() || wrong_way {
         return Ok(Matrix::new(1, 0, Vec::new()));
     }
     // The count stays in `f64` until `check_shape` has judged it, so a count
@@ -558,7 +670,12 @@ fn range(a: f64, s: f64, b: f64) -> R<Matrix> {
     let n = n as usize;
     let data = (0..count)
         .map(|k| {
-            if 2 * k <= n {
+            // The first element is the start itself, spelled out rather than
+            // computed as `a + 0 * s`: with an infinite step that product is
+            // `NaN`, so `1:Inf:5` would have been `NaN` instead of `1`.
+            if k == 0 {
+                a
+            } else if 2 * k <= n {
                 a + k as f64 * s
             } else {
                 right - (n - k) as f64 * s
@@ -837,7 +954,7 @@ mod tests {
         assert_eq!(ok_out("2 * 3"), "ans =\n\n     6\n\n");
         // An assignment leaves `ans` untouched, so it is still undefined here.
         let e = err_msg("x = 5;\nans");
-        assert!(e.contains("Undefined function or variable 'ans'"), "{e}");
+        assert!(e.contains("Unrecognized function or variable 'ans'"), "{e}");
         // Naming an existing variable echoes under its own name, not `ans`.
         assert_eq!(ok_out("x = 5;\nx"), "x =\n\n     5\n\n");
     }
@@ -1003,7 +1120,7 @@ mod tests {
         assert_eq!(ok_out("x = 0 && undefined_fn();\ndisp(x)"), "     0\n");
         assert_eq!(ok_out("y = 1 || undefined_fn();\ndisp(y)"), "     1\n");
         // ... and it really would have failed.
-        assert!(err_msg("disp(undefined_fn())").contains("Undefined function or variable"));
+        assert!(err_msg("disp(undefined_fn())").contains("Unrecognized function or variable"));
         assert_eq!(ok_out("disp(1 && 1)"), "     1\n");
         assert_eq!(ok_out("disp(0 || 0)"), "     0\n");
         assert_eq!(ok_out("disp(1 && 0)"), "     0\n");
@@ -1021,8 +1138,11 @@ mod tests {
         assert_eq!(out, "     1\n     2\n");
         let e = r.unwrap_err();
         assert_eq!(e.line, Some(3));
-        assert_eq!(e.msg, "Undefined function or variable 'y'.");
-        assert_eq!(e.to_string(), "Line 3: Undefined function or variable 'y'.");
+        assert_eq!(e.msg, "Unrecognized function or variable 'y'.");
+        assert_eq!(
+            e.to_string(),
+            "Line 3: Unrecognized function or variable 'y'."
+        );
     }
 
     #[test]
@@ -1098,18 +1218,18 @@ mod tests {
 
     #[test]
     fn an_unknown_name_is_undefined_with_or_without_arguments() {
-        assert!(err_msg("nope").contains("Undefined function or variable 'nope'"));
-        assert!(err_msg("nope(1)").contains("Undefined function or variable 'nope'"));
+        assert!(err_msg("nope").contains("Unrecognized function or variable 'nope'"));
+        assert!(err_msg("nope(1)").contains("Unrecognized function or variable 'nope'"));
     }
 
     #[test]
     fn clear_removes_only_the_named_variable() {
         assert_eq!(ok_out("a = 1; b = 2; clear('a'); disp(b)"), "     2\n");
         let e = err_msg("a = 1; b = 2; clear('a'); a");
-        assert!(e.contains("Undefined function or variable 'a'"), "{e}");
+        assert!(e.contains("Unrecognized function or variable 'a'"), "{e}");
         // With no argument it still clears the whole workspace.
         let e = err_msg("a = 1; b = 2; clear; b");
-        assert!(e.contains("Undefined function or variable 'b'"), "{e}");
+        assert!(e.contains("Unrecognized function or variable 'b'"), "{e}");
     }
 
     #[test]
@@ -1208,8 +1328,31 @@ mod tests {
         assert!(range(1.0, f64::NAN, 5.0).unwrap().is_empty());
         // Inf:Inf has no count either: the difference is NaN.
         assert!(range(f64::INFINITY, 1.0, f64::INFINITY).unwrap().is_empty());
-        // An infinite step is untouched by this cycle; see Known bugs.
-        assert!(range(1.0, f64::INFINITY, 5.0).unwrap().is_empty());
+    }
+
+    /// An infinite *step* follows the documented count `fix((k - j) / i)`,
+    /// which is `0` for `1:Inf:5` and so one element, the start. It used to
+    /// return the empty on the way in, which made `size(1:Inf:5)` `1 0`.
+    #[test]
+    fn an_infinite_range_step_gives_the_start_alone() {
+        let r = range(1.0, f64::INFINITY, 5.0).unwrap();
+        assert_eq!((r.rows, r.cols), (1, 1));
+        // Not `NaN`: the first element is the start itself, never `a + 0 * s`.
+        assert_eq!(r.data, [1.0]);
+        assert_eq!(ok_out("disp(size(1:Inf:5))"), "     1     1\n");
+        assert_eq!(ok_out("disp(1:Inf:5)"), "     1\n");
+        // Descending with a negative infinite step is the mirror of it.
+        assert_eq!(range(5.0, f64::NEG_INFINITY, 1.0).unwrap().data, [5.0]);
+        // A range that runs against its step is still empty, which an
+        // infinite step must not change: the division gives a *signed zero*
+        // there, which is not less than zero.
+        assert!(range(5.0, f64::INFINITY, 1.0).unwrap().is_empty());
+        assert!(range(1.0, f64::NEG_INFINITY, 5.0).unwrap().is_empty());
+        // The finite direction rule is untouched.
+        assert!(range(5.0, 1.0, 1.0).unwrap().is_empty());
+        assert!(range(1.0, -1.0, 5.0).unwrap().is_empty());
+        // Equal end points are one element whatever the step.
+        assert_eq!(range(5.0, f64::INFINITY, 5.0).unwrap().data, [5.0]);
     }
 
     /// Acceptance test 17, the `index_read` half: a two-subscript read sizes
@@ -1304,7 +1447,7 @@ mod tests {
 
     #[test]
     fn e_is_an_ordinary_name() {
-        assert_eq!(err_msg("disp(e)"), "Undefined function or variable 'e'.");
+        assert_eq!(err_msg("disp(e)"), "Unrecognized function or variable 'e'.");
         assert_eq!(ok_out("e = 5; disp(e)"), "     5\n");
         assert_eq!(ok_out("fprintf('%.4f\\n', exp(1))"), "2.7183\n");
     }
@@ -1329,6 +1472,271 @@ mod tests {
         );
         assert_eq!(ok_out("disp(size(reshape(1:6, [], 2)))"), "     3     2\n");
         assert_eq!(ok_out("disp(sum([1 2; 3 4], 'all'))"), "    10\n");
+    }
+
+    // ---- the nesting limit -------------------------------------------
+
+    /// The message both the parser and the evaluator raise at the limit.
+    const TOO_DEEP: &str = "Nesting is too deep. The maximum nesting depth is 10000.";
+
+    /// Runs `f` on a thread with the stack `src/main.rs` gives the
+    /// interpreter. The limit only means anything against that stack, and a
+    /// test thread's default is a small fraction of it; running these on the
+    /// default stack would prove the opposite of what they claim.
+    fn on_the_interpreter_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(f)
+            .expect("the test thread should spawn")
+            .join()
+            .expect("the limit must fire before the stack does");
+    }
+
+    /// `-(-(...-1))`, built rather than parsed, so the evaluator's limit can
+    /// be reached without the parser's firing first.
+    fn nested_neg(depth: usize) -> Expr {
+        let mut e = Expr::Num(1.0);
+        for _ in 0..depth {
+            e = Expr::Neg(Box::new(e));
+        }
+        e
+    }
+
+    /// Acceptance test 16, the parser half: the limit fires at the boundary
+    /// and one past it, for every shape of nesting QA D4 found. About 96,000
+    /// nested parentheses used to exhaust even the 256 MB stack and abort
+    /// with exit 134, which no `Result` can catch.
+    #[test]
+    fn the_parser_refuses_nesting_past_the_limit() {
+        on_the_interpreter_stack(|| {
+            // Two levels are spent before the first bracket: the statement,
+            // and the expression the statement holds.
+            let deepest = MAX_DEPTH - 2;
+            for (open, close) in [("(", ")"), ("[", "]"), ("abs(", ")"), ("x(", ")")] {
+                let src = |n: usize| format!("x = 1;\n{}1{}", open.repeat(n), close.repeat(n));
+                assert!(
+                    run(&src(deepest)).0.is_ok(),
+                    "{open} at the limit should parse"
+                );
+                assert_eq!(err_msg(&src(deepest + 1)), TOO_DEEP, "{open}");
+            }
+            // A flat sum nests by association rather than by recursion: the
+            // parser never recurses to build `1+1+...+1`, but the tree it
+            // builds is one level deeper per term, and the evaluator does.
+            let sum = |n: usize| format!("x = {};", vec!["1"; n].join("+"));
+            assert!(run(&sum(MAX_DEPTH - 1)).0.is_ok());
+            assert_eq!(err_msg(&sum(MAX_DEPTH)), TOO_DEEP);
+            // Nested blocks are counted the same way.
+            let blocks = |n: usize| format!("{}\n{}", "if 1\n".repeat(n), "end\n".repeat(n));
+            assert_eq!(err_msg(&blocks(MAX_DEPTH + 1)), TOO_DEEP);
+            // So are the two chains that fold rather than recurse through the
+            // precedence ladder: a transpose chain and a sign chain.
+            let quotes = |n: usize| format!("x = 1;\ny = x{};", "'".repeat(n));
+            assert!(run(&quotes(MAX_DEPTH - 2)).0.is_ok());
+            assert_eq!(err_msg(&quotes(MAX_DEPTH - 1)), TOO_DEEP);
+            let signs = |n: usize| format!("y = {}1;", "-".repeat(n));
+            assert!(run(&signs(MAX_DEPTH - 2)).0.is_ok());
+            assert_eq!(err_msg(&signs(MAX_DEPTH - 1)), TOO_DEEP);
+        });
+    }
+
+    /// Acceptance test 16, the evaluator half. The tree is built directly, so
+    /// the parser's limit cannot fire first and mask it.
+    #[test]
+    fn the_evaluator_refuses_nesting_past_the_limit() {
+        on_the_interpreter_stack(|| {
+            let mut it = Interp::with_output(Box::new(io::sink()));
+            // The outermost node is level 1, so the deepest legal tree has
+            // one fewer node than the limit above its leaf.
+            assert!(it.eval(&nested_neg(MAX_DEPTH - 1)).is_ok());
+            let e = it.eval(&nested_neg(MAX_DEPTH)).unwrap_err();
+            assert_eq!(e.msg, TOO_DEEP);
+            // The counter is not left raised: the REPL hands the same
+            // interpreter the next line, and it must still work.
+            assert_eq!(ok_out("disp(1)"), "     1\n");
+            let (r, _) = run("x = 1; disp(x + 1)");
+            assert!(r.is_ok());
+        });
+    }
+
+    // ---- break and continue outside a loop ---------------------------
+
+    /// QA D8. `break` used to unwind out of the whole script, so the
+    /// statements after it never ran and the process still exited 0.
+    #[test]
+    fn break_or_continue_outside_a_loop_is_an_error() {
+        for (word, stmt) in [("break", "break"), ("continue", "continue")] {
+            let (r, out) = run(&format!("disp(1)\n{stmt}\ndisp(2)"));
+            // Everything printed before it is still printed, which is why
+            // this is raised when the statement runs and not when it parses.
+            assert_eq!(out, "     1\n");
+            let e = r.unwrap_err();
+            assert_eq!(e.msg, format!("'{word}' is only valid inside a loop."));
+            assert_eq!(e.line, Some(2));
+            // Inside an `if` that is itself outside a loop, likewise.
+            assert!(err_msg(&format!("if 1\n{stmt}\nend")).contains(word));
+        }
+        // Inside a loop both still work, including from a nested block.
+        assert_eq!(
+            ok_out("for k = 1:3\nif k == 2\nbreak\nend\ndisp(k)\nend"),
+            "     1\n"
+        );
+        assert_eq!(
+            ok_out("for k = 1:3\nif k == 2\ncontinue\nend\ndisp(k)\nend"),
+            "     1\n     3\n"
+        );
+        // ... and the loop that ran does not make a later top-level `break`
+        // legal, however it ended.
+        assert!(err_msg("for k = 1:2\nbreak\nend\nbreak").contains("only valid inside"));
+        assert!(err_msg("for k = 1:2\nundefined_name;\nend").contains("Unrecognized"));
+        assert!(err_msg("while 1\nbreak\nend\ncontinue").contains("only valid inside"));
+    }
+
+    // ---- the line an `elseif` reports --------------------------------
+
+    /// QA D27. The whole `if` statement is located at its own line, so an
+    /// error in a later arm's condition used to be tagged with line 1.
+    #[test]
+    fn an_error_in_an_elseif_condition_names_the_elseif_line() {
+        assert_eq!(err("if 0\nelseif undefined_name\nend").line, Some(2));
+        assert_eq!(
+            err("disp(1)\nif 0\nelseif 0\nelseif undefined_name\nend").line,
+            Some(4)
+        );
+        // The `if`'s own condition still names the `if`.
+        assert_eq!(err("if undefined_name\nelseif 1\nend").line, Some(1));
+        // An error in a body still names the body's line, not the arm's.
+        assert_eq!(err("if 0\nelseif 1\nundefined_name;\nend").line, Some(3));
+    }
+
+    // ---- logical conversion ------------------------------------------
+
+    /// Acceptance test 14 (QA D5): `NaN` is neither true nor false.
+    #[test]
+    fn a_nan_is_refused_wherever_a_logical_is_wanted() {
+        let want = "NaN's cannot be converted to logicals.";
+        for src in [
+            "if NaN, end",
+            "if NaN, disp('true'), end",
+            "while NaN, end",
+            "disp(NaN & 1)",
+            "disp(1 | NaN)",
+            "disp(~NaN)",
+            "disp(NaN && 1)",
+            "disp(NaN || 1)",
+            "disp(1 && NaN)",
+            "disp(0 || NaN)",
+            "if [1 NaN], end",
+        ] {
+            assert_eq!(err_msg(src), want, "{src}");
+        }
+        // A short-circuit that never reaches the `NaN` never converts it,
+        // which is how MATLAB behaves too: the operand is not evaluated.
+        assert_eq!(ok_out("disp(1 || NaN)"), "     1\n");
+        assert_eq!(ok_out("disp(0 && NaN)"), "     0\n");
+        // Everything else converts as it always did.
+        assert_eq!(ok_out("if Inf, disp(1), end"), "     1\n");
+        assert_eq!(ok_out("disp(~0)"), "     1\n");
+        assert_eq!(ok_out("disp([1 0] & [1 1])"), "     1     0\n");
+        assert_eq!(ok_out("disp(isnan(NaN))"), "     1\n");
+    }
+
+    /// Acceptance test 13: `&&` and `||` need one value to branch on.
+    #[test]
+    fn the_short_circuit_operators_reject_arrays_and_empties() {
+        let want = "Operands to the logical AND (&&) and OR (||) operators \
+                    must be convertible to logical scalar values.";
+        for src in [
+            "disp([1 1] && 1)",
+            "disp([] || 1)",
+            "disp(1 && [1 1])",
+            "disp(0 || [])",
+            "disp('ab' && 1)",
+        ] {
+            assert_eq!(err_msg(src), want, "{src}");
+        }
+        // Short-circuiting still stops before the second operand, so a
+        // right-hand side that would be refused is never reached.
+        assert_eq!(ok_out("disp(0 && [1 1])"), "     0\n");
+        assert_eq!(ok_out("disp(1 || [])"), "     1\n");
+        // `if` is unaffected: it takes an array and an empty.
+        assert_eq!(ok_out("if [1 1], disp(1), end"), "     1\n");
+        assert_eq!(ok_out("n = 0;\nif [], n = 1; end\ndisp(n)"), "     0\n");
+    }
+
+    // ---- chained ranges ----------------------------------------------
+
+    /// Acceptance test 2: MATLAB reads `1:2:3:4` as `(1:2:3):4`, and so does
+    /// SplatCrab now that `parse_range` loops; it used to be a parse error.
+    ///
+    /// Both spellings then reach the same place: `1:2:3` is the `1x2`
+    /// `[1 3]`, and a colon whose start is not a scalar is SplatCrab's own
+    /// deliberate error. MATLAB is understood to take the first element
+    /// instead, which is a separate row in Known bugs and not this bullet's
+    /// business; what this bullet owns is that the two spellings agree.
+    #[test]
+    fn a_chained_range_reads_left_to_right() {
+        assert_eq!(err_msg("disp(1:2:3:4)"), err_msg("disp((1:2:3):4)"));
+        assert_eq!(err_msg("disp(1:2:3:4)"), "range start must be a scalar.");
+        assert_eq!(err_msg("disp(1:2:3:4:5)"), err_msg("disp(((1:2:3):4):5)"));
+        // A chain whose left-hand range is a single element evaluates, and
+        // gives what the parenthesised spelling gives.
+        assert_eq!(ok_out("disp(1:2:1:4)"), ok_out("disp((1:2:1):4)"));
+        assert_eq!(ok_out("disp(1:2:1:4)"), "     1     2     3     4\n");
+        // The two- and three-operand forms are untouched.
+        assert_eq!(ok_out("disp(1:3)"), "     1     2     3\n");
+        assert_eq!(ok_out("disp(1:2:5)"), "     1     3     5\n");
+        // A bare colon in an index still is one.
+        assert_eq!(ok_out("A = [1 2; 3 4]; disp(A(:, 1)')"), "     1     3\n");
+        assert_eq!(ok_out("x = 1:4; disp(x(2:3))"), "     2     3\n");
+    }
+
+    // ---- empty-result shapes -----------------------------------------
+
+    /// Acceptance test 12. Each of these was a `0x1` or a `1x0` where MATLAB
+    /// gives a `0x0`, and `disp([])` printed `[]` where MATLAB prints nothing.
+    #[test]
+    fn empty_results_have_matlabs_shapes() {
+        assert_eq!(ok_out("disp(size(find([])))"), "     0     0\n");
+        assert_eq!(ok_out("disp(size(diag([])))"), "     0     0\n");
+        assert_eq!(ok_out("disp(size(''))"), "     0     0\n");
+        assert_eq!(ok_out("disp(size(num2str([])))"), "     0     0\n");
+        // `disp([])` prints nothing at all; `x = []` still shows its `[]`,
+        // which is a separate deviation scheduled to cycle 02.
+        assert_eq!(ok_out("disp([])"), "");
+        assert_eq!(ok_out("x = []"), "x =\n\n     []\n\n");
+        // `disp('')` is still a line with nothing on it.
+        assert_eq!(ok_out("disp('')"), "\n");
+        // A shape that has an orientation to keep still keeps it.
+        assert_eq!(ok_out("disp(size(find([0 0])))"), "     1     0\n");
+        assert_eq!(ok_out("disp(size(find([0; 0])))"), "     0     1\n");
+        assert_eq!(ok_out("disp(size(find([1 0 1])))"), "     1     2\n");
+    }
+
+    /// `s(:)` is a column in MATLAB. It used to come back as a row, because a
+    /// `Value::Str` is a row of characters and has nowhere to put any other
+    /// shape; the codes are what a column can carry until cycle 02's `Char`
+    /// class (QA D17).
+    #[test]
+    fn a_colon_index_of_a_char_is_a_column() {
+        assert_eq!(ok_out("s = 'abc'; disp(size(s(:)))"), "     3     1\n");
+        // Every other index of a char is still a char.
+        assert_eq!(ok_out("s = 'abc'; disp(s(2))"), "b\n");
+        assert_eq!(ok_out("s = 'abc'; disp(s([3 1]))"), "ca\n");
+        assert_eq!(ok_out("s = 'abc'; disp(s(2:3))"), "bc\n");
+        assert_eq!(ok_out("s = 'abc'; disp(size(s([1;2])))"), "     1     2\n");
+    }
+
+    // ---- the byte-order mark -----------------------------------------
+
+    /// QA D29. Three bytes before the first statement are an encoding marker,
+    /// not source; they used to be `unexpected character '\u{feff}'`.
+    #[test]
+    fn a_leading_byte_order_mark_is_skipped() {
+        assert_eq!(ok_out("\u{feff}disp(1)"), "     1\n");
+        // Only a leading one. A mark in the middle is a real stray character.
+        let e = err_msg("disp(1)\n\u{feff}disp(2)");
+        assert!(e.contains("unexpected character"), "{e}");
     }
 
     #[test]

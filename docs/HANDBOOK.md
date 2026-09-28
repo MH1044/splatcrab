@@ -77,7 +77,8 @@ SplatCrab 0.1.0  (type 'exit' to quit)
 
 Errors in the REPL carry no line number, because one line per entry makes it
 noise, and the session survives them. Note that REPL diagnostics currently go
-to stdout, not stderr; see [Differences](#differences-from-matlab).
+to stderr, as in a script, but without a line number: a prompt entry is one
+line, so `Line 1:` would be noise.
 
 ## The language
 
@@ -1070,7 +1071,7 @@ n =
 1 3 5 7 
 ```
 
-A `break` or `continue` outside a loop currently ends the script silently with
+A `break` or `continue` outside a loop is an error, as in MATLAB. It used to end the script silently with
 exit 0 instead of erroring. See [Differences](#differences-from-matlab).
 
 ### What counts as true
@@ -1131,15 +1132,15 @@ a =
 
 b =
 
-       Inf
+   Inf
 
 c =
 
-      -Inf
+  -Inf
 
 d =
 
-       NaN
+   NaN
 
 e =
 
@@ -1152,7 +1153,6 @@ f =
 g =
 
      0
-
 ```
 
 There is no `e` constant: MATLAB does not have one, so write `exp(1)`. `e` is
@@ -1792,7 +1792,7 @@ clear x
 ```
 
 ```
-Error: Line 2: unexpected Ident("x")
+Error: Line 2: unexpected 'x'
 ```
 
 ### Timing
@@ -1851,8 +1851,8 @@ Z =
 
 N =
 
-       NaN       NaN       NaN
-       NaN       NaN       NaN
+   NaN   NaN   NaN
+   NaN   NaN   NaN
 
 T =
 
@@ -1867,7 +1867,6 @@ E =
 
      1     0     0
      0     1     0
-
 ```
 
 `pi(2)` stays an error, as in MATLAB. A trailing size of `1` is dropped, so
@@ -1939,19 +1938,20 @@ c = sort([3 1 2], 'ascend')
 ```
 a =
 
-    1.0000    2.0000    3.0000       NaN
+     1     2     3   NaN
 
 b =
 
-       NaN    3.0000    2.0000    1.0000
+   NaN     3     2     1
 
 c =
 
      1     2     3
-
 ```
 
-The four-decimal columns in `a` and `b` are a display bug, not a value bug:
+A `NaN` no longer widens its row: it has no digits, so it neither changes the
+format nor the column width. The values were always right; only the display
+was wrong.
 one non-finite element currently forces the whole row out of integer format.
 MATLAB prints `1 2 3 NaN`.
 
@@ -2231,8 +2231,7 @@ f =
 
 g =
 
-       NaN
-
+   NaN
 ```
 
 ### Smaller argument fixes
@@ -2349,8 +2348,8 @@ y =
 
 An all-integer matrix prints in integer columns; anything else prints in fixed
 point with four decimals. There is no `format long` or `format short`, and no
-common scale factor (`1.0e+03 *`). Wide matrices print on one long unwrapped
-line rather than MATLAB's `Columns 1 through 13` blocks.
+common scale factor (`1.0e+03 *`). Wide matrices do wrap into MATLAB's
+`Columns N through M` blocks, at 80 columns.
 
 ### `fprintf` conversions
 
@@ -2512,7 +2511,7 @@ disp('after')
 
 ```
 before
-Error: Line 2: Undefined function or variable 'undefined_thing'.
+Error: Line 2: Unrecognized function or variable 'undefined_thing'.
 ```
 
 The line is the line of the statement that raised the error, including inside
@@ -2527,7 +2526,7 @@ end
 
 ```
      1
-Error: Line 3: Undefined function or variable 'nope'.
+Error: Line 3: Unrecognized function or variable 'nope'.
 ```
 
 Common messages:
@@ -2579,11 +2578,12 @@ y = x + ;
 ```
 
 ```
-Error: Line 2: unexpected Semi in expression
+Error: Line 2: unexpected ';' in expression
 ```
 
 The line and position are right, but the token is named by its internal
-`Debug` name rather than as `';'`. That rendering is a known bug.
+token's own spelling, `';'`, which is what it does now. It used to print the
+internal `Debug` name, `Semi`.
 
 ### Exit codes
 
@@ -2607,9 +2607,11 @@ fprintf('%.65536f\n', 1);
 Error: Line 1: The width or precision in a format specifier must be at most 8192.
 ```
 
-One input still aborts with 134: around 96,000 levels of nesting exhausts the
-parser's stack. It is the last of its family and belongs to cycle 01e. Until
-it is closed, nothing here claims that no input can kill the process.
+No input the project knows of reaches 101 or 134 any more. Nesting is bounded
+at 10,000 levels in both the parser and the evaluator, so an over-deep
+expression is an ordinary error rather than a stack overflow. That is a claim
+about every input tried, not a proof; if you find one that crashes, it is a
+bug worth reporting.
 
 ## Differences from MATLAB
 
@@ -2675,8 +2677,8 @@ MATLAB gives `0 1.5000`, `1x0 empty double row vector`, wider integer columns,
 `1.0e+03 *` with a scaled row, `-2.0000`, `1.2345e+03`, `1.0000e-03` and
 `1.0000e+10`.
 
-A single non-finite element forces the whole row into four-decimal format,
-where MATLAB keeps integer columns:
+A `NaN` or `Inf` in a row keeps MATLAB's integer columns, which it did not
+before cycle 01e:
 
 ```matlab
 disp([1 2 NaN])
@@ -2684,8 +2686,8 @@ disp(NaN)
 ```
 
 ```
-    1.0000    2.0000       NaN
-       NaN
+     1     2   NaN
+   NaN
 ```
 
 MATLAB gives `     1     2   NaN` and `   NaN`: it keeps integer columns when
@@ -2725,8 +2727,8 @@ the index list "element 1, element 1, element 1". **Do not use logical
 indexing yet.** Use `find` instead. Cycle 02 makes comparisons logical and
 cycle 03 implements the indexing.
 
-`NaN` converts silently to true, and `&&`/`||` accept non-scalars, where
-MATLAB errors in both cases:
+`NaN` cannot be converted to a logical, and `&&` and `||` require an operand
+convertible to a logical scalar. Both refuse, as MATLAB does:
 
 ```matlab
 if NaN, disp('NaN is true'), end
@@ -2736,19 +2738,7 @@ c = [1 1] && 1
 ```
 
 ```
-NaN is true
-a =
-
-     1
-
-b =
-
-     0
-
-c =
-
-     1
-
+Error: Line 1: NaN's cannot be converted to logicals.
 ```
 
 ### Numerics
@@ -2763,7 +2753,7 @@ a = [Inf 0] * [0; 1]
 ```
 a =
 
-       NaN
+   NaN
 ```
 
 A result that would be complex is refused rather than returned as a `NaN` that
@@ -2840,13 +2830,13 @@ disp(222)
 ```
 
 Command syntax is a parse error, so `clear x`, `format long` and `disp hello`
-all fail; use `clear('x')`. Chained ranges are rejected (`1:2:3:4` is
+all fail; use `clear('x')`. Chained ranges now parse as MATLAB reads them (`1:2:3:4` is
 `unexpected Colon`, MATLAB reads it as `(1:2:3):4`). Hex literals (`0x1F`) are
 rejected. A UTF-8 BOM at the start of a file is rejected, which a Windows
 editor or PowerShell can easily produce.
 
-A `break` or `continue` outside a loop ends the script silently with exit 0,
-where MATLAB errors:
+A `break` or `continue` outside a loop is an error, as in MATLAB. It used to
+end the script silently with exit 0:
 
 ```matlab
 disp(1)
@@ -2856,6 +2846,7 @@ disp(2)
 
 ```
      1
+Error: Line 2: 'break' is only valid inside a loop.
 ```
 
 `2` never prints and the exit code is 0.
@@ -2882,9 +2873,9 @@ MATLAB reports `100% sure`. With a format and arguments (`error('value %d',
 7)`) SplatCrab is correct; it is the one-argument case that is wrong. An
 identifier first argument is not supported either.
 
-Empty-result shapes differ in several places: `find([])` and `diag([])` are
-0x1 where MATLAB gives 0x0, `size('')` is `1 0` where MATLAB gives `0 0`, and
-`disp([])` prints `[]` where MATLAB prints nothing.
+Empty-result shapes match MATLAB: `find([])` and `diag([])` are 0x0,
+`size('')` is `0 0`, and `disp([])` prints nothing. All four differed before
+cycle 01e.
 
 ```matlab
 a = size(find([]))
@@ -2897,21 +2888,19 @@ d = num2str([1 2; 3 4])
 ```
 a =
 
-     0     1
+     0     0
 
 b =
 
-     0     1
+     0     0
 
 c =
 
-     1     0
+     0     0
 
-     []
 d =
 
     '1  3  2  4'
-
 ```
 
 `num2str` of a matrix gives one row in column-major order; MATLAB gives a
@@ -2919,16 +2908,23 @@ d =
 
 ### Error text
 
-Three message texts differ from current MATLAB, deliberately unresolved for
-now: `Undefined function or variable 'x'.` is
-`Unrecognized function or variable 'x'.` in R2020a and later; the size-mismatch
-message names the operator and the sizes where MATLAB says only
-`Arrays have incompatible sizes for this operation.`; and the `x(0)` text ends
-`must be positive integers or logical values.` in MATLAB.
+Message text follows MATLAB R2020a and later, except where SplatCrab's wording
+says strictly more. An unknown name is `Unrecognized function or variable
+'x'.`, which is R2020a's phrasing rather than the older `Undefined function or
+variable`.
+
+Two messages deliberately keep their own wording, because they say more than
+MATLAB's:
+
+- The size-mismatch message names the operator and both shapes. MATLAB says
+  only `Arrays have incompatible sizes for this operation.`
+- The `x(0)` message ends `must be positive integers.` MATLAB's ends
+  `must be positive integers or logical values.`, which is not yet true here;
+  it changes when cycle 03 makes a logical mask index.
 
 ### REPL
 
-REPL diagnostics go to stdout rather than stderr, so a piped session cannot
+REPL diagnostics used to go to stdout rather than stderr, so a piped session could not
 separate them from output. An incomplete block at end of input is discarded
 silently.
 
@@ -2977,5 +2973,5 @@ plot(1:10)
 ```
 
 ```
-Error: Line 1: Undefined function or variable 'plot'.
+Error: Line 1: Unrecognized function or variable 'plot'.
 ```

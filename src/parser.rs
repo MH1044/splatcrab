@@ -59,12 +59,36 @@ pub enum Stmt {
     Expr(Expr, bool),
     Assign(String, Expr, bool),
     IndexAssign(String, Vec<Expr>, Expr, bool),
-    If(Vec<(Expr, Vec<Located>)>, Option<Vec<Located>>),
+    If(Vec<IfArm>, Option<Vec<Located>>),
     For(String, Expr, Vec<Located>),
     While(Expr, Vec<Located>),
     Break,
     Continue,
 }
+
+/// One `if` or `elseif` arm: a condition, the line that condition is written
+/// on, and the body to run when it holds.
+///
+/// The line is on the arm for the same reason [`Located`] exists: an error
+/// raised while evaluating an `elseif` condition must report the `elseif`'s
+/// own line, not the line of the `if` that opened the statement (QA D27).
+/// `Expr` itself stays position-free, so expression trees still compare over
+/// structure alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IfArm {
+    pub cond: Expr,
+    pub line: u32,
+    pub body: Vec<Located>,
+}
+
+/// The deepest nesting the parser will build and the evaluator will walk.
+///
+/// Both recursions are one frame per level, so one number bounds both: a
+/// program the parser accepts is one the evaluator can walk without running
+/// out of stack. See the Design notes of `docs/modules/01e-display-and-parser.md`
+/// for how the number was chosen and the margin it leaves against the 256 MB
+/// stack `src/main.rs` reserves.
+pub const MAX_DEPTH: usize = 10_000;
 
 /// A statement with the source line it starts on.
 ///
@@ -86,6 +110,8 @@ pub struct Parser {
     pos: usize,
     /// Depth of `name( ... )` argument lists we are inside; enables `end` and bare `:`.
     in_index: usize,
+    /// How deeply nested the construct being parsed is; see [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Parser {
@@ -95,6 +121,7 @@ impl Parser {
             lines: Vec::new(),
             pos: 0,
             in_index: 0,
+            depth: 0,
         }
     }
 
@@ -105,7 +132,25 @@ impl Parser {
             lines: lexed.lines,
             pos: 0,
             in_index: 0,
+            depth: 0,
         }
+    }
+
+    /// Counts one more level of nesting, refusing anything past [`MAX_DEPTH`].
+    ///
+    /// Two things call it, because both make the tree one level deeper.
+    /// Recursive descent does: `((x))`, `[[x]]`, `f(f(x))` and a nested block
+    /// each add a level. So does a left-folding loop: `1+1+1` is
+    /// `(1+1)+1`, and a flat sum of 280,000 terms is a 280,000-deep tree even
+    /// though the parser never recursed to build it. Counting only recursion
+    /// would leave that sum to overflow the evaluator's stack instead.
+    fn deepen(&mut self) -> R<()> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            let line = self.line();
+            bail!(error::nesting_too_deep(MAX_DEPTH).at(line));
+        }
+        Ok(())
     }
 
     fn peek(&self) -> &Token {
@@ -174,7 +219,12 @@ impl Parser {
             // The line of the token that opens the statement is the line a
             // runtime error inside it reports.
             let line = self.line();
+            // A block inside a block is a level of nesting like any other:
+            // `if 1, if 1, ... end end` recurses through here once per level,
+            // in the parser and again in `Interp::exec`.
+            self.deepen()?;
             let stmt = self.parse_stmt()?;
+            self.depth -= 1;
             out.push(Located { stmt, line });
         }
     }
@@ -185,16 +235,28 @@ impl Parser {
             Token::If => {
                 self.next();
                 let mut arms = Vec::new();
+                // The condition's own line, not the statement's: they differ
+                // for every `elseif`, and an error in one must name it.
+                let cond_line = self.line();
                 let cond = self.parse_expr()?;
                 let body = self.parse_block(&[Token::End, Token::Else, Token::ElseIf])?;
-                arms.push((cond, body));
+                arms.push(IfArm {
+                    cond,
+                    line: cond_line,
+                    body,
+                });
                 loop {
                     match self.next() {
                         Token::ElseIf => {
+                            let cond_line = self.line();
                             let cond = self.parse_expr()?;
                             let body =
                                 self.parse_block(&[Token::End, Token::Else, Token::ElseIf])?;
-                            arms.push((cond, body));
+                            arms.push(IfArm {
+                                cond,
+                                line: cond_line,
+                                body,
+                            });
                         }
                         Token::Else => {
                             let body = self.parse_block(&[Token::End])?;
@@ -278,47 +340,66 @@ impl Parser {
 
     // ---- expressions -------------------------------------------------
 
+    /// Every nested expression enters here: a parenthesised group, a matrix
+    /// element, an index or call argument, and the expression of a statement.
+    /// That is what makes [`Parser::depth`] the nesting depth.
     pub fn parse_expr(&mut self) -> R<Expr> {
-        self.parse_oror()
+        self.deepen()?;
+        let e = self.parse_oror();
+        self.depth -= 1;
+        e
     }
 
     fn parse_oror(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_andand()?;
         while self.eat(&Token::OrOr) {
+            self.deepen()?;
             let right = self.parse_andand()?;
             left = Expr::Binary(BinOp::OrOr, Box::new(left), Box::new(right));
         }
+        self.depth = save;
         Ok(left)
     }
 
     fn parse_andand(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_or()?;
         while self.eat(&Token::AndAnd) {
+            self.deepen()?;
             let right = self.parse_or()?;
             left = Expr::Binary(BinOp::AndAnd, Box::new(left), Box::new(right));
         }
+        self.depth = save;
         Ok(left)
     }
 
     fn parse_or(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_and()?;
         while self.eat(&Token::Or) {
+            self.deepen()?;
             let right = self.parse_and()?;
             left = Expr::Binary(BinOp::Or, Box::new(left), Box::new(right));
         }
+        self.depth = save;
         Ok(left)
     }
 
     fn parse_and(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_cmp()?;
         while self.eat(&Token::And) {
+            self.deepen()?;
             let right = self.parse_cmp()?;
             left = Expr::Binary(BinOp::And, Box::new(left), Box::new(right));
         }
+        self.depth = save;
         Ok(left)
     }
 
     fn parse_cmp(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_range()?;
         loop {
             let op = match self.peek() {
@@ -328,14 +409,24 @@ impl Parser {
                 Token::Le => BinOp::Le,
                 Token::Gt => BinOp::Gt,
                 Token::Ge => BinOp::Ge,
-                _ => return Ok(left),
+                _ => break,
             };
             self.next();
+            self.deepen()?;
             let right = self.parse_range()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
+        self.depth = save;
+        Ok(left)
     }
 
+    /// `a:b`, `a:s:b`, and any number of further colons after them.
+    ///
+    /// MATLAB reads `1:2:3:4` as `(1:2:3):4`: the first three operands form
+    /// the stepped range, and each colon after that starts a new two-operand
+    /// range whose start is everything so far. The loop is what makes that
+    /// work; it used to handle two colons and stop, so `1:2:3:4` was a parse
+    /// error.
     fn parse_range(&mut self) -> R<Expr> {
         // Bare `:` inside an index: `A(:, 1)`
         if self.in_index > 0
@@ -345,38 +436,44 @@ impl Parser {
             self.next();
             return Ok(Expr::Colon);
         }
-        let first = self.parse_add()?;
-        if !self.eat(&Token::Colon) {
-            return Ok(first);
+        let save = self.depth;
+        let mut e = self.parse_add()?;
+        while self.eat(&Token::Colon) {
+            self.deepen()?;
+            let second = self.parse_add()?;
+            // A third operand only joins the range being built now. After
+            // `1:2:3` is closed, `:4` opens a fresh one around it.
+            e = if self.eat(&Token::Colon) {
+                let third = self.parse_add()?;
+                Expr::Range(Box::new(e), Some(Box::new(second)), Box::new(third))
+            } else {
+                Expr::Range(Box::new(e), None, Box::new(second))
+            };
         }
-        let second = self.parse_add()?;
-        if self.eat(&Token::Colon) {
-            let third = self.parse_add()?;
-            Ok(Expr::Range(
-                Box::new(first),
-                Some(Box::new(second)),
-                Box::new(third),
-            ))
-        } else {
-            Ok(Expr::Range(Box::new(first), None, Box::new(second)))
-        }
+        self.depth = save;
+        Ok(e)
     }
 
     fn parse_add(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_mul()?;
         loop {
             let op = match self.peek() {
                 Token::Plus => BinOp::Add,
                 Token::Minus => BinOp::Sub,
-                _ => return Ok(left),
+                _ => break,
             };
             self.next();
+            self.deepen()?;
             let right = self.parse_mul()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
+        self.depth = save;
+        Ok(left)
     }
 
     fn parse_mul(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut left = self.parse_unary()?;
         loop {
             let op = match self.peek() {
@@ -386,70 +483,99 @@ impl Parser {
                 Token::DotStar => BinOp::EMul,
                 Token::DotSlash => BinOp::EDiv,
                 Token::DotBackslash => BinOp::ELDiv,
-                _ => return Ok(left),
+                _ => break,
             };
             self.next();
+            self.deepen()?;
             let right = self.parse_unary()?;
             left = Expr::Binary(op, Box::new(left), Box::new(right));
         }
+        self.depth = save;
+        Ok(left)
     }
 
     fn parse_unary(&mut self) -> R<Expr> {
+        // A prefix chain such as `----x` recurses once per sign.
         match self.peek() {
             Token::Minus => {
+                self.deepen()?;
                 self.next();
-                Ok(Expr::Neg(Box::new(self.parse_unary()?)))
+                let e = Expr::Neg(Box::new(self.parse_unary()?));
+                self.depth -= 1;
+                Ok(e)
             }
             Token::Plus => {
+                self.deepen()?;
                 self.next();
-                self.parse_unary()
+                let e = self.parse_unary()?;
+                self.depth -= 1;
+                Ok(e)
             }
             Token::Not => {
+                self.deepen()?;
                 self.next();
-                Ok(Expr::Not(Box::new(self.parse_unary()?)))
+                let e = Expr::Not(Box::new(self.parse_unary()?));
+                self.depth -= 1;
+                Ok(e)
             }
             _ => self.parse_power(),
         }
     }
 
     fn parse_power(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut base = self.parse_postfix()?;
         loop {
             let op = match self.peek() {
                 Token::Caret => BinOp::Pow,
                 Token::DotCaret => BinOp::EPow,
-                _ => return Ok(base),
+                _ => break,
             };
             self.next();
+            self.deepen()?;
             // MATLAB allows a unary sign directly in the exponent: 2^-1
             let exp = self.parse_power_operand()?;
             base = Expr::Binary(op, Box::new(base), Box::new(exp));
         }
+        self.depth = save;
+        Ok(base)
     }
 
     fn parse_power_operand(&mut self) -> R<Expr> {
         match self.peek() {
             Token::Minus => {
+                self.deepen()?;
                 self.next();
-                Ok(Expr::Neg(Box::new(self.parse_power_operand()?)))
+                let e = Expr::Neg(Box::new(self.parse_power_operand()?));
+                self.depth -= 1;
+                Ok(e)
             }
             Token::Plus => {
+                self.deepen()?;
                 self.next();
-                self.parse_power_operand()
+                let e = self.parse_power_operand()?;
+                self.depth -= 1;
+                Ok(e)
             }
             Token::Not => {
+                self.deepen()?;
                 self.next();
-                Ok(Expr::Not(Box::new(self.parse_power_operand()?)))
+                let e = Expr::Not(Box::new(self.parse_power_operand()?));
+                self.depth -= 1;
+                Ok(e)
             }
             _ => self.parse_postfix(),
         }
     }
 
     fn parse_postfix(&mut self) -> R<Expr> {
+        let save = self.depth;
         let mut e = self.parse_primary()?;
         while self.eat(&Token::Transpose) {
+            self.deepen()?;
             e = Expr::Transpose(Box::new(e));
         }
+        self.depth = save;
         Ok(e)
     }
 
@@ -544,6 +670,11 @@ mod tests {
     /// A statement and the line it is expected to start on.
     fn at(line: u32, stmt: Stmt) -> Located {
         Located { stmt, line }
+    }
+
+    /// An `if` arm: its condition, the line that condition is on, and its body.
+    fn arm(cond: Expr, line: u32, body: Vec<Located>) -> IfArm {
+        IfArm { cond, line, body }
     }
 
     fn num(v: f64) -> Expr {
@@ -735,6 +866,31 @@ mod tests {
         );
     }
 
+    /// MATLAB reads `1:2:3:4` as `(1:2:3):4`: the first three operands make
+    /// the stepped range, and each colon after that opens a fresh
+    /// two-operand range around everything so far. It used to be a parse
+    /// error, because `parse_range` handled two colons and did not loop.
+    #[test]
+    fn a_chain_of_colons_folds_to_the_left() {
+        assert_eq!(
+            parse_expr("1:2:3:4"),
+            range(range(num(1.0), Some(num(2.0)), num(3.0)), None, num(4.0))
+        );
+        // Spelling the grouping out gives the same tree.
+        assert_eq!(parse_expr("1:2:3:4"), parse_expr("(1:2:3):4"));
+        // Past four operands the rule keeps applying to what has been built:
+        // the range closed by `1:2:3` becomes the start of the next one, and
+        // that one takes a step of its own if a further colon offers it.
+        assert_eq!(parse_expr("1:2:3:4:5"), parse_expr("(1:2:3):4:5"));
+        assert_eq!(parse_expr("1:2:3:4:5:6"), parse_expr("((1:2:3):4:5):6"));
+        // Two colons and one colon are unchanged.
+        assert_eq!(parse_expr("1:3"), range(num(1.0), None, num(3.0)));
+        assert_eq!(
+            parse_expr("1:2:9"),
+            range(num(1.0), Some(num(2.0)), num(9.0))
+        );
+    }
+
     #[test]
     fn comparison_is_looser_than_range() {
         assert_eq!(
@@ -877,8 +1033,9 @@ mod tests {
                 1,
                 Stmt::If(
                     vec![
-                        (ident("a"), vec![at(2, Stmt::Expr(num(1.0), false))]),
-                        (ident("b"), vec![at(4, Stmt::Expr(num(2.0), false))]),
+                        arm(ident("a"), 1, vec![at(2, Stmt::Expr(num(1.0), false))]),
+                        // The `elseif` condition carries line 3, its own.
+                        arm(ident("b"), 3, vec![at(4, Stmt::Expr(num(2.0), false))]),
                     ],
                     Some(vec![at(6, Stmt::Expr(num(3.0), false))]),
                 )
@@ -893,7 +1050,7 @@ mod tests {
             vec![at(
                 1,
                 Stmt::If(
-                    vec![(ident("a"), vec![at(2, Stmt::Expr(num(1.0), false))])],
+                    vec![arm(ident("a"), 1, vec![at(2, Stmt::Expr(num(1.0), false))])],
                     None
                 )
             )]
@@ -946,8 +1103,9 @@ mod tests {
                     vec![at(
                         2,
                         Stmt::If(
-                            vec![(
+                            vec![arm(
                                 bin(BinOp::Gt, ident("i"), num(1.0)),
+                                2,
                                 vec![at(3, Stmt::Break)],
                             )],
                             None
@@ -992,6 +1150,50 @@ mod tests {
     #[test]
     fn unmatched_paren_is_an_error() {
         assert!(parse_result("(1 + 2").is_err());
+    }
+
+    /// A parse message names the token the way it was written, not by its
+    /// Rust variant: `unexpected ';'`, never `unexpected Semi`.
+    #[test]
+    fn a_parse_error_names_the_token_as_it_was_written() {
+        let msg = |src: &str| parse_result(src).unwrap_err().msg;
+        assert_eq!(msg("y = x + ;"), "unexpected ';' in expression");
+        assert_eq!(msg("y = x + "), "unexpected end of input in expression");
+        assert_eq!(msg("y = x + \n"), "unexpected end of line in expression");
+        assert_eq!(msg("y = x + )"), "unexpected ')' in expression");
+        assert_eq!(msg("y = (1 + 2;"), "expected ')' but found ';'");
+        assert_eq!(msg("end"), "unexpected 'end' with no matching block");
+        assert_eq!(
+            msg("for 1 = 1:2\nend"),
+            "expected loop variable after 'for', found '1'"
+        );
+        // A number shows its value and an identifier its name. `0x1F` lexes
+        // as `0` then the identifier `x1F`, which is the message QA D30 left
+        // as `unexpected Ident("x1F")`.
+        assert_eq!(msg("x = 0x1F"), "unexpected 'x1F'");
+        assert_eq!(msg("x = 1 2"), "unexpected '2'");
+        assert_eq!(msg("x = 1 0.3"), "unexpected '0.3'");
+        // Nothing in a message says `Token` or a variant name any more.
+        for src in ["y = x + ;", "end", "x = 0x1F", "y = (1 + 2;"] {
+            let m = msg(src);
+            assert!(!m.contains("Semi") && !m.contains("Ident("), "{src}: {m}");
+        }
+    }
+
+    /// The depth counter measures nesting, not size: it is restored as each
+    /// construct closes, so a long flat program never approaches the limit
+    /// however many statements and operators it contains. The boundary
+    /// itself is tested in `interp.rs`, where the test can run on the stack
+    /// the interpreter actually uses.
+    #[test]
+    fn depth_is_nesting_and_not_program_length() {
+        let many = vec!["x = f(1) + [2 3] * 4 - (5 + 6);"; 2000].join("\n");
+        assert!(parse_result(&many).is_ok());
+        // Sibling expressions inside one statement do not accumulate either.
+        let args = vec!["(1 + 2)"; 2000].join(", ");
+        assert!(parse_result(&format!("x = f({args});")).is_ok());
+        let row = vec!["(1 + 2)"; 2000].join(" ");
+        assert!(parse_result(&format!("x = [{row}];")).is_ok());
     }
 
     // ---- line numbers ------------------------------------------------------

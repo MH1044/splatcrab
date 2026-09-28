@@ -115,20 +115,29 @@ z
 - Numbers, strings, variables, `ans`, comments, line continuation. A `...`
   separates elements inside brackets just as a space does, so `[1 ...` newline
   `-2]` is two elements
-- Matrix literals, ranges `a:b` and `a:s:b`, capped so `1:1e15` is a clean
-  error rather than an allocator abort. A range lands exactly on its end point
-  and is symmetric about its middle, so `x = 0:0.1:0.3; x(end) == 0.3` is `1`;
-  an infinite end point such as `0:Inf` is refused
+- Matrix literals, ranges `a:b`, `a:s:b`, and chains of them: `1:2:3:4` reads
+  as `(1:2:3):4`, the way MATLAB reads it. Ranges are capped, so `1:1e15` is a
+  clean error rather than an allocator abort; one lands exactly on its end
+  point and is symmetric about its middle, so `x = 0:0.1:0.3; x(end) == 0.3`
+  is `1`. An infinite end point such as `0:Inf` is refused, and an infinite
+  *step* follows MATLAB's documented count, so `1:Inf:5` is the one element `1`
 - Operators `+ - * / \ ^`, elementwise `.* ./ .\ .^`, transpose, comparisons,
   `& | ~` and short-circuit `&& ||`, with broadcasting. A result too big to
   allocate is a clean error wherever its shape comes from the operands, so
   `ones(1e5,1) + ones(1,1e5)` names the size it was asked for instead of
-  aborting the process
+  aborting the process. A `NaN` is refused wherever a logical is wanted, as
+  MATLAB refuses it, and `&&` and `||` need an operand convertible to a
+  logical scalar, so `[1 1] && 1` is an error rather than `1`
 - Indexing `A(i)`, `A(i,j)`, `v(2:4)`, `A(:,1)`, `A(end)`, and growth on
   indexed assignment such as `z(end+1) = x`
 - `if` / `elseif` / `else`, `for` over ranges and matrix columns, `while`,
   `break`, `continue`. A `for` that runs zero times still assigns the empty to
-  its loop variable, as MATLAB does
+  its loop variable, as MATLAB does, and a `break` with no loop around it is
+  an error rather than a silent end to the script
+- Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
+  brackets, calls, indexes, blocks or chained operators, past which the parser
+  and the evaluator both give a clean error. Nothing a user can type aborts
+  the process any more
 - Square `A\b`, `inv`, `det`, integer matrix powers. The singular test is
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
@@ -152,10 +161,18 @@ z
 - A builtin that produces no value, such as `disp`, is legal as a statement
   and is "Too many output arguments." in an expression; every builtin rejects
   extra arguments with "Too many input arguments."
+- Display that follows MATLAB's: a matrix too wide for the 80-column window
+  wraps into `Columns N through M` blocks, integer columns survive a `NaN` or
+  an `Inf` beside them, and `disp([])` prints nothing at all
 - Errors that say where they happened: a script prints
   `Error: Line N: <msg>` on stderr and exits 1, reporting the line of the
-  statement that raised it, including inside a loop or `if` body
-- A REPL with multi-line continuation, and a script runner
+  statement that raised it, including inside a loop, an `if` body or an
+  `elseif` condition. A parse error names the token the way you wrote it, so
+  `y = x + ;` reports `unexpected ';' in expression`
+- A REPL with multi-line continuation, and a script runner. REPL diagnostics
+  go to stderr like a script's, a block left open at end of input is reported
+  rather than discarded, and a script file may start with a UTF-8 byte-order
+  mark or hold bytes that are not valid UTF-8
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.

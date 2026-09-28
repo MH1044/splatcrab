@@ -68,6 +68,10 @@ fn trace(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 /// `numel(v) + abs(k)`, and `diag(A, k)` returns the k-th diagonal of `A` as
 /// a column. `k > 0` is above the main diagonal. A `k` past the matrix gives
 /// a 0x1, which is Octave's answer and MATLAB's shape for an empty diagonal.
+///
+/// `diag([])` is the exception: it is `0x0` in MATLAB, not the `0x1` that
+/// rule would give, because a `0x0` has no diagonal to orient. The argument
+/// is still validated first, so `diag([], 'x')` is the offset error.
 fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 2, "diag")?;
     let m = mat(a, 0, "diag")?;
@@ -79,6 +83,9 @@ fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     } else {
         0.0
     };
+    if m.rows == 0 && m.cols == 0 {
+        return one_mat(Matrix::empty());
+    }
     if m.is_vector() {
         let n = m.numel();
         let (order, _) = check_shape(n as f64 + k.abs(), n as f64 + k.abs())?;
@@ -315,6 +322,10 @@ fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 /// `find(X)`, `find(X, n)`, `find(X, n, 'first')` and `find(X, n, 'last')`.
 /// The last `n` indices stay in ascending order, as MATLAB returns them, and
 /// the result is a row for a row vector and a column otherwise.
+///
+/// `find([])` is `0x0` rather than the `0x1` "otherwise" would give: a `0x0`
+/// input has no orientation to keep, which MATLAB reflects in the result.
+/// `find(zeros(1, 0))` is still the `1x0` its row shape asks for.
 fn find(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 3, "find")?;
     let m = mat(a, 0, "find")?;
@@ -344,7 +355,9 @@ fn find(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
             idx.truncate(n);
         }
     }
-    one_mat(if m.rows == 1 {
+    one_mat(if m.rows == 0 && m.cols == 0 {
+        Matrix::empty()
+    } else if m.rows == 1 {
         Matrix::row(idx)
     } else {
         Matrix::col(idx)

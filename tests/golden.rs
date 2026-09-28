@@ -10,6 +10,10 @@
 //! the file is typed at the prompt through stdin. Everything else -- `.out`,
 //! `.err`, the exit-code rule -- is identical.
 //!
+//! Every case asserts an exact exit code. `.err` holds a substring that must
+//! appear on stderr; `.exit` holds the expected code when it is not the one
+//! the other files imply (1 with an `.err`, 0 without).
+//!
 //!   cargo test --test golden
 //!   GOLDEN_FILTER=00-baseline cargo test --test golden    # path substring
 //!   UPDATE_GOLDEN=1 cargo test --test golden              # rewrite .out
@@ -207,9 +211,36 @@ fn diff(expected: &str, actual: &str) -> String {
     out
 }
 
+/// The exit code a case must produce.
+///
+/// It is asserted in every case and never left free, because the exit code is
+/// the harness's main tripwire: a panic is 101 and a stack overflow or an
+/// allocator abort is 134, so a case that checked only the message text would
+/// pass on the very abort it was written to catch.
+///
+/// The default is what the other files imply: 1 when an `.err` names a
+/// diagnostic, 0 when there is none. An `.exit` file states the code outright
+/// where that default is wrong. The case it exists for is a REPL session that
+/// reports an error on stderr and then carries on to a clean `exit`: the
+/// diagnostic is the point of the case, and the exit code of 0 is half of it,
+/// since it is what says the session survived.
+fn expected_code(exit_path: &Path, has_err: bool) -> Result<i32, String> {
+    match fs::read_to_string(exit_path) {
+        Ok(s) => s.trim().parse().map_err(|_| {
+            format!(
+                "{} must hold a decimal exit code, not {:?}",
+                exit_path.display(),
+                s.trim()
+            )
+        }),
+        Err(_) => Ok(if has_err { 1 } else { 0 }),
+    }
+}
+
 fn check_case(m: &Path, update: bool) -> Result<(), String> {
     let out_path = m.with_extension("out");
     let err_path = m.with_extension("err");
+    let exit_path = m.with_extension("exit");
     let r = run_case(m);
     if r.timed_out {
         return Err(format!("timed out after {TIMEOUT:?} (infinite loop?)"));
@@ -218,6 +249,7 @@ fn check_case(m: &Path, update: bool) -> Result<(), String> {
     let expect_err = fs::read_to_string(&err_path)
         .ok()
         .map(|s| s.trim().to_string());
+    let expect_code = expected_code(&exit_path, expect_err.is_some())?;
 
     if update {
         let text = if actual.is_empty() {
@@ -239,20 +271,20 @@ fn check_case(m: &Path, update: bool) -> Result<(), String> {
     };
 
     let mut problems = Vec::new();
-    match (&expect_err, r.code) {
-        (None, Some(0)) => {}
-        (None, code) => problems.push(format!(
-            "exit code {code:?} but there is no .err file; stderr was:\n{}",
+    if r.code != Some(expect_code) {
+        problems.push(format!(
+            "expected exit code {expect_code} but the process exited {:?}; stderr was:\n{}",
+            r.code,
             r.stderr.trim_end()
-        )),
-        (Some(sub), Some(1)) if r.stderr.contains(sub.as_str()) => {}
-        (Some(sub), Some(1)) => problems.push(format!(
-            "stderr did not contain {sub:?}; stderr was:\n{}",
-            r.stderr.trim_end()
-        )),
-        (Some(sub), code) => problems.push(format!(
-            "expected an error containing {sub:?} but the exit code was {code:?}"
-        )),
+        ));
+    }
+    if let Some(sub) = &expect_err {
+        if !r.stderr.contains(sub.as_str()) {
+            problems.push(format!(
+                "stderr did not contain {sub:?}; stderr was:\n{}",
+                r.stderr.trim_end()
+            ));
+        }
     }
     if expected != actual {
         problems.push(format!(

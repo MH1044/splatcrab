@@ -3,7 +3,7 @@
 //! Two jobs in one file, on purpose. `MError` carries a message and the source
 //! line it came from, and the constructors below are the only place a message
 //! is spelled out, so the same wording can never drift apart between two call
-//! sites. `Undefined function or variable '{}'.` is raised from two places in
+//! sites. `Unrecognized function or variable '{}'.` is raised from two places in
 //! `interp.rs` and `Dimensions of arrays being concatenated are not
 //! consistent.` from two more; each is now one function.
 //!
@@ -103,31 +103,36 @@ pub fn unexpected_char(c: char) -> MError {
 
 // ---- parser ----------------------------------------------------------
 
+// Every one of these renders the offending token with `{}`, not `{:?}`.
+// `Token`'s `Display` is the human spelling (`';'`, `')'`, `end of input`);
+// its `Debug` is the Rust variant name, which is what used to reach the user
+// as `unexpected Semi in expression`.
+
 pub fn expected_token(want: &Token, found: &Token) -> MError {
-    MError::new(format!("expected {:?} but found {:?}", want, found))
+    MError::new(format!("expected {} but found {}", want, found))
 }
 
 pub fn unexpected_token(found: &Token) -> MError {
-    MError::new(format!("unexpected {:?}", found))
+    MError::new(format!("unexpected {}", found))
 }
 
 pub fn unexpected_in_expression(found: &Token) -> MError {
-    MError::new(format!("unexpected {:?} in expression", found))
+    MError::new(format!("unexpected {} in expression", found))
 }
 
 pub fn expected_end_of_if(found: &Token) -> MError {
-    MError::new(format!("expected 'end' to close 'if', found {:?}", found))
+    MError::new(format!("expected 'end' to close 'if', found {}", found))
 }
 
 pub fn expected_loop_variable(found: &Token) -> MError {
     MError::new(format!(
-        "expected loop variable after 'for', found {:?}",
+        "expected loop variable after 'for', found {}",
         found
     ))
 }
 
 pub fn block_with_no_opener(found: &Token) -> MError {
-    MError::new(format!("unexpected {:?} with no matching block", found))
+    MError::new(format!("unexpected {} with no matching block", found))
 }
 
 pub fn invalid_assignment_target() -> MError {
@@ -138,10 +143,62 @@ pub fn unterminated_matrix() -> MError {
     MError::new("unterminated matrix literal: missing ']'")
 }
 
+/// An expression or a block nested past [`crate::parser::MAX_DEPTH`].
+///
+/// The parser and the evaluator raise the same message from the same limit:
+/// the two recursions are the same shape, so a program the parser accepts is
+/// one the evaluator can walk. Without it, about 96,000 nested parentheses
+/// exhausted even the 256 MB interpreter stack and aborted the process with
+/// exit 134 (QA D4), which no `Result` can catch.
+pub fn nesting_too_deep(limit: usize) -> MError {
+    MError::new(format!(
+        "Nesting is too deep. The maximum nesting depth is {}.",
+        limit
+    ))
+}
+
+/// A block left open when the input ran out: the REPL's end of file, which
+/// used to discard the half-typed block and exit 0 (QA D36).
+///
+/// Lower case like the other messages the parse raises, and worded to cover
+/// both openers the REPL keeps reading for, a block and a bracket.
+pub fn unterminated_block() -> MError {
+    MError::new("unterminated block: the input ended before its 'end' or closing bracket.")
+}
+
 // ---- evaluator -------------------------------------------------------
 
 pub fn end_outside_index() -> MError {
     MError::new("'end' is only valid inside an index expression.")
+}
+
+/// `break` with no enclosing loop (QA D8). It used to unwind out of the whole
+/// script, so the statements after it never ran and the process still exited
+/// 0. Raised when the statement runs, not when it parses, so everything the
+/// script printed before it is still printed.
+pub fn break_outside_loop() -> MError {
+    MError::new("'break' is only valid inside a loop.")
+}
+
+/// `continue` with no enclosing loop; see [`break_outside_loop`].
+pub fn continue_outside_loop() -> MError {
+    MError::new("'continue' is only valid inside a loop.")
+}
+
+/// MATLAB's wording, for `if NaN`, `NaN & 1` and `~NaN` (QA D5). A `NaN` is
+/// neither true nor false, and taking it as true is silent and wrong.
+pub fn nan_to_logical() -> MError {
+    MError::new("NaN's cannot be converted to logicals.")
+}
+
+/// MATLAB's wording, for `[1 1] && 1` and `[] || 1`. The short-circuit
+/// operators need one value to branch on, so an array or an empty is an
+/// error rather than "all non-zero".
+pub fn logical_scalar_operand() -> MError {
+    MError::new(
+        "Operands to the logical AND (&&) and OR (||) operators must be \
+         convertible to logical scalar values.",
+    )
 }
 
 pub fn colon_outside_index() -> MError {
@@ -205,8 +262,11 @@ pub fn ambiguous_growth() -> MError {
     MError::new("Attempt to grow array along ambiguous dimension.")
 }
 
+/// MATLAB R2020a and later. The wording before it was `Undefined function or
+/// variable`, which is what this printed until cycle 01e settled QA D33; see
+/// the message-text policy in that cycle's Design notes.
 pub fn undefined(name: &str) -> MError {
-    MError::new(format!("Undefined function or variable '{}'.", name))
+    MError::new(format!("Unrecognized function or variable '{}'.", name))
 }
 
 pub fn too_many_outputs() -> MError {
@@ -490,11 +550,11 @@ mod tests {
     fn display_adds_the_line_prefix_only_when_one_is_known() {
         assert_eq!(
             undefined("y").to_string(),
-            "Undefined function or variable 'y'."
+            "Unrecognized function or variable 'y'."
         );
         assert_eq!(
             undefined("y").at(3).to_string(),
-            "Line 3: Undefined function or variable 'y'."
+            "Line 3: Unrecognized function or variable 'y'."
         );
     }
 

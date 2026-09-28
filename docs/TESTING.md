@@ -24,7 +24,8 @@ A case is a `.m` file with a sibling `.out`:
 |---|---|
 | `<name>.m` | the script. Line 1 is `% covers: <spec bullet>` |
 | `<name>.out` | exact expected stdout. May be empty |
-| `<name>.err` | optional. A substring that must appear in stderr; the process must exit 1 |
+| `<name>.err` | optional. A substring that must appear in stderr |
+| `<name>.exit` | optional. The expected exit code, when it is not the implied one |
 | `<name>.stdin` | optional. Piped to the script's stdin |
 | `<name>.repl` | a REPL session instead of a script. Line 1 is the marker; the rest is typed at the prompt |
 
@@ -36,11 +37,11 @@ case with neither fails loudly rather than being skipped in silence.
 ### REPL cases
 
 A `.repl` file is a case in its own right, discovered by the same two rules and
-taking the same `.out` and `.err` siblings. The difference is how it runs: the
-binary is spawned with **no script argument**, so it enters the REPL, and the
-file is piped to its stdin, which the REPL reads line by line as if typed. The
-`% covers:` marker on line 1 is stripped first, so it is not typed at the
-prompt.
+taking the same `.out`, `.err` and `.exit` siblings. The difference is how it
+runs: the binary is spawned with **no script argument**, so it enters the REPL,
+and the file is piped to its stdin, which the REPL reads line by line as if
+typed. The `% covers:` marker on line 1 is stripped first, so it is not typed
+at the prompt.
 
 The expected output therefore contains the banner and the `>> ` prompts, which
 are part of what the case pins down. Use a `.repl` case only for behaviour that
@@ -53,9 +54,36 @@ A `.m` with no marker and no `.out` is a helper: a function or script file that
 a case next to it calls by name. Each case runs with its own directory as the
 working directory, so helpers resolve without a path.
 
-Without an `.err` file the process must exit 0. With one it must exit 1 and
-stderr must contain the substring. A case may have both an `.out` and an
-`.err`: that is how "output was flushed before the error" gets tested.
+## The exit code
+
+**Every case asserts an exact exit code.** It is the harness's main tripwire:
+a clean error is 1, a panic is 101, and a stack overflow or an allocator abort
+is 134, so a case that checked only the message text would pass on the very
+abort it was written to catch. Nothing is ever left free — not "non-zero", not
+"anything but 0".
+
+The code a case expects is usually implied by its other files: **0 when there
+is no `.err`, 1 when there is one.** An `.exit` file, holding the code as a
+decimal number, states it outright where that default is wrong.
+
+`.err` itself says only "stderr must contain this substring", which is how a
+case can assert a diagnostic *and* a zero exit. That combination is the REPL's:
+a session that reports an error and then runs on to a clean `exit` has to pin
+both halves, since the survival is exactly what is being tested and it is the
+exit code that shows it. `repl_error_has_no_line` and `repl_error_to_stderr`
+are the two, each with an `.err` and an `.exit` of `0`. Before cycle 01e the
+`.err` substring and the exit code of 1 were one rule, so those cases could
+only pin the *absence* of the text from stdout — a build that dropped the
+diagnostic entirely would have passed them.
+
+A case may have both an `.out` and an `.err`: that is how "output was flushed
+before the error" gets tested.
+
+An `.err` substring is chosen by hand from the spec, always. Choose one long
+enough to be load-bearing: `Error: Unrecognized function or variable
+'bad_name'.` starts at the `Error:` prefix on purpose, so a stray `Line 1: `
+between the two breaks the match, which is the whole point of the case that
+holds it.
 
 Name error cases `err_*`. Group cases by module: `tests/cases/NN-name/`.
 
@@ -87,8 +115,9 @@ directory other than the one being worked on is a red flag by default. Always
 pair it with `GOLDEN_FILTER` so unrelated cases cannot be rewritten silently.
 CI never sets `UPDATE_GOLDEN`.
 
-`.err` files are never rewritten by the tool. The expected error text is always
-chosen by hand from the spec.
+`.err` and `.exit` files are never rewritten by the tool. The expected error
+text and the expected exit code are always chosen by hand
+from the spec.
 
 ## Floating point
 

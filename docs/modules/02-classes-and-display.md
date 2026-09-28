@@ -36,13 +36,20 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - Console UTF-8 on Windows via a `SetConsoleOutputCP` FFI call, so the
   multiplication sign in size headers renders
 - Indexed assignment into a char keeps it char: `s = 'abc'; s(1) = 'X'` must
-  give `Xbc`, not `88 98 99`. Growth likewise
-- `&&` and `||` reject non-scalar and empty operands, as MATLAB does
-- Wide matrices wrap into `Columns N through M` blocks instead of printing on
-  one long line
-- Empty-result shapes match MATLAB: `find([])` and `diag([])` are `0x0`,
-  `size('')` is `0 0`, `s(:)` on a char is a column, and `disp([])` prints
-  nothing at all
+  give `Xbc`, not `88 98 99`. Growth likewise. Its Known bugs row was marked
+  01e and moved here by that cycle, whose Out of scope explains why: the fix
+  is the `Class` tag this cycle exists to add, and doing it sooner would have
+  meant inventing a temporary mechanism and then deleting it
+- `s(:)` of a char is a char column. Cycle 01e gave it MATLAB's *shape*, but a
+  `Value::Str` has nowhere to record one, so it comes back as character codes;
+  carrying the class through it is part of QA D17 above
+
+Three bullets that stood here were fixed by cycle 01e and removed from this
+Scope in the same commit: wide matrices printing on one unwrapped line, `&&`
+and `||` accepting non-scalar and empty operands, and the empty-result shapes
+of `find([])`, `diag([])`, `size('')` and `disp([])`. What is left of that
+last one for this cycle is the class half rather than the shape half — the
+typed empty headers named in the display bullet above.
 
 ## Out of scope
 
@@ -83,13 +90,13 @@ Every new error message needs an `err_*` case.
 6. `x = true(1,3); x(2) = 5; disp(class(x)); disp(x)` → `logical\n   1   1   1`; `y = [1 2 3]; y(2) = 'a'; disp(y)` → `     1    97     3`
 7. `disp(double('A')); disp(char([72 105])); disp(logical([2 0 -1]))` → `    65\nHi\n   1   0   1`
 8. `logical(NaN)` → err `NaN's cannot be converted to logicals.`
-9. `x = zeros(0,3)` → `x =\n\n  0×3 empty double matrix\n`; `y = 1:0` → `y =\n\n  1×0 empty double row vector\n`; `disp([])` prints nothing.
+9. `x = zeros(0,3)` → `x =\n\n  0×3 empty double matrix\n`; `y = 1:0` → `y =\n\n  1×0 empty double row vector\n`. (`disp([])` printing nothing stood here too; cycle 01e did it, and its `empty_result_shapes` case pins it.)
 10. Display fidelity (verify against real MATLAB): `x = 1000` → `        1000`; `x = [1 1000]` → `           1        1000`; `x = 1234.5` → `   1.2345e+03`; `x = [1.5 1000.5]` → `   1.0e+03 *\n\n    0.0015    1.0005`; `x = [0 1.5]` → `         0    1.5000`; `x = [0.001 0.002]` → `   1.0e-03 *\n\n    1.0000    2.0000`; `x = -0` → `     0`; `det([1 2; 3 4])` → `   -2.0000`. Also the scalar
     fixed-point range (QA D20): `x = 12345.6` → `   1.2346e+04`;
     `x = 0.001` → `   1.0000e-03`; `x = 1e10` → `   1.0000e+10`.
 11. `for k = 'abc', fprintf('%s:%s ', class(k), k); end; fprintf('\n')` → `char:a char:b char:c `
 12. `if 'abc', disp(1), end; if [], disp(2), end; if [1 0], disp(3), end` → `     1`
-13. `[1 2] && 1` → err `Operands to the || and && operators must be convertible to logical scalar values.`
+13. (Was `[1 2] && 1` → an error about a logical scalar. Cycle 01e did it, with the wording `Operands to the logical AND (&&) and OR (||) operators must be convertible to logical scalar values.`, and its `err_and_non_scalar` and `err_or_empty` cases pin it. Nothing is left here: once comparisons return `Logical`, the operands of `&&` reach the same conversion as before.)
 14. `s = 'abc'` → `s =\n\n    'abc'\n`; `c = ['ab'; 'cd']` → `c =\n\n  2×2 char array\n\n    'ab'\n    'cd'\n`
 15. `x = fliplr('abc'); disp(class(x)); disp(x); disp(sort('cab')); s = []; s = [s 'abc']; disp(class(s)); t = 'ab'.'; disp(size(t)); disp(class(t)); disp(class(+'a'))` → `char\ncba\nabc\nchar\n     2     1\nchar\ndouble`
 16. `x = [5 6 7]; x(x > 0)` → a clean error, not `5 5 5`. Suggested text `Logical indexing is not supported yet.`; cycle 03 replaces the error with the real thing

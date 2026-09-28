@@ -31,10 +31,18 @@ fn run() -> i32 {
 
     if args.len() > 1 {
         let path = &args[1];
-        let src = match std::fs::read_to_string(path) {
-            Ok(s) => s,
+        // Read bytes and decode leniently rather than demanding valid UTF-8.
+        // A Windows editor writes a `% café` comment in Windows-1252, and
+        // `read_to_string` refused the whole file over it with a message that
+        // was not even in the `Error:` format (QA D29). MATLAB and Octave
+        // read such a file, so SplatCrab does too: an undecodable byte
+        // becomes U+FFFD, which is harmless inside a comment or a string and
+        // is an ordinary `unexpected character` error anywhere else. A
+        // leading UTF-8 byte-order mark is skipped by the lexer.
+        let src = match std::fs::read(path) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
-                eprintln!("Cannot read {}: {}", path, e);
+                eprintln!("Error: Cannot read {}: {}", path, e);
                 return 1;
             }
         };
@@ -71,14 +79,37 @@ fn run() -> i32 {
             continue;
         }
         if let Err(e) = it.run(&buf) {
-            // No line number here: a REPL entry is one line, so "Line 1:"
-            // would be noise rather than information.
-            println!("Error: {}", e.msg);
+            report(&mut it, &e);
         }
         buf.clear();
     }
+    // The input ran out inside an unfinished block. Piping `for k = 1:3` and
+    // `disp(k)` with no `end` used to discard the buffer in silence and exit
+    // 0 (QA D36). Nothing in the buffer is run: `needs_more` said an opener
+    // was still waiting, so the statements inside it were never complete.
+    let mut code = 0;
+    if !buf.trim().is_empty() {
+        report(&mut it, &splatcrab::error::unterminated_block());
+        code = 1;
+    }
     let _ = it.out.flush();
-    0
+    code
+}
+
+/// Prints a REPL diagnostic.
+///
+/// It goes to stderr, as script mode's already does, so that a piped session
+/// can separate diagnostics from output; it used to go to stdout, where
+/// nothing downstream could tell the two apart. Whatever the entry printed
+/// before failing is flushed first, so the two streams stay in order when
+/// both land on the same terminal.
+///
+/// No line number: a REPL entry is one line, so `Line 1:` would be noise
+/// rather than information.
+fn report(it: &mut interp::Interp, e: &splatcrab::error::MError) {
+    let _ = it.out.flush();
+    io::stdout().flush().ok();
+    eprintln!("Error: {}", e.msg);
 }
 
 /// True while the buffered input has an unclosed bracket or block, so the

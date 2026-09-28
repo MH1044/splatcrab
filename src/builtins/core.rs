@@ -274,11 +274,19 @@ fn isvector(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 // ---- output ----------------------------------------------------------
 
+/// `disp(x)`: the value's display body with no `x =` header.
+///
+/// An empty matrix prints nothing at all, as in MATLAB; it used to print
+/// `     []`. `disp('')` still prints its empty line, because an empty char
+/// is a line with no characters on it rather than no output. The `[]` body
+/// itself is unchanged for the named display `x = []`, which is a separate
+/// deviation scheduled to cycle 02.
 fn disp(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "disp")?;
     need(args, 1, "disp")?;
     let text = match &args[0] {
         Value::Str(s) => format!("{s}\n"),
+        Value::Mat(m) if m.is_empty() => String::new(),
         Value::Mat(m) => m.format(),
     };
     it.emit(&text)?;

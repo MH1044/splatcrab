@@ -3,6 +3,7 @@
 *.m    text eol=lf
 *.out  text eol=lf
 *.err  text eol=lf
+*.exit text eol=lf
 *.repl text eol=lf
 *.md   text eol=lf
 *.yml  text eol=lf

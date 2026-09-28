@@ -1,0 +1,3 @@
+% covers: 8 - an incomplete block at EOF is reported, not discarded
+for k = 1:3
+disp(k)

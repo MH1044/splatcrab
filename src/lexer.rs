@@ -5,6 +5,8 @@
 //!    `[1 - 2]` is one) and a newline acts like `;`.
 //!  * `'` is a transpose after a value and a string delimiter otherwise.
 
+use std::fmt;
+
 use crate::bail;
 use crate::error::{self, R};
 
@@ -58,6 +60,76 @@ pub enum Token {
     Continue,
 
     Eof,
+}
+
+/// How a token is named to a human, as opposed to `Debug`, which names the
+/// Rust variant.
+///
+/// Every parse message renders the offending token through this, so
+/// `y = x + ;` reports `unexpected ';' in expression` rather than
+/// `unexpected Semi in expression`. One rule covers the whole form: a
+/// token's text is quoted whatever the token is, so a number reads `'0.3'`
+/// beside `')'` and an identifier `'x1F'`. The two tokens with no spelling at
+/// all, the end of a line and the end of the input, say so in words instead.
+///
+/// The one rendering that reads worse than the rest is `Transpose`, whose
+/// spelling is itself a quote: it comes out as `'''`. A string and an
+/// identifier also render alike, since both are `'text'`; the surrounding
+/// message says which was expected.
+impl fmt::Display for Token {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let word = match self {
+            // `{}` on an `f64` is the shortest round-tripping form, so `0.3`
+            // stays `0.3` and `2.0` shows as `2`, the way it was written.
+            Token::Num(v) => return write!(f, "'{}'", v),
+            Token::Ident(s) | Token::Str(s) => return write!(f, "'{}'", s),
+            Token::Newline => return f.write_str("end of line"),
+            Token::Eof => return f.write_str("end of input"),
+
+            Token::Plus => "+",
+            Token::Minus => "-",
+            Token::Star => "*",
+            Token::Slash => "/",
+            Token::Backslash => "\\",
+            Token::Caret => "^",
+            Token::DotStar => ".*",
+            Token::DotSlash => "./",
+            Token::DotBackslash => ".\\",
+            Token::DotCaret => ".^",
+            Token::Transpose => "'",
+
+            Token::Assign => "=",
+            Token::Eq => "==",
+            Token::Ne => "~=",
+            Token::Lt => "<",
+            Token::Le => "<=",
+            Token::Gt => ">",
+            Token::Ge => ">=",
+            Token::And => "&",
+            Token::Or => "|",
+            Token::AndAnd => "&&",
+            Token::OrOr => "||",
+            Token::Not => "~",
+
+            Token::LParen => "(",
+            Token::RParen => ")",
+            Token::LBracket => "[",
+            Token::RBracket => "]",
+            Token::Comma => ",",
+            Token::Semi => ";",
+            Token::Colon => ":",
+
+            Token::If => "if",
+            Token::ElseIf => "elseif",
+            Token::Else => "else",
+            Token::End => "end",
+            Token::For => "for",
+            Token::While => "while",
+            Token::Break => "break",
+            Token::Continue => "continue",
+        };
+        write!(f, "'{}'", word)
+    }
 }
 
 /// Can this token be the last token of a value?  Used to decide whether a
@@ -120,7 +192,16 @@ pub fn lex(src: &str) -> R<Vec<Token>> {
     Ok(scan(src)?.tokens)
 }
 
+/// A UTF-8 byte-order mark, which a Windows editor or `Out-File` writes at the
+/// start of a file. It is an encoding marker, not source, and MATLAB and
+/// Octave both skip it; SplatCrab used to report
+/// `unexpected character '\u{feff}'` on line 1 (QA D29).
+const BOM: char = '\u{feff}';
+
 pub fn scan(src: &str) -> R<Lexed> {
+    // Only a *leading* mark is skipped. One in the middle of a file is a real
+    // stray character and still reported as one.
+    let src = src.strip_prefix(BOM).unwrap_or(src);
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut i = 0;
