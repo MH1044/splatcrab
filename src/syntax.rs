@@ -17,7 +17,10 @@ use crate::lexer::{self, Token};
 /// rather than a prompt that waits for more input that can never fix it.
 ///
 /// A new statement that opens a block must be counted here, beside `if`,
-/// `for`, `while`, `switch` and `try`. A `%{` block comment still open at the
+/// `for`, `while`, `switch` and `try`. Since cycle 05 `function` is one too,
+/// so the REPL and the page read a whole definition before refusing it;
+/// a definition with no `end`, legal in a function file, never completes
+/// here, which is right for the places that ask, where none is legal. A `%{` block comment still open at the
 /// end is unfinished too, since the lines that close it are still to come.
 pub fn is_complete(src: &str) -> bool {
     let lexed = match lexer::scan(src) {
@@ -38,7 +41,12 @@ pub fn is_complete(src: &str) -> bool {
             // An `end` inside `(...)` or `{...}` is an index's, not a block's.
             Token::LParen | Token::LBrace => parens += 1,
             Token::RParen | Token::RBrace => parens -= 1,
-            Token::If | Token::For | Token::While | Token::Switch | Token::Try => blocks += 1,
+            Token::If
+            | Token::For
+            | Token::While
+            | Token::Switch
+            | Token::Try
+            | Token::Function => blocks += 1,
             Token::End if parens == 0 => blocks -= 1,
             _ => {}
         }
@@ -102,5 +110,15 @@ mod tests {
         assert!(is_complete("x = 1 %{"));
         // `case {` is an index-like brace: an `end` there is not a block's.
         assert!(is_complete("switch x, case {1, 2}, end"));
+    }
+
+    /// Cycle 05's acceptance test 16, and a definition holding a block.
+    #[test]
+    fn a_function_is_a_block() {
+        assert!(!is_complete("function y = f(x)\ny = x;"));
+        assert!(is_complete("function y = f(x)\ny = x;\nend"));
+        assert!(!is_complete("function f()\nif 1\nend"));
+        assert!(is_complete("function f()\nif 1\nend\nend"));
+        assert!(is_complete("function r = f(x), r = x(end); end"));
     }
 }

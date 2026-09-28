@@ -24,6 +24,7 @@ each entry. `docs/ROADMAP.md` is the order the rest arrives in.
 - [Operators](#operators)
 - [Indexing](#indexing)
 - [Control flow](#control-flow)
+- [Functions](#functions)
 - [Builtins](#builtins)
 - [Argument forms](#argument-forms)
 - [Output and formatting](#output-and-formatting)
@@ -1788,8 +1789,9 @@ inner
 after
 ```
 
-`e.stack` arrives with user functions in cycle 05; until then it is the Dot
-error any other field gives:
+`e.stack` is a struct array in MATLAB, so it arrives with structs in cycle
+07; until then it is the Dot error any other field gives. The trace of an
+uncaught error is printed already; see [the error trace](#the-error-trace):
 
 ```matlab
 try
@@ -1830,9 +1832,245 @@ string true
 
 `if NaN` is an error, as in MATLAB: `NaN's cannot be converted to logicals.`
 
+## Functions
+
+### Local functions
+
+A script may end in `function` blocks, which its statements, and each other,
+can call. Every statement comes first: a statement after a function is
+`Function definitions in a script must appear at the end of the file.`
+
+```matlab
+disp(sq(4))
+r = hyp(3, 4)
+
+function y = sq(x)
+    y = x^2;
+end
+
+function h = hyp(a, b)
+    h = sqrt(sq(a) + sq(b));
+end
+```
+
+```
+    16
+r =
+
+     5
+```
+
+```matlab
+x = 1;
+function f()
+end
+y = 2;
+```
+
+```
+Error: Line 4: Function definitions in a script must appear at the end of the file.
+```
+
+The header takes every MATLAB form: `function name`, `function name(a, b)`,
+`function y = name(...)` and `function [y, z] = name(...)`, with `~` for an
+argument the function ignores. A function called as a statement that returns
+a value sets `ans`, as a builtin does.
+
+### Outputs, `nargin` and `nargout`
+
+`[a, b] = f(...)` takes several outputs. Inside a function, `nargin` is how
+many arguments it was called with, and `nargout` how many outputs it was asked
+for: `1` in an expression, `0` as a statement. Arguments may be left off the
+end, which is how a default is written; one too many is `Too many input
+arguments.`
+
+```matlab
+[s, p] = sp(2, 3);
+disp([s p])
+disp(scale(5))
+disp(scale(5, 3))
+counts
+
+function [s, p] = sp(a, b)
+    s = a + b;
+    p = a * b;
+end
+
+function y = scale(x, k)
+    if nargin < 2
+        k = 10;
+    end
+    y = k * x;
+end
+
+function a = counts()
+    a = nargout;
+    fprintf('asked for %d\n', nargout);
+end
+```
+
+```
+     5     6
+    50
+    15
+asked for 0
+ans =
+
+     0
+```
+
+An output the function never assigns is an error when it is asked for:
+
+```matlab
+z = bad(1)
+
+function y = bad(x)
+end
+```
+
+```
+Error: Line 1: Output argument "y" (and maybe others) not assigned during call to "bad".
+```
+
+### Scope and `return`
+
+A function sees only its own variables: its arguments and what it assigns.
+The caller's are out of reach, and what it assigns is gone when it returns.
+`end` inside a function's indexing is the function's own, so `x(f(end))` is
+always `x`'s `end`. `return` leaves the function at once, from inside any
+loop.
+
+```matlab
+x = 1;
+change_x();
+disp(x)
+disp(first_negative([3 1 -4 1 -5]))
+
+function change_x()
+    x = 99;
+end
+
+function k = first_negative(v)
+    for k = 1:numel(v)
+        if v(k) < 0
+            return
+        end
+    end
+    k = 0;
+end
+```
+
+```
+     1
+     3
+```
+
+### Recursion
+
+A function may call itself, 500 calls deep at most. One more is the clean
+error `Maximum recursion limit of 500 reached.`, never a crash.
+
+```matlab
+disp(fact(10))
+try
+    forever(1)
+catch e
+    disp(e.message)
+end
+
+function r = fact(n)
+    if n <= 1, r = 1; else, r = n * fact(n - 1); end
+end
+
+function forever(n)
+    forever(n + 1);
+end
+```
+
+```
+     3628800
+Maximum recursion limit of 500 reached.
+```
+
+### The error trace
+
+An error that leaves a function reports the line of the script's own
+statement that failed, and then one `  in <fn> (line N)` line per function
+it came out of, innermost first:
+
+```matlab
+disp('start')
+outer(1)
+
+function outer(n)
+    inner(n);
+end
+
+function inner(n)
+    error('inner failed with %d', n);
+end
+```
+
+```
+start
+Error: Line 2: inner failed with 1
+  in inner (line 9)
+  in outer (line 5)
+```
+
+### Function files, scripts and the path
+
+A file `name.m` in the current folder, or in a folder `addpath` added, is
+callable as `name`. If it starts with `function` it is a function file: its
+first function is the one the file name calls, and any others are
+subfunctions, private to that file. A function file's functions may all end
+with `end` or all go without, in which case each one runs to the next
+`function`. Any other `.m` file is a script, and calling it runs it in the
+caller's workspace, so what it assigns is the caller's.
+
+A name is looked up in this order: a variable, then a function of the running
+file, then a local function of the script being run, then a file in the
+current folder, then a file on the path, then a builtin. So a file on the
+path shadows a builtin of its name, as in MATLAB:
+
+    addpath('shadow')    % shadow/max.m returns 42
+    max([1 5 2])         % 42
+    rmpath('shadow')
+    max([1 5 2])         % 5
+
+`addpath` puts folders at the front of the path, and `rmpath` takes them off;
+a relative folder is resolved against the current folder. A file is read once
+and kept; it is read again when the path changes, and, from the REPL, the
+protocol or the browser page, when it has changed on disk since the last
+entry.
+
+`exist(name)` is `1` for a variable, `2` for a file on the path, `5` for a
+builtin and `0` otherwise. `feval('name', ...)` calls a function by name.
+
+```matlab
+x = 1;
+disp([exist('x') exist('max') exist('nosuch')])
+disp(feval('max', [4 9 2]))
+disp(feval('twice', 21))
+
+function y = twice(x)
+    y = 2 * x;
+end
+```
+
+```
+     1     5     0
+     9
+    42
+```
+
+At the REPL, in a protocol `eval` and in the browser page, a `function` block
+is read to its `end` and then refused: `Function definitions are not
+supported in this context.` Define functions in a script or a function file.
+
 ## Builtins
 
-93 names, each an ordinary function registered by name. Every one rejects
+99 names, each an ordinary function registered by name. Every one rejects
 arguments it does not understand with `Too many input arguments.` rather than
 ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 `clear`, `who`, bare `tic`, bare `toc`) is legal as a statement and is
@@ -2678,6 +2916,11 @@ done
 `who` prints the typed table that MATLAB's `whos` prints, and `whos` prints
 the same thing. `clear x`, without parentheses, is
 [command syntax](#command-syntax).
+
+### Functions and the path
+
+`nargin nargout exist feval addpath rmpath`, described with user functions
+under [Functions](#functions).
 
 ### Timing
 
@@ -3884,7 +4127,7 @@ answer. `inv` of a singular matrix errors where MATLAB warns and returns
 `Inf`. `who` prints the typed table that is MATLAB's `whos`.
 
 A caught error is a minimal `MException`: `e.message`, `e.identifier` and
-`class(e)`, with no `e.stack` until cycle 05, and a one-line display of
+`class(e)`, with no `e.stack` until cycle 07, and a one-line display of
 SplatCrab's own. An error the interpreter raises itself has an empty
 identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`.
 `warning('off')` and `lastwarn` do not exist: `warning('off')` prints
@@ -3937,6 +4180,20 @@ message used to end `must be positive integers.`; since logical indexing
 arrived in cycle 03 it ends `must be positive integers or logical values.`,
 as MATLAB's does.
 
+### Functions
+
+`exist` gives `5` for every builtin, where MATLAB gives `2` for the ones it
+ships as `.m` files, `linspace` among them. What `exist` gives for a
+function local to the running script is not settled by MATLAB's
+documentation; SplatCrab gives `0`. The trace names a local function or a
+subfunction alone, `in g3`, where MATLAB writes `script>g3`. A function in a
+file on the path can call a local function of the script being run, which
+MATLAB does not allow. A file may mix functions that end with `end` and
+functions that do not, and a script's local functions may go without `end`;
+MATLAB refuses both. Calling a script with arguments or for a value is
+`Too many input arguments.` or `Too many output arguments.`, where MATLAB
+names the script in its message.
+
 ### REPL
 
 REPL diagnostics used to go to stdout rather than stderr, so a piped session could not
@@ -3949,8 +4206,8 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 
 | Missing | Arrives in |
 |---|---|
-| User-defined functions, `nargin` / `nargout`, scoping | 05 |
-| `e.stack` and the error trace | 05 |
+| `e.stack` of a caught error | 07 |
+| `varargin`, `varargout`, `global`, `persistent`, nested functions | 07 and later |
 | Function handles and anonymous functions `@(x) ...` | 06 |
 | Cell arrays `{...}` | 07 |
 | Structs `s.field` | 07 |

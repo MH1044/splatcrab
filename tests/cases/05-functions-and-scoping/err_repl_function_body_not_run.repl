@@ -1,0 +1,5 @@
+% covers: 16 - the REPL shares is_complete, so it reads a function block through its end before refusing it: the disp(5) inside never runs
+function f()
+disp(5)
+end
+exit

@@ -66,6 +66,14 @@ pub fn register(r: &mut Registry) {
     add(r, "who", who, "who - list the variables in the workspace.");
     add(r, "whos", who, "whos - list the workspace variables with their sizes.");
 
+    // ---- functions and the path (cycle 05) ---------------------------
+    add(r, "nargin", nargin, "nargin - how many arguments the running function was called with.");
+    add(r, "nargout", nargout, "nargout - how many outputs the running function was asked for.");
+    add(r, "exist", exist, "exist(name) - 1 for a variable, 2 for a file on the path, 5 for a builtin, 0 otherwise.");
+    add(r, "feval", feval, "feval(name,...) - call the function name with the other arguments.");
+    add(r, "addpath", addpath, "addpath(d1,...) - put folders at the front of the search path.");
+    add(r, "rmpath", rmpath, "rmpath(d1,...) - take folders off the search path.");
+
     // ---- timing ------------------------------------------------------
     add(r, "tic", tic, "tic - start a stopwatch; t = tic returns a handle.");
     add(r, "toc", toc, "toc, toc(t) - elapsed seconds since tic.");
@@ -540,7 +548,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
             a.rows == b.rows && a.cols == b.cols && a.data.iter().zip(&b.data).all(|(x, y)| x == y)
         }
         (Value::Exception(a), Value::Exception(b)) => {
-            a.msg == b.msg && a.identifier == b.identifier
+            a.msg == b.msg && a.identifier() == b.identifier()
         }
         _ => false,
     }
@@ -550,7 +558,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
 
 fn clear(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     if args.is_empty() {
-        it.vars.clear();
+        it.vars_mut().clear();
     } else {
         // `clear('a')` clears only `a`. Clearing a name that is not there is
         // not an error in MATLAB either. `clear all`, and so `clear('all')`,
@@ -560,10 +568,10 @@ fn clear(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
             .map(|i| string(args, i, "clear"))
             .collect::<R<Vec<String>>>()?;
         if names.iter().any(|n| n == "all") {
-            it.vars.clear();
+            it.vars_mut().clear();
         }
         for name in &names {
-            it.vars.remove(name);
+            it.vars_mut().remove(name);
         }
     }
     none()
@@ -577,20 +585,84 @@ fn clc(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 fn who(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 0, "who")?;
-    let mut names: Vec<String> = it.vars.keys().cloned().collect();
+    let mut names: Vec<String> = it.vars().keys().cloned().collect();
     names.sort();
     if names.is_empty() {
         return none();
     }
     let mut text = String::from("Your variables are:\n\n");
     for n in &names {
-        let v = &it.vars[n];
+        let v = &it.vars()[n];
         let (rows, cols) = v.dims();
         let row = format!("  {:<12} {}x{} {}\n", n, rows, cols, v.class_name());
         text.push_str(&row);
     }
     text.push('\n');
     it.emit(&text)?;
+    none()
+}
+
+// ---- functions and the path -----------------------------------------
+
+/// `nargin` inside a function: the arguments it was called with.
+fn nargin(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 0, "nargin")?;
+    let (n, _) = it.call_counts()?;
+    one_mat(Matrix::scalar(n as f64))
+}
+
+/// `nargout` inside a function: the outputs it was asked for, `0` when it
+/// was called as a statement.
+fn nargout(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 0, "nargout")?;
+    let (_, n) = it.call_counts()?;
+    one_mat(Matrix::scalar(n as f64))
+}
+
+/// `exist(name)`; see `Interp::exist` for the values.
+fn exist(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    need(args, 1, "exist")?;
+    at_most(args, 1, "exist")?;
+    let name = string(args, 0, "exist")?;
+    one_mat(Matrix::scalar(it.exist(&name)))
+}
+
+/// `feval('name', args...)`: calls `name` as a call written in the source
+/// would, variables excepted, and passes the caller's `nargout` on.
+///
+/// A run of leading `'feval'` names that reach this builtin is peeled off
+/// first, so `feval('feval', 'feval', 'f', x)` is one call of `f`: without
+/// it every name re-entered the interpreter and copied the rest of the
+/// arguments, quadratic in the length of the run. The call itself goes
+/// through `call_nested`, which counts it against the nesting budget.
+fn feval(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
+    need(args, 1, "feval")?;
+    let mut first = 0;
+    let mut name = string(args, first, "feval")?;
+    if name == "feval" && it.reaches_builtin("feval") {
+        while name == "feval" && first + 1 < args.len() {
+            first += 1;
+            name = string(args, first, "feval")?;
+        }
+    }
+    it.call_nested(&name, args[first + 1..].to_vec(), nargout)
+}
+
+/// The folder arguments of `addpath` and `rmpath`.
+fn folders(args: &[Value], name: &str) -> R<Vec<String>> {
+    need(args, 1, name)?;
+    (0..args.len()).map(|i| string(args, i, name)).collect()
+}
+
+fn addpath(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    let dirs = folders(args, "addpath")?;
+    it.add_path(&dirs)?;
+    none()
+}
+
+fn rmpath(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    let dirs = folders(args, "rmpath")?;
+    it.remove_path(&dirs)?;
     none()
 }
 
@@ -1213,16 +1285,16 @@ mod tests {
     #[test]
     fn clear_with_a_name_clears_only_that_name() {
         let mut it = Interp::with_output(Box::new(std::io::sink()));
-        it.vars.insert("a".to_string(), num(1.0));
-        it.vars.insert("b".to_string(), num(2.0));
+        it.vars_mut().insert("a".to_string(), num(1.0));
+        it.vars_mut().insert("b".to_string(), num(2.0));
         clear(&mut it, &[Value::str("a")], 0).unwrap();
-        assert!(!it.vars.contains_key("a"));
-        assert!(it.vars.contains_key("b"));
+        assert!(!it.vars().contains_key("a"));
+        assert!(it.vars().contains_key("b"));
         // Clearing a name that is not there is not an error.
         clear(&mut it, &[Value::str("nope")], 0).unwrap();
         // With no arguments it still clears everything.
         clear(&mut it, &[], 0).unwrap();
-        assert!(it.vars.is_empty());
+        assert!(it.vars().is_empty());
     }
 
     #[test]
@@ -1727,9 +1799,9 @@ mod tests {
                 .is_empty()
         );
         let e = call(error, &[s("100% sure")], 0).unwrap_err();
-        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("100% sure", ""));
+        assert_eq!((e.msg.as_str(), e.identifier()), ("100% sure", ""));
         let e = call(error, &[s("p:q"), s("v %d"), num(2.0)], 0).unwrap_err();
-        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("v 2", "p:q"));
+        assert_eq!((e.msg.as_str(), e.identifier()), ("v 2", "p:q"));
         assert_eq!(call(error, &[num(1.0)], 0).unwrap_err().msg, "error");
     }
 
@@ -1754,7 +1826,7 @@ mod tests {
         );
         assert_eq!(call(assert, &[no(), s("50%")], 0).unwrap_err().msg, "50%");
         let e = call(assert, &[no(), s("a:b"), s("m")], 0).unwrap_err();
-        assert_eq!((e.msg.as_str(), e.identifier.as_str()), ("m", "a:b"));
+        assert_eq!((e.msg.as_str(), e.identifier()), ("m", "a:b"));
         // The condition is judged as `if` judges it.
         assert!(call(assert, &[Value::Mat(Matrix::empty())], 0).is_err());
         assert!(call(assert, &[Value::Mat(Matrix::row(vec![1.0, 0.0]))], 0).is_err());

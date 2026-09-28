@@ -86,8 +86,10 @@ mod tests {
     /// less `e`, which cycle 01c removed: MATLAB has no `e` constant. Cycle
     /// 02 added the eight class builtins: `class`, `islogical`, `ischar`,
     /// `isnumeric`, `isa`, `logical`, `char` and `double`. Cycle 04 added
-    /// five: `rethrow`, `lasterr`, `warning`, `assert` and `isequal`.
-    const EXPECTED: usize = 93;
+    /// five: `rethrow`, `lasterr`, `warning`, `assert` and `isequal`. Cycle
+    /// 05 added six: `nargin`, `nargout`, `exist`, `feval`, `addpath` and
+    /// `rmpath`.
+    const EXPECTED: usize = 99;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -189,6 +191,12 @@ mod tests {
             "warning",
             "assert",
             "isequal",
+            "nargin",
+            "nargout",
+            "exist",
+            "feval",
+            "addpath",
+            "rmpath",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

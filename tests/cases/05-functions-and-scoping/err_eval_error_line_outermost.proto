@@ -1,0 +1,3 @@
+% covers: 15 - under --protocol an error raised inside a function file answers with the line of the submitted code's statement, the outermost frame, not fails_inside.m's own line 4
+{"id":1,"op":"eval","code":"z = 1;\nfails_inside(2)"}
+{"id":2,"op":"eval","code":"disp(z)"}

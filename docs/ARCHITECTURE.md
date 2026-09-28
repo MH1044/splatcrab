@@ -114,6 +114,17 @@ Cycle 04 added `Stmt::Switch(subject, Vec<CaseArm>, otherwise)` and
 does, and its body. The name after `catch` is the bound variable only when
 it follows `catch` directly, with no comma or newline between.
 
+Cycle 05 added `function` and `return`. `parse_program` returns a `Program`,
+the statements and then the `Function`s defined after them (name, outputs,
+parameters with `~` kept in place, body, line); a statement after a function
+is MATLAB's "Function definitions in a script must appear at the end of the
+file.", and a `function` inside a block is "Function definitions are not
+supported in this context." A body is read as a block that stops at `end` or
+at the next `function`, so a function file's functions may all go without
+`end`. `Stmt::Return` is the one new statement. The lexer makes a function
+line's outputs and parameters variables of the body for command syntax, and
+forgets the names assigned before it.
+
 `Token` also has a `Display` form, which is what every parse message renders
 the offending token through; its `Debug` is the Rust variant name and used to
 reach the user as `unexpected Semi in expression`. The parser counts nesting
@@ -123,7 +134,10 @@ deepens the tree without recursing (`1+1+…+1`). `Interp` counts the same way
 against the same constant, so a program the parser accepts is one the
 evaluator can walk; see invariant 6.
 
-**`error.rs`** holds `MError { msg, line, identifier }`, the `R<T>` alias every fallible
+**`error.rs`** holds `MError { msg, line }` with its identifier and, since
+cycle 05, its `stack` of `StackEntry { name, line }` boxed together behind
+`identifier()` and `stack()` (an `MError` rides in every `R<Value>`, so its
+size is paid in every frame of a deep recursion), the `R<T>` alias every fallible
 path returns, a `bail!` macro, and a constructor for every message the
 interpreter can raise. Nothing else in the crate spells a message out; a unit
 test scans the other files for an `Err(`, `bail!(` or `ok_or_else` handed a
@@ -146,8 +160,15 @@ display. Since cycle 04 `Value` has a second variant, `Exception`, the
 'MException'.`
 
 **`interp.rs`** walks the tree. It resolves `name(args)` as indexing when
-`name` is a variable and as a builtin call otherwise, and grows arrays on
-indexed assignment. It no longer knows what any individual builtin does.
+`name` is a variable and as a call otherwise, and grows arrays on indexed
+assignment. Since cycle 05 it holds a stack of `Frame`s and calls user
+functions: `call_function` is invariant 4, `call_user` runs a function in a
+frame of its own, `run_script` runs a script file in the caller's, and
+`find_file` and `load` look files up on the path (`Interp::cwd` first, then
+the `addpath` folders) through a lookup cache and a file cache that a
+generation counter keeps honest. `run` runs a script, local functions
+allowed; `run_command` is the REPL's and the protocol's, and refuses a
+definition. It no longer knows what any individual builtin does.
 Reading, assignment and deletion share one index pipeline since cycle 03:
 `eval_index_args` turns the subscripts into zero-based `Sel`s (a logical
 subscript becomes the positions `find` would give), `resolve_read`,
@@ -180,7 +201,8 @@ REPL asks it after every line and the protocol's `complete` asks it on
 request, so the two can never disagree. It was `needs_more` in `main.rs`
 until cycle U0. Since cycle 04 it counts `switch` and `try` as openers
 beside `if`, `for` and `while`, and an open `%{` block comment as
-unfinished.
+unfinished; since cycle 05 `function` too, so a definition is read whole
+before it is refused.
 
 **`env.rs`** is the environment as seen from outside the evaluator.
 `completions(prefix, &vars, &registry)` lists every variable and builtin
@@ -243,13 +265,16 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    `mask_positions`), for reading, assignment and deletion alike. Everything
    downstream of it, the `resolve_*` functions included, is zero-based;
    everything in user-facing error messages is one-based.
-3. **`end` is resolved through `end_stack`**, pushed per index argument with
-   the size of the dimension being indexed. A function call must never push
-   to it, or `x(f(end))` would bind `end` to the wrong thing.
-4. **Name resolution order is variable first, then builtin.** A user variable
-   shadows a builtin of the same name, as in MATLAB: after `sum = 3`, `sum(1)`
-   indexes the variable. Later modules insert user functions and path files
-   between the two.
+3. **`end` is resolved through the running frame's `end_stack`**, pushed per
+   index argument with the size of the dimension being indexed. Since cycle
+   05 the stack lives in the `Frame`, so a call starts with an empty one:
+   `x(f(end))` binds `end` to `x`, and nothing `f` indexes can see it.
+4. **Name resolution order is variable, then the running file's local
+   functions, then the script's local functions, then a file on the path,
+   then a builtin** (`Interp::call_function`). A user variable shadows every
+   function, as in MATLAB: after `sum = 3`, `sum(1)` indexes the variable.
+   A file on the path, the current folder first, shadows a builtin of its
+   name.
 5. **All interpreter output goes through `Interp::emit`.** No `print!` outside
    `src/main.rs`. Tests swap `Interp.out` for a buffer to capture output.
    Diagnostics a program goes on after, `warning` since cycle 04 and cycle
@@ -366,12 +391,17 @@ every message text defined there and nowhere else. Script mode prints
 `Error: Line N: <msg>`; the REPL prints `Error: <msg>`, since a REPL entry is
 one line. A statement's line is attached in `exec_block` by `MError::at`,
 which keeps the first line it is given, so an error inside a `for` body
-reports the body's line. The `stack` field and the `  in <fn> (line N)` trace
-wait for cycle 05, since a stack only means something once user functions
-exist; adding the field is additive, because no call site formats a message
-itself. Cycle 04 added the first such field, `identifier`, the same way, and
-the `MException` that `catch e` binds is the `MError` itself (see "Add a
-value type").
+reports the body's line. Cycle 04 added the first further field,
+`identifier`, and the `MException` that `catch e` binds is the `MError`
+itself (see "Add a value type"). Cycle 05 added the stack, the same way: an
+error leaving a user function or a path script passes `MError::leaving`,
+which moves its line into a new `StackEntry` and clears it, so the calling
+statement records its own. At the top the line is therefore always a line of
+the code that was run, which is what the protocol's `line` means, and the
+trace, `MError::trace`, is one `  in <fn> (line N)` per frame, innermost
+first, which `main.rs` prints to stderr after the message, in script mode
+and at the REPL alike. The protocol does not send it; `e.stack` is cycle
+07's.
 
 **Registry (cycle 01, in place).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
@@ -427,12 +457,21 @@ stdin by `--http-stdio`, so the golden cases pin every byte without a socket,
 and `tests/ui_server.rs` covers the socket itself. The Design notes of
 `docs/modules/U1-ui-server.md` have the details.
 
-**Frames (cycle 05).** A stack of `Frame { vars, end_stack, unit, func_name }`
-with `frames[0]` as the base workspace, never popped. Moving `end_stack` into
-the frame is what stops `end` leaking across a call. Resolution order becomes
-variable, then the running file's local functions, then the script's local
-functions, then a file on the path, then a builtin. User files shadow
-builtins, as in MATLAB.
+**Frames (cycle 05, in place).** A stack of `Frame { vars, end_stack, unit,
+func_name, nargin, nargout }` with `frames[0]` as the base workspace, never
+popped; `Interp::vars()` is the running frame's. Moving `end_stack` into the
+frame is what stops `end` leaking across a call. `unit` is the parsed file
+the frame's code came from, whose local functions come first in resolution;
+a path script swaps its own in while it runs in the caller's frame.
+Resolution order is variable, then the running file's local functions, then
+the script's local functions, then a file on the path, then a builtin. User
+files shadow builtins, as in MATLAB. Files are found against `Interp::cwd`,
+never `std::env`, and cached by path; a generation counter, bumped by
+`addpath`, `rmpath` and every `run`, makes every cached lookup and file stale,
+and a stale file is reused only if its modification time and length are
+unchanged. At most 500 calls run at once (`MAX_RECURSION`), and every frame
+shares the one nesting budget of `MAX_DEPTH`; the Design notes of
+`docs/modules/05-functions-and-scoping.md` have the stack measurements.
 
 **Containers (cycle 07).** `CellArray` and `StructArray` as separate types that
 reuse index-resolution helpers factored out of `Matrix`, rather than making
@@ -455,7 +494,10 @@ cycle named:
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | Indexing into or growing a second page, `A(:, :, 2) = 5` or `A(:, :, [1 1])`, is "N-D arrays are not supported."; MATLAB builds the N-D array. Cycle 03 accepted it | later, with N-D arrays |
-| An `MException` is minimal: `message`, `identifier` and `class`, with no `stack`, `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction` | `stack` in 05; the rest later |
+| An `MException` is minimal: `message`, `identifier` and `class`, with no `stack`, `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`. Cycle 05 added the uncaught error's trace; the data is in the `MError`, but `e.stack` needs a struct array | `e.stack` in 07; the rest later |
+| `exist` gives `5` for every builtin, where MATLAB gives `2` for the builtins it ships as `.m` files (`linspace`, for instance): every SplatCrab builtin is built in. What `exist` gives for a function local to the running script is not settled by the MathWorks page; SplatCrab gives `0`, and no case asserts it | by design; the local-function value later (verify first) |
+| The trace names a function alone, `  in g3 (line 8)`, where MATLAB writes `Error in script>g3 (line 8)`; the spec fixes SplatCrab's form | by design |
+| Functions are more permissive than MATLAB's in three ways, none of which changes what a file MATLAB accepts means: a function in a file on the path can call a local function of the script being run (invariant 4 reads the script's local functions after the running file's, where MATLAB keeps local functions private to their file); a file may mix functions that end with `end` and functions that do not; and a script's local functions may go without `end`. Calling a script with arguments or for a value is `Too many input arguments.` or `Too many output arguments.`, where MATLAB names the script | later |
 | Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
 | `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `hold on` and `format long` are the unrecognized-name error | `hold` 12, `format` 13, warning state later |
 
@@ -553,6 +595,15 @@ cannot afford. Every result shape computed from operand shapes now goes
 through `args::check_shape` before anything is allocated: broadcasting in
 `Matrix::try_zip`, `matmul`, every read and write through `resolve_read` and `resolve_write` (cycle 03), and `math::reduce`
 (QA D1), which is the same guard that stops a `matmul` size wrapping (QA D2).
+
+**Cycle 05 measured the evaluator again, and the 01e margin does not hold for
+nested calls.** A chain of 10,000 builtin calls, `abs(abs(...1...))`, needed
+198 MB of stack in a debug build at cycle 04's HEAD (46 MB in release), about
+20 KB a level, far from the "about 28x" below, which was measured on a flat
+sum. It still fits the 256 MB thread, and cycle 05, having shrunk `MError`,
+brought it to 172 MB (44 MB in release). The debug figure is the one the
+golden harness runs, so it is the margin to watch: see the Design notes of
+`docs/modules/05-functions-and-scoping.md`.
 
 **Cycle 01e closed the last member: deep nesting overflows the stack (QA D4),
 so invariant 6 holds again.** The parser and the evaluator each count nesting

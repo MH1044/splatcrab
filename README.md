@@ -25,9 +25,9 @@ x =
 
 SplatCrab is early software (version 0.1.0). The core language works:
 matrices, the double, logical and char classes, indexing, control flow with
-`switch` and `try`/`catch`, command syntax, formatted output and 93
-builtins. User functions, cells, structs, complex
-numbers and plotting are not there yet. See
+`switch` and `try`/`catch`, command syntax, user functions in scripts and in
+function files on a path, formatted output and 99 builtins. Function handles,
+cells, structs, complex numbers and plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -200,6 +200,15 @@ z
   lists; `try` / `catch e`, where `e` is a minimal `MException` with
   `e.message` and `e.identifier`; `error('id:x', fmt, ...)` with MATLAB's
   argument rules, `rethrow`, `lasterr`, `warning`, `assert` and `isequal`
+- User functions: local functions at the end of a script, function files
+  with subfunctions, and scripts on the path, which run in the caller's
+  workspace. Multiple outputs, `nargin`, `nargout`, `return`, a workspace of
+  its own for each call, and a recursion limit of 500 that is a clean error.
+  A name resolves to a variable, then a function of the running file, then
+  one of the script's, then a file in the current folder or on the path,
+  then a builtin, so a file shadows a builtin of its name. `addpath`,
+  `rmpath`, `exist` and `feval`. An error that leaves a function prints an
+  `  in <fn> (line N)` trace after its message
 - Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts
@@ -208,8 +217,8 @@ z
   relative to the matrix, so the perfectly conditioned `[1e-15 0; 0 1e-15]` is
   solved rather than written off, and `det` and `\` agree on what singular
   means
-- 93 builtins in a registry, from `zeros` and `linspace` through `sum` and
-  `cumsum` to `fprintf`, `sprintf`, `class` and `tic`/`toc`. Each is an ordinary
+- 99 builtins in a registry, from `zeros` and `linspace` through `sum` and
+  `cumsum` to `fprintf`, `sprintf`, `class`, `feval` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
   `min`, `sort`, `size` and `find` answer with more than one value when asked
 - The argument forms MATLAB code uses: size vectors such as
@@ -259,7 +268,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-User functions, function handles, cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+Function handles, cells, structs, N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -270,7 +279,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 93 builtins,
+                                         builtins/    the 99 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

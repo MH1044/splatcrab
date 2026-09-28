@@ -1,0 +1,2 @@
+{"id":1,"ok":false,"out":"","error":{"message":"Function definitions are not supported in this context.","line":1}}
+{"id":2,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'f'.","line":1}}

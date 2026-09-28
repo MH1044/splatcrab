@@ -2,14 +2,18 @@
 
 use std::collections::HashMap;
 use std::io::{self, Write};
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{Instant, SystemTime};
 
 use crate::bail;
 use crate::builtins::math::powf_real;
 use crate::builtins::{self, Registry};
 use crate::error;
-use crate::lexer::scan_known;
-use crate::parser::{Access, BinOp, CaseArm, Expr, LValue, Located, MAX_DEPTH, Parser, Stmt};
+use crate::lexer::{scan, scan_known};
+use crate::parser::{
+    Access, BinOp, CaseArm, Expr, Function, LValue, Located, MAX_DEPTH, Parser, Program, Stmt,
+};
 use crate::value::{Class, Matrix, Value, nonfinite};
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -17,10 +21,113 @@ use crate::value::{Class, Matrix, Value, nonfinite};
 /// without touching a single `use crate::interp::R` in `builtins/`.
 pub use crate::error::R;
 
-pub struct Interp {
+/// How many user function calls (and path scripts) may be running at once.
+/// One more is MATLAB's "Maximum recursion limit of 500 reached.", a clean
+/// error; see the Design notes of `docs/modules/05-functions-and-scoping.md`
+/// for the stack this leaves against the 256 MB interpreter thread.
+pub const MAX_RECURSION: usize = 500;
+
+/// One workspace: the base workspace, or one running user function's.
+///
+/// `frames[0]` is the base workspace and is never popped; a call pushes a
+/// frame and pops it however the call ends. A function sees only its own
+/// frame, so its variables, and its `end`, are its own (invariant 3).
+pub struct Frame {
     pub vars: HashMap<String, Value>,
-    /// Value of `end` for the index argument currently being evaluated.
+    /// Value of `end` for the index argument currently being evaluated in
+    /// this frame. It moved here from `Interp` in cycle 05, which is what
+    /// keeps `x(f(end))` binding `end` to `x` whatever `f` indexes.
     end_stack: Vec<usize>,
+    /// The file the running code came from, whose local functions are the
+    /// first functions a name resolves to (invariant 4). A path script
+    /// running in this workspace swaps its own in for as long as it runs.
+    unit: Rc<Unit>,
+    /// The function this frame runs, `None` for the base workspace.
+    func_name: Option<String>,
+    /// What `nargin` and `nargout` answer inside the function.
+    nargin: usize,
+    nargout: usize,
+}
+
+impl Frame {
+    fn new(unit: Rc<Unit>, func_name: Option<String>) -> Frame {
+        Frame {
+            vars: HashMap::new(),
+            end_stack: Vec::new(),
+            unit,
+            func_name,
+            nargin: 0,
+            nargout: 0,
+        }
+    }
+}
+
+/// One parsed source text: a script (the code `run` was given, or a script
+/// file on the path) or a function file.
+#[derive(Default)]
+pub struct Unit {
+    /// The script's statements; empty for a function file.
+    stmts: Vec<Located>,
+    /// Every function the text defines, by its own name: a script's local
+    /// functions, or a function file's entry and subfunctions.
+    functions: HashMap<String, Rc<Function>>,
+    /// A function file's first function, which its file name calls.
+    entry: Option<Rc<Function>>,
+}
+
+impl Unit {
+    /// A text whose statements are empty and which defines a function is a
+    /// function file, whose first function is its entry. Anything else is
+    /// a script. A second definition of one name is ignored.
+    fn from_program(prog: Program) -> Unit {
+        let is_function_file = prog.stmts.is_empty() && !prog.functions.is_empty();
+        let mut unit = Unit {
+            stmts: prog.stmts,
+            ..Unit::default()
+        };
+        for f in prog.functions {
+            let f = Rc::new(f);
+            if is_function_file && unit.entry.is_none() {
+                unit.entry = Some(f.clone());
+            }
+            unit.functions.entry(f.name.clone()).or_insert(f);
+        }
+        unit
+    }
+}
+
+/// A function or script file read from disk, and when.
+struct CachedFile {
+    /// The generation it was last known good in; see `Interp::generation`.
+    generation: u64,
+    /// Its modification time and length when it was read, which is how a
+    /// stale entry is told apart from a changed file.
+    stamp: Option<(SystemTime, u64)>,
+    unit: Rc<Unit>,
+}
+
+pub struct Interp {
+    /// The call stack; see [`Frame`]. Never empty.
+    frames: Vec<Frame>,
+    /// The code `run` is running, whose local functions every frame can
+    /// call after its own file's (invariant 4).
+    script: Rc<Unit>,
+    /// How many user calls are running: the recursion count.
+    calls: usize,
+    /// The directory every path lookup resolves against: function files,
+    /// `addpath` and `rmpath`. Seeded from the process's working directory
+    /// and never read from `std::env` again; cycle 13's `cd` changes it.
+    pub cwd: PathBuf,
+    /// The folders `addpath` added, first searched first. The current
+    /// folder is searched before all of them.
+    search_path: Vec<PathBuf>,
+    /// Bumped by `addpath`, `rmpath` and every `run`, so that no cached
+    /// lookup or file from before is used without being checked again.
+    generation: u64,
+    /// Parsed files, keyed by path.
+    files: HashMap<PathBuf, CachedFile>,
+    /// Which file a name resolved to, and in which generation.
+    lookups: HashMap<String, (u64, Option<PathBuf>)>,
     rng: u64,
     /// The builtin library, built once here and never changed afterwards.
     builtins: Registry,
@@ -54,6 +161,8 @@ enum Flow {
     Normal,
     Break,
     Continue,
+    /// `return`: ends the running function or script.
+    Return,
 }
 
 /// What a `switch` compares its cases against.
@@ -193,9 +302,16 @@ impl Interp {
     /// Builds an interpreter over both sinks: `out` for output, `err` for
     /// warnings.
     pub fn with_sinks(out: Box<dyn Write>, err: Box<dyn Write>) -> Self {
+        let script = Rc::new(Unit::default());
         Interp {
-            vars: HashMap::new(),
-            end_stack: Vec::new(),
+            frames: vec![Frame::new(script.clone(), None)],
+            script,
+            calls: 0,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            search_path: Vec::new(),
+            generation: 0,
+            files: HashMap::new(),
+            lookups: HashMap::new(),
             rng: 0x9E37_79B9_7F4A_7C15,
             builtins: builtins::registry(),
             start: Instant::now(),
@@ -211,6 +327,26 @@ impl Interp {
     /// The builtin library, read-only: what `env::completions` lists.
     pub fn builtins(&self) -> &Registry {
         &self.builtins
+    }
+
+    /// The running frame: the base workspace, or the innermost call's.
+    fn frame(&self) -> &Frame {
+        self.frames.last().expect("frames[0] is never popped")
+    }
+
+    fn frame_mut(&mut self) -> &mut Frame {
+        self.frames.last_mut().expect("frames[0] is never popped")
+    }
+
+    /// The running frame's variables: the base workspace's between runs,
+    /// which is what `who`, the protocol's `workspace` and its completions
+    /// read.
+    pub fn vars(&self) -> &HashMap<String, Value> {
+        &self.frame().vars
+    }
+
+    pub fn vars_mut(&mut self) -> &mut HashMap<String, Value> {
+        &mut self.frame_mut().vars
     }
 
     /// Counts one more level of evaluation, refusing anything past the
@@ -239,28 +375,61 @@ impl Interp {
         self.err.flush().map_err(error::output)
     }
 
+    /// Runs `src` as a script in the base workspace: statements, then any
+    /// local functions, which the statements can call. What script mode
+    /// runs a file with.
     pub fn run(&mut self, src: &str) -> R<()> {
+        self.run_with(src, true)
+    }
+
+    /// Runs `src` as a command-line entry: the REPL's, a protocol `eval`'s
+    /// and so the browser page's. It is a script in every way but one: a
+    /// `function` block is refused before anything runs, with MATLAB's
+    /// "Function definitions are not supported in this context."
+    pub fn run_command(&mut self, src: &str) -> R<()> {
+        self.run_with(src, false)
+    }
+
+    fn run_with(&mut self, src: &str, functions: bool) -> R<()> {
         // An entry that failed part-way left its counters raised, and the
         // REPL hands the same interpreter the next line. Without this, one
         // over-deep expression would make every later statement too deep and
         // a `break` left mid-loop would make a later top-level one legal.
+        // Every call pops its own frame however it ends, so the frames are
+        // already back to the base workspace; that is only made sure of.
         self.depth = 0;
         self.loop_depth = 0;
-        let result = self.run_entry(src);
+        self.calls = 0;
+        self.frames.truncate(1);
+        self.frame_mut().end_stack.clear();
+        // A file edited since the last entry is read again.
+        self.generation += 1;
+        let result = self.run_entry(src, functions);
         if let Err(e) = &result {
             self.last_err = e.msg.clone();
         }
         result
     }
 
-    fn run_entry(&mut self, src: &str) -> R<()> {
+    fn run_entry(&mut self, src: &str, functions: bool) -> R<()> {
         // Command syntax depends on which names are variables (`x -1` is an
         // expression when `x` is one), so the lexer is told the workspace.
-        let vars = &self.vars;
+        let vars = self.vars();
         let lexed = scan_known(src, &|name| vars.contains_key(name))?;
-        let stmts = Parser::with_lines(lexed).parse_program()?;
-        self.exec_block(&stmts)?;
-        Ok(())
+        let prog = Parser::with_lines(lexed).parse_program()?;
+        if let (false, Some(f)) = (functions, prog.functions.first()) {
+            bail!(error::function_not_supported_here().at(f.line));
+        }
+        let unit = Rc::new(Unit::from_program(prog));
+        // The script's local functions are callable while it runs, and
+        // only then.
+        let script = std::mem::replace(&mut self.script, unit.clone());
+        let base = std::mem::replace(&mut self.frames[0].unit, unit.clone());
+        let result = self.exec_block(&unit.stmts);
+        self.script = script;
+        self.frames[0].unit = base;
+        // A `return` at the top ends the script, which is all it can do.
+        result.map(|_| ())
     }
 
     // ---- statements --------------------------------------------------
@@ -295,17 +464,17 @@ impl Interp {
                 let result = match self.call_form(e) {
                     Some((n, args)) => {
                         let a = self.eval_args(args)?;
-                        self.call_builtin(n, a, 0)?
+                        self.call_function(n, a, 0)?
                     }
                     None => vec![self.eval(e)?],
                 };
                 if let Some(v) = result.into_iter().next() {
                     let name = match e {
-                        Expr::Ident(n) if self.vars.contains_key(n) => n.clone(),
+                        Expr::Ident(n) if self.vars().contains_key(n) => n.clone(),
                         _ => "ans".to_string(),
                     };
                     if name == "ans" {
-                        self.vars.insert(name.clone(), v.clone());
+                        self.vars_mut().insert(name.clone(), v.clone());
                     }
                     if *show {
                         self.emit(&v.display(&name))?;
@@ -374,20 +543,18 @@ impl Interp {
                 // unsettled, so no golden case asserts it.
                 if m.cols == 0 {
                     let empty = Matrix::new(m.rows, 0, Vec::new()).with_class(m.class);
-                    self.vars.insert(name.clone(), Value::Mat(empty));
+                    self.vars_mut().insert(name.clone(), Value::Mat(empty));
                 }
                 self.loop_depth += 1;
                 let flow = self.run_for(name, &m, body);
                 self.loop_depth -= 1;
-                flow?;
-                Ok(Flow::Normal)
+                flow
             }
             Stmt::While(cond, body) => {
                 self.loop_depth += 1;
                 let flow = self.run_while(cond, body);
                 self.loop_depth -= 1;
-                flow?;
-                Ok(Flow::Normal)
+                flow
             }
             // MATLAB errors on a `break` with no loop around it; Octave 8.4
             // gives a parse error. It is raised here rather than in the
@@ -399,16 +566,17 @@ impl Interp {
                 // counters raised (a failed `deepen` does not undo itself),
                 // so they are put back to what they were at the `try` before
                 // the handler runs. `end_stack` is popped on every path.
-                let (depth, loop_depth, ends) = (self.depth, self.loop_depth, self.end_stack.len());
+                let (depth, loop_depth, ends) =
+                    (self.depth, self.loop_depth, self.frame().end_stack.len());
                 match self.exec_block(body) {
                     Ok(flow) => Ok(flow),
                     Err(e) => {
                         self.depth = depth;
                         self.loop_depth = loop_depth;
-                        self.end_stack.truncate(ends);
+                        self.frame_mut().end_stack.truncate(ends);
                         self.last_err = e.msg.clone();
                         if let Some(name) = var {
-                            self.vars.insert(name.clone(), Value::Exception(e));
+                            self.vars_mut().insert(name.clone(), Value::Exception(e));
                         }
                         self.exec_block(handler)
                     }
@@ -418,6 +586,7 @@ impl Interp {
             Stmt::Continue if self.loop_depth == 0 => Err(error::continue_outside_loop()),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
+            Stmt::Return => Ok(Flow::Return),
         }
     }
 
@@ -466,8 +635,9 @@ impl Interp {
     /// The iterations of a `for`, split out so the caller can put
     /// `loop_depth` back however the body ends: normally, on a `break`, or on
     /// an error unwinding through it. A `loop_depth` left raised would make a
-    /// later top-level `break` legal.
-    fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<()> {
+    /// later top-level `break` legal. A `return` in the body ends the loop
+    /// and is passed on, to end the function or script around it.
+    fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<Flow> {
         for c in 0..m.cols {
             let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
             // Each column keeps the class, so `for k = 'abc'` iterates chars.
@@ -477,22 +647,26 @@ impl Interp {
                 Matrix::col(column)
             }
             .with_class(m.class);
-            self.vars.insert(name.to_string(), Value::Mat(v));
-            if let Flow::Break = self.exec_block(body)? {
-                break;
+            self.vars_mut().insert(name.to_string(), Value::Mat(v));
+            match self.exec_block(body)? {
+                Flow::Break => break,
+                Flow::Return => return Ok(Flow::Return),
+                Flow::Normal | Flow::Continue => {}
             }
         }
-        Ok(())
+        Ok(Flow::Normal)
     }
 
     /// The iterations of a `while`; see [`run_for`](Interp::run_for).
-    fn run_while(&mut self, cond: &Expr, body: &[Located]) -> R<()> {
+    fn run_while(&mut self, cond: &Expr, body: &[Located]) -> R<Flow> {
         while self.eval_mat(cond)?.truth()? {
-            if let Flow::Break = self.exec_block(body)? {
-                break;
+            match self.exec_block(body)? {
+                Flow::Break => break,
+                Flow::Return => return Ok(Flow::Return),
+                Flow::Normal | Flow::Continue => {}
             }
         }
-        Ok(())
+        Ok(Flow::Normal)
     }
 
     // ---- expressions -------------------------------------------------
@@ -511,12 +685,13 @@ impl Interp {
             // A string literal is a 1-row char of UTF-16 code units.
             Expr::Str(s) => Ok(Value::str(s)),
             Expr::Ident(n) => {
-                if let Some(v) = self.vars.get(n) {
+                if let Some(v) = self.vars().get(n) {
                     return Ok(v.clone());
                 }
                 self.call_for_value(n, vec![])
             }
             Expr::End => self
+                .frame()
                 .end_stack
                 .last()
                 .map(|n| Value::Mat(Matrix::scalar(*n as f64)))
@@ -675,13 +850,13 @@ impl Interp {
 
     // ---- indexing ----------------------------------------------------
 
-    /// The builtin call an expression makes, if it is one: a name that is
-    /// not a variable, bare or with one `(...)`. Those are the forms that can
+    /// The call an expression makes, if it is one: a name that is not a
+    /// variable, bare or with one `(...)`. Those are the forms that can
     /// be asked for other than one value; everything else is evaluated.
     fn call_form<'e>(&self, e: &'e Expr) -> Option<(&'e str, &'e [Expr])> {
         match e {
-            Expr::Ident(n) if !self.vars.contains_key(n) => Some((n, &[])),
-            Expr::Access(n, chain) if !self.vars.contains_key(n) => match chain.as_slice() {
+            Expr::Ident(n) if !self.vars().contains_key(n) => Some((n, &[])),
+            Expr::Access(n, chain) if !self.vars().contains_key(n) => match chain.as_slice() {
                 [Access::Paren(args)] => Some((n, args)),
                 _ => None,
             },
@@ -701,7 +876,7 @@ impl Interp {
         let values = match self.call_form(e) {
             Some((name, args)) => {
                 let a = self.eval_args(args)?;
-                self.call_builtin(name, a, n)?
+                self.call_function(name, a, n)?
             }
             None => {
                 let v = self.eval(e)?;
@@ -719,7 +894,7 @@ impl Interp {
 
     /// Shows a variable under its own name, after an assignment to it.
     fn show_var(&mut self, name: &str) -> R<()> {
-        let shown = match self.vars.get(name) {
+        let shown = match self.vars().get(name) {
             Some(v) => v.display(name),
             None => return Ok(()),
         };
@@ -737,7 +912,7 @@ impl Interp {
         let Some((first, rest)) = chain.split_first() else {
             return self.eval_node(&Expr::Ident(name.to_string()));
         };
-        let mut v = if let Some(var) = self.vars.get(name) {
+        let mut v = if let Some(var) = self.vars().get(name) {
             match (var, first) {
                 (Value::Mat(_), Access::Paren(args)) => self.index_var(name, args)?,
                 (Value::Mat(_), other) => bail!(container_access(other)),
@@ -795,12 +970,12 @@ impl Interp {
     /// storage, and one that could change its shape is judged against the
     /// shape it has now.
     fn index_var(&mut self, name: &str, args: &[Expr]) -> R<Value> {
-        let (rows, cols) = match self.vars.get(name) {
+        let (rows, cols) = match self.vars().get(name) {
             Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => return Err(error::undefined(name)),
         };
         let sel = self.eval_index_args(rows, cols, args)?;
-        let m = match self.vars.get(name) {
+        let m = match self.vars().get(name) {
             Some(v) => v.mat()?,
             None => return Err(error::undefined(name)),
         };
@@ -843,9 +1018,9 @@ impl Interp {
                 (_, 1) => cols,
                 _ => 1,
             };
-            self.end_stack.push(end_val);
+            self.frame_mut().end_stack.push(end_val);
             let v = self.eval_mat(a);
-            self.end_stack.pop();
+            self.frame_mut().end_stack.pop();
             let v = v?;
             out.push(if v.class == Class::Logical {
                 mask_positions(&v)
@@ -860,7 +1035,7 @@ impl Interp {
     fn assign_to(&mut self, target: &LValue, v: Value) -> R<()> {
         match target.chain.as_slice() {
             [] => {
-                self.vars.insert(target.name.clone(), v);
+                self.vars_mut().insert(target.name.clone(), v);
                 Ok(())
             }
             [Access::Paren(args)] => self.assign_index(&target.name, args, v),
@@ -878,11 +1053,11 @@ impl Interp {
     /// stored, created as `[]` if it does not exist yet. Looked up by `&str`
     /// so that the common case, an existing variable, allocates nothing.
     fn target_mut(&mut self, name: &str) -> R<&mut Matrix> {
-        if !self.vars.contains_key(name) {
-            self.vars
+        if !self.vars().contains_key(name) {
+            self.vars_mut()
                 .insert(name.to_string(), Value::Mat(Matrix::empty()));
         }
-        match self.vars.get_mut(name) {
+        match self.vars_mut().get_mut(name) {
             Some(Value::Mat(m)) => Ok(m),
             Some(v) => Err(error::not_an_array(v.class_name())),
             None => unreachable!("inserted above"),
@@ -906,7 +1081,7 @@ impl Interp {
         // does not exist yet, or is the 0x0 double `[]`, takes the class of
         // what is assigned into it, which is how `s = []; s(1) = 'a'` builds
         // a char.
-        let (rows, cols, class) = match self.vars.get(name) {
+        let (rows, cols, class) = match self.vars().get(name) {
             Some(v) => v.mat().map(|m| (m.rows, m.cols, m.class))?,
             None => (0, 0, Class::Double),
         };
@@ -918,7 +1093,7 @@ impl Interp {
         let rhs = rhs.to_class(class)?;
         let sel = self.eval_index_args(rows, cols, args)?;
         // Judged against the shape the variable has now; see `index_var`.
-        let (rows, cols) = match self.vars.get(name) {
+        let (rows, cols) = match self.vars().get(name) {
             Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
@@ -932,12 +1107,12 @@ impl Interp {
     /// `name(args) = []`: deletes elements, rows or columns, keeping the
     /// class. Checked in full before the variable changes.
     fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
-        let (rows, cols) = match self.vars.get(name) {
+        let (rows, cols) = match self.vars().get(name) {
             Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
         let sel = self.eval_index_args(rows, cols, args)?;
-        let (rows, cols) = match self.vars.get(name) {
+        let (rows, cols) = match self.vars().get(name) {
             Some(v) => v.mat().map(|m| (m.rows, m.cols))?,
             None => (0, 0),
         };
@@ -981,13 +1156,342 @@ impl Interp {
         }
     }
 
-    /// The single value an expression wants from a builtin.
+    /// The single value an expression wants from a call.
     fn call_for_value(&mut self, name: &str, args: Vec<Value>) -> R<Value> {
-        self.call_builtin(name, args, 1)?
+        self.call_function(name, args, 1)?
             .into_iter()
             .next()
             .ok_or_else(error::too_many_outputs)
     }
+
+    // ---- functions (cycle 05) ------------------------------------------
+
+    /// Calls the function `name`, which is not a variable, asking it for
+    /// `nargout` values. **Invariant 4**, after the variable its callers
+    /// have already ruled out: the running file's local functions, then the
+    /// script's, then a file on the path, then a builtin. A user file
+    /// therefore shadows a builtin of its name. `feval` comes in here too.
+    pub(crate) fn call_function(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        if let Some((unit, f)) = self.local_function(name) {
+            return self.call_user(unit, f, name, args, nargout);
+        }
+        if let Some(path) = self.find_file(name) {
+            let unit = self.load(&path, name)?;
+            return match unit.entry.clone() {
+                Some(f) => self.call_user(unit, f, name, args, nargout),
+                None => self.run_script(unit, name, args, nargout),
+            };
+        }
+        self.call_builtin(name, args, nargout)
+    }
+
+    /// A builtin's call back into the interpreter, `feval`'s today and
+    /// `arrayfun`'s later, counted as one level of the nesting budget that
+    /// every frame shares. Without it a chain of such calls re-entered the
+    /// evaluator with nothing counting, and 499 frames each running a
+    /// 600-deep `feval` chain overflowed the stack (cycle 05's review): the
+    /// one kind of recursion invariant 6 had not yet bounded.
+    pub(crate) fn call_nested(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        self.deepen()?;
+        let r = self.call_function(name, args, nargout);
+        self.depth -= 1;
+        r
+    }
+
+    /// True when a call to `name` reaches the builtin of that name: no local
+    /// function and no file on the path shadows it.
+    pub(crate) fn reaches_builtin(&mut self, name: &str) -> bool {
+        self.local_function(name).is_none() && self.find_file(name).is_none()
+    }
+
+    /// `name` among the running file's local functions, then among the
+    /// script's, with the file it belongs to.
+    fn local_function(&self, name: &str) -> Option<(Rc<Unit>, Rc<Function>)> {
+        [&self.frame().unit, &self.script]
+            .into_iter()
+            .find_map(|u| u.functions.get(name).map(|f| (u.clone(), f.clone())))
+    }
+
+    /// Counts one more running call, refusing the one past the limit.
+    fn enter(&mut self) -> R<()> {
+        if self.calls >= MAX_RECURSION {
+            bail!(error::recursion_limit(MAX_RECURSION));
+        }
+        self.calls += 1;
+        Ok(())
+    }
+
+    /// Runs the user function `f` from `unit` in a frame of its own.
+    ///
+    /// The checks a call fails before it starts come first, and so carry no
+    /// trace: more arguments than parameters, more outputs than the function
+    /// has, and the recursion limit. The body then runs with its parameters
+    /// bound, its own `end` stack and no loop around it, so a `break` in it
+    /// cannot reach a loop in the caller. An error leaving the body gains a
+    /// trace entry, `name` at the line it was raised on, and takes the
+    /// caller's line next; see [`error::MError::leaving`].
+    ///
+    /// Asked for `nargout` values, the function returns that many of its
+    /// outputs, and one it did not assign is MATLAB's "Output argument ...
+    /// not assigned" error. Asked for none, as a statement asks, it returns
+    /// its first output if it assigned one, which becomes `ans`.
+    fn call_user(
+        &mut self,
+        unit: Rc<Unit>,
+        f: Rc<Function>,
+        name: &str,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        if args.len() > f.params.len() {
+            bail!(error::too_many_args());
+        }
+        if nargout > f.outputs.len() {
+            bail!(error::too_many_outputs());
+        }
+        self.enter()?;
+        let mut frame = Frame::new(unit, Some(name.to_string()));
+        frame.nargin = args.len();
+        frame.nargout = nargout;
+        for (p, v) in f.params.iter().zip(args) {
+            if p != "~" {
+                frame.vars.insert(p.clone(), v);
+            }
+        }
+        self.frames.push(frame);
+        let loop_depth = std::mem::take(&mut self.loop_depth);
+        let result = self.exec_block(&f.body);
+        self.loop_depth = loop_depth;
+        let frame = self.frames.pop().expect("the frame pushed above");
+        self.calls -= 1;
+        result.map_err(|e| e.leaving(name))?;
+        let mut vars = frame.vars;
+        let mut out = Vec::new();
+        for (k, o) in f.outputs.iter().enumerate().take(nargout.max(1)) {
+            match vars.remove(o) {
+                Some(v) => out.push(v),
+                None if k < nargout => bail!(error::output_not_assigned(o, name)),
+                None => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Runs a script file from the path in the caller's workspace, as
+    /// MATLAB does: its assignments are the caller's variables. A script
+    /// takes no inputs and gives no outputs, so either is the call's own
+    /// error. It counts against the recursion limit like a function, and an
+    /// error leaving it gains a trace entry, so that the line reported at the
+    /// top is never a line of the script file.
+    fn run_script(
+        &mut self,
+        unit: Rc<Unit>,
+        name: &str,
+        args: Vec<Value>,
+        nargout: usize,
+    ) -> R<Vec<Value>> {
+        if !args.is_empty() {
+            bail!(error::too_many_args());
+        }
+        if nargout > 0 {
+            bail!(error::too_many_outputs());
+        }
+        self.enter()?;
+        let running = std::mem::replace(&mut self.frame_mut().unit, unit.clone());
+        let loop_depth = std::mem::take(&mut self.loop_depth);
+        let result = self.exec_block(&unit.stmts);
+        self.loop_depth = loop_depth;
+        self.frame_mut().unit = running;
+        self.calls -= 1;
+        result.map_err(|e| e.leaving(name))?;
+        Ok(Vec::new())
+    }
+
+    /// The `.m` file `name` resolves to: `name.m` in the current folder,
+    /// then in each folder `addpath` added, in order. A name that is not an
+    /// identifier resolves to nothing, so `feval('../x')` cannot reach
+    /// outside the path. The answer is kept for the rest of the generation,
+    /// which is what keeps a builtin call in a loop from asking the file
+    /// system every time.
+    fn find_file(&mut self, name: &str) -> Option<PathBuf> {
+        if let Some((generation, found)) = self.lookups.get(name) {
+            if *generation == self.generation {
+                return found.clone();
+            }
+        }
+        let found = if is_identifier(name) {
+            let file = format!("{}.m", name);
+            std::iter::once(&self.cwd)
+                .chain(&self.search_path)
+                .map(|dir| dir.join(&file))
+                .find(|p| is_exact_file(p))
+        } else {
+            None
+        };
+        self.lookups
+            .insert(name.to_string(), (self.generation, found.clone()));
+        found
+    }
+
+    /// The parsed file at `path`, called `name`, from the cache when the
+    /// cached copy is known good: read in this generation, or read before
+    /// with the modification time and length the file still has. A parse
+    /// error in the file is reported with a trace entry for it, since its
+    /// line is a line of that file.
+    fn load(&mut self, path: &Path, name: &str) -> R<Rc<Unit>> {
+        let generation = self.generation;
+        let stamp = if let Some(c) = self.files.get_mut(path) {
+            if c.generation == generation {
+                return Ok(c.unit.clone());
+            }
+            let stamp = file_stamp(path);
+            if stamp.is_some() && stamp == c.stamp {
+                c.generation = generation;
+                return Ok(c.unit.clone());
+            }
+            stamp
+        } else {
+            file_stamp(path)
+        };
+        let bytes =
+            std::fs::read(path).map_err(|e| error::cannot_read(&path.display().to_string(), &e))?;
+        let src = String::from_utf8_lossy(&bytes);
+        // Parsed on the evaluator's stack, so counted from its depth.
+        let depth = self.depth;
+        let prog = scan(&src)
+            .and_then(|lexed| Parser::with_lines(lexed).at_depth(depth).parse_program())
+            .map_err(|e| e.leaving(name))?;
+        let unit = Rc::new(Unit::from_program(prog));
+        self.files.insert(
+            path.to_path_buf(),
+            CachedFile {
+                generation,
+                stamp,
+                unit: unit.clone(),
+            },
+        );
+        Ok(unit)
+    }
+
+    /// `nargin` or `nargout` of the running function; outside every
+    /// function, MATLAB's error. A script on the path runs in its caller's
+    /// frame, so inside one called from a function these are the
+    /// function's.
+    pub(crate) fn call_counts(&self) -> R<(usize, usize)> {
+        let frame = self.frame();
+        match frame.func_name {
+            Some(_) => Ok((frame.nargin, frame.nargout)),
+            None => Err(error::nargin_outside_function()),
+        }
+    }
+
+    /// `exist(name)`: `1` for a variable of the running frame, `2` for a
+    /// file on the path, `5` for a builtin, `0` otherwise, the values of
+    /// the MathWorks `exist` page. A function local to the running file is
+    /// none of those and gives `0`; what MATLAB gives there is unverified,
+    /// and no case asserts it.
+    pub(crate) fn exist(&mut self, name: &str) -> f64 {
+        if self.vars().contains_key(name) {
+            1.0
+        } else if self.find_file(name).is_some() {
+            2.0
+        } else if self.builtins.contains_key(name) {
+            5.0
+        } else {
+            0.0
+        }
+    }
+
+    /// A folder as `addpath` and `rmpath` name it, resolved against
+    /// [`Interp::cwd`] when it is relative.
+    fn resolve_dir(&self, dir: &str) -> PathBuf {
+        let p = Path::new(dir);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.cwd.join(p)
+        }
+    }
+
+    /// `addpath(d1, d2, ...)`: puts the folders at the front of the path in
+    /// the order given, moving one already on it rather than listing it
+    /// twice. A folder that does not exist is a warning and is left off, as
+    /// in MATLAB. Every cached lookup is stale afterwards.
+    pub(crate) fn add_path(&mut self, dirs: &[String]) -> R<()> {
+        let mut front = Vec::new();
+        for d in dirs {
+            let p = self.resolve_dir(d);
+            if p.is_dir() {
+                self.search_path.retain(|q| *q != p);
+                front.retain(|q| *q != p);
+                front.push(p);
+            } else {
+                self.emit_err(&error::warning_line(&error::addpath_not_a_folder(d)))?;
+            }
+        }
+        front.append(&mut self.search_path);
+        self.search_path = front;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// `rmpath(d1, ...)`: takes the folders off the path. One that is not on
+    /// it is a warning. Every cached lookup is stale afterwards.
+    pub(crate) fn remove_path(&mut self, dirs: &[String]) -> R<()> {
+        for d in dirs {
+            let p = self.resolve_dir(d);
+            if self.search_path.contains(&p) {
+                self.search_path.retain(|q| *q != p);
+            } else {
+                self.emit_err(&error::warning_line(&error::rmpath_not_on_path(d)))?;
+            }
+        }
+        self.generation += 1;
+        Ok(())
+    }
+}
+
+/// A file's modification time and length, `None` if either is unknown.
+fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// True when `p` is a file whose name is spelled exactly as asked.
+///
+/// Windows and macOS match file names without regard to case, so `is_file`
+/// alone let `ADDONE(1)` find `addone.m` there and not on Linux: resolution
+/// depended on the platform (cycle 05's review). MATLAB's names are
+/// case-sensitive, so the directory listing must hold the exact name.
+fn is_exact_file(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    let (Some(dir), Some(name)) = (p.parent(), p.file_name()) else {
+        return false;
+    };
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|e| e.file_name() == name)
+    })
+}
+
+/// True for a MATLAB identifier: a letter, then letters, digits and `_`.
+fn is_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ---- helpers ---------------------------------------------------------
@@ -1091,11 +1595,11 @@ fn matrix_power(a: &Matrix, p: f64) -> R<Matrix> {
 // validate everything before it touches the target.
 
 /// `e.message` and `e.identifier` of an `MException`. Any other name is the
-/// Dot error a matrix gives, until cycle 05 adds `e.stack`.
+/// Dot error a matrix gives, until cycle 07 adds `e.stack`, a struct array.
 fn exception_field(e: &error::MError, field: &str) -> R<Value> {
     match field {
         "message" => Ok(Value::str(&e.msg)),
-        "identifier" => Ok(Value::str(&e.identifier)),
+        "identifier" => Ok(Value::str(e.identifier())),
         _ => Err(error::dot_indexing_unsupported()),
     }
 }
@@ -2456,7 +2960,7 @@ mod tests {
         let buf = Rc::new(RefCell::new(Vec::new()));
         let mut it = Interp::with_output(Box::new(Shared(buf)));
         it.run(&format!("{src};")).unwrap();
-        it.vars["ans"].mat().unwrap().class
+        it.vars()["ans"].mat().unwrap().class
     }
 
     /// The propagation table: arithmetic is double, comparisons and logical
@@ -2948,7 +3452,7 @@ mod tests {
             let buf = Rc::new(RefCell::new(Vec::new()));
             let mut it = Interp::with_output(Box::new(Shared(buf)));
             assert!(it.run(src).is_err(), "{src}");
-            let x = it.vars["x"].mat().unwrap();
+            let x = it.vars()["x"].mat().unwrap();
             assert_eq!((x.rows, x.cols, x.data.len()), (1, 3, 3), "{src}");
         }
     }
@@ -2982,13 +3486,13 @@ mod tests {
         let mut last = std::ptr::null();
         for _ in 0..10_000 {
             it.run("z(end+1) = 1;").unwrap();
-            let p = it.vars["z"].mat().unwrap().data.as_ptr();
+            let p = it.vars()["z"].mat().unwrap().data.as_ptr();
             if p != last {
                 reallocations += 1;
                 last = p;
             }
         }
-        let z = it.vars["z"].mat().unwrap();
+        let z = it.vars()["z"].mat().unwrap();
         assert_eq!((z.rows, z.cols), (1, 10_000));
         assert!(reallocations < 64, "{reallocations} reallocations");
         assert_eq!(
@@ -3128,7 +3632,7 @@ mod tests {
         // Nothing is assigned when the outputs fall short.
         let mut it = Interp::with_output(Box::new(io::sink()));
         assert!(it.run("[a, b] = sum(1);").is_err());
-        assert!(!it.vars.contains_key("a") && !it.vars.contains_key("b"));
+        assert!(!it.vars().contains_key("a") && !it.vars().contains_key("b"));
     }
 
     /// The `nargout` forms of `size`, `max`, `min`, `sort` and `find`,
@@ -3403,7 +3907,7 @@ mod tests {
             assert!(it.exec(&stmt).is_ok());
             assert_eq!(it.depth, before.0);
             assert_eq!(it.loop_depth, 1);
-            assert!(matches!(it.vars.get("e"), Some(Value::Exception(e)) if e.msg == TOO_DEEP));
+            assert!(matches!(it.vars().get("e"), Some(Value::Exception(e)) if e.msg == TOO_DEEP));
         });
     }
 
@@ -3468,11 +3972,11 @@ mod tests {
         let mut it = Interp::with_output(Box::new(io::sink()));
         it.run("x = 1; y = 2; z = 3;").unwrap();
         it.run("clear x y").unwrap();
-        let mut names: Vec<&String> = it.vars.keys().collect();
+        let mut names: Vec<&String> = it.vars().keys().collect();
         names.sort();
         assert_eq!(names, ["z"]);
         it.run("a = 1; clear all").unwrap();
-        assert!(it.vars.is_empty());
+        assert!(it.vars().is_empty());
         // A variable known from an earlier entry is an expression, not a
         // command.
         it.run("x = 3;").unwrap();
@@ -3489,5 +3993,437 @@ mod tests {
     fn a_block_comment_is_not_run() {
         assert_eq!(ok_out("%{\ndisp(111)\n%}\ndisp(1)"), "     1\n");
         assert_eq!(ok_out("disp(1)\n%{\ndisp(2)"), "     1\n");
+    }
+
+    // ---- functions and scoping (cycle 05) -------------------------------
+
+    /// A fresh directory under the system's temporary one, removed when
+    /// dropped, for the tests that put function files on disk.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> TempDir {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "splatcrab-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            TempDir(dir)
+        }
+
+        fn write(&self, rel: &str, text: &str) {
+            let p = self.0.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).expect("temp subdir");
+            }
+            std::fs::write(p, text).expect("temp file");
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An interpreter whose working directory is `dir`, and its output.
+    fn in_dir(dir: &TempDir) -> (Interp, Rc<RefCell<Vec<u8>>>) {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut it = Interp::with_sinks(Box::new(Shared(buf.clone())), Box::new(io::sink()));
+        it.cwd = dir.0.clone();
+        (it, buf)
+    }
+
+    fn take(buf: &Rc<RefCell<Vec<u8>>>) -> String {
+        String::from_utf8(std::mem::take(&mut *buf.borrow_mut())).unwrap()
+    }
+
+    #[test]
+    fn a_local_function_is_called_with_its_outputs_and_nargin() {
+        assert_eq!(
+            ok_out("disp(sq(4))\nfunction y = sq(x)\n    y = x^2;\nend"),
+            "    16\n"
+        );
+        assert_eq!(
+            ok_out(
+                "[s, p] = sp(2, 3);\ndisp([s p])\nfunction [s, p] = sp(a, b)\ns = a + b; p = a * b;\nend"
+            ),
+            "     5     6\n"
+        );
+        assert_eq!(
+            ok_out(
+                "disp(f(1)); disp(f(1, 2))\nfunction r = f(a, b)\nif nargin < 2, b = 10; end\nr = a + b;\nend"
+            ),
+            "    11\n     3\n"
+        );
+        // nargout: 1 in an expression, 0 as a statement, 2 for two targets.
+        assert_eq!(
+            ok_out(
+                "disp(h()); h\n[a, b] = h(); disp(a)\nfunction [r, q] = h()\nr = nargout; q = 0;\nend"
+            ),
+            "     1\nans =\n\n     0\n\n     2\n"
+        );
+        // A statement asks for nothing, so an unassigned output is no error.
+        assert_eq!(ok_out("g()\nfunction y = g()\nend"), "");
+    }
+
+    #[test]
+    fn return_leaves_the_function_from_inside_a_loop() {
+        assert_eq!(
+            ok_out(
+                "disp(early(5)); disp(early(-5))\nfunction r = early(x)\nr = 0; if x > 0, r = 1; return; end\nr = -1;\nend"
+            ),
+            "     1\n    -1\n"
+        );
+        assert_eq!(
+            ok_out(
+                "disp(first(7))\nfunction k = first(n)\nfor k = 1:10\nwhile true\nif k == n, return; end\nbreak\nend\nend\nk = 0;\nend"
+            ),
+            "     7\n"
+        );
+        // At the top it ends the script.
+        assert_eq!(ok_out("disp(1)\nreturn\ndisp(2)"), "     1\n");
+    }
+
+    /// A function sees only its own variables, and `break` in it never
+    /// reaches a loop in its caller.
+    #[test]
+    fn a_frame_isolates_variables() {
+        assert_eq!(
+            ok_out("x = 1; g2(); disp(x)\nfunction g2()\nx = 99;\nend"),
+            "     1\n"
+        );
+        let e = err("x = 1; g3()\nfunction g3()\ndisp(x)\nend");
+        assert_eq!(e.msg, "Unrecognized function or variable 'x'.");
+        assert_eq!(e.line, Some(1));
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.run("a = 1; f(2)\nfunction f(b)\nc = b;\nend").unwrap();
+        let mut names: Vec<&String> = it.vars().keys().collect();
+        names.sort();
+        assert_eq!(names, ["a"]);
+        assert_eq!(
+            err_msg("for k = 1:2\nf()\nend\nfunction f()\nbreak\nend"),
+            "'break' is only valid inside a loop."
+        );
+    }
+
+    /// Invariant 3: `end` is the running frame's. In `x(f(end))` it is
+    /// `x`'s, and inside `f` it is only ever what `f` itself indexes.
+    #[test]
+    fn a_frame_isolates_end() {
+        assert_eq!(
+            ok_out(
+                "x = [10 20 30 40];\ndisp(x(f(end)))\nfunction r = f(n)\nv = [1 2];\nr = v(end) + n - 3;\nend"
+            ),
+            "    30\n"
+        );
+        // A function with no index of its own cannot see the caller's.
+        let e = err("x = [1 2 3];\ny = x(g())\nfunction r = g()\nr = end;\nend");
+        assert!(e.msg.contains("end"), "{}", e.msg);
+    }
+
+    #[test]
+    fn the_argument_and_output_checks() {
+        let e = err("sq(1, 2)\nfunction y = sq(x)\ny = x;\nend");
+        assert_eq!(
+            (e.msg.as_str(), e.stack().len()),
+            ("Too many input arguments.", 0)
+        );
+        let e = err("z = bad(1)\nfunction y = bad(x)\nend");
+        assert_eq!(
+            e.msg,
+            "Output argument \"y\" (and maybe others) not assigned during call to \"bad\"."
+        );
+        assert!(e.stack().is_empty());
+        assert_eq!(
+            err_msg("z = g()\nfunction g()\nend"),
+            "Too many output arguments."
+        );
+        assert_eq!(
+            err_msg("[a, b] = f()\nfunction a = f()\na = 1;\nend"),
+            "Too many output arguments."
+        );
+        assert_eq!(
+            err_msg("x = nargin"),
+            "You can only call nargin/nargout from within a MATLAB function."
+        );
+    }
+
+    /// The trace: one entry per function the error left, innermost first,
+    /// and the error's own line is the calling script's.
+    #[test]
+    fn an_error_in_a_function_carries_a_trace() {
+        let e = err(
+            "x = 1;\nouter()\nfunction outer()\ninner();\nend\nfunction inner()\nerror('boom');\nend",
+        );
+        assert_eq!(e.msg, "boom");
+        assert_eq!(e.line, Some(2));
+        assert_eq!(e.trace(), "  in inner (line 7)\n  in outer (line 4)\n");
+        // A caught error keeps its trace, and the script goes on.
+        assert_eq!(
+            ok_out("try\nf()\ncatch e\ndisp(e.message)\nend\nfunction f()\nerror('x');\nend"),
+            "x\n"
+        );
+    }
+
+    /// The recursion limit is a clean error at 501 frames. It is run on the
+    /// interpreter's own stack, as the nesting limit's tests are.
+    #[test]
+    fn the_recursion_limit_is_a_clean_error() {
+        on_the_interpreter_stack(|| {
+            let e = err("inf_rec(1)\nfunction r = inf_rec(n)\nr = inf_rec(n + 1);\nend");
+            assert_eq!(e.msg, "Maximum recursion limit of 500 reached.");
+            assert_eq!(e.stack().len(), MAX_RECURSION);
+            // Exactly 500 frames are allowed.
+            let depth = |n: usize| {
+                format!(
+                    "disp(d({}))\nfunction r = d(n)\nif n <= 1, r = 1; else, r = 1 + d(n - 1); end\nend",
+                    n
+                )
+            };
+            assert_eq!(ok_out(&depth(MAX_RECURSION)), "   500\n");
+            assert_eq!(
+                err_msg(&depth(MAX_RECURSION + 1)),
+                "Maximum recursion limit of 500 reached."
+            );
+            // Recovered from, the interpreter is back at its base frame.
+            let mut it = Interp::with_output(Box::new(io::sink()));
+            it.run("try\nf(1)\ncatch\nend\nx = 1;\nfunction f(n)\nf(n + 1);\nend")
+                .unwrap();
+            assert_eq!(it.frames.len(), 1);
+            assert!(it.vars().contains_key("x"));
+        });
+    }
+
+    /// Invariant 6 against the frames: the nesting counter is shared by
+    /// every frame, so 500 frames each deep in an expression reach one
+    /// clean error or the other, never the end of the stack.
+    #[test]
+    fn deep_frames_stay_within_the_stack() {
+        on_the_interpreter_stack(|| {
+            for wrap in ["-(", "abs(", "1+("] {
+                for k in [5, 18, 1000] {
+                    let src = format!(
+                        "r = f(1);\nfunction r = f(n)\nr = {}f(n + 1){};\nend",
+                        wrap.repeat(k),
+                        ")".repeat(k)
+                    );
+                    let msg = err_msg(&src);
+                    assert!(
+                        msg == "Maximum recursion limit of 500 reached." || msg == TOO_DEEP,
+                        "{wrap} {k}: {msg}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// The REPL, the protocol and the page refuse a definition before
+    /// running anything.
+    #[test]
+    fn a_command_entry_refuses_a_function() {
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        let e = it.run_command("x = 1;\nfunction f()\nend").unwrap_err();
+        assert_eq!(
+            (e.msg.as_str(), e.line),
+            (
+                "Function definitions are not supported in this context.",
+                Some(2)
+            )
+        );
+        assert!(it.vars().is_empty());
+    }
+
+    /// Invariant 4: variable, the running file's local functions, the
+    /// script's, a file on the path, a builtin.
+    #[test]
+    fn names_resolve_in_order() {
+        let dir = TempDir::new("resolve");
+        dir.write("max.m", "function m = max(x)\nm = 42;\nend\n");
+        dir.write("sq.m", "function y = sq(x)\ny = -1;\nend\n");
+        dir.write(
+            "helper.m",
+            "function y = helper(x)\ny = [sq(x) twice(x)];\n\nfunction z = sq(x)\nz = 100;\n",
+        );
+        let (mut it, buf) = in_dir(&dir);
+        // A path file shadows a builtin; a variable shadows both.
+        it.run("disp(max([1 5 2]))").unwrap();
+        assert_eq!(take(&buf), "    42\n");
+        it.run("max = [7 8]; disp(max(2))").unwrap();
+        assert_eq!(take(&buf), "     8\n");
+        it.run("clear max").unwrap();
+        // A script's local function shadows a path file of its name.
+        it.run("disp(sq(3))\nfunction y = sq(x)\ny = x^2;\nend")
+            .unwrap();
+        assert_eq!(take(&buf), "     9\n");
+        // Inside helper.m, its own `sq` comes first, then the script's
+        // `twice`: the running file, then the script.
+        it.run("disp(helper(3))\nfunction z = twice(x)\nz = 2 * x;\nend")
+            .unwrap();
+        assert_eq!(take(&buf), "   100     6\n");
+        // Without the script, `twice` is nowhere.
+        let e = it.run("helper(3)").unwrap_err();
+        assert_eq!(e.msg, "Unrecognized function or variable 'twice'.");
+        assert_eq!(e.trace(), "  in helper (line 2)\n");
+        // A subfunction is private to its file.
+        dir.write(
+            "helper2.m",
+            "function y = helper2(x)\ny = x;\nfunction z = inner(x)\nz = x;\n",
+        );
+        assert_eq!(
+            it.run("helper2(1); inner(1)").unwrap_err().msg,
+            "Unrecognized function or variable 'inner'."
+        );
+    }
+
+    #[test]
+    fn a_script_on_the_path_runs_in_the_callers_workspace() {
+        let dir = TempDir::new("script");
+        dir.write("setup.m", "a = 7;\nif a > 0, return; end\na = 0;\n");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("setup; disp(a)").unwrap();
+        assert_eq!(take(&buf), "     7\n");
+        // Called from a function, it fills the function's workspace.
+        it.run("clear all\ndisp(f())\ndisp(exist('a'))\nfunction r = f()\nsetup\nr = a;\nend")
+            .unwrap();
+        assert_eq!(take(&buf), "     7\n     0\n");
+        assert_eq!(
+            it.run("setup(1)").unwrap_err().msg,
+            "Too many input arguments."
+        );
+        assert_eq!(
+            it.run("x = setup").unwrap_err().msg,
+            "Too many output arguments."
+        );
+    }
+
+    #[test]
+    fn exist_and_feval() {
+        let dir = TempDir::new("exist");
+        dir.write("addone.m", "function y = addone(x)\ny = x + 1;\nend\n");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("x = 1; disp([exist('x') exist('addone') exist('max') exist('nosuch')])")
+            .unwrap();
+        assert_eq!(take(&buf), "     1     2     5     0\n");
+        it.run("disp(feval('addone', 41)); disp(feval('max', [1 3 2]))")
+            .unwrap();
+        assert_eq!(take(&buf), "    42\n     3\n");
+        // feval skips variables, as a string names a function.
+        it.run("addone = 5; disp(feval('addone', 1))").unwrap();
+        assert_eq!(take(&buf), "     2\n");
+        it.run("[m, k] = feval('max', [1 3 2]); disp([m k])")
+            .unwrap();
+        assert_eq!(take(&buf), "     3     2\n");
+        // Not an identifier, never a path.
+        it.run("disp(exist('../addone'))").unwrap();
+        assert_eq!(take(&buf), "     0\n");
+    }
+
+    /// `addpath` and `rmpath` bump the generation, so a lookup cached
+    /// before them is never used after.
+    #[test]
+    fn the_cache_generation() {
+        let dir = TempDir::new("cache");
+        dir.write("a/f.m", "function r = f()\nr = 1;\nend\n");
+        dir.write("b/f.m", "function r = f()\nr = 2;\nend\n");
+        let (mut it, buf) = in_dir(&dir);
+        let g0 = it.generation;
+        it.run("addpath('a'); disp(f()); addpath('b'); disp(f()); rmpath('b'); disp(f())")
+            .unwrap();
+        assert_eq!(take(&buf), "     1\n     2\n     1\n");
+        // One for the run, one for each change of the path.
+        assert_eq!(it.generation, g0 + 4);
+        assert_eq!(it.search_path, vec![dir.0.join("a")]);
+        // Adding a folder already on the path moves it, never lists it twice.
+        it.run("addpath('b', 'a'); addpath('a')").unwrap();
+        assert_eq!(it.search_path, vec![dir.0.join("a"), dir.0.join("b")]);
+        it.run("rmpath('a', 'b')").unwrap();
+        assert!(it.search_path.is_empty());
+        // A file changed between entries is read again; within one it is not.
+        it.run("addpath('a'); disp(f())").unwrap();
+        assert_eq!(take(&buf), "     1\n");
+        dir.write("a/f.m", "function r = f()\nr = 33;\nend\n");
+        it.run("disp(f())").unwrap();
+        assert_eq!(take(&buf), "    33\n");
+        // A cached file is known good for the rest of its generation.
+        let path = dir.0.join("a").join("f.m");
+        assert_eq!(it.files[&path].generation, it.generation);
+        // The name cache forgets a file that has gone.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            it.run("f()").unwrap_err().msg,
+            "Unrecognized function or variable 'f'."
+        );
+    }
+
+    #[test]
+    fn addpath_and_rmpath_warn_for_a_folder_they_cannot_use() {
+        let dir = TempDir::new("warn");
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(Shared(buf.clone())));
+        it.cwd = dir.0.clone();
+        it.run("addpath('nothere'); rmpath('nothere')").unwrap();
+        assert_eq!(
+            take(&buf),
+            "Warning: Name is nonexistent or not a directory: nothere\n\
+             Warning: \"nothere\" not found in path.\n"
+        );
+    }
+
+    /// A parse error in a file on the path names that file's line in the
+    /// trace, and the calling line at the top.
+    #[test]
+    fn a_broken_file_on_the_path_is_a_clean_error() {
+        let dir = TempDir::new("broken");
+        dir.write("broken.m", "function y = broken()\ny = (1;\nend\n");
+        let (mut it, _) = in_dir(&dir);
+        let e = it.run("x = 1;\ny = broken()").unwrap_err();
+        assert_eq!(e.line, Some(2));
+        assert_eq!(e.trace(), "  in broken (line 2)\n");
+    }
+
+    /// A file parsed while the evaluator is already deep counts its nesting
+    /// from there, so the two together stay under the one limit.
+    #[test]
+    fn a_file_parsed_deep_shares_the_nesting_budget() {
+        on_the_interpreter_stack(|| {
+            let dir = TempDir::new("deepparse");
+            let body = format!("{}1{}", "(".repeat(6000), ")".repeat(6000));
+            dir.write(
+                "deepf.m",
+                &format!("function y = deepf()\ny = {};\nend\n", body),
+            );
+            let (mut it, _) = in_dir(&dir);
+            // Alone, the file parses and runs.
+            it.run("x = deepf();").unwrap();
+            // From inside 6,000 levels of calls it does not: the parser
+            // starts where the evaluator is.
+            let dir2 = TempDir::new("deepparse2");
+            dir2.write(
+                "deepf.m",
+                &format!("function y = deepf()\ny = {};\nend\n", body),
+            );
+            let (mut it, _) = in_dir(&dir2);
+            let src = format!("x = {}deepf(){};", "abs(".repeat(6000), ")".repeat(6000));
+            let e = it.run(&src).unwrap_err();
+            assert_eq!(e.msg, TOO_DEEP);
+            assert_eq!(e.stack().len(), 1);
+        });
+    }
+
+    /// Command syntax inside a function: its parameters are variables, and
+    /// the script's variables are not.
+    #[test]
+    fn command_syntax_knows_a_functions_parameters() {
+        assert_eq!(
+            ok_out("disp(f(5))\nfunction r = f(a)\nr = a -1;\nend"),
+            "     4\n"
+        );
     }
 }

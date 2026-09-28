@@ -100,6 +100,31 @@ pub enum Stmt {
     Try(Vec<Located>, Option<String>, Vec<Located>),
     Break,
     Continue,
+    /// `return`: leaves the running function, or the running script
+    /// (cycle 05).
+    Return,
+}
+
+/// A `function` block (cycle 05): its name, the names of its outputs and of
+/// its parameters in order, its body, and the line its `function` is on.
+/// A parameter written `~` is ignored, and is kept as `"~"` so that the
+/// argument count still counts it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Function {
+    pub name: String,
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub body: Vec<Located>,
+    pub line: u32,
+}
+
+/// A whole source text: its statements and the functions defined after
+/// them. A function file is one whose statements are empty and whose first
+/// function is its entry; a script may end in local functions.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct Program {
+    pub stmts: Vec<Located>,
+    pub functions: Vec<Function>,
 }
 
 /// One `case` of a `switch`: the values it matches, the line the `case` is
@@ -185,6 +210,16 @@ impl Parser {
         }
     }
 
+    /// The same parser, counting its nesting from `depth` rather than from
+    /// zero. A function file is parsed when it is first called, however
+    /// deep the evaluator already is, on the same stack; starting from the
+    /// evaluator's depth keeps the two recursions together under the one
+    /// [`MAX_DEPTH`], so the file cannot overflow what the caller left.
+    pub fn at_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
     /// Counts one more level of nesting, refusing anything past [`MAX_DEPTH`].
     ///
     /// Two things call it, because both make the tree one level deeper.
@@ -248,13 +283,118 @@ impl Parser {
         }
     }
 
-    pub fn parse_program(&mut self) -> R<Vec<Located>> {
-        let stmts = self.parse_block(&[])?;
-        if self.peek() != &Token::Eof {
-            let line = self.line();
-            bail!(error::unexpected_token(self.peek()).at(line));
+    /// A whole source text: statements, then any `function` blocks.
+    ///
+    /// Once a function has been defined, only another may follow: a
+    /// statement after one is MATLAB's "Function definitions in a script
+    /// must appear at the end of the file.", reported on the statement's
+    /// line. A function ends at its `end`, or, if it has none, at the next
+    /// `function` or the end of the text; see [`Parser::parse_function`].
+    pub fn parse_program(&mut self) -> R<Program> {
+        let mut prog = Program {
+            stmts: self.parse_block(&[Token::Function])?,
+            functions: Vec::new(),
+        };
+        loop {
+            self.skip_terminators();
+            match self.peek() {
+                Token::Eof => return Ok(prog),
+                Token::Function => {
+                    let f = self.parse_function()?;
+                    prog.functions.push(f);
+                }
+                // An `end` with nothing open, after a function that took
+                // its own.
+                t @ (Token::End
+                | Token::Else
+                | Token::ElseIf
+                | Token::Case
+                | Token::Otherwise
+                | Token::Catch) => {
+                    let line = self.line();
+                    bail!(error::block_with_no_opener(t).at(line));
+                }
+                _ => {
+                    let line = self.line();
+                    bail!(error::functions_at_end().at(line));
+                }
+            }
         }
-        Ok(stmts)
+    }
+
+    /// `function [outs] = name(params)`, its body, and its `end` if it has
+    /// one.
+    ///
+    /// The header is `function name`, `function name(a, b)`,
+    /// `function y = name(...)` or `function [y, z] = name(...)`, with `~`
+    /// allowed for a parameter. The body is read as a block that stops at
+    /// `end` or at the next `function`: the blocks inside it take their own
+    /// `end`s, so the first `end` at the body's own level is the function's.
+    /// A body that stops at a `function` or at the end of the text had no
+    /// `end`, which MATLAB allows in a function file.
+    ///
+    /// SplatCrab accepts a file that mixes the two forms, and a script whose
+    /// functions have no `end`; MATLAB is stricter about both. Neither
+    /// changes what a file that MATLAB accepts means.
+    fn parse_function(&mut self) -> R<Function> {
+        let line = self.line();
+        self.expect(Token::Function)?;
+        let mut outputs = Vec::new();
+        if self.eat(&Token::LBracket) {
+            loop {
+                match self.next() {
+                    Token::RBracket => break,
+                    Token::Comma => {}
+                    Token::Ident(n) => outputs.push(n),
+                    t => bail!(error::unexpected_token(&t).at(line)),
+                }
+            }
+            self.expect(Token::Assign)?;
+        }
+        let mut name = self.header_name(line)?;
+        if outputs.is_empty() && self.eat(&Token::Assign) {
+            outputs.push(name);
+            name = self.header_name(line)?;
+        }
+        let mut params = Vec::new();
+        if self.eat(&Token::LParen) {
+            loop {
+                match self.next() {
+                    Token::RParen => break,
+                    Token::Comma => {}
+                    Token::Ident(n) => params.push(n),
+                    Token::Not => params.push("~".to_string()),
+                    t => bail!(error::unexpected_token(&t).at(line)),
+                }
+            }
+        }
+        match self.peek() {
+            Token::Newline | Token::Semi | Token::Comma | Token::Eof => {}
+            t => {
+                let at = self.line();
+                bail!(error::unexpected_token(t).at(at));
+            }
+        }
+        self.deepen()?;
+        let body = self.parse_block(&[Token::End, Token::Function]);
+        self.depth -= 1;
+        let body = body?;
+        self.eat(&Token::End);
+        Ok(Function {
+            name,
+            outputs,
+            params,
+            body,
+            line,
+        })
+    }
+
+    /// The function's name in its header.
+    fn header_name(&mut self, line: u32) -> R<String> {
+        match self.next() {
+            Token::Ident(n) => Ok(n),
+            t => bail!(error::unexpected_token(&t).at(line)),
+        }
     }
 
     fn parse_block(&mut self, stops: &[Token]) -> R<Vec<Located>> {
@@ -346,6 +486,14 @@ impl Parser {
                 self.end_stmt()?;
                 Ok(Stmt::Continue)
             }
+            Token::Return => {
+                self.next();
+                self.end_stmt()?;
+                Ok(Stmt::Return)
+            }
+            // A definition inside a block: `if c, function f(), end, end`.
+            // Only the top level of a file can hold one.
+            Token::Function => bail!(error::function_not_supported_here().at(line)),
             Token::Switch => {
                 self.next();
                 let subject = self.parse_expr()?;
@@ -532,7 +680,8 @@ impl Parser {
             | Token::ElseIf
             | Token::Case
             | Token::Otherwise
-            | Token::Catch => Ok(true),
+            | Token::Catch
+            | Token::Function => Ok(true),
             _ => {
                 let line = self.line();
                 bail!(error::unexpected_token(self.peek()).at(line))
@@ -924,7 +1073,10 @@ mod tests {
     fn parse_result(src: &str) -> R<Vec<Located>> {
         let lexed = scan(src).expect("lex should succeed");
         let mut p = Parser::with_lines(lexed);
-        p.parse_program()
+        p.parse_program().map(|prog| {
+            assert!(prog.functions.is_empty(), "no functions expected");
+            prog.stmts
+        })
     }
 
     /// A statement and the line it is expected to start on.
@@ -1502,7 +1654,10 @@ mod tests {
         // `Parser::new` is what the expression tests and the REPL's
         // `needs_more` use; with no line table every statement is line 1.
         let toks = lex("x = 1;\ny = 2;").expect("lex should succeed");
-        let stmts = Parser::new(toks).parse_program().expect("should parse");
+        let stmts = Parser::new(toks)
+            .parse_program()
+            .expect("should parse")
+            .stmts;
         assert_eq!(stmts.iter().map(|s| s.line).collect::<Vec<_>>(), vec![1, 1]);
     }
 
@@ -1867,5 +2022,111 @@ mod tests {
         let msg = |src: &str| parse_result(src).unwrap_err().msg;
         assert_eq!(msg("try\nx = 1;"), "expected 'end' but found end of input");
         assert_eq!(msg("try, catch e f, end"), "unexpected 'f'");
+    }
+
+    // ---- function definitions (cycle 05) -------------------------------
+
+    fn program(src: &str) -> R<Program> {
+        Parser::with_lines(scan(src).expect("lex should succeed")).parse_program()
+    }
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Every header form, with and without `end`.
+    #[test]
+    fn function_headers_parse_in_every_form() {
+        let p = program("disp(sq(4))\nfunction y = sq(x)\n    y = x^2;\nend").unwrap();
+        assert_eq!(p.stmts.len(), 1);
+        let f = &p.functions[0];
+        assert_eq!(
+            (f.name.as_str(), &f.outputs, &f.params, f.line),
+            ("sq", &strings(&["y"]), &strings(&["x"]), 2)
+        );
+        assert_eq!(
+            f.body,
+            vec![at(
+                3,
+                Stmt::Assign(lv("y"), bin(BinOp::Pow, ident("x"), num(2.0)), false)
+            )]
+        );
+
+        let f = &program("function [s, p] = sp(a, b)\ns = a + b; p = a * b;\nend")
+            .unwrap()
+            .functions[0];
+        assert_eq!(
+            (&f.outputs, &f.params),
+            (&strings(&["s", "p"]), &strings(&["a", "b"]))
+        );
+        assert_eq!(f.body.len(), 2);
+        // `[s p]` is `[s, p]`, the lexer's whitespace rule.
+        let f = &program("function [s p] = sp()\nend").unwrap().functions[0];
+        assert_eq!(f.outputs, strings(&["s", "p"]));
+
+        // No outputs, no arguments, with and without parentheses.
+        for src in ["function g2()\nx = 99;\nend", "function g2\nx = 99;\nend"] {
+            let f = &program(src).unwrap().functions[0];
+            assert_eq!(f.name, "g2");
+            assert!(f.outputs.is_empty() && f.params.is_empty(), "{src}");
+            assert_eq!(f.body, vec![at(2, Stmt::Assign(lv("x"), num(99.0), false))]);
+        }
+        // An ignored parameter keeps its place.
+        let f = &program("function f(~, b)\nend").unwrap().functions[0];
+        assert_eq!(f.params, strings(&["~", "b"]));
+        // On one line.
+        let f = &program("function r = f(x), r = x; end").unwrap().functions[0];
+        assert_eq!(f.body.len(), 1);
+    }
+
+    /// A function file's functions may all go without `end`: each body runs
+    /// to the next `function` or the end of the text, and the blocks inside
+    /// keep their own `end`s.
+    #[test]
+    fn functions_without_end_run_to_the_next_function() {
+        let p = program(
+            "function y = helper(x)\nif x > 0\ny = twice(x);\nend\n\nfunction z = twice(x)\nz = 2 * x;\n",
+        )
+        .unwrap();
+        assert!(p.stmts.is_empty());
+        let names: Vec<&str> = p.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["helper", "twice"]);
+        assert_eq!(p.functions[0].body.len(), 1);
+        assert!(matches!(p.functions[0].body[0].stmt, Stmt::If(..)));
+        assert_eq!(p.functions[1].line, 6);
+        // An end-less body can hold a `return`.
+        let p = program("function f\nreturn\n").unwrap();
+        assert_eq!(p.functions[0].body, vec![at(2, Stmt::Return)]);
+    }
+
+    /// Where a definition may not go.
+    #[test]
+    fn a_statement_after_a_function_is_refused() {
+        let e = program("x = 1;\nfunction f()\nend\ny = 2;").unwrap_err();
+        assert_eq!(
+            (e.msg.as_str(), e.line),
+            (
+                "Function definitions in a script must appear at the end of the file.",
+                Some(4)
+            )
+        );
+        // Inside a block.
+        let e = program("if 1\nfunction f()\nend\nend").unwrap_err();
+        assert_eq!(
+            (e.msg.as_str(), e.line),
+            (
+                "Function definitions are not supported in this context.",
+                Some(2)
+            )
+        );
+        // A stray `end` after a function that took its own.
+        let e = program("function f()\nend\nend").unwrap_err();
+        assert_eq!(e.msg, "unexpected 'end' with no matching block");
+        // A header that is not one.
+        assert_eq!(program("function 3").unwrap_err().msg, "unexpected '3'");
+        assert_eq!(
+            program("function y = f(x) y").unwrap_err().msg,
+            "unexpected 'y'"
+        );
     }
 }

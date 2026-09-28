@@ -1,0 +1,2 @@
+Error: Line 4: Maximum recursion limit of 500 reached.
+  in inf_rec (line 6)

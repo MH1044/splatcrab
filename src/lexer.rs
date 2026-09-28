@@ -74,6 +74,10 @@ pub enum Token {
     Otherwise,
     Try,
     Catch,
+    /// `function`, which opens a definition (cycle 05).
+    Function,
+    /// `return`, which leaves the running function or script (cycle 05).
+    Return,
 
     Eof,
 }
@@ -152,6 +156,8 @@ impl fmt::Display for Token {
             Token::Otherwise => "otherwise",
             Token::Try => "try",
             Token::Catch => "catch",
+            Token::Function => "function",
+            Token::Return => "return",
         };
         write!(f, "'{}'", word)
     }
@@ -376,6 +382,25 @@ fn assigned_names(stmt: &[Token]) -> Vec<String> {
     }
 }
 
+/// The outputs and parameters a `function` line names, from its `function`
+/// token to where it ends: every identifier but the function's own name,
+/// which is the one straight after the `=`, or the first when there is none.
+fn header_names(line: &[Token]) -> Vec<String> {
+    let has_outputs = line.contains(&Token::Assign);
+    let mut past_assign = !has_outputs;
+    let mut named = false;
+    let mut names = Vec::new();
+    for t in line.iter().skip(1) {
+        match t {
+            Token::Assign => past_assign = true,
+            Token::Ident(_) if past_assign && !named => named = true,
+            Token::Ident(n) => names.push(n.clone()),
+            _ => {}
+        }
+    }
+    names
+}
+
 /// A UTF-8 byte-order mark, which a Windows editor or `Out-File` writes at the
 /// start of a file. It is an encoding marker, not source, and MATLAB and
 /// Octave both skip it; SplatCrab used to report
@@ -416,6 +441,11 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
     // The statement whose assigned names were last collected.
     let mut named_at: Option<usize> = None;
     let mut open_comment = false;
+    // Where the `function` line being lexed began, until it ends.
+    let mut header: Option<usize> = None;
+    // Past the first `function`, a workspace of its own: the variables the
+    // source started with are not its variables.
+    let mut in_function = false;
 
     while i < n {
         let c = chars[i];
@@ -438,6 +468,12 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
             })
         {
             stmt_start = toks.len();
+            // A `function` line just ended: its outputs and its parameters
+            // are the function's first variables, so `a -1` in its body is
+            // an expression, as MATLAB reads it.
+            if let Some(h) = header.take() {
+                assigned.extend(header_names(&toks.tokens[h..]));
+            }
         }
 
         // A block comment: `%{` alone on its line, through the matching
@@ -597,15 +633,24 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
                 "otherwise" => Token::Otherwise,
                 "try" => Token::Try,
                 "catch" => Token::Catch,
+                "function" => Token::Function,
+                "return" => Token::Return,
                 _ => Token::Ident(word),
             };
+            // Each function is a workspace of its own, so what the source
+            // assigned before this one says nothing about names inside it.
+            if tok == Token::Function && toks.len() == stmt_start {
+                assigned.clear();
+                in_function = true;
+                header = Some(toks.len());
+            }
             if let Token::Ident(name) = &tok {
                 // `catch e` binds `e`.
                 if toks.last() == Some(&Token::Catch) {
                     assigned.insert(name.clone());
                 } else if toks.len() == stmt_start
                     && open.is_empty()
-                    && !known(name)
+                    && (in_function || !known(name))
                     && !assigned.contains(name)
                     && is_command(&chars, i)
                 {
@@ -1820,5 +1865,51 @@ mod tests {
                 Token::Eof,
             ]
         );
+    }
+
+    /// Cycle 05: `function` and `return` are keywords, and a function line
+    /// makes its outputs and parameters variables of the body, while the
+    /// names the script assigned, and the workspace, are not.
+    #[test]
+    fn a_function_line_names_its_variables() {
+        assert_eq!(
+            lx("function y = f(x)\nreturn"),
+            vec![
+                Token::Function,
+                id("y"),
+                Token::Assign,
+                id("f"),
+                Token::LParen,
+                id("x"),
+                Token::RParen,
+                Token::Newline,
+                Token::Return,
+                Token::Eof,
+            ]
+        );
+        let minus = [id("a"), Token::Minus, Token::Num(1.0)];
+        for src in [
+            "function r = f(a)\na -1",
+            "function [a, b] = f()\na -1",
+            "function f(q, a)\na -1",
+        ] {
+            let toks = lx(src);
+            assert_eq!(&toks[toks.len() - 4..toks.len() - 1], &minus[..], "{src}");
+        }
+        // The function's own name is not one of them, and neither is a name
+        // assigned before the function or known to the workspace.
+        let cmd = [id("a"), Token::LParen, st("-1"), Token::RParen];
+        for src in [
+            "function r = a()\na -1",
+            "function a\na -1",
+            "a = 1;\nfunction g()\na -1",
+        ] {
+            let toks = lx(src);
+            assert_eq!(&toks[toks.len() - 5..toks.len() - 1], &cmd[..], "{src}");
+        }
+        let toks = scan_known("function g()\na -1", &|n| n == "a")
+            .unwrap()
+            .tokens;
+        assert_eq!(&toks[toks.len() - 5..toks.len() - 1], &cmd[..]);
     }
 }

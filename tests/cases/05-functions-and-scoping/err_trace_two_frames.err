@@ -1,0 +1,3 @@
+Error: Line 5: Unrecognized function or variable 'undefined_q'.
+  in inner_fn (line 10)
+  in outer_fn (line 7)

@@ -10,7 +10,8 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 ## Scope
 
 - **The working directory is interpreter state, not the process's.**
-  `Interp::cwd`, readable and settable, and every path-resolving builtin
+  `Interp::cwd`, which cycle 05 introduced for its path lookups, readable
+  and settable here, and every path-resolving builtin
   resolves against it. `cd` moves the interpreter, never `std::env`. This
   matters more than it looks: the golden harness gives each case its own
   working directory, and the interface confines the file pane to a root, so a

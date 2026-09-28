@@ -1,0 +1,5 @@
+% covers: 16 - complete counts function ... end as a block: open until its own end is typed, and an if inside it needs its own end first
+{"id":1,"op":"complete","code":"function y = f(x)\ny = x;"}
+{"id":2,"op":"complete","code":"function y = f(x)\ny = x;\nend"}
+{"id":3,"op":"complete","code":"function y = f(x)\nif x\ny = x;\nend"}
+{"id":4,"op":"complete","code":"function y = f(x)\nif x\ny = x;\nend\nend"}

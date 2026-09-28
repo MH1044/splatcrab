@@ -1,0 +1,4 @@
+% covers: 15 - at the REPL a function block is refused with MATLAB's not-in-this-context error once its end is typed, and the session goes on to a clean exit
+function f()
+end
+exit

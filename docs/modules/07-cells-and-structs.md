@@ -16,6 +16,10 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 - `for` over cells
 - `cell struct fieldnames isfield rmfield getfield setfield iscell isstruct cellfun num2cell cell2mat deal`
 - `varargin/varargout`
+- `e.stack` of a caught `MException`, a struct array of `file`, `name` and
+  `line`, one element per frame. Cycle 04 deferred it to 05 and 05 to
+  here: it is a struct array, and structs are this cycle's. Cycle 05's
+  error trace is the data it holds
 - displays
 
 ## Out of scope

@@ -33,7 +33,7 @@ and the table names the cycle that owns it.
 | 02 | [classes-and-display](modules/02-classes-and-display.md) | Logical and char classes as a tag on `Matrix`; class propagation; MATLAB display fidelity | Done (2026-09-28) |
 | 03 | [indexing-forms](modules/03-indexing-forms.md) | Logical indexing, element deletion, in-place assignment, access-chain AST, multiple return values | Done (2026-09-28) |
 | 04 | [switch-try-commands](modules/04-switch-try-commands.md) | `switch`, `try`/`catch` with an `MException`, `warning`, `assert`, command syntax, block comments | Done (2026-09-28) |
-| 05 | [functions-and-scoping](modules/05-functions-and-scoping.md) | User functions in scripts and on a path, frames, `nargin`/`nargout`, `return`, recursion, subfunctions | Planned |
+| 05 | [functions-and-scoping](modules/05-functions-and-scoping.md) | User functions in scripts and on a path, frames, `nargin`/`nargout`, `return`, recursion, subfunctions | Done (2026-09-28) |
 | 06 | [function-handles](modules/06-function-handles.md) | `@name` and `@(x) body` with capture, `feval`, `arrayfun`, `func2str`, `str2func` | Planned |
 | 07 | [cells-and-structs](modules/07-cells-and-structs.md) | Cell arrays, structs and struct arrays, comma-separated lists, `varargin`/`varargout` | Planned |
 | 08 | [linear-algebra](modules/08-linear-algebra.md) | LU, QR with least squares, Cholesky, eigenvalues, SVD, `rank`, `pinv`, matrix norms | Planned |

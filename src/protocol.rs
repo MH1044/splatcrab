@@ -104,7 +104,7 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
         }),
         "workspace" => Ok(workspace(it, id.clone())),
         "completions" => field(&req, "prefix").map(|prefix| {
-            let items = env::completions(prefix, &it.vars, it.builtins());
+            let items = env::completions(prefix, it.vars(), it.builtins());
             Json::object([
                 ("id", id.clone()),
                 ("ok", Json::Bool(true)),
@@ -171,7 +171,7 @@ fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
     // nothing reaches stderr.
     let saved = std::mem::replace(&mut it.out, Box::new(Capture(buf.clone())));
     let saved_err = std::mem::replace(&mut it.err, Box::new(Capture(buf.clone())));
-    let result = it.run(code);
+    let result = it.run_command(code);
     it.out = saved;
     it.err = saved_err;
     let out = Json::String(String::from_utf8_lossy(&buf.borrow()).into_owned());
@@ -188,12 +188,12 @@ fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
 
 /// One `{name, size, class}` per variable, sorted by name.
 fn workspace(it: &Interp, id: Json) -> Json {
-    let mut names: Vec<&String> = it.vars.keys().collect();
+    let mut names: Vec<&String> = it.vars().keys().collect();
     names.sort();
     let vars = names
         .into_iter()
         .map(|name| {
-            let v = &it.vars[name];
+            let v = &it.vars()[name];
             let (rows, cols) = v.dims();
             Json::object([
                 ("name", Json::String(name.clone())),

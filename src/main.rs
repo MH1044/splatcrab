@@ -102,7 +102,7 @@ fn run() -> i32 {
         let src = match std::fs::read(path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
-                eprintln!("Error: Cannot read {}: {}", path, e);
+                eprintln!("Error: {}", error::cannot_read(path, &e));
                 return 1;
             }
         };
@@ -112,8 +112,11 @@ fn run() -> i32 {
         let _ = it.out.flush();
         if let Err(e) = result {
             // `MError`'s Display supplies the `Line N: ` part when a line is
-            // known, so the prefix is spelled in exactly one place.
+            // known, so the prefix is spelled in exactly one place. The
+            // line is the script's own; the functions the error came out of
+            // follow, innermost first.
             eprintln!("Error: {}", e);
+            eprint!("{}", e.trace());
             return 1;
         }
         return 0;
@@ -138,7 +141,8 @@ fn run() -> i32 {
         if !syntax::is_complete(&buf) {
             continue;
         }
-        if let Err(e) = it.run(&buf) {
+        // A command-line entry: a `function` block is refused.
+        if let Err(e) = it.run_command(&buf) {
             report(&mut it, &e);
         }
         buf.clear();
@@ -262,9 +266,11 @@ fn http_stdio(opts: UiOptions) -> i32 {
 /// both land on the same terminal.
 ///
 /// No line number: a REPL entry is one line, so `Line 1:` would be noise
-/// rather than information.
+/// rather than information. The trace of the functions the error came out
+/// of follows it, as in script mode.
 fn report(it: &mut interp::Interp, e: &splatcrab::error::MError) {
     let _ = it.out.flush();
     io::stdout().flush().ok();
     eprintln!("Error: {}", e.msg);
+    eprint!("{}", e.trace());
 }

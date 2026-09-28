@@ -81,7 +81,9 @@ library target was added so tests can drive the interpreter in process, and
 | `ranges` | Default, fractional and negative steps; an empty range; `linspace` |
 | `logical_ops` | Comparisons, elementwise and short-circuit logicals, negation |
 | `builtins_sample` | Constructors, shape queries, elementwise math, linear algebra, `find`, `sort` |
-| `who` | The workspace listing |
+| `who_listing` | The workspace listing. Named `who` until cycle 05, when a
+file in the current folder began to shadow a builtin (invariant 4) and the
+case's `who` statement resolved to the case itself |
 | `rand_shape` | `rand` shape and range only, so the generator can change |
 | `err_dims` | Elementwise operation with incompatible sizes |
 | `err_matmul` | Matrix multiply with disagreeing inner dimensions |

@@ -84,18 +84,40 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `break` and `continue` | 00 | `control_flow` | |
 | `break` or `continue` outside a loop is an error | 01e | `err_break_outside_loop`, `err_continue_outside_loop` | It used to unwind out of the whole script, so the statements after it never ran and the process still exited 0 (QA D8). Raised when the statement runs, not when it parses, so the output before it is still printed |
 | `switch` / `case` / `otherwise` | 04 | `switch_otherwise`, `switch_char_case`, `switch_cell_case`, `switch_break_in_for`, `err_switch_not_scalar`, `err_nesting_switch`, `err_switch_stray_statement`, `err_case_without_switch` | The first matching `case` runs, with no fall-through. A number matches a number of equal value whatever its class; a char matches a char of the same text and never a number by its code. `case {a, b}` matches any of its values, and is syntax rather than a cell until cycle 07. `break` and `continue` inside act on the enclosing loop. A subject that is neither a scalar nor a character vector is `SWITCH expression must be a scalar or a character vector.` |
-| `try` / `catch` | 04 | `try_catch_message`, `try_catch_identifier`, `try_catch_undefined`, `try_rethrow_nested`, `rethrow_keeps_identifier`, `err_rethrow_uncaught`, `exception_class`, `err_exception_stack`, `err_exception_arithmetic`, `err_rethrow_not_exception`, `err_nesting_try` | Every runtime error inside `try` is caught, a builtin's included. `catch e` on the same line binds a minimal `MException`: `e.message`, `e.identifier`, `class(e)` is `'MException'`, and any other field is the Dot error until cycle 05's `e.stack`. `catch` followed by a comma or a newline binds nothing, and a `try` with no `catch` ignores the error. `break` and `continue` pass through. `rethrow(e)` raises it again unchanged, line included |
+| `try` / `catch` | 04 | `try_catch_message`, `try_catch_identifier`, `try_catch_undefined`, `try_rethrow_nested`, `rethrow_keeps_identifier`, `err_rethrow_uncaught`, `exception_class`, `err_exception_stack`, `err_exception_arithmetic`, `err_rethrow_not_exception`, `err_nesting_try` | Every runtime error inside `try` is caught, a builtin's included. `catch e` on the same line binds a minimal `MException`: `e.message`, `e.identifier`, `class(e)` is `'MException'`, and any other field is the Dot error until cycle 07's `e.stack`, a struct array. `catch` followed by a comma or a newline binds nothing, and a `try` with no `catch` ignores the error. `break` and `continue` pass through. `rethrow(e)` raises it again unchanged, line included |
 | A `for` that does not run still assigns its variable | 01d | `for_zero_iterations_assigns_empty` | After `k = 7; for k = []; end`, `k` is the empty; a name that did not exist comes into existence. The exact empty shape MATLAB gives is unsettled, so no case asserts it |
+
+## Functions
+
+Cases in `05-functions-and-scoping/`.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| Local functions at the end of a script | 05 | `local_function_call`, `statement_call_ans`, `err_function_before_statement` | Every header form: `function name`, `function name(a, b)`, `function y = name(...)`, `function [y, z] = name(...)`, `~` for an ignored argument. A statement after a function is `Function definitions in a script must appear at the end of the file.` A call as a statement that returns a value sets and shows `ans` |
+| Multiple outputs | 05 | `multiple_outputs`, `err_output_not_assigned` | `[s, p] = f(...)` through cycle 03's multiple assignment. An output asked for and never assigned is `Output argument "y" (and maybe others) not assigned during call to "f".`; asking for more outputs than the function has is `Too many output arguments.` |
+| `nargin` and `nargout` | 05 | `nargin_default`, `nargout_values`, `err_nargin_outside_function` | `nargout` is `1` in an expression, `0` as a statement and the target count of `[a, b] = f()`. Arguments may be left off the end; one too many is `Too many input arguments.`, raised before the call, with no trace line (`err_too_many_inputs`). Outside every function both are `You can only call nargin/nargout from within a MATLAB function.` |
+| `return` | 05 | `early_return` | Leaves the function from inside any loop or block; at the top of a script it ends the script |
+| A workspace per call | 05 | `err_caller_variable_invisible`, `end_inside_call` | A function sees only its arguments and what it assigns; `end` is resolved in the running frame, so `x(f(end))` binds `end` to `x` and a function's own indexing never sees the caller's (invariant 3). `break` in a function never reaches a loop in its caller |
+| Recursion, limited to 500 calls | 05 | `fact_recursion`, `recursion_deep_frames`, `err_recursion_limit`, `err_recursion_nested_expression` | The 501st nested call is `Maximum recursion limit of 500 reached.`, a clean error. Every frame shares the one nesting budget of 10,000 levels, so 500 frames deep in expressions end in one clean error or the other, never an abort (invariant 6) |
+| The error trace | 05 | `err_trace_two_frames`, `err_eval_error_line_outermost` | An uncaught error that left a function prints `Error: Line N: <msg>`, `N` the script's own line, then one `  in <fn> (line N)` per function it left, innermost first, to stderr. The REPL prints the message and the trace without a line |
+| Function files and subfunctions on a path | 05 | `path_test`, `err_subfunction_private`, `subfunction_before_script_function`, `local_shadows_path_file` | `name.m` in the current folder or on the path, starting with `function`: its first function is what `name` calls, the rest are private to the file. A file's functions may all end with `end` or all go without |
+| Scripts on the path run in the caller's workspace | 05 | `script_on_path`, `script_in_function_workspace` | Called from a function, a script fills the function's workspace. A script takes no arguments and gives no outputs |
+| Name resolution, and user files shadow builtins | 05 | `variable_shadows_function`, `local_shadows_path_file`, `addpath_shadow` | Variable, then the running file's local functions, then the script's, then the current folder, then the path, then a builtin (invariant 4) |
+| `addpath` and `rmpath` | 05 | `addpath_shadow`, `addpath_after_lookup`, `err_path_folder_warnings` | `addpath` puts folders at the front of the path, `rmpath` takes them off, both relative to `Interp::cwd`. A folder that does not exist, or is not on the path, is a warning. Each bumps the file cache's generation, so a lookup cached before is never used after |
+| `exist` and `feval` | 05 | `exist_kinds`, `exist_path_file`, `feval_local_function` | `exist` is `1` for a variable, `2` for a file on the path, `5` for a builtin, `0` otherwise. `feval('name', ...)` calls a function by name, variables excepted |
+| Definitions refused at the REPL, the protocol and the page | 05 | `err_repl_function_refused`, `err_repl_function_body_not_run`, `err_eval_function_refused`, `complete_function_block`, `err_eval_error_line_outermost` | `Function definitions are not supported in this context.` `syntax::is_complete` counts `function ... end` as a block, so the whole definition is read first and none of it runs. A protocol error inside a function keeps `line` the submitted code's own |
 
 ## Builtins
 
-93 names, each an ordinary function in `src/builtins/` registered by name in
+99 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
 cases in `01-registry-and-builtins`. Cycle 01 counted 81. Cycle 02 added the
 eight class builtins, and cycle 04 five: `rethrow`, `lasterr`, `warning`,
-`assert` and `isequal`, each exercised by the `04-switch-try-commands` cases. Cycle 01c removed `e`, which
+`assert` and `isequal`, each exercised by the `04-switch-try-commands` cases.
+Cycle 05 added six, `nargin`, `nargout`, `exist`, `feval`, `addpath` and
+`rmpath`, exercised by the `05-functions-and-scoping` cases. Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -118,6 +140,7 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Comparison | `isequal` | 04 | `core.rs` |
 | Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04 |
 | Timing | `tic toc` | 01 | `core.rs` |
+| Functions and the path | `nargin nargout exist feval addpath rmpath` | 05 | `core.rs` |
 
 Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
 a dimension past the array's returns the input unchanged and `0` is an error.

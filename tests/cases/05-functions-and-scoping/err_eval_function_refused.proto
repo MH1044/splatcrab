@@ -1,0 +1,3 @@
+% covers: 15 - under --protocol an eval of a function block is an error answer with MATLAB's not-in-this-context text, defining nothing, and the process exits 0
+{"id":1,"op":"eval","code":"function f()\nend"}
+{"id":2,"op":"eval","code":"f()"}

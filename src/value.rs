@@ -52,7 +52,7 @@ pub enum Value {
     /// The `MException` a `catch e` binds (cycle 04): the error that was
     /// caught, whole, so that `rethrow(e)` raises it again unchanged, its
     /// line included. `e.message` and `e.identifier` read its two texts;
-    /// `e.stack` waits for cycle 05. It is a value of its own, not an array,
+    /// `e.stack` waits for cycle 07, which has structs. It is a value of its own, not an array,
     /// so every array operation refuses it with [`error::not_an_array`].
     Exception(error::MError),
 }
@@ -139,10 +139,10 @@ impl Value {
 
 /// The one line an `MException` displays as.
 fn exception_line(e: &error::MError) -> String {
-    if e.identifier.is_empty() {
+    if e.identifier().is_empty() {
         format!("  {}: {}\n", EXCEPTION_CLASS, e.msg)
     } else {
-        format!("  {} ({}): {}\n", EXCEPTION_CLASS, e.identifier, e.msg)
+        format!("  {} ({}): {}\n", EXCEPTION_CLASS, e.identifier(), e.msg)
     }
 }
 

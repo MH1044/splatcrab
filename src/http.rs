@@ -776,10 +776,10 @@ mod tests {
         for headers in &refusals {
             let r = send(&mut it, &api_with(headers));
             assert_ne!(r.status, "HTTP/1.1 200 OK", "{headers}");
-            assert!(it.vars.is_empty(), "{headers}");
+            assert!(it.vars().is_empty(), "{headers}");
         }
         assert_eq!(send(&mut it, &api_with(GOOD)).status, "HTTP/1.1 200 OK");
-        assert!(it.vars.contains_key("x"));
+        assert!(it.vars().contains_key("x"));
     }
 
     #[test]

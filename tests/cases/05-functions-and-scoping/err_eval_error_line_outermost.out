@@ -1,0 +1,2 @@
+{"id":1,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'no_such_name_zz'.","line":2}}
+{"id":2,"ok":true,"out":"     1\n"}

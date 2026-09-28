@@ -7,8 +7,8 @@
 //! `interp.rs` and `Dimensions of arrays being concatenated are not
 //! consistent.` from two more; each is now one function.
 //!
-//! Adding a field later is additive: cycle 05 gives `MError` a `stack` and the
-//! `  in <fn> (line N)` trace, which needs no change at any call site because
+//! Adding a field is additive: cycle 05 gave `MError` its `stack` and the
+//! `  in <fn> (line N)` trace, which needed no change at any call site because
 //! every one of them goes through a constructor here.
 
 use std::fmt;
@@ -18,15 +18,43 @@ use crate::lexer::Token;
 /// An interpreter error: what went wrong, and where, once a line is known.
 ///
 /// `line` is `None` until the error passes the statement that raised it; see
-/// [`MError::at`].
+/// [`MError::at`]. Once the error has left a user function it is the line of
+/// the statement in the *calling* code, so that at the top it is always a
+/// line of the code that was run, never of another file; the lines inside
+/// the functions it passed through are in [`MError::stack`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MError {
     pub msg: String,
     pub line: Option<u32>,
+    /// The identifier and the stack, which most errors never have: `None`
+    /// until one of them is set.
+    ///
+    /// Boxed together, because an `MError` rides in every `R<Value>` the
+    /// evaluator returns, and every byte it has is paid again in every frame
+    /// of a deep recursion. Cycle 05's stack, added as a bare `Vec`, cost
+    /// the 10,000-level expression about a fifth more stack; boxing it with
+    /// the identifier made the error smaller than it was before either.
+    extra: Option<Box<Extra>>,
+}
+
+/// The rarely present parts of an [`MError`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Extra {
     /// The identifier `error('MyPkg:myid', ...)` attached, which a `catch`
     /// reads back as `e.identifier`. Empty for every error the interpreter
     /// raises itself, and for `error` called without one (cycle 04).
-    pub identifier: String,
+    identifier: String,
+    /// The user functions (and path scripts) the error unwound out of,
+    /// innermost first, each with the line it was on there (cycle 05).
+    stack: Vec<StackEntry>,
+}
+
+/// One frame an error unwound out of: the function's name and the line of
+/// the statement that failed in it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackEntry {
+    pub name: String,
+    pub line: Option<u32>,
 }
 
 /// Every fallible path in the interpreter returns this.
@@ -38,14 +66,61 @@ impl MError {
         MError {
             msg: msg.into(),
             line: None,
-            identifier: String::new(),
+            extra: None,
         }
+    }
+
+    /// The identifier `error('MyPkg:myid', ...)` attached; empty for every
+    /// error the interpreter raises itself, and for `error` called without
+    /// one (cycle 04).
+    pub fn identifier(&self) -> &str {
+        self.extra.as_ref().map_or("", |x| x.identifier.as_str())
+    }
+
+    /// The user functions (and path scripts) the error unwound out of,
+    /// innermost first, each with the line it was on there; empty for an
+    /// error raised in the code that was run itself (cycle 05).
+    pub fn stack(&self) -> &[StackEntry] {
+        self.extra.as_ref().map_or(&[], |x| x.stack.as_slice())
+    }
+
+    /// The same error once it has unwound out of the user function `name`:
+    /// the line it carried, which is a line of that function's file, moves
+    /// into a new outermost [`StackEntry`], and `line` is cleared so that
+    /// the calling statement records its own.
+    pub fn leaving(mut self, name: &str) -> MError {
+        let entry = StackEntry {
+            name: name.to_string(),
+            line: self.line.take(),
+        };
+        self.extra
+            .get_or_insert_with(Box::default)
+            .stack
+            .push(entry);
+        self
+    }
+
+    /// The trace printed after the message of an uncaught error: one
+    /// `  in <fn> (line N)` line per frame, innermost first, each ending in a
+    /// newline. Empty when the error never left the code that was run.
+    pub fn trace(&self) -> String {
+        let mut s = String::new();
+        for entry in self.stack() {
+            match entry.line {
+                Some(n) => s.push_str(&format!("  in {} (line {})\n", entry.name, n)),
+                None => s.push_str(&format!("  in {}\n", entry.name)),
+            }
+        }
+        s
     }
 
     /// The same error carrying `identifier`, as `error('id:x', fmt, ...)`
     /// raises it.
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> MError {
-        self.identifier = identifier.into();
+        let identifier = identifier.into();
+        if !identifier.is_empty() || self.extra.is_some() {
+            self.extra.get_or_insert_with(Box::default).identifier = identifier;
+        }
         self
     }
 
@@ -322,6 +397,60 @@ pub fn undefined(name: &str) -> MError {
 
 pub fn too_many_outputs() -> MError {
     MError::new("Too many output arguments.")
+}
+
+// ---- functions (cycle 05) ----------------------------------------------
+
+/// MATLAB's wording: a statement after a local function in a script. The
+/// first sentence is confirmed by the title of a MathWorks Answers thread.
+pub fn functions_at_end() -> MError {
+    MError::new("Function definitions in a script must appear at the end of the file.")
+}
+
+/// MATLAB's wording: a `function` block typed at the REPL, sent in a
+/// protocol `eval` or from the browser page, or opened inside another block.
+/// Confirmed, like [`functions_at_end`], by a MathWorks Answers title.
+pub fn function_not_supported_here() -> MError {
+    MError::new("Function definitions are not supported in this context.")
+}
+
+/// MATLAB's wording: a user function asked for an output it never assigned.
+/// `name` is the first such output, `func` the function.
+pub fn output_not_assigned(name: &str, func: &str) -> MError {
+    MError::new(format!(
+        "Output argument \"{}\" (and maybe others) not assigned during call to \"{}\".",
+        name, func
+    ))
+}
+
+/// MATLAB's wording: one call more than the recursion limit allows. It is a
+/// clean error rather than the stack overflow it would otherwise become.
+pub fn recursion_limit(limit: usize) -> MError {
+    MError::new(format!("Maximum recursion limit of {} reached.", limit))
+}
+
+/// `nargin` or `nargout` outside every function, where there is no call for
+/// them to describe. The wording is MATLAB's as recalled, not confirmed
+/// against a MathWorks source, so its case pins it as SplatCrab's own.
+pub fn nargin_outside_function() -> MError {
+    MError::new("You can only call nargin/nargout from within a MATLAB function.")
+}
+
+/// A function file on the path that could not be read. `main.rs` words the
+/// same failure for the script it is given the same way.
+pub fn cannot_read(path: &str, e: &std::io::Error) -> MError {
+    MError::new(format!("Cannot read {}: {}", path, e))
+}
+
+/// The warning `addpath` gives for a folder that does not exist, which it
+/// then leaves off the path (MATLAB's first sentence).
+pub fn addpath_not_a_folder(dir: &str) -> String {
+    format!("Name is nonexistent or not a directory: {}", dir)
+}
+
+/// The warning `rmpath` gives for a folder that is not on the path.
+pub fn rmpath_not_on_path(dir: &str) -> String {
+    format!("\"{}\" not found in path.", dir)
 }
 
 pub fn concat_dims() -> MError {
@@ -738,6 +867,23 @@ mod tests {
         // A statement further out must not overwrite it, which is what makes
         // an error inside a `for` body report the body's line.
         assert_eq!(e.at(1).line, Some(4));
+    }
+
+    /// Cycle 05: leaving a function moves the line into the trace, and the
+    /// trace lists the frames innermost first.
+    #[test]
+    fn the_trace_lists_each_frame_left_innermost_first() {
+        let e = undefined("x").at(8).leaving("g3");
+        assert_eq!(e.line, None);
+        assert_eq!(e.trace(), "  in g3 (line 8)\n");
+        let e = e.at(4).leaving("outer").at(2);
+        assert_eq!(
+            e.to_string(),
+            "Line 2: Unrecognized function or variable 'x'."
+        );
+        assert_eq!(e.trace(), "  in g3 (line 8)\n  in outer (line 4)\n");
+        assert_eq!(undefined("x").trace(), "");
+        assert_eq!(too_many_outputs().leaving("f").trace(), "  in f\n");
     }
 
     #[test]
