@@ -30,8 +30,8 @@ function files on a path, function handles and anonymous functions, cell
 arrays and structs, linear algebra, numerics (polynomials, interpolation,
 statistics, sets, root finding, minimisation, quadrature and ODEs), formatted
 output, complex numbers with `fft`, string functions, regular expressions,
-file input and output with `save` and `load`, and 211 builtins. Plotting is
-not there yet. See
+file input and output with `save` and `load`, plotting to SVG and PNG, and
+231 builtins. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -265,7 +265,7 @@ z
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 211 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 231 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -302,6 +302,17 @@ z
   ...)` writes to stderr. `load` reads a MAT-file as untrusted input: every
   size it claims is checked before anything is allocated, so a truncated or
   hostile file is a clean error
+- Plotting (cycle 12): `figure`, `gcf`, `close` (`close all`), `clf`,
+  `subplot`, `plot` (vectors, one line per matrix column, x-y pairs and
+  line specs such as `'r--o'`), `scatter`, `bar` (grouped for a matrix),
+  `histogram` (a bin count or edges), `xlabel`, `ylabel`, `title`,
+  `legend`, `grid`, `axis`, `xlim`, `ylim` and `hold`, with `hold on`,
+  `grid on` and `close all` as commands. `saveas(gcf, 'f.svg')` and
+  `print('-dpng', '-r150', 'f.png')` write SVG, or PNG through a rasterizer,
+  bitmap font and store-only zlib encoder of SplatCrab's own. At an
+  interactive prompt each figure an entry changes opens in the system's
+  viewer; a script never opens one. `gcf` is the figure's number, as in
+  MATLAB before R2014b, and a figure's work is linear in its points
 - Complex numbers (cycle 10): `1i`, `2.5j` and `1e3i` literals, with `i`
   and `j` the imaginary unit unless a variable of the name exists; the
   operators, `'` as the conjugate and `.'` as the plain transpose, matrix
@@ -349,8 +360,9 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-N-D arrays, integer classes, compressed MAT-files and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
-time.
+N-D arrays, integer classes, compressed MAT-files, 3-D plots and interaction
+with a figure. `docs/ROADMAP.md` has the order they arrive in, one module at
+a time.
 
 ## How it is built
 
@@ -360,8 +372,9 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 211 builtins,
+                                         builtins/    the 231 builtins,
                                                       behind a registry
+                                         plot/        figures, SVG, PNG
 
                             error.rs: MError, and every message text
 ```

@@ -8,6 +8,11 @@
                                               │
                                          builtins/
                                          the library, behind a registry
+                                              │
+                                         plot/        figures, and their
+                                         figure.rs    layout into a scene,
+                                         svg.rs       written as SVG or
+                                         png.rs       rasterized into a PNG
 
                             error.rs: MError, and every message text
 
@@ -25,11 +30,11 @@
  stdin ────► http::serve_stdio (--http-stdio): the same http::handle, no socket
 ```
 
-`src/lib.rs` exposes the twelve modules: the six of the language (`lexer`,
+`src/lib.rs` exposes the thirteen modules: the six of the language (`lexer`,
 `parser`, `interp`, `value`, `builtins`, `error`), the four of the
 evaluation protocol that cycle U0 added (`json`, `syntax`, `env`,
-`protocol`) and the two of the UI server that cycle U1 added (`http`,
-`server`). `src/ui/` holds the page's three files, which `http.rs` embeds.
+`protocol`), the two of the UI server that cycle U1 added (`http`,
+`server`) and cycle 12's `plot`. `src/ui/` holds the page's three files, which `http.rs` embeds.
 `src/main.rs` is the CLI and REPL and is the only file allowed to use
 `print!`. It runs everything, `--protocol` and `--ui` included, on a thread
 with a 256 MB stack, because Windows gives the main thread 1 MB and the
@@ -328,6 +333,33 @@ the length of every call, so under `--protocol`, `--ui` and
 `--http-stdio` an `input` is a clean error rather than a read of the next
 request.
 
+**`plot/`** is cycle 12's plotting, in four files. `mod.rs` holds the
+twenty builtins and their argument rules, registered from
+`builtins::registry` like any other; they only change state. `figure.rs`
+holds that state, `Figures`, which `Interp.figures` is: every open figure by
+number (a `BTreeMap`), the order figures were last made current in, whose
+last is the current figure, and the numbers changed since the REPL last
+asked. A `Figure` holds its `Axes`, one per subplot, each placed by a
+rectangle in fractions of the figure, and the current one; an `Axes` holds
+its `Series` (a line, a scatter or bars, each a copy of the user's data),
+its hold state, labels, legend, grid and limits. `figure.rs` also parses
+line specs, holds the tick rule, and lays a figure out, `scene`, into one
+flat list of drawing `Item`s in pixels of the 560x420 figure: groups,
+optionally clipped, rectangles, lines, polylines, markers and texts.
+`svg.rs` writes a scene as SVG text and `png.rs` rasterizes it and encodes
+the pixels, so the two formats read one layout and cannot disagree. The
+SVG vocabulary, the tick rule, the font and the rasterizer's coverage are
+in the Design notes of `docs/modules/12-plotting.md`.
+
+Nothing is drawn until a figure is saved, printed or asked for:
+`Interp::figure_svg(n)` renders figure `n` from what it holds and
+`Interp::figure_numbers()` lists the open ones, so a front end can show a
+figure inline without a file (cycle U4 adds the protocol operation). A
+plotting call is judged whole before it copies or changes anything: its
+data's pairing, then the figure's point budget (`figure::MAX_POINTS`),
+counted from the arguments in place, each thing drawn weighted by the SVG
+it writes, then the copy and the change.
+
 **`syntax.rs`** answers questions about source text short of parsing it.
 `is_complete` says whether an entry typed line by line has ended, by counting
 brackets and block openers against their closers over the token stream; the
@@ -384,7 +416,14 @@ server, writes the answer and closes. It holds no policy: every check is in
 window with no framework and no external resource, embedded with
 `include_str!` so the binary is the whole program.
 
-**`main.rs`** is the CLI. On Windows it first switches the console's output
+**`main.rs`** is the CLI. Since cycle 12 its REPL shows figures: when
+standard input is a terminal (`std::io::IsTerminal`), after each entry it
+asks `Interp::take_changed_figures` for the figures the entry changed,
+writes each to `splatcrab-<pid>-figure-<n>.svg` in the temporary folder
+and opens it with `server::open_browser`'s launcher, ignoring any failure.
+That is the only place a viewer opens: no builtin opens one, and a script,
+a golden case, CI (whose standard input is never a terminal), `--protocol`,
+`--ui` and `--http-stdio` never reach that code. On Windows it first switches the console's output
 code page to UTF-8 with `SetConsoleOutputCP(65001)`, declared as a raw
 `extern "system"` function under `#[cfg(windows)]`, because the crate takes no
 dependencies; everything the interpreter writes is UTF-8 already.
@@ -448,6 +487,13 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    struct array with no fields, which no bytes pay for, by
    `mat::MAX_FIELDLESS`, and bounds cells and structs nested in a file by
    `mat::MAX_DEPTH`;
+   since cycle 12 a figure holds at most `plot::figure::MAX_POINTS` points,
+   a marker, a circle, a bar, a line's run and a series each weighted by
+   the SVG it writes, judged from the arguments before a plotting call
+   copies or changes anything, so no figure writes much more than 256 MiB
+   of SVG; and every segment the rasterizer walks is clipped to its clip
+   box first, a wide one drawn a run across it a pixel along, so drawing
+   costs time linear in the points whatever their coordinates;
    `fileread`, `fgetl`, `fgets` and `input` stop reading text at
    `io::MAX_TEXT_BYTES`, past which no char row could hold it, and the rows
    of numbers read from a text file are judged by `check_shape` as each is
@@ -466,7 +512,8 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    `linalg.rs`; `numerics.rs` for polynomials, samples, statistics and
    number theory, `sets.rs` for the set functions, `solvers.rs` for a
    builtin that iterates on a user's function, and since cycle 11
-   `strings.rs` for text and `io.rs` for input and files. The signature is
+   `strings.rs` for text and `io.rs` for input and files. A plotting
+   builtin goes in `src/plot/mod.rs`, whose `register` the registry calls. The signature is
    `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`; return `one_mat(m)`
    for a numeric value and `none()` for a builtin that produces none.
    `one_mat` makes its result a double whatever `m`'s class, which is MATLAB's
@@ -528,7 +575,9 @@ Vandermonde matrix of `polyfit`, the combinations of `nchoosek(v, k)`
 its points. Cycle 11's too: every array a MAT-file declares, the `[m n]` of `fread`
 (judged by the elements read, never by the size asked), the matrix
 `readmatrix`, `csvread` and `load -ascii` build from rows of text, whose
-longest row times their count can dwarf the file, and `blanks`. The operands can
+longest row times their count can dwarf the file, and `blanks`. Cycle 12's
+too: a PNG's pixel size, from the figure's size and `print`'s `-r`, before
+the image is allocated, and `histogram`'s bin count. The operands can
 be tiny and the result enormous — `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
 elements from 2e5 — so "the operands fit, therefore the result fits" is never
 true. A new operation of that kind belongs on the same list.
@@ -788,7 +837,8 @@ cycle named:
 | Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
 | Function handles, cycle 06: `func2str` renders an anonymous function from its parse tree, so `@(x) (x)` reads back `@(x)x` where MATLAB keeps the text as written; the trace names an anonymous function `  in @(n)g(n)` with no line; an anonymous call counts against the recursion limit of 500; `str2func` of a text that is not a name makes a handle that fails only when called. The Design notes of `docs/modules/06-function-handles.md` have each | by design (verify first) |
 | Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
-| `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `hold on` and `format long` are the unrecognized-name error | `hold` 12, `format` 13, warning state later |
+| `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `format long` is the unrecognized-name error | `format` 13, warning state later |
+| Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
 removed, because it misstated MATLAB. Since R2018a, `s = 'abc'` displays as

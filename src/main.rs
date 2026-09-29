@@ -16,7 +16,7 @@
 //!                          another, each response followed by a newline
 //!                          (docs/modules/U1-ui-server.md)
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use splatcrab::error::{self, MError};
 use splatcrab::{http, interp, protocol, server, syntax};
@@ -124,6 +124,8 @@ fn run() -> i32 {
 
     println!("SplatCrab 0.1.0  (type 'exit' to quit)\n");
     let stdin = io::stdin();
+    // Figures are shown only to a person at a terminal (cycle 12).
+    let interactive = stdin.is_terminal();
     let mut buf = String::new();
     loop {
         print!("{}", if buf.is_empty() { ">> " } else { "   " });
@@ -145,6 +147,9 @@ fn run() -> i32 {
         if let Err(e) = it.run_command(&buf) {
             report(&mut it, &e);
         }
+        if interactive {
+            show_figures(&mut it);
+        }
         buf.clear();
     }
     // The input ran out inside an unfinished block. Piping `for k = 1:3` and
@@ -158,6 +163,28 @@ fn run() -> i32 {
     }
     let _ = it.out.flush();
     code
+}
+
+/// Hands every figure the last entry changed to the operating system's
+/// viewer (cycle 12): each is written to a temporary SVG, one file per
+/// figure number, and opened as `--ui` opens its page. Only the interactive
+/// REPL calls this, when standard input is a terminal, so a script, a
+/// golden case, CI, `--protocol`, `--ui` and `--http-stdio` never open a
+/// viewer. A failure to write or to open the file is ignored: the figure
+/// is still there for `saveas`.
+fn show_figures(it: &mut interp::Interp) {
+    for n in it.take_changed_figures() {
+        let Some(svg) = it.figure_svg(n) else {
+            continue;
+        };
+        let name = format!("splatcrab-{}-figure-{}.svg", std::process::id(), n);
+        let path = std::env::temp_dir().join(name);
+        if std::fs::write(&path, svg).is_ok() {
+            if let Some(p) = path.to_str() {
+                server::open_browser(p);
+            }
+        }
+    }
 }
 
 /// The options of `--ui` and `--http-stdio`.

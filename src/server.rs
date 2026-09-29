@@ -71,7 +71,9 @@ pub fn new_token() -> String {
 }
 
 /// Tries to open `url` in the default browser, and ignores any failure: the
-/// URL is printed already, and the user can open it by hand.
+/// URL is printed already, and the user can open it by hand. The REPL
+/// opens a figure's temporary SVG file the same way (cycle 12), since each
+/// launcher opens a path with the program the system gives its type.
 pub fn open_browser(url: &str) {
     let mut cmd = if cfg!(windows) {
         // `start` is a shell built-in; its first quoted argument is a window

@@ -581,16 +581,17 @@ ans =
 
 A command ends at a newline, a `,`, a `;` or a `%` outside quotes. Whether a
 name is a variable is decided before the script runs, from the names it has
-assigned by then, as MATLAB decides it in a file. `hold on` and
-`format long` are command syntax too, but `hold` and `format` arrive in
-cycles 12 and 13, so today they are the unrecognized-name error:
+assigned by then, as MATLAB decides it in a file. `hold on`, `grid on`
+and `close all` are command syntax for the plotting builtins (see
+[Plotting](#plotting)). `format long` is command syntax too, but `format`
+arrives in cycle 13, so today it is the unrecognized-name error:
 
 ```matlab
-hold on
+format long
 ```
 
 ```
-Error: Line 1: Unrecognized function or variable 'hold'.
+Error: Line 1: Unrecognized function or variable 'format'.
 ```
 
 ### Display and `;`
@@ -4342,6 +4343,218 @@ available in this session: there is no terminal to read from.`, with the
 session going on; at the end of standard input it is `'input' reached the
 end of standard input.`
 
+### Plotting
+
+`figure gcf close clf subplot plot scatter bar histogram xlabel ylabel
+title legend grid axis xlim ylim hold saveas print`. The builtins change a
+figure's state and print nothing; a figure is drawn when it is saved.
+`saveas(gcf, 'f.svg')` writes SVG, and `saveas(gcf, 'f.png')` or
+`print('-dpng', 'f.png')` a PNG of 560x420 pixels. Every path is taken
+against the current folder, like `fopen`'s.
+
+**Plot kinds.** `plot(y)`, `plot(x, y)` and `plot(x1, y1, spec1, x2, y2,
+...)` draw lines, one for each column of a matrix. A line spec such as
+`'r--o'` sets a colour (`rgbcmykw`), a line style (`-`, `--`, `:`, `-.`)
+and a marker (`o+*.xsd^v<>ph`); a series without a colour takes MATLAB's
+colour order in turn. `scatter(x, y, sz, c, 'filled')` draws a circle at
+each point, `bar(y)` and `bar(x, y, width)` a bar for each value, grouped
+for a matrix, and `histogram(x)`, `histogram(x, nbins)` and
+`histogram(x, edges)` bars of counts.
+
+In the SVG each axes is a `<g class="axes">` group, each line a
+`<polyline>`, each scatter point and `o` marker a `<circle>`, each bar a
+`<rect class="bar">` and each label a `<text>` holding the label alone,
+escaped, so a script can check what it drew:
+
+```matlab
+x = 1:5;
+plot(x, x.^2, 'o-');
+hold on
+plot(x, 2*x, 'k:');
+legend('square', 'double');
+title('Two lines');
+v = axis
+saveas(gcf, 'lines.svg');
+s = fileread('lines.svg');
+delete('lines.svg')
+disp(numel(strfind(s, '<polyline')))
+disp(numel(strfind(s, '<circle')))
+disp(~isempty(strfind(s, '>square<')))
+```
+
+```
+v =
+
+     1     5     0    25
+
+     2
+     5
+   1
+```
+
+**Labels, legends and axes.** `xlabel`, `ylabel` and `title` take one
+char vector; labels are plain text. `legend('a', 'b')` or
+`legend({'a', 'b'})` names the series in order, `legend` alone names them
+`data1`, `data2`, ..., and `legend off` removes it. `grid on`, `grid off`
+and `grid` show, hide and toggle grid lines at the ticks. `xlim([lo hi])`,
+`ylim([lo hi])` and `axis([x0 x1 y0 y1])` fix the limits, an infinite end
+staying automatic, and with no argument they return the limits shown;
+`axis` also takes `tight`, `equal`, `square`, `auto`, `off` and more.
+Automatic limits widen to the tick step, a multiple of 1, 2 or 5 times a
+power of ten:
+
+```matlab
+scatter([1 2 3 4], [2 4 1 3], 'r', 'filled');
+xlabel('time'); ylabel('level');
+grid on
+xlim([0 5]);
+v = axis
+saveas(gcf, 'points.svg');
+s = fileread('points.svg');
+delete('points.svg')
+fprintf('%d circles\n', numel(strfind(s, '<circle')))
+fprintf('%d %d\n', ~isempty(strfind(s, '>time<')), ~isempty(strfind(s, 'class="grid"')))
+```
+
+```
+v =
+
+     0     5     1     4
+
+4 circles
+1 1
+```
+
+**Hold.** With hold off, the default, each `plot`, `scatter`, `bar` or
+`histogram` replaces what the axes held, its labels, legend and limits
+included. `hold on` keeps it, and the colour order carries on:
+
+```matlab
+plot(1:3);
+hold on
+plot(3:-1:1);
+hold off
+saveas(gcf, 'held.svg');
+a = numel(strfind(fileread('held.svg'), '<polyline'));
+plot(1:2);
+saveas(gcf, 'held.svg');
+b = numel(strfind(fileread('held.svg'), '<polyline'));
+delete('held.svg')
+fprintf('%d lines, then %d\n', a, b)
+```
+
+```
+2 lines, then 1
+```
+
+**Subplots.** `subplot(m, n, p)` makes the `p`-th axes of an `m`-by-`n`
+grid current, counting along the rows from the top left; `subplot(211)` is
+the same as `subplot(2, 1, 1)`. Each axes keeps its own series, labels and
+hold, and `axis` answers for the current one:
+
+```matlab
+figure;
+subplot(2, 1, 1); bar([3 1 2]);
+subplot(2, 1, 2); histogram([1 2 2 3 3 3], 3);
+v = axis
+saveas(gcf, 'grid.svg');
+s = fileread('grid.svg');
+delete('grid.svg')
+fprintf('%d axes, %d bars\n', numel(strfind(s, 'class="axes"')), numel(strfind(s, '<rect class="bar"')))
+```
+
+```
+v =
+
+     1     3     0     3
+
+2 axes, 6 bars
+```
+
+**Figures.** `gcf` is the current figure's number, a figure being made if
+none is open; `figure` makes a new one with the lowest free number,
+`figure(n)` makes figure `n` current, `close` closes the current one (the
+one current before it becomes current again), `close(n)` figure `n`,
+`close all` every one, and `clf` empties the current one:
+
+```matlab
+disp(gcf)
+figure(5);
+figure;
+disp(gcf)
+close
+disp(gcf)
+close all
+figure;
+disp(gcf)
+```
+
+```
+     1
+     2
+     5
+     1
+```
+
+**Saving.** `saveas(fig, name)` takes the format from the extension, and
+a name with none is an error that says so; `saveas(fig, name, fmt)` takes
+it from `fmt`. `print` saves the current figure:
+`-dpng` or `-dsvg` names the format, `-r<dpi>` a PNG's resolution in dots
+an inch (96 by default, and for `-r0`), `-f<n>` another figure, and a name
+with no extension gets the format's. `print` with no file name is an
+error, since there is no printer:
+
+```matlab
+plot(1:3);
+print('-dpng', '-r192', 'line.png');
+fid = fopen('line.png'); b = fread(fid, 24); fclose(fid);
+delete('line.png')
+disp(b(1:8)')
+disp(b(17:24)')
+print('-dsvg', 'line');
+disp(numel(strfind(fileread('line.svg'), '<polyline')))
+delete('line.svg')
+```
+
+```
+   137    80    78    71    13    10    26    10
+     0     0     4    96     0     0     3    72
+     1
+```
+
+The first row is the PNG signature and the second the image's width and
+height, 1120 and 840 at 192 dots an inch.
+
+**Limits.** A figure holds at most 16,777,216 points. A line's vertex
+counts one, and everything else what its SVG takes in vertices' worth: a
+scatter circle 6, a bar 9, a marker from 6 for `o` to 17 for a
+hexagram, so a million hexagrams are refused. The count is judged from
+the arguments before a plotting call copies or changes anything, and a
+PNG's pixel size is judged like any array's, so a huge resolution is
+refused before a file is written. A bad argument is a clean error:
+
+```matlab
+plot(1:3);
+try, print('-dpng', '-r100000', 'big.png'); catch e, disp(e.message), end
+disp(fopen('big.png'))
+try, close(7); catch e, disp(e.message), end
+try, plot(1:3, 'LineWidth', 2); catch e, disp(e.message), end
+saveas(gcf, 'f.jpg')
+```
+
+```
+Requested 437500x583333 array exceeds the maximum array size.
+    -1
+Invalid figure handle.
+Invalid line specification 'LineWidth'.
+Error: Line 6: Unsupported format 'jpg' for 'saveas'; SplatCrab writes svg and png.
+```
+
+**The viewer.** At the REPL, when standard input is a terminal, every
+figure an entry changed opens in the system's viewer, as a temporary SVG
+file. A script never opens one, and neither do `--protocol`, `--ui` and
+`--http-stdio`.
+
 ### Workspace
 
 `clear clc who whos`. `clear()` with no arguments empties the workspace, and
@@ -5706,6 +5919,17 @@ y =
 
 ```
 
+### Plotting
+
+`gcf` and `figure` give the figure's number, a double, as MATLAB did
+before R2014b; SplatCrab has no graphics objects, so there are no handles
+to set properties through, and no builtin returns one. A complex argument
+to a plotting builtin is refused, where MATLAB plots the real part against
+the imaginary. Labels are plain text, with no TeX. `histogram` with no bin
+count uses Sturges' rule, and the tick rule, the fonts and the layout are
+SplatCrab's own; a figure cannot be zoomed, panned or clicked, and there
+are no 3-D plots.
+
 ### Error text
 
 Message text follows MATLAB R2020a and later, except where SplatCrab's wording
@@ -5749,7 +5973,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | `global`, `persistent`, nested functions | later |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
 | Compressed MAT-files, `regexpi`, backreferences | not scheduled |
-| Plotting | 12 |
+| 3-D plots, surfaces, interaction with a figure | not scheduled |
 | `exit` in a script, `exit(code)`, `format`, `help`, `eval` | 13 |
 | Integer classes and `single` | not scheduled |
 
@@ -5757,9 +5981,9 @@ Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-plot(1:10)
+eval('1 + 1')
 ```
 
 ```
-Error: Line 1: Unrecognized function or variable 'plot'.
+Error: Line 1: Unrecognized function or variable 'eval'.
 ```

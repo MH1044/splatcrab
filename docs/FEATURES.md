@@ -14,7 +14,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | A char element is a UTF-16 code unit | 02 | `char_utf16_units` | `length('😀')` is `2` and `double('😀')` is `55357 56832`, as in MATLAB; `disp` and `%s` decode the units back to UTF-8, so the pair prints as one character (QA D37) |
 | `%` comments | 00 | every case | |
 | Block comments `%{ ... %}` | 04 | `block_comment`, `block_comment_skips_code`, `block_comment_deep` | `%{` and `%}` each alone on its line, surrounding whitespace allowed; they nest, counted rather than recursed into. A marker with anything else on its line is an ordinary comment. An unterminated `%{` runs to the end of a script as a comment, and keeps the REPL reading. The lines between them used to execute (QA D7) |
-| Command syntax | 04 | `command_disp_word`, `command_clear_two_words`, `command_variable_expression`, `err_command_clear_one`, `err_command_clear_all`, `err_command_hold_unrecognized`, `err_command_format_unrecognized` | MATLAB's rule: a statement that starts with a name that is not a variable, then whitespace, then a word that is not an operator followed by whitespace, calls the name with each word as a char argument. Quotes group words; the command ends at a newline, `,`, `;` or `%` outside quotes. `clear x y`, `clear all` and `disp hello` work; `x -1` with `x` a variable stays `x - 1`. Whether a name is a variable is decided before the source runs, from the workspace and the names it has assigned so far. `hold on` and `format long` are the unrecognized-name error until cycles 12 and 13. It used to be a parse error (QA D31) |
+| Command syntax | 04 | `command_disp_word`, `command_clear_two_words`, `command_variable_expression`, `err_command_clear_one`, `err_command_clear_all`, `err_command_format_unrecognized`, `hold_on_close_all_commands`, `grid_on_as_command` | MATLAB's rule: a statement that starts with a name that is not a variable, then whitespace, then a word that is not an operator followed by whitespace, calls the name with each word as a char argument. Quotes group words; the command ends at a newline, `,`, `;` or `%` outside quotes. `clear x y`, `clear all` and `disp hello` work; `x -1` with `x` a variable stays `x - 1`. Whether a name is a variable is decided before the source runs, from the workspace and the names it has assigned so far. Since cycle 12 `hold on`, `grid on` and `close all` call the plotting builtins; `format long` is the unrecognized-name error until cycle 13. It used to be a parse error (QA D31) |
 | `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
 | `...` separates elements inside brackets | 01b | `continuation_bracket_element` | `[1 ...` newline `-2]` is two elements, like `[1 -2]` |
 | `;` suppresses display, `,` and newline show | 00 | `indexing` | |
@@ -145,7 +145,8 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-211 names, each an ordinary function in `src/builtins/` registered by name in
+231 names, each an ordinary function in `src/builtins/` (the plotting ones
+in `src/plot/`) registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -169,7 +170,9 @@ added ten, `i`, `j`, `real`, `imag`, `conj`, `angle`, `isreal`, `complex`,
 [Complex numbers](#complex-numbers)). Cycle 11 added thirty-eight, the
 string, regular-expression and file functions, exercised by the
 `11-strings-and-io` cases (see
-[Strings, regular expressions and files](#strings-regular-expressions-and-files)). Cycle 01c removed `e`, which
+[Strings, regular expressions and files](#strings-regular-expressions-and-files)).
+Cycle 12 added twenty, the plotting builtins, exercised by the
+`12-plotting` cases (see [Plotting](#plotting)). Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -379,6 +382,31 @@ Cases in `tests/cases/11-strings-and-io/`.
 | `save` and `load` | 11 | `save_load_mat_round_trip`, `save_load_ascii`, `err_save_fieldless_struct_bound` | Uncompressed MAT-files of version 5: doubles (complex too), logicals, chars, cells and structs, and on reading also the integer and `single` classes, as doubles. `-ascii` writes MATLAB's `%.7e` columns. `S = load(...)` gives a struct. `save` refuses a variable past the 4 GiB an element can hold and a struct array with no fields past 1,048,576 elements, which `load` would refuse |
 | `load` treats a MAT-file as untrusted | 11 | `err_load_mat_truncated`, `err_load_mat_huge_dims`, `err_load_mat_fieldless_struct_bound` | Every length is checked against the bytes there and every size goes through `check_shape` before anything is allocated, so a truncated file is `Unable to read MAT-file ...` and a header claiming 1e12 elements is `Requested 1000000x1000000 array exceeds the maximum array size.` A struct array with no fields, which its bytes cannot bound, may have at most 1,048,576 elements (`mat::MAX_FIELDLESS`), a recorded deviation |
 | A file path resolves against the current folder | 11 | every file case | `fopen`, `fileread`, `readmatrix`, `writematrix`, `csvread`, `csvwrite`, `save`, `load` and `delete` all go through `Interp::cwd` |
+
+## Plotting
+
+Cycle 12. The builtins are in `src/plot/mod.rs`, the figure state, the
+layout and the tick rule in `figure.rs`, the SVG writer in `svg.rs`, and
+the rasterizer, its bitmap font and the PNG encoder in `png.rs`. Cases in
+`tests/cases/12-plotting/`, which read a saved SVG back with `fileread`
+and `strfind` and delete every file they write.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `figure`, `gcf`, `close`, `clf` | 12 | `gcf_counts_figures`, `close_all_restarts_numbering`, `gcf_class_double`, `limits_axis_clf_run`, `err_close_not_open` | `figure` makes the lowest unused number current, `figure(n)` makes figure `n` current, made if need be, and `n = figure` returns the number. `gcf` returns the current figure's number as a double, making figure 1 if none is open: MATLAB before R2014b, a recorded deviation, since MATLAB now returns a Figure object. `close` closes the current figure, `close(n)` figure `n`, and `close all` every figure; a number that names no open figure is `Invalid figure handle.` `clf` removes every axes |
+| `subplot(m, n, p)` | 12 | `subplot_two_axes`, `err_subplot_index_past_grid` | `p` counts along the rows from the top left; a vector `p` spans the cells, and `subplot(211)` is `subplot(2, 1, 1)`. The axes at a place is reused, and a new one deletes every axes it overlaps, as MATLAB's does; each axes is a `class="axes"` group of the SVG |
+| `plot` | 12 | `plot_polyline_and_tick_label`, `plot_matrix_columns`, `plot_line_spec_red_dashed`, `hold_on_two_lines`, `err_plot_bad_line_spec`, `err_plot_lengths_differ` | `plot(y)` against `1:n`, a matrix one line per column; `plot(x, y)` pairing a vector with the matrix columns (or rows) of its length; several `x, y, spec` groups in one call. Line specs: a colour `rgbcmykw`, a style `-`, `--`, `:`, `-.` and a marker `o+*.xsd^v><ph`, in any order; a marker alone draws no line. Series without a colour take MATLAB's colour order in turn. A line is one `<polyline>`, split at a `NaN` or `Inf` |
+| `scatter` | 12 | `scatter_circles`, `err_scatter_negative_size`, `err_scatter_bad_color` | `scatter(x, y, sz, c, 'filled')`: a `<circle>` a point; `sz` in points squared, one or one a point (default 36); `c` a colour letter or an RGB triple |
+| `bar` | 12 | `bar_rects`, `err_bar_text_data`, `err_bar_zero_width` | `bar(y)`, `bar(x, y)`, `bar(y, width)`, `bar(x, y, width)` and a colour letter; a matrix is grouped, one series per column. Each bar is a `<rect class="bar">` |
+| `histogram` | 12 | `histogram_bins`, `err_histogram_zero_bins` | `histogram(x, n)` in `n` equal bins from the smallest value to the largest, the last closed; `histogram(x, edges)`; with neither, Sturges' rule, a recorded choice. Non-finite values are left out |
+| `xlabel`, `ylabel`, `title`, `legend` | 12 | `labels_title_legend_text`, `labels_escaped_in_svg` | Each text is a `<text>` of its own, escaped, so `xlabel('t')` is `>t<` in the SVG. `legend` takes labels or a cell, `legend off` removes it, and a label with no series to name is not drawn. No TeX: `_` and `^` are literal |
+| `grid`, `hold`, `axis`, `xlim`, `ylim` | 12 | `grid_on_as_command`, `hold_on_two_lines`, `limits_axis_clf_run`, `err_hold_unknown_option`, `err_xlim_decreasing` | `on`, `off` or a toggle; `hold all` is `hold on`. `axis([x0 x1 y0 y1])`, `axis tight`, `auto`, `equal`, `image`, `square`, `normal`, `manual`, `on` and `off`; `v = axis`, `v = xlim` and `v = ylim` return the limits shown, and an infinite limit is automatic. With hold off, a plotting call clears the axes and resets its labels, legend, grid and limits, MATLAB's `NextPlot` `'replace'` |
+| Tick labels | 12 | `plot_polyline_and_tick_label` | A step of 1, 2 or 5 times a power of ten, at most ten intervals; automatic limits widen to multiples of it. A label is written from its digits, so `9` is `9` and `0.3` is `0.3` |
+| `saveas` and `print` | 12 | `print_png_signature`, `err_print_huge_resolution`, `err_saveas_unsupported_format`, `err_saveas_no_extension`, `err_print_bad_resolution`, `err_print_no_file_name` | `saveas(fig, 'f.svg')`, `saveas(fig, 'f.png')` or `saveas(fig, 'f', 'png')`, and a name with no extension and no format is an error that says how to give one; `print('-dpng', '-r150', 'f.png')`, `print('-dsvg', 'f.svg')`, `-f2` or a leading figure number. A PNG is 560x420 at the default 96 dots an inch, and its pixel size goes through `check_shape`, so `-r100000` is a clean `Requested ...` error before any file is written. Paths resolve against the current folder |
+| Complex data is refused | 12 | `err_plot_complex_input` | Cycle 10's gate: `Complex values are not supported by 'plot'.`; MATLAB plots the real part against the imaginary, a recorded deviation |
+| Bounded work | 12 | `plot_large_linear`, `err_plot_too_many_points`, `err_plot_markers_over_budget`, `extreme_limits_stay_numbers` | A plotting call copies its data and nothing more; drawing is one pass over the points, and each segment the rasterizer walks is clipped first. A figure holds at most 16,777,216 points: a line's vertex counts one, and a marker (6 for `o` to 17 for a hexagram), a scatter circle (6), a bar (9), each run of a line and each series what its SVG takes, so no figure writes much more than 256 MiB of SVG. The count is judged from the arguments, read in place, before the call copies or changes anything |
+| Figures in memory | 12 | unit test in `src/plot/mod.rs` | `Interp::figure_numbers()` and `Interp::figure_svg(n)`, the SVG `saveas` would write, for a front end to show inline |
+| The REPL's viewer | 12 | by hand | Only when standard input is a terminal: after each entry, every figure it changed is written to `splatcrab-<pid>-figure-<n>.svg` in the temporary folder and opened with `cmd /c start`, `open` or `xdg-open`, a failure ignored. Scripts, golden cases, CI, `--protocol`, `--ui` and `--http-stdio` never open one |
 
 ## Output and formatting
 

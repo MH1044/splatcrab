@@ -170,6 +170,10 @@ pub struct Interp {
     pub input: InputSource,
     /// The files `fopen` has open, by identifier (cycle 11).
     pub(crate) open_files: crate::builtins::io::FileTable,
+    /// The open figures (cycle 12), by number, and which is current; see
+    /// `plot::figure`. Read from outside through [`Interp::figure_svg`] and
+    /// [`Interp::figure_numbers`].
+    pub(crate) figures: crate::plot::figure::Figures,
 }
 
 /// Where [`Interp::input`] reads from.
@@ -377,7 +381,28 @@ impl Interp {
             last_err: String::new(),
             input: InputSource::Stdin,
             open_files: crate::builtins::io::FileTable::default(),
+            figures: crate::plot::figure::Figures::default(),
         }
+    }
+
+    /// The numbers of the open figures, ascending (cycle 12).
+    pub fn figure_numbers(&self) -> Vec<u32> {
+        self.figures.numbers()
+    }
+
+    /// Figure `n` as the text of an SVG document, drawn from what it holds
+    /// now, or `None` when no figure `n` is open (cycle 12). The same text
+    /// `saveas(n, 'f.svg')` writes, with no file involved, so a front end
+    /// can show a figure inline.
+    pub fn figure_svg(&self, n: u32) -> Option<String> {
+        let fig = self.figures.get(n)?;
+        Some(crate::plot::svg::render(&crate::plot::figure::scene(fig)))
+    }
+
+    /// The open figures changed since the last call, ascending: what the
+    /// interactive REPL hands to the viewer after an entry (cycle 12).
+    pub fn take_changed_figures(&mut self) -> Vec<u32> {
+        self.figures.take_changed()
     }
 
     /// The builtin library, read-only: what `env::completions` lists.
@@ -5518,9 +5543,11 @@ mod tests {
         assert_eq!(ok_out("x = 3; x -1"), "ans =\n\n     2\n\n");
         assert_eq!(ok_out("class hello"), "ans =\n\n    'char'\n\n");
         assert_eq!(ok_out("class hello;"), "");
+        // `hold` is a builtin since cycle 12; `format` arrives in 13.
+        assert_eq!(ok_out("hold on"), "");
         assert_eq!(
-            err_msg("hold on"),
-            "Unrecognized function or variable 'hold'."
+            err_msg("format long"),
+            "Unrecognized function or variable 'format'."
         );
         assert_eq!(
             err_msg("x = 1; clear x\nx"),

@@ -62,6 +62,7 @@ pub fn registry() -> Registry {
     complex::register(&mut r);
     strings::register(&mut r);
     io::register(&mut r);
+    crate::plot::register(&mut r);
     r
 }
 
@@ -154,7 +155,7 @@ pub fn complex_gate(name: &str, args: &[Value]) -> R<()> {
     Ok(())
 }
 
-fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
+pub(crate) fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
     let clash = r.insert(name, Entry { f, help });
     debug_assert!(clash.is_none(), "builtin '{name}' registered twice");
 }
@@ -164,7 +165,7 @@ fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
 /// builtin: `abs(true)`, `cumsum('abc')` and `sum(true, 3)` are doubles. It
 /// is enforced here rather than trusted to each builtin, because several of
 /// them hand back a clone of their argument on some path.
-fn one_mat(m: Matrix) -> R<Vec<Value>> {
+pub(crate) fn one_mat(m: Matrix) -> R<Vec<Value>> {
     Ok(vec![Value::Mat(m.with_class(Class::Double))])
 }
 
@@ -181,7 +182,7 @@ fn one(v: Value) -> R<Vec<Value>> {
 }
 
 /// A builtin that produced no value, such as `disp`.
-fn none() -> R<Vec<Value>> {
+pub(crate) fn none() -> R<Vec<Value>> {
     Ok(Vec::new())
 }
 
@@ -208,8 +209,9 @@ mod tests {
     /// `isreal`, `complex`, `fft` and `ifft`. Cycle 11 added thirty-eight:
     /// the twenty-one string functions of `strings.rs` beside `num2str`,
     /// which moved there, and the sixteen file functions of `io.rs` beside
-    /// `fprintf`, which moved there, and `input`.
-    const EXPECTED: usize = 211;
+    /// `fprintf`, which moved there, and `input`. Cycle 12 added the
+    /// twenty plotting builtins of `plot/mod.rs`.
+    const EXPECTED: usize = 231;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -414,6 +416,26 @@ mod tests {
             "delete",
             "save",
             "load",
+            "figure",
+            "gcf",
+            "close",
+            "clf",
+            "subplot",
+            "plot",
+            "scatter",
+            "bar",
+            "histogram",
+            "xlabel",
+            "ylabel",
+            "title",
+            "legend",
+            "grid",
+            "axis",
+            "xlim",
+            "ylim",
+            "hold",
+            "saveas",
+            "print",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

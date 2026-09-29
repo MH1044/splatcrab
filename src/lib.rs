@@ -14,6 +14,9 @@
 //! Since cycle U1, `http` turns the bytes of one HTTP request into the bytes
 //! of its response, and `server` is the loopback socket around it behind
 //! `splatcrab --ui`; the page it serves is embedded from `src/ui/`.
+//!
+//! Since cycle 12, `plot` holds the figures, the SVG writer, and the PNG
+//! rasterizer and encoder.
 
 pub mod builtins;
 pub mod env;
@@ -23,6 +26,7 @@ pub mod interp;
 pub mod json;
 pub mod lexer;
 pub mod parser;
+pub mod plot;
 pub mod protocol;
 pub mod server;
 pub mod syntax;

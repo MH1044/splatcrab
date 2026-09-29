@@ -55,8 +55,9 @@ mod tests {
         let r = registry();
         let got = completions("dis", &vars(&["display_count", "dia"]), &r);
         assert_eq!(got, ["disp", "display_count"]);
+        // Cycle 12's `xlabel` and `xlim` sort among the variables.
         let got = completions("x", &vars(&["x2", "x", "x10"]), &r);
-        assert_eq!(got, ["x", "x10", "x2"]);
+        assert_eq!(got, ["x", "x10", "x2", "xlabel", "xlim"]);
     }
 
     #[test]

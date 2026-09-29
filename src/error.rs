@@ -1388,6 +1388,124 @@ pub fn bad_precision(precision: &str, name: &str) -> MError {
     MError::new(format!("Invalid precision '{}' for '{}'.", precision, name))
 }
 
+// ---- plotting (cycle 12) ---------------------------------------------------
+//
+// SplatCrab's own texts, except "Invalid figure handle.", MATLAB's for a
+// figure that is not open.
+
+/// A plotting call that would take a figure past `plot::figure::MAX_POINTS`
+/// points, each thing it draws weighted by the SVG it writes.
+pub fn too_many_points(max: usize) -> MError {
+    MError::new(format!(
+        "A figure holds at most {} points; this plot would take it past that.",
+        max
+    ))
+}
+
+/// `plot(1:3, 'LineWidth')`: text where a line spec such as `'r--o'` was
+/// expected.
+pub fn bad_line_spec(spec: &str) -> MError {
+    MError::new(format!("Invalid line specification '{}'.", spec))
+}
+
+/// `plot(1:3, 1:4)`: data that cannot be paired.
+pub fn plot_lengths(name: &str) -> MError {
+    MError::new(format!(
+        "Vectors given to '{}' must be the same length.",
+        name
+    ))
+}
+
+/// `bar('abc')`: text where numeric data was expected.
+pub fn plot_data(pos: usize, name: &str) -> MError {
+    MError::new(format!(
+        "Argument {} to '{}' must be numeric data.",
+        pos, name
+    ))
+}
+
+/// A figure number that names no open figure, or is not a positive whole
+/// number: `close(7)`, `saveas(3, 'f.svg')`, `figure(1.5)`.
+pub fn invalid_figure() -> MError {
+    MError::new("Invalid figure handle.")
+}
+
+/// `subplot(2, 1, 3)`, `subplot(0, 1, 1)`, `subplot(2, 1)`.
+pub fn bad_subplot() -> MError {
+    MError::new("subplot needs positive whole numbers m and n and an index p from 1 to m*n.")
+}
+
+/// `xlim([2 1])`, `axis([0 1 0])`: limits that are not `n` numbers in
+/// increasing pairs.
+pub fn bad_limits(name: &str, n: usize) -> MError {
+    MError::new(format!(
+        "Limits for '{}' must be a {}-element vector of increasing numbers.",
+        name, n
+    ))
+}
+
+/// `hold maybe`, `axis sideways`: an option the builtin does not take.
+pub fn plot_option(name: &str, opt: &str) -> MError {
+    MError::new(format!("Unknown option '{}' for '{}'.", opt, name))
+}
+
+/// `saveas(gcf, 'f.jpg')`, `print('-djpeg', 'f')`.
+pub fn plot_format(name: &str, format: &str) -> MError {
+    MError::new(format!(
+        "Unsupported format '{}' for '{}'; SplatCrab writes svg and png.",
+        format, name
+    ))
+}
+
+/// `saveas(gcf, 'f')`: a file name with no extension to take the format
+/// from, and no format given.
+pub fn saveas_no_extension(name: &str) -> MError {
+    MError::new(format!(
+        "'saveas' cannot tell the format of '{}': give the file name an extension, .svg or .png, or the format as a third argument.",
+        name
+    ))
+}
+
+/// `print('-rabc', 'f.png')`: a resolution that is not a non-negative
+/// number of dots an inch.
+pub fn bad_resolution(opt: &str) -> MError {
+    MError::new(format!("Invalid resolution '{}' for 'print'.", opt))
+}
+
+/// `print('-dpng')` with no file name.
+pub fn print_needs_file() -> MError {
+    MError::new("'print' needs a file name; SplatCrab does not send figures to a printer.")
+}
+
+/// `histogram(x, 0)`, `histogram(x, [1 1])`.
+pub fn bad_bins() -> MError {
+    MError::new(
+        "The bins of 'histogram' must be a positive whole number of bins or increasing bin edges.",
+    )
+}
+
+/// `scatter(x, y, -1)`: sizes that are not positive, or not one or one a
+/// point.
+pub fn bad_scatter_size() -> MError {
+    MError::new(
+        "Marker sizes for 'scatter' must be positive numbers, one for all points or one for each.",
+    )
+}
+
+/// `scatter(x, y, 3, 'q')`: a colour that is not a colour letter or an RGB
+/// triple of fractions.
+pub fn bad_color(name: &str) -> MError {
+    MError::new(format!(
+        "Invalid colour for '{}': use a letter such as 'r' or an RGB triple in [0, 1].",
+        name
+    ))
+}
+
+/// `bar(1:3, 0)`.
+pub fn bad_bar_width() -> MError {
+    MError::new("The bar width for 'bar' must be a positive number.")
+}
+
 /// A way a MAT file fails to load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatFault {
@@ -1794,7 +1912,7 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 22] = [
+        const FILES: [(&str, &str); 26] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
@@ -1817,6 +1935,10 @@ mod tests {
             ("builtins/printf.rs", include_str!("builtins/printf.rs")),
             ("builtins/io.rs", include_str!("builtins/io.rs")),
             ("builtins/mat.rs", include_str!("builtins/mat.rs")),
+            ("plot/mod.rs", include_str!("plot/mod.rs")),
+            ("plot/figure.rs", include_str!("plot/figure.rs")),
+            ("plot/svg.rs", include_str!("plot/svg.rs")),
+            ("plot/png.rs", include_str!("plot/png.rs")),
         ];
         // Anything whose argument becomes the error value.
         const MAKERS: [&str; 5] = ["Err(", "ok_or(", "ok_or_else(||", "map_err(|e|", "bail!("];

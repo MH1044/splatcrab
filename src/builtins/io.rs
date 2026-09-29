@@ -685,7 +685,7 @@ fn read_file(it: &Interp, name: &str) -> R<Vec<u8>> {
         .map_err(|e| error::cannot_read_file(name, &e))
 }
 
-fn write_file(it: &mut Interp, name: &str, bytes: &[u8]) -> R<()> {
+pub(crate) fn write_file(it: &mut Interp, name: &str, bytes: &[u8]) -> R<()> {
     let path = it.resolve_path(name);
     not_a_folder(&path)
         .and_then(|_| fs::write(&path, bytes))

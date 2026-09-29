@@ -40,7 +40,7 @@ and the table names the cycle that owns it.
 | 09 | [numerics](modules/09-numerics.md) | Polynomials, interpolation, quadrature, root finding, optimisation, `ode45`, filtering, statistics | Done (2026-09-29) |
 | 10 | [complex](modules/10-complex.md) | Complex numbers, `fft`, complex eigenvalues. Decided on 2026-09-28: it is built | Done (2026-09-29) |
 | 11 | [strings-and-io](modules/11-strings-and-io.md) | String functions, regular expressions, file reading and writing, `save`/`load` | Done (2026-09-29) |
-| 12 | [plotting](modules/12-plotting.md) | `plot`, `scatter`, `bar`, `histogram`, `subplot`, labels and legends, SVG and PNG output | Planned |
+| 12 | [plotting](modules/12-plotting.md) | `plot`, `scatter`, `bar`, `histogram`, `subplot`, labels and legends, SVG and PNG output | Done (2026-09-29) |
 | 13 | [environment](modules/13-environment.md) | REPL line editing and history, tab completion, `help`, `which`, `eval`, `format` | Planned |
 
 ## The U series: the interface
