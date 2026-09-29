@@ -29,9 +29,8 @@ matrices, the double, logical and char classes, indexing, control flow with
 function files on a path, function handles and anonymous functions, cell
 arrays and structs, linear algebra, numerics (polynomials, interpolation,
 statistics, sets, root finding, minimisation, quadrature and ODEs), formatted
-output and 163 builtins.
-Complex numbers and
-plotting are not there yet. See
+output, complex numbers with `fft` and 173 builtins. Plotting is not there
+yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -246,14 +245,14 @@ z
   least-squares solution by column-pivoted Householder QR
 - Decompositions: `[Q, R] = qr(A)`, `chol` (and `[R, p] = chol(A)`),
   `eig` and `[V, D] = eig(A)` (Jacobi for a symmetric matrix, Hessenberg QR
-  for any other; a complex eigenvalue is a clean refusal until cycle 10),
+  for any other, a complex pair as complex values with complex vectors),
   `svd` and `[U, S, V] = svd(A)` by one-sided Jacobi, and on top of them
   `rank`, `pinv`, `null`, `orth`, `cond` and the matrix `norm(A)`,
   `norm(A, 1)`, `norm(A, Inf)` and `norm(A, 'fro')`. Every iteration has a cap
   and a `NaN` or `Inf` never makes one hang. Also `kron`, `cross`, `triu`,
   `tril` and `magic`
-- Numerics: `polyfit`, `polyval`, `roots` (real roots; complex ones are a
-  clean refusal until cycle 10), `conv`, `deconv` and `filter`;
+- Numerics: `polyfit`, `polyval`, `roots` (complex roots as complex values),
+  `conv`, `deconv` and `filter`;
   `interp1` (linear, nearest, previous, next), `trapz`, `cumtrapz` and
   `diff`; `std`, `var`, `median` and `mode`, column by column on a matrix;
   `factorial`, `nchoosek`, `primes`, `isprime`, `gcd` and `lcm`; `logspace`,
@@ -265,7 +264,7 @@ z
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 163 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 173 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -280,9 +279,19 @@ z
 - `fprintf` and `sprintf` with a bounded width and precision, so no format
   specifier can panic or build a pad it cannot afford; `%d` prints an integer
   past `2^63` in full, and `%.Ns` truncates a string before padding it
-- A result that would be complex, such as `sqrt(-4)` or `(-8)^(1/3)`, is a
-  clean error naming complex numbers rather than a silent `NaN`. Cycle 10
-  replaces the error with the value
+- Complex numbers (cycle 10): `1i`, `2.5j` and `1e3i` literals, with `i`
+  and `j` the imaginary unit unless a variable of the name exists; the
+  operators, `'` as the conjugate and `.'` as the plain transpose, matrix
+  products and `\` and `/` of complex systems; `real`, `imag`, `conj`,
+  `angle`, `abs`, `isreal` and `complex`; `sum`, `prod`, `mean`, `cumsum`,
+  `exp`, `sin`, `cos`, `sqrt`, `log`, `log2`, `log10`, `asin`, `acos` and
+  `power`, where `sqrt(-4)` is `2i` and `(-8)^(1/3)` is `1 + 1.7321i`;
+  complex `eig` and `roots`; `fft` and `ifft` of any length in O(n log n),
+  radix-2 or Bluestein. An operation whose imaginary parts are all zero gives
+  a real result, as MATLAB's does, and `complex(a, b)` keeps a zero one.
+  `==` and `~=` compare both parts, the other comparisons the real parts,
+  and `fprintf` prints the real part. Every other builtin refuses a complex
+  argument rather than drop the imaginary part
 - A builtin that produces no value, such as `disp`, is legal as a statement
   and is "Too many output arguments." in an expression; every builtin rejects
   extra arguments with "Too many input arguments."
@@ -317,7 +326,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-N-D arrays, integer classes, complex numbers, and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+N-D arrays, integer classes and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -328,7 +337,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 163 builtins,
+                                         builtins/    the 173 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

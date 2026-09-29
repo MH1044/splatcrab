@@ -13,6 +13,9 @@ use crate::error::{self, R};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Token {
     Num(f64),
+    /// An imaginary literal (cycle 10), `1i`, `2.5j`, `1e3i`: the number
+    /// written before its `i` or `j`, which the value multiplies.
+    Imag(f64),
     Ident(String),
     Str(String),
 
@@ -26,7 +29,11 @@ pub enum Token {
     DotSlash,
     DotBackslash,
     DotCaret,
+    /// `'` after a value: the conjugate transpose, `A'`.
     Transpose,
+    /// `.'`: the plain transpose, which keeps the imaginary parts' signs
+    /// (cycle 10; before it both spellings were one token).
+    DotTranspose,
 
     Assign,
     Eq,
@@ -102,6 +109,7 @@ impl fmt::Display for Token {
             // `{}` on an `f64` is the shortest round-tripping form, so `0.3`
             // stays `0.3` and `2.0` shows as `2`, the way it was written.
             Token::Num(v) => return write!(f, "'{}'", v),
+            Token::Imag(v) => return write!(f, "'{}i'", v),
             Token::Ident(s) | Token::Str(s) => return write!(f, "'{}'", s),
             Token::Newline => return f.write_str("end of line"),
             Token::Eof => return f.write_str("end of input"),
@@ -117,6 +125,7 @@ impl fmt::Display for Token {
             Token::DotBackslash => ".\\",
             Token::DotCaret => ".^",
             Token::Transpose => "'",
+            Token::DotTranspose => ".'",
 
             Token::Assign => "=",
             Token::Eq => "==",
@@ -170,12 +179,14 @@ fn ends_value(t: &Token) -> bool {
     matches!(
         t,
         Token::Num(_)
+            | Token::Imag(_)
             | Token::Ident(_)
             | Token::Str(_)
             | Token::RParen
             | Token::RBracket
             | Token::RBrace
             | Token::Transpose
+            | Token::DotTranspose
             | Token::End
     )
 }
@@ -622,6 +633,18 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
                 Ok(v) => v,
                 Err(_) => bail!(error::invalid_number(&text).at(line)),
             };
+            // An `i` or a `j` straight after the digits, and not the start
+            // of a longer name, makes the literal imaginary (cycle 10): `1i`,
+            // `2.5j`, `1e3i`. `2ix` and `3j_` are not imaginary literals.
+            let unit = i < n && matches!(chars[i], 'i' | 'j');
+            let word_goes_on = chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_');
+            if unit && !word_goes_on {
+                i += 1;
+                toks.push(Token::Imag(v), line);
+                continue;
+            }
             toks.push(Token::Num(v), line);
             continue;
         }
@@ -753,7 +776,7 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
             ('.', Some('/')) => (Token::DotSlash, 2),
             ('.', Some('\\')) => (Token::DotBackslash, 2),
             ('.', Some('^')) => (Token::DotCaret, 2),
-            ('.', Some('\'')) => (Token::Transpose, 2),
+            ('.', Some('\'')) => (Token::DotTranspose, 2),
             ('+', _) => (Token::Plus, 1),
             ('-', _) => (Token::Minus, 1),
             ('*', _) => (Token::Star, 1),
@@ -1012,10 +1035,50 @@ mod tests {
         );
     }
 
+    /// Since cycle 10 `.'` is its own token, the plain transpose, and `'`
+    /// the conjugate one.
     #[test]
-    fn dot_quote_is_transpose() {
-        assert_eq!(lx(".'"), vec![Token::Transpose, Token::Eof]);
-        assert_eq!(lx("a.'"), vec![id("a"), Token::Transpose, Token::Eof]);
+    fn dot_quote_is_the_plain_transpose() {
+        assert_eq!(lx(".'"), vec![Token::DotTranspose, Token::Eof]);
+        assert_eq!(lx("a.'"), vec![id("a"), Token::DotTranspose, Token::Eof]);
+        assert_eq!(
+            lx("a.''"),
+            vec![id("a"), Token::DotTranspose, Token::Transpose, Token::Eof]
+        );
+    }
+
+    #[test]
+    fn imaginary_literals() {
+        assert_eq!(lx("1i"), vec![Token::Imag(1.0), Token::Eof]);
+        assert_eq!(lx("2.5j"), vec![Token::Imag(2.5), Token::Eof]);
+        assert_eq!(lx("1e3i"), vec![Token::Imag(1000.0), Token::Eof]);
+        assert_eq!(lx(".5i"), vec![Token::Imag(0.5), Token::Eof]);
+        assert_eq!(
+            lx("3+4i"),
+            vec![Token::Num(3.0), Token::Plus, Token::Imag(4.0), Token::Eof]
+        );
+        // In brackets it is one element, and a quote after it transposes.
+        assert_eq!(
+            lx("[1 2i]'"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Imag(2.0),
+                Token::RBracket,
+                Token::Transpose,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("2i'"),
+            vec![Token::Imag(2.0), Token::Transpose, Token::Eof]
+        );
+        // A longer word after the digits is not the unit.
+        assert_eq!(lx("2ix"), vec![Token::Num(2.0), id("ix"), Token::Eof]);
+        assert_eq!(lx("3j_"), vec![Token::Num(3.0), id("j_"), Token::Eof]);
+        // The bare names are identifiers; the evaluator decides what they are.
+        assert_eq!(lx("i"), vec![id("i"), Token::Eof]);
     }
 
     // ---- numbers ------------------------------------------------------
@@ -1099,7 +1162,7 @@ mod tests {
     fn number_followed_by_dot_transpose() {
         assert_eq!(
             lx("3.'"),
-            vec![Token::Num(3.0), Token::Transpose, Token::Eof]
+            vec![Token::Num(3.0), Token::DotTranspose, Token::Eof]
         );
     }
 
@@ -1489,7 +1552,7 @@ mod tests {
             lx("x.\\y"),
             vec![id("x"), Token::DotBackslash, id("y"), Token::Eof]
         );
-        assert_eq!(lx("x.'"), vec![id("x"), Token::Transpose, Token::Eof]);
+        assert_eq!(lx("x.'"), vec![id("x"), Token::DotTranspose, Token::Eof]);
         assert_eq!(
             lx("a...\n+ b"),
             vec![id("a"), Token::Plus, id("b"), Token::Eof]
@@ -1531,7 +1594,7 @@ mod tests {
             vec![id("s"), Token::Dot, id("a"), Token::Transpose, Token::Eof]
         );
         // A quote straight after the dot is the `.'` operator, as before.
-        assert_eq!(lx("s.'"), vec![id("s"), Token::Transpose, Token::Eof]);
+        assert_eq!(lx("s.'"), vec![id("s"), Token::DotTranspose, Token::Eof]);
         // After an opening brace it still opens a string.
         assert_eq!(
             lx("c{'a'}"),

@@ -43,15 +43,25 @@ pub fn register(r: &mut Registry) {
 
 /// The function a solver calls: a handle, or a function named by a char,
 /// as `feval` takes either.
+/// The solver's own name comes along, for the refusal of a complex value.
 enum Target {
-    Handle(Rc<Func>),
-    Name(String),
+    Handle(Rc<Func>, &'static str),
+    Name(String, &'static str),
 }
 
-fn target(a: &[Value], name: &str) -> R<Target> {
+impl Target {
+    /// The solver calling the function.
+    fn solver(&self) -> &'static str {
+        match self {
+            Target::Handle(_, s) | Target::Name(_, s) => s,
+        }
+    }
+}
+
+fn target(a: &[Value], name: &'static str) -> R<Target> {
     match a.first() {
-        Some(Value::Func(f)) => Ok(Target::Handle(f.clone())),
-        Some(v) if v.is_char() => Ok(Target::Name(v.text().unwrap_or_default())),
+        Some(Value::Func(f)) => Ok(Target::Handle(f.clone(), name)),
+        Some(v) if v.is_char() => Ok(Target::Name(v.text().unwrap_or_default(), name)),
         Some(_) => Err(error::arg_not_a_handle(1, name)),
         None => Err(error::not_enough_args(name)),
     }
@@ -61,14 +71,20 @@ fn target(a: &[Value], name: &str) -> R<Target> {
 /// output.
 fn call(it: &mut Interp, t: &Target, args: Vec<Value>) -> R<Value> {
     let callee = match t {
-        Target::Handle(f) => Callee::Handle(f),
-        Target::Name(n) => Callee::Name(n),
+        Target::Handle(f, _) => Callee::Handle(f),
+        Target::Name(n, _) => Callee::Name(n),
     };
     let mut out = it.call_nested(callee, args, 1)?;
     if out.is_empty() {
         return Err(error::too_many_outputs());
     }
-    Ok(out.swap_remove(0))
+    let v = out.swap_remove(0);
+    // Every solver reads real values only, so a complex one is refused
+    // rather than read by its real part (cycle 10).
+    if let Value::Mat(m) = &v {
+        m.require_real(t.solver())?;
+    }
+    Ok(v)
 }
 
 fn num(v: f64) -> Value {

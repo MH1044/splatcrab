@@ -398,6 +398,9 @@ pub(crate) fn map_elements(
             }
             let mut class: Option<Class> = None;
             let mut data = Vec::with_capacity(vals.len());
+            // A complex result makes the output complex (cycle 10), stored
+            // by the flag rule; it is never read by its real part alone.
+            let mut im = Vec::with_capacity(vals.len());
             for v in &vals {
                 let m = v.mat()?;
                 class = match class {
@@ -405,11 +408,18 @@ pub(crate) fn map_elements(
                     Some(c) if c == m.class => Some(c),
                     Some(_) => Some(Class::Double),
                 };
-                data.push(m.data[0]);
+                let z = m.c(0);
+                data.push(z.re);
+                im.push(z.im);
             }
-            Ok(Value::Mat(
-                Matrix::new(rows, cols, data).with_class(class.unwrap_or_default()),
-            ))
+            let class = class.unwrap_or_default();
+            let m = Matrix::new(rows, cols, data).with_im(Some(im));
+            let m = if m.is_complex() {
+                m
+            } else {
+                m.with_class(class)
+            };
+            Ok(Value::Mat(m))
         })
         .collect()
 }

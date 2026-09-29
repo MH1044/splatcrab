@@ -42,7 +42,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | `^` with an integer exponent | 00 | `demo_smoke`, `mpower_singular_warns_inf` | Negative exponents invert; a singular matrix to a negative power warns and is `Inf` everywhere, as `inv` is (cycle 08) |
 | `.* ./ .^` elementwise | 00 | `matrix_ops` | |
 | `.\` elementwise left divide | 01b | `eldiv_vector`, `eldiv_after_number` | `a.\b` is `b./a`; `2.\x` no longer means `2 \ x` |
-| Transpose `'` and `.'` | 00 | `matrix_ops` | |
+| Transpose `'` and `.'` | 00 | `matrix_ops`, `ctranspose_conjugates`, `transpose_does_not_conjugate` | Since cycle 10 `'` is the conjugate transpose and `.'` the plain one |
 | `== ~= < <= > >=` | 00 | `logical_ops` | Results are `logical`, since 02; they were 0/1 doubles |
 | `& \|` elementwise, `&& \|\|` short-circuit | 00 | `logical_ops` | `logical` results, since 02 |
 | `~` negation | 00 | `logical_ops` | A `logical` result, since 02 |
@@ -52,7 +52,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Scalar and row/column broadcasting | 00 | `builtins_sample` | |
 | A result too big to allocate is a clean error | 01d | `err_zip_result_size`, `err_matmul_result_size`, `err_matmul_size_wraps`, `err_index_result_size` | Broadcasting, `*`, a two-subscript read and a reduction all size their result from their operands, and all judge it before allocating. `ones(1e5,1) + ones(1,1e5)` used to abort the process, exit 134 |
 | `*` keeps `Inf` and `NaN` through a zero factor | 01d | `matmul_keeps_inf_and_nan` | `[Inf 0] * [0; 1]` is `NaN`, as in MATLAB. A sparsity shortcut used to skip the multiply and give `0` |
-| A result that would be complex is a clean error | 01d | `err_complex_sqrt`, `err_complex_log`, `err_complex_asin`, `err_complex_power_operator`, and five more | `sqrt(-4)`, `log(-1)`, `asin(2)`, `(-8)^(1/3)` and the rest used to return `NaN` and exit 0. Cycle 10 replaces the error with the value |
+| A result that would be complex is the complex value | 10 | `complex_sqrt_negative`, `complex_log_negative`, `complex_log2_negative`, `complex_log10_negative`, `complex_asin_above_one`, `complex_acos_outside_range`, `complex_power_operator_fractional`, `complex_elementwise_power_fractional`, `complex_power_builtin_fractional` | `sqrt(-4)`, `log(-1)`, `asin(2)`, `(-8)^(1/3)` and the rest used to return `NaN` and exit 0; cycle 01d made them a clean error, and cycle 10 the value on the principal branch. The nine `err_complex_*` cases of 01d went with the refusal |
 
 ## Indexing
 
@@ -143,7 +143,7 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-163 names, each an ordinary function in `src/builtins/` registered by name in
+173 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -161,7 +161,10 @@ cases. Cycle 08 added fifteen, `lu`, `qr`, `chol`, `eig`, `svd`, `rank`,
 exercised by the `08-linear-algebra` cases (see
 [Linear algebra](#linear-algebra)). Cycle 09 added thirty-three, the
 polynomials, samples, statistics, number theory, grids, sets and solvers,
-exercised by the `09-numerics` cases (see [Numerics](#numerics)). Cycle 01c removed `e`, which
+exercised by the `09-numerics` cases (see [Numerics](#numerics)). Cycle 10
+added ten, `i`, `j`, `real`, `imag`, `conj`, `angle`, `isreal`, `complex`,
+`fft` and `ifft`, exercised by the `10-complex` cases (see
+[Complex numbers](#complex-numbers)). Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -281,7 +284,7 @@ record every choice.
 | `inv` and `A^-1` of a singular matrix | 08 | `inv_singular_warns_inf`, `inv_zero_warns_inf`, `mpower_singular_warns_inf` | The singular warning and `Inf` everywhere: `inv([1 2; 2 4])` is `Inf Inf; Inf Inf` and `inv(0)` is `Inf`, as in MATLAB and Octave (QA D26). A matrix singular only to working precision, with no exact zero pivot, warns and returns the computed inverse |
 | `[Q, R] = qr(A)` | 08 | `qr_factors` | Householder, full: `Q` is `m`-by-`m`. `R`'s diagonal takes LAPACK's signs, so it may be negative; below it is exact `0`. `R = qr(A)` gives `R` alone |
 | `chol(A)`, `[R, p] = chol(A)` | 08 | `chol_upper_factor`, `err_chol_not_positive_definite`, `err_chol_nan_input` | Upper `R` with `R'*R = A`, from the upper triangle. Not positive definite, a `NaN` pivot included, is `Matrix must be positive definite.`; the two-output form returns the failing column instead |
-| `eig(A)`, `[V, D] = eig(A)` | 08 | `eig_symmetric_ascending`, `eig_nonsymmetric_real`, `eig_nonsymmetric_hessenberg`, `eig_two_outputs`, `eig_vectors_residual`, `err_eig_complex_eigenvalues`, `err_eig_nan_input` | An exactly symmetric `A` by cyclic Jacobi, eigenvalues ascending; any other by Hessenberg reduction and the shifted double QR iteration, in the order found, unit eigenvectors. A complex eigenvalue is `Complex results are not supported. ...` until cycle 10. A `NaN` or `Inf` is `Input to 'eig' must not contain NaN or Inf.` |
+| `eig(A)`, `[V, D] = eig(A)` | 08 | `eig_symmetric_ascending`, `eig_nonsymmetric_real`, `eig_nonsymmetric_hessenberg`, `eig_two_outputs`, `eig_vectors_residual`, `eig_complex_eigenvalues_rotation`, `err_eig_nan_input` | An exactly symmetric `A` by cyclic Jacobi, eigenvalues ascending; any other by Hessenberg reduction and the shifted double QR iteration, in the order found, unit eigenvectors. Since cycle 10 a complex pair is two complex values, the positive imaginary part first, with complex vectors (it was a refusal, `err_eig_complex_eigenvalues`); a complex `A` is refused. A `NaN` or `Inf` is `Input to 'eig' must not contain NaN or Inf.` |
 | `svd(A)`, `[U, S, V] = svd(A)` | 08 | `svd_values_descending`, `svd_three_outputs`, `svd_zero_row_converges`, `err_svd_inf_input` | One-sided Jacobi; values descending; `U` and `V` full and orthogonal. A `NaN` or `Inf` is refused, as for `eig` |
 | `rank pinv null orth cond` | 08 | `rank_deficient_and_full`, `pinv_rank_deficient`, `null_basis`, `orth_basis`, `norm_matrix_and_cond` | Through the SVD. `rank` counts singular values above `max(m, n) * eps(s(1))`, and `null` and `orth` use the same tolerance; `pinv` drops those at or below `max(m, n) * s(1) * eps`. `rank` and `pinv` take a tolerance argument. `cond` is `s(1) / s(end)`, `Inf` for a singular matrix |
 | Matrix `norm` | 08 | `norm_matrix_and_cond`, `err_norm_matrix_type`, `err_norm_matrix_order` | `norm(A)` and `norm(A, 2)` the largest singular value, `norm(A, 1)` the largest column sum, `norm(A, Inf)` the largest row sum, `norm(A, 'fro')` the root sum of squares. Other orders are `Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.` A `NaN` gives `NaN`; an `Inf` gives an `Inf` 2-norm |
@@ -299,7 +302,7 @@ singleton, so a matrix is worked on column by column.
 | Feature | Since | Golden case | Notes |
 |---|---|---|---|
 | `polyfit(x, y, n)`, `polyval(p, x)` | 09 | `polyfit_line_fit`, `polyval_scalar` | Least squares through the column-pivoted QR of cycle 08; too few distinct points warns with the rank-deficient text. `[p, S, mu]` is not provided |
-| `roots(p)` | 09 | `roots_real_distinct`, `err_roots_complex` | Eigenvalues of the companion matrix, a column, then a `0` per trailing zero. Complex roots, a real root of multiplicity three or more among them, are `Complex results are not supported. The polynomial has complex roots.` until cycle 10 |
+| `roots(p)` | 09 | `roots_real_distinct`, `roots_complex_pair_in_order`, `roots_complex_sorted` | Eigenvalues of the companion matrix, a column, then a `0` per trailing zero. Since cycle 10 complex roots are complex values, and a real root of multiplicity three or more comes back as a complex pair a rounding error apart, as the eigensolver finds it (a refusal before, `err_roots_complex`); complex coefficients are refused |
 | `conv(u, v, shape)`, `[q, r] = deconv(b, a)` | 09 | `conv_polynomials`, `deconv_quotient_remainder` | `'full'`, `'same'` and `'valid'`. `r` has the shape of `b`, its leading coefficients exactly `0` |
 | `filter(b, a, x)` | 09 | `filter_iir_impulse`, `filter_fir_moving_average` | Direct form II transposed from rest, normalised by `a(1)`, along the first non-singleton dimension; `zi`, `zf` and `dim` are not provided |
 | `interp1(x, v, xq, method, extrap)`, `interp1(v, xq)` | 09 | `interp1_linear_inside`, `interp1_nearest`, `interp1_outside_is_nan` | `'linear'`, `'nearest'` (a tie takes the upper point), `'previous'`, `'next'`; `NaN` outside unless `'extrap'` or a value. `'spline'` and `'pchip'` are refused |
@@ -315,6 +318,29 @@ singleton, so a matrix is worked on column by column.
 | `integral(f, a, b)` | 09 | `integral_finite_interval`, `integral_infinite_limits`, `err_integral_divergent` | Global adaptive Gauss-Kronrod 7-15, `AbsTol` 1e-10 and `RelTol` 1e-6; an infinite limit is mapped onto a finite interval; 650 subintervals at most |
 | `ode45(f, tspan, y0, opts)`, `odeset` | 09 | `ode45_scalar_decay`, `ode45_oscillator_system`, `ode45_output_columns`, `odeset_tolerances`, `err_ode45_blowup` | Dormand-Prince 5(4) with MATLAB's step control and `Refine` 4; `RelTol`, `AbsTol`, `MaxStep`, `InitialStep`, `Refine`. 50,000 steps at most, and a step below `16 eps(t)` is an error |
 | Every solver call is counted | 09 | `err_fzero_recursion_limit`, `err_fminsearch_recursion_limit`, `err_integral_recursion_limit`, `err_ode45_recursion_limit` | Through `Interp::call_nested`, so a function that calls a solver on itself meets the recursion limit, a clean error |
+
+## Complex numbers
+
+Cycle 10. `Matrix` holds the imaginary parts in `im`, column-major like
+`data`; the scalar arithmetic, `fft` and `ifft` are in
+`src/builtins/complex.rs`, and the Design notes of
+`docs/modules/10-complex.md` record every choice.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| Imaginary literals `1i`, `2.5j`, `1e3i` | 10 | `imaginary_literal_forms`, `class_of_complex_is_double` | A number with `i` or `j` straight after it; a complex value is class `double` |
+| `i` and `j` as the unit, shadowed by a variable | 10 | `imaginary_unit_shadowed_by_variable` | Builtins, so invariant 4 puts a variable first, and `clear i` brings the unit back |
+| Complex display | 10 | `display_complex_scalar`, `abs_real_imag_conj` | `   3.0000 - 4.0000i`, four decimals on both parts, a zero as `0.0000`; columns of one width; a scale factor or `e` format outside `[0.01, 1000)`; wide matrices wrap in column blocks |
+| The flag rule | 10 | `isreal_arithmetic_drops_zero_imag`, `isreal_complex_keeps_zero_imag` | MathWorks': a result whose imaginary parts are all zero is real, `isreal(1i * 0)` is true, and `complex(a, b)` keeps complex storage, `isreal(complex(1, 0))` false. Indexing, concatenation and deletion follow the same rule; an indexed assignment keeps complex storage until the next arithmetic result (`assign_keeps_complex_storage`), which keeps assignment loops linear (`complex_growth_perf_guard`) |
+| `+ - * / \ .* ./ .\ .^ ^`, unary minus | 10 | `complex_arithmetic_operators`, `complex_index_and_assign` | Matrix products, `\` and `/` of complex systems through the real embedding, integer matrix powers; a real target assigned a complex value becomes complex |
+| `real imag conj angle abs isreal complex` | 10 | `abs_real_imag_conj`, `angle_of_complex`, `isreal_complex_keeps_zero_imag` | `angle` is in `[-pi, pi]` |
+| Comparisons | 10 | `eq_compares_both_parts`, `ne_compares_both_parts`, `ordering_compares_real_parts`, `le_ge_compare_real_parts` | MathWorks': `==` and `~=` both parts, `< <= > >=` the real parts only |
+| `fprintf` and `sprintf` print the real part | 10 | `printf_prints_real_part`, `sprintf_prints_real_part` | MathWorks' `sprintf` page: "Numeric conversions print only the real component" |
+| `sum prod mean cumsum exp sin cos sqrt log log2 log10 asin acos power` | 10 | `complex_kernels_take_complex_input`, `sin_cos_imaginary_axis`, `complex_sqrt_negative` and the rest of the row above | Complex input as well as complex results; the branch cuts are on the negative real axis and, for `asin` and `acos`, outside `[-1, 1]`, a point on a cut taken from above |
+| Complex `eig` and `roots` | 10 | `eig_complex_eigenvalues_rotation`, `roots_complex_pair_in_order`, `roots_complex_sorted` | See the rows under [Linear algebra](#linear-algebra) and [Numerics](#numerics) |
+| `fft` and `ifft` | 10 | `fft_impulse`, `fft_moduli_length_four`, `ifft_round_trip_length_three`, `fft_prime_length_fast` | Of a row, or of each column; radix-2 Cooley-Tukey for a power of two and Bluestein's chirp convolution for any other length, so every length is O(n log n): a prime length of 100,003 runs at once |
+| A builtin that does not take complex input refuses it | 10 | `err_sort_complex_input`, `err_max_complex_input`, `err_min_complex_input`, `err_floor_complex_input`, `err_mod_complex_input`, `err_fzero_complex_start`, `err_fzero_complex_value`, `err_if_complex_condition`, `err_colon_complex_operand`, `err_char_target_complex_assign` | `Complex values are not supported by 'sort'.`, from the registry's gate for every builtin not on `builtins::TAKES_COMPLEX`, and from a solver for a complex value its function returns; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` say `Complex values cannot be converted to logicals.`, a complex operand of `:` is refused as `':'`, and a complex value assigned into a char array as `'char'`. Never an answer from the real parts alone |
+| Complex values in cells, structs and the workspace | 10 | `cell_and_struct_hold_complex`, `workspace_lists_complex_as_double` | Under `--protocol`, `workspace` lists a complex variable with class `double`, in U0's `vars` shape |
 
 ## Output and formatting
 

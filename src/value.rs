@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::bail;
+use crate::builtins::complex::C;
 use crate::error::{self, R};
 use crate::interp::Unit;
 use crate::parser::{AnonFn, Function};
@@ -41,8 +42,15 @@ impl Class {
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    /// Column-major: element (r, c) lives at data[c * rows + r].
+    /// Column-major: element (r, c) lives at data[c * rows + r]. For a
+    /// complex array these are the real parts.
     pub data: Vec<f64>,
+    /// The imaginary parts (cycle 10), column-major like `data`, or `None`
+    /// for real storage. Only a double is ever complex. Every operation
+    /// drops an imaginary part that is zero throughout, through
+    /// [`Matrix::with_im`]; [`Matrix::complex_parts`], which is `complex`,
+    /// is the one way to keep one.
+    pub im: Option<Vec<f64>>,
     /// How the elements are to be read. Every constructor below makes a
     /// `Double`; a result of another class says so with [`Matrix::with_class`]
     /// or [`Matrix::to_class`].
@@ -443,7 +451,7 @@ impl Value {
     /// `arrayfun` hands its function.
     pub fn element(&self, k: usize) -> Value {
         match self {
-            Value::Mat(m) => Value::Mat(Matrix::scalar(m.data[k]).with_class(m.class)),
+            Value::Mat(m) => Value::Mat(m.element(k)),
             Value::Cell(c) => Value::Cell(Rc::new(CellArray::new(1, 1, vec![c.data[k].clone()]))),
             Value::Struct(s) => Value::Struct(Rc::new(s.element(k))),
             v => v.clone(),
@@ -688,7 +696,7 @@ fn field_summary(v: &Value, room: usize) -> String {
         }
         Value::Mat(m) if m.is_empty() && m.rows == 0 && m.cols == 0 => "[]".to_string(),
         Value::Mat(m) if m.is_scalar() => m.format().trim().to_string(),
-        Value::Mat(m) if m.rows == 1 && !m.is_empty() => {
+        Value::Mat(m) if m.rows == 1 && !m.is_empty() && !m.is_complex() => {
             let (texts, _, scale) = m.cells();
             let inline = format!("[{}]", texts.join(" "));
             if scale.is_none() && inline.chars().count() <= room {
@@ -748,8 +756,104 @@ impl Matrix {
             rows,
             cols,
             data,
+            im: None,
             class: Class::Double,
         }
+    }
+
+    /// True for complex storage.
+    pub fn is_complex(&self) -> bool {
+        self.im.is_some()
+    }
+
+    /// Element `k`, linear and zero-based, as a complex scalar; the
+    /// imaginary part of real storage is `0`.
+    pub fn c(&self, k: usize) -> C {
+        C::new(self.data[k], self.im.as_ref().map_or(0.0, |v| v[k]))
+    }
+
+    /// This matrix with `im` as its imaginary parts, stored real when they
+    /// are all zero: the flag rule every operation but `complex` follows.
+    pub fn with_im(mut self, im: Option<Vec<f64>>) -> Matrix {
+        debug_assert!(im.as_ref().is_none_or(|v| v.len() == self.data.len()));
+        self.im = im.filter(|v| v.iter().any(|x| *x != 0.0));
+        self
+    }
+
+    /// The flag rule applied to this matrix as it stands.
+    pub fn normalized(mut self) -> Matrix {
+        let im = self.im.take();
+        self.with_im(im)
+    }
+
+    /// `rows x cols` complex values, stored real when every imaginary part
+    /// is zero.
+    pub fn from_c(rows: usize, cols: usize, z: Vec<C>) -> Matrix {
+        let (re, im): (Vec<f64>, Vec<f64>) = z.into_iter().map(|z| (z.re, z.im)).unzip();
+        Matrix::new(rows, cols, re).with_im(Some(im))
+    }
+
+    /// Complex storage, kept even when every imaginary part is zero: what
+    /// `complex(a, b)` makes, and nothing else does.
+    pub fn complex_parts(rows: usize, cols: usize, re: Vec<f64>, im: Vec<f64>) -> Matrix {
+        let mut m = Matrix::new(rows, cols, re);
+        m.im = Some(im);
+        m
+    }
+
+    /// The complex conjugate; real storage is its own.
+    pub fn conj(&self) -> Matrix {
+        let mut m = self.clone();
+        if let Some(im) = &mut m.im {
+            im.iter_mut().for_each(|x| *x = -*x);
+        }
+        m.normalized()
+    }
+
+    /// `A'`, the conjugate transpose.
+    pub fn ctranspose(&self) -> Matrix {
+        self.transpose().conj()
+    }
+
+    /// The refusal of a complex argument by a kernel that reads only the
+    /// real parts, which is how no imaginary part is ever dropped in
+    /// silence (cycle 10).
+    pub fn require_real(&self, name: &str) -> R<()> {
+        if self.is_complex() {
+            bail!(error::complex_argument(name));
+        }
+        Ok(())
+    }
+
+    /// Every element through `f` as a complex scalar, stored by the flag
+    /// rule.
+    pub fn map_c(&self, f: impl Fn(C) -> C) -> Matrix {
+        let z = (0..self.numel()).map(|k| f(self.c(k))).collect();
+        Matrix::from_c(self.rows, self.cols, z)
+    }
+
+    /// [`zip`](Matrix::zip) over complex scalars, with the same broadcasting
+    /// and the same size check, stored by the flag rule.
+    pub fn zip_c(&self, o: &Matrix, op: &str, f: impl Fn(C, C) -> C) -> R<Matrix> {
+        let dims_err = || error::operator_dims(op, self.rows, self.cols, o.rows, o.cols);
+        let rows = broadcast_dim(self.rows, o.rows).ok_or_else(dims_err)?;
+        let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
+        crate::builtins::args::check_shape(rows as f64, cols as f64)?;
+        let at = |m: &Matrix, r: usize, c: usize| {
+            let r = if m.rows == 1 { 0 } else { r };
+            let c = if m.cols == 1 { 0 } else { c };
+            m.c(c * m.rows + r)
+        };
+        let mut re = Vec::with_capacity(rows * cols);
+        let mut im = Vec::with_capacity(rows * cols);
+        for c in 0..cols {
+            for r in 0..rows {
+                let z = f(at(self, r, c), at(o, r, c));
+                re.push(z.re);
+                im.push(z.im);
+            }
+        }
+        Ok(Matrix::new(rows, cols, re).with_im(Some(im)))
     }
 
     /// This matrix with its class tag set, leaving the elements alone. The
@@ -782,7 +886,17 @@ impl Matrix {
     /// This matrix converted to `class`: a logical is every element tested
     /// against zero, which refuses a `NaN` exactly as `if NaN` does; a char is
     /// every element as a [`code_unit`]; a double keeps the values.
+    ///
+    /// A complex array becomes a logical or a char nowhere: MATLAB converts
+    /// neither, and dropping the imaginary part would be silent.
     pub fn to_class(self, class: Class) -> R<Matrix> {
+        if self.is_complex() {
+            match class {
+                Class::Double => return Ok(self),
+                Class::Logical => bail!(error::complex_to_logical()),
+                Class::Char => bail!(error::complex_argument("char")),
+            }
+        }
         let data = match class {
             Class::Double => self.data,
             Class::Logical if self.class == Class::Logical => self.data,
@@ -799,6 +913,7 @@ impl Matrix {
             rows: self.rows,
             cols: self.cols,
             data,
+            im: None,
             class,
         })
     }
@@ -874,6 +989,16 @@ impl Matrix {
         self.data[c * self.rows + r] = v;
     }
 
+    /// Element `k` as a 1x1 of the same class, stored by the flag rule.
+    pub fn element(&self, k: usize) -> Matrix {
+        let im = self.im.as_ref().map(|v| vec![v[k]]);
+        Matrix::scalar(self.data[k])
+            .with_class(self.class)
+            .with_im(im)
+    }
+
+    /// The one element of a 1x1 matrix. The real part, so a caller that
+    /// might see a complex value refuses one first (cycle 10).
     pub fn scalar_value(&self) -> Option<f64> {
         if self.is_scalar() {
             Some(self.data[0])
@@ -890,6 +1015,9 @@ impl Matrix {
     /// That is the only way this fails, so an empty stays false rather than
     /// becoming an error.
     pub fn truth(&self) -> R<bool> {
+        if self.is_complex() {
+            bail!(error::complex_to_logical());
+        }
         if self.data.iter().any(|v| v.is_nan()) {
             bail!(error::nan_to_logical());
         }
@@ -902,6 +1030,9 @@ impl Matrix {
     /// logical value, so an array or an empty is an error rather than "all
     /// non-zero". `[1 1] && 1` used to be `1` and `[] || 1` used to be `1`.
     pub fn logical_scalar(&self) -> R<bool> {
+        if self.is_complex() {
+            bail!(error::complex_to_logical());
+        }
         match self.scalar_value() {
             Some(v) if v.is_nan() => bail!(error::nan_to_logical()),
             Some(v) => Ok(v != 0.0),
@@ -942,9 +1073,11 @@ impl Matrix {
         self.try_zip(o, op, |a, b| Ok(f(a, b)))
     }
 
-    /// [`zip`](Matrix::zip) for an operation that may refuse an element, which
-    /// is what `.^` needs now that a would-be-complex result is an error
-    /// rather than a `NaN`. `zip` is this function with an infallible closure.
+    /// [`zip`](Matrix::zip) for an operation that may refuse an element,
+    /// which is what `&` and `|` need, since a `NaN` cannot become a
+    /// logical. `zip` is this function with an infallible closure. (Cycle
+    /// 01d added it for `.^`, whose would-be-complex results were refused
+    /// until cycle 10 computed them through [`zip_c`](Matrix::zip_c).)
     ///
     /// The broadcast shape goes through `args::check_shape` before a single
     /// element is allocated. `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
@@ -972,15 +1105,34 @@ impl Matrix {
         Ok(Matrix::new(rows, cols, data))
     }
 
+    /// `A.'`, the plain transpose: the imaginary parts move with the real
+    /// ones and keep their signs.
     pub fn transpose(&self) -> Matrix {
-        let mut data = Vec::with_capacity(self.numel());
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                data.push(self.get(r, c));
+        let flip = |v: &[f64]| {
+            let mut out = Vec::with_capacity(v.len());
+            for r in 0..self.rows {
+                for c in 0..self.cols {
+                    out.push(v[c * self.rows + r]);
+                }
             }
-        }
+            out
+        };
+        let im = self.im.as_deref().map(flip);
         // Rearrangement keeps the class: `'ab'.'` is a char column.
-        Matrix::new(self.cols, self.rows, data).with_class(self.class)
+        Matrix::new(self.cols, self.rows, flip(&self.data))
+            .with_class(self.class)
+            .with_im(im)
+    }
+
+    /// The real parts, as a real matrix of the same class.
+    pub fn real_part(&self) -> Matrix {
+        Matrix::new(self.rows, self.cols, self.data.clone()).with_class(self.class)
+    }
+
+    /// The imaginary parts, as a real matrix; zeros for real storage.
+    pub fn imag_part(&self) -> Matrix {
+        let im = self.im.clone().unwrap_or_else(|| vec![0.0; self.numel()]);
+        Matrix::new(self.rows, self.cols, im)
     }
 
     /// Matrix product. The result shape comes from the operands, so it goes
@@ -993,7 +1145,28 @@ impl Matrix {
     /// There is deliberately no `if b == 0.0 { continue }` shortcut. Skipping
     /// the multiply meant `Inf * 0` and `NaN * 0` never happened, so
     /// `[Inf 0] * [0; 1]` gave `0` where MATLAB gives `NaN`.
+    ///
+    /// A complex product is four real ones, `(Ar*Br - Ai*Bi) + (Ar*Bi +
+    /// Ai*Br)i`, and two when one side is real, which then scales the
+    /// other's parts and never multiplies a zero imaginary part in.
     pub fn matmul(&self, o: &Matrix) -> R<Matrix> {
+        if self.is_complex() || o.is_complex() {
+            if self.cols != o.rows {
+                bail!(error::matmul_dims(self.rows, self.cols, o.rows, o.cols));
+            }
+            let (ar, br) = (self.real_part(), o.real_part());
+            let (re, im) = match (self.is_complex(), o.is_complex()) {
+                (true, false) => (ar.matmul(&br)?, self.imag_part().matmul(&br)?),
+                (false, true) => (ar.matmul(&br)?, ar.matmul(&o.imag_part())?),
+                _ => {
+                    let (ai, bi) = (self.imag_part(), o.imag_part());
+                    let re = ar.matmul(&br)?.zip(&ai.matmul(&bi)?, "*", |x, y| x - y)?;
+                    let im = ar.matmul(&bi)?.zip(&ai.matmul(&br)?, "*", |x, y| x + y)?;
+                    (re, im)
+                }
+            };
+            return Ok(re.with_class(Class::Double).with_im(Some(im.data)));
+        }
         if self.cols != o.rows {
             bail!(error::matmul_dims(self.rows, self.cols, o.rows, o.cols));
         }
@@ -1053,10 +1226,21 @@ impl Matrix {
     /// rank is below the smaller dimension.
     ///
     /// [`singular_tol`]: Matrix::singular_tol
+    ///
+    /// A complex system is solved through its real embedding (cycle 10):
+    /// `A = Ar + Ai*i` becomes the real `[Ar -Ai; Ai Ar]` and `B` the real
+    /// `[Br; Bi]`, whose solution is `[Xr; Xi]`. The embedding is singular
+    /// exactly when `A` is, its residual norm is `A`'s, and its rank is
+    /// twice `A`'s, so the shared LU and least-squares code answer for the
+    /// complex system, warnings included.
     pub fn solve(&self, b: &Matrix) -> R<(Matrix, Option<String>)> {
         use crate::builtins::factor;
         if b.rows != self.rows {
             bail!(error::solve_dims(self.rows, self.cols, b.rows, b.cols));
+        }
+        if self.is_complex() || b.is_complex() {
+            let (x, w) = self.embed()?.solve_embedded(&b.embed_rhs()?)?;
+            return Ok((x.unembed_rhs(self.cols), w));
         }
         if self.rows == self.cols {
             let f = factor::lu(self);
@@ -1079,8 +1263,82 @@ impl Matrix {
         if self.rows != self.cols {
             bail!(error::nonsquare_inverse());
         }
+        if self.is_complex() {
+            // The inverse of the embedding is the embedding of the inverse,
+            // `[Xr -Xi; Xi Xr]`: its first `n` columns are `[Xr; Xi]`.
+            let n = self.rows;
+            let (x, w) = self.embed()?.inv()?;
+            let first = Matrix::new(2 * n, n, x.data[..2 * n * n].to_vec());
+            return Ok((first.unembed_rhs(n), w));
+        }
         let f = crate::builtins::factor::lu(self);
         Ok((f.inverse()?, f.singular.then(error::singular_warning)))
+    }
+
+    /// The real `2m x 2n` embedding `[Ar -Ai; Ai Ar]` of an `m x n` matrix.
+    /// Four times the input's elements, so its shape is judged by
+    /// `check_shape` before anything is allocated (cycle 10's review).
+    fn embed(&self) -> R<Matrix> {
+        let (m, n) = (self.rows, self.cols);
+        crate::builtins::args::check_shape(2.0 * m as f64, 2.0 * n as f64)?;
+        let mut e = Matrix::filled(2 * m, 2 * n, 0.0);
+        for c in 0..n {
+            for r in 0..m {
+                let z = self.c(c * m + r);
+                e.set(r, c, z.re);
+                e.set(r + m, c + n, z.re);
+                e.set(r + m, c, z.im);
+                e.set(r, c + n, -z.im);
+            }
+        }
+        Ok(e)
+    }
+
+    /// `B` as the real `[Br; Bi]`, its shape judged first as `embed`'s is.
+    fn embed_rhs(&self) -> R<Matrix> {
+        let (m, k) = (self.rows, self.cols);
+        crate::builtins::args::check_shape(2.0 * m as f64, k as f64)?;
+        let mut e = Matrix::filled(2 * m, k, 0.0);
+        for c in 0..k {
+            for r in 0..m {
+                let z = self.c(c * m + r);
+                e.set(r, c, z.re);
+                e.set(r + m, c, z.im);
+            }
+        }
+        Ok(e)
+    }
+
+    /// The complex `n x k` matrix whose parts are stacked in this real
+    /// `2n x k` one, `[Xr; Xi]`.
+    fn unembed_rhs(&self, n: usize) -> Matrix {
+        let k = self.cols;
+        let mut re = Vec::with_capacity(n * k);
+        let mut im = Vec::with_capacity(n * k);
+        for c in 0..k {
+            for r in 0..n {
+                re.push(self.get(r, c));
+                im.push(self.get(r + n, c));
+            }
+        }
+        Matrix::new(n, k, re).with_im(Some(im))
+    }
+
+    /// [`solve`](Matrix::solve) of a real embedding, whose rank is twice
+    /// the complex matrix's: a rank-deficiency warning names half of it.
+    fn solve_embedded(&self, b: &Matrix) -> R<(Matrix, Option<String>)> {
+        use crate::builtins::factor;
+        if self.rows == self.cols {
+            let f = factor::lu(self);
+            let x = f.solve(b)?;
+            return Ok((x, f.singular.then(error::singular_warning)));
+        }
+        let (x, rank) = factor::lstsq(self, b)?;
+        let full = self.rows.min(self.cols);
+        Ok((
+            x,
+            (rank < full).then(|| error::rank_deficient_warning(rank.div_ceil(2))),
+        ))
     }
 
     /// The determinant from the shared LU: exactly `0` where `solve` warns.
@@ -1163,6 +1421,74 @@ impl Matrix {
         (self.fixed_texts(scale), 10, Some(header))
     }
 
+    /// [`cells`](Matrix::cells) for complex storage (cycle 10): each element
+    /// is its real part, the sign of its imaginary part, and that part's
+    /// magnitude with an `i`, `   3.0000 - 4.0000i`, and every column is
+    /// as wide as every other.
+    ///
+    /// Both parts are always written with four decimals, a zero as
+    /// `0.0000`, which is the form the spec records for `sqrt(-4)`. The
+    /// layout is chosen from the largest finite magnitude among all the
+    /// parts, real and imaginary, by the rule a real double's fixed-point
+    /// layout uses: from `0.01` up to below `1000` the parts are as they
+    /// are; outside it a scalar writes both parts in short `e` format and
+    /// an array shares the `   1.0e+03 *` scale factor over both. The real
+    /// field is three characters wider than the widest real part, not
+    /// counting its sign, so a minus sign takes one of the three spaces
+    /// that separate columns; the imaginary field is as wide as the widest
+    /// magnitude. An imaginary part of `-0` is written `+ 0.0000i`, as the
+    /// spec's `[1+2i 3]'` records.
+    fn complex_cells(&self) -> (Vec<String>, usize, Option<String>) {
+        let im = self.im.as_deref().unwrap_or(&[]);
+        let max_abs = self
+            .data
+            .iter()
+            .chain(im)
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let exp = if max_abs > 0.0 {
+            max_abs.log10().floor() as i32
+        } else {
+            0
+        };
+        let (scale, e_format, header) = if (-2..=2).contains(&exp) {
+            (1.0, false, None)
+        } else if self.is_scalar() {
+            (1.0, true, None)
+        } else {
+            let scale: f64 = format!("1e{exp}").parse().unwrap_or(1.0);
+            (scale, false, Some(format!("   1.0e{:+03} *\n\n", exp)))
+        };
+        let part = |v: f64| {
+            // A zero of either sign is written without one.
+            let v = if v == 0.0 { 0.0 } else { v };
+            if !v.is_finite() {
+                nonfinite(v)
+            } else if e_format {
+                crate::interp::fmt_e(v, 4)
+            } else {
+                format!("{:.4}", v / scale)
+            }
+        };
+        let re: Vec<String> = self.data.iter().map(|&v| part(v)).collect();
+        let mag: Vec<String> = im.iter().map(|&v| part(v.abs())).collect();
+        let wre = 3 + re
+            .iter()
+            .map(|t| t.trim_start_matches('-').len())
+            .max()
+            .unwrap_or(0);
+        let wim = mag.iter().map(String::len).max().unwrap_or(0);
+        let texts: Vec<String> = (0..self.numel())
+            .map(|k| {
+                let sign = if im[k] < 0.0 { '-' } else { '+' };
+                format!("{:>wre$} {} {:>wim$}i", re[k], sign, mag[k])
+            })
+            .collect();
+        (texts, wre + 3 + wim + 1, header)
+    }
+
     /// Every element divided by `scale` in four decimals, with an exact zero
     /// as a bare `0` and a non-finite value as its name.
     fn fixed_texts(&self, scale: f64) -> Vec<String> {
@@ -1191,7 +1517,11 @@ impl Matrix {
         if self.is_empty() {
             return "     []\n".to_string();
         }
-        let (texts, width, scale) = self.cells();
+        let (texts, width, scale) = if self.is_complex() {
+            self.complex_cells()
+        } else {
+            self.cells()
+        };
         // At least one column per block, however wide a single column is:
         // wrapping every element onto its own line is still better than a
         // block with no columns in it, which would never terminate.

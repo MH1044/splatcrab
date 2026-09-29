@@ -1,0 +1,3 @@
+% covers: 13 - under --protocol, workspace lists a complex variable with class double and size [1,1]; U0's vars shape is unchanged
+{"id":1,"op":"eval","code":"z = 1+2i;"}
+{"id":2,"op":"workspace"}

@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::{Instant, SystemTime};
 
 use crate::bail;
-use crate::builtins::math::powf_real;
+use crate::builtins::complex::C;
 use crate::builtins::{self, Registry};
 use crate::error;
 use crate::lexer::{scan, scan_known};
@@ -202,7 +202,7 @@ pub(crate) enum Callee<'a> {
 /// What a `switch` compares its cases against.
 enum Subject {
     Text(String),
-    Num(f64),
+    Num(C),
 }
 
 /// One subscript after evaluation, zero-based.
@@ -671,7 +671,7 @@ impl Interp {
     ) -> R<Flow> {
         let subject = match self.eval(subject)? {
             Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => Subject::Text(m.text()),
-            Value::Mat(m) if m.is_scalar() && m.class != Class::Char => Subject::Num(m.data[0]),
+            Value::Mat(m) if m.is_scalar() && m.class != Class::Char => Subject::Num(m.c(0)),
             _ => bail!(error::switch_expression()),
         };
         for arm in arms {
@@ -681,8 +681,9 @@ impl Interp {
                     (Subject::Text(s), Value::Mat(m)) => {
                         m.class == Class::Char && m.rows <= 1 && m.text() == *s
                     }
+                    // A number matches by `==`, both parts (cycle 10).
                     (Subject::Num(x), Value::Mat(m)) => {
-                        m.class != Class::Char && m.is_scalar() && m.data[0] == *x
+                        m.class != Class::Char && m.is_scalar() && m.c(0) == *x
                     }
                     _ => false,
                 };
@@ -704,14 +705,19 @@ impl Interp {
     /// and is passed on, to end the function or script around it.
     fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<Flow> {
         for c in 0..m.cols {
-            let column: Vec<f64> = (0..m.rows).map(|r| m.get(r, c)).collect();
+            let span = c * m.rows..(c + 1) * m.rows;
+            let column: Vec<f64> = m.data[span.clone()].to_vec();
+            // A complex column carries its imaginary parts, stored by the
+            // flag rule as an index would give it (cycle 10).
+            let im = m.im.as_ref().map(|v| v[span].to_vec());
             // Each column keeps the class, so `for k = 'abc'` iterates chars.
             let v = if m.rows == 1 {
                 Matrix::scalar(column[0])
             } else {
                 Matrix::col(column)
             }
-            .with_class(m.class);
+            .with_class(m.class)
+            .with_im(im);
             self.vars_mut().insert(name.to_string(), Value::Mat(v));
             match self.exec_block(body)? {
                 Flow::Break => break,
@@ -788,6 +794,8 @@ impl Interp {
     fn eval_node(&mut self, e: &Expr) -> R<Value> {
         match e {
             Expr::Num(v) => Ok(Value::Mat(Matrix::scalar(*v))),
+            // `0i` is real by the flag rule, as `1i * 0` is.
+            Expr::Imag(v) => Ok(Value::Mat(Matrix::from_c(1, 1, vec![C::new(0.0, *v)]))),
             // A string literal is a 1-row char of UTF-16 code units.
             Expr::Str(s) => Ok(Value::str(s)),
             Expr::Ident(n) => {
@@ -808,16 +816,38 @@ impl Interp {
             Expr::Matrix(rows) => self.build_matrix(rows),
             Expr::Cell(rows) => self.build_cell(rows),
             // Both signs are arithmetic, so both give a double: `+'a'` is 97.
-            Expr::Neg(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| -x))),
-            Expr::Pos(a) => Ok(Value::Mat(self.eval_mat(a)?.map(|x| x))),
+            Expr::Neg(a) => {
+                let m = self.eval_mat(a)?;
+                Ok(Value::Mat(if m.is_complex() {
+                    m.map_c(|z| -z)
+                } else {
+                    m.map(|x| -x)
+                }))
+            }
+            Expr::Pos(a) => {
+                let m = self.eval_mat(a)?;
+                Ok(Value::Mat(if m.is_complex() {
+                    m.map_c(|z| z)
+                } else {
+                    m.map(|x| x)
+                }))
+            }
             // `~` converts each element to a logical first, so `~NaN` is the
-            // same refusal as `if NaN` rather than the `0` it used to give.
-            Expr::Not(a) => Ok(Value::Mat(
-                self.eval_mat(a)?
-                    .try_map(|x| Ok(!Matrix::logical_element(x)? as u8 as f64))?
-                    .with_class(Class::Logical),
-            )),
-            Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
+            // same refusal as `if NaN` rather than the `0` it used to give,
+            // and a complex operand is refused as `if` refuses one.
+            Expr::Not(a) => {
+                let m = self.eval_mat(a)?;
+                if m.is_complex() {
+                    bail!(error::complex_to_logical());
+                }
+                Ok(Value::Mat(
+                    m.try_map(|x| Ok(!Matrix::logical_element(x)? as u8 as f64))?
+                        .with_class(Class::Logical),
+                ))
+            }
+            // `'` conjugates as it transposes and `.'` does not (cycle 10).
+            Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.ctranspose())),
+            Expr::DotTranspose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
             Expr::Range(a, step, b) => {
                 let a = self.eval_scalar(a, "range start")?;
                 let b = self.eval_scalar(b, "range end")?;
@@ -870,10 +900,12 @@ impl Interp {
         self.eval(e)?.into_mat()
     }
 
+    /// One real number: a range's start, step or end. A complex operand of
+    /// `:` is refused rather than read by its real part.
     fn eval_scalar(&mut self, e: &Expr, what: &str) -> R<f64> {
-        self.eval_mat(e)?
-            .scalar_value()
-            .ok_or_else(|| error::not_a_scalar(what))
+        let m = self.eval_mat(e)?;
+        m.require_real(":")?;
+        m.scalar_value().ok_or_else(|| error::not_a_scalar(what))
     }
 
     /// The arguments of a call. A cs-list among them, `f(c{:})` or
@@ -940,71 +972,79 @@ impl Interp {
         };
         let bool_op =
             |f: fn(f64, f64) -> bool| move |x: f64, y: f64| if f(x, y) { 1.0 } else { 0.0 };
-        let r = match op {
-            BinOp::Add => a.zip(&b, "+", |x, y| x + y)?,
-            BinOp::Sub => a.zip(&b, "-", |x, y| x - y)?,
-            BinOp::EMul => a.zip(&b, ".*", |x, y| x * y)?,
-            BinOp::EDiv => a.zip(&b, "./", |x, y| x / y)?,
-            // `a.\b` divides the other way round, element by element.
-            BinOp::ELDiv => a.zip(&b, ".\\", |x, y| y / x)?,
-            BinOp::EPow => a.try_zip(&b, ".^", powf_real)?,
-            BinOp::Mul => {
-                if a.is_scalar() || b.is_scalar() {
-                    a.zip(&b, "*", |x, y| x * y)?
-                } else {
-                    a.matmul(&b)?
+        let r = if a.is_complex() || b.is_complex() {
+            self.complex_binary(op, &a, &b)?
+        } else {
+            match op {
+                BinOp::Add => a.zip(&b, "+", |x, y| x + y)?,
+                BinOp::Sub => a.zip(&b, "-", |x, y| x - y)?,
+                BinOp::EMul => a.zip(&b, ".*", |x, y| x * y)?,
+                BinOp::EDiv => a.zip(&b, "./", |x, y| x / y)?,
+                // `a.\b` divides the other way round, element by element.
+                BinOp::ELDiv => a.zip(&b, ".\\", |x, y| y / x)?,
+                // A power can be complex from real operands, `(-8).^(1/3)`
+                // (cycle 10; a refusal before it), so it is always taken over
+                // complex scalars; `C::pow` is the real `powf` wherever that is
+                // real, so a real result is unchanged.
+                BinOp::EPow => a.zip_c(&b, ".^", C::pow)?,
+                BinOp::Mul => {
+                    if a.is_scalar() || b.is_scalar() {
+                        a.zip(&b, "*", |x, y| x * y)?
+                    } else {
+                        a.matmul(&b)?
+                    }
                 }
-            }
-            BinOp::Div => {
-                if b.is_scalar() {
-                    a.zip(&b, "/", |x, y| x / y)?
-                } else {
-                    // a / b  ==  (b' \ a')'
-                    let (x, w) = b.transpose().solve(&a.transpose())?;
-                    self.warn(w)?;
-                    x.transpose()
+                BinOp::Div => {
+                    if b.is_scalar() {
+                        a.zip(&b, "/", |x, y| x / y)?
+                    } else {
+                        // a / b  ==  (b' \ a')'
+                        let (x, w) = b.transpose().solve(&a.transpose())?;
+                        self.warn(w)?;
+                        x.transpose()
+                    }
                 }
-            }
-            BinOp::LDiv => {
-                if a.is_scalar() {
-                    a.zip(&b, "\\", |x, y| y / x)?
-                } else {
-                    let (x, w) = a.solve(&b)?;
-                    self.warn(w)?;
-                    x
+                BinOp::LDiv => {
+                    if a.is_scalar() {
+                        a.zip(&b, "\\", |x, y| y / x)?
+                    } else {
+                        let (x, w) = a.solve(&b)?;
+                        self.warn(w)?;
+                        x
+                    }
                 }
-            }
-            BinOp::Pow => {
-                if a.is_scalar() && b.is_scalar() {
-                    Matrix::scalar(powf_real(a.data[0], b.data[0])?)
-                } else if let Some(p) = b.scalar_value() {
-                    let (x, w) = matrix_power(&a, p)?;
-                    self.warn(w)?;
-                    x
-                } else {
-                    bail!(error::matrix_exponent());
+                BinOp::Pow => {
+                    if a.is_scalar() && b.is_scalar() {
+                        Matrix::from_c(1, 1, vec![a.c(0).pow(b.c(0))])
+                    } else if let Some(p) = b.scalar_value() {
+                        let (x, w) = matrix_power(&a, p)?;
+                        self.warn(w)?;
+                        x
+                    } else {
+                        bail!(error::matrix_exponent());
+                    }
                 }
+                BinOp::Eq => a.zip(&b, "==", bool_op(|x, y| x == y))?,
+                BinOp::Ne => a.zip(&b, "~=", bool_op(|x, y| x != y))?,
+                BinOp::Lt => a.zip(&b, "<", bool_op(|x, y| x < y))?,
+                BinOp::Le => a.zip(&b, "<=", bool_op(|x, y| x <= y))?,
+                BinOp::Gt => a.zip(&b, ">", bool_op(|x, y| x > y))?,
+                BinOp::Ge => a.zip(&b, ">=", bool_op(|x, y| x >= y))?,
+                // Element-wise `&` and `|` convert each pair to logicals first,
+                // so `NaN & 1` is a refusal rather than `1`.
+                // Both elements are converted before either is looked at, since
+                // the conversion is what can fail: `1 | NaN` is a refusal even
+                // though a short-circuit would never have read the `NaN`.
+                BinOp::And => a.try_zip(&b, "&", |x, y| {
+                    let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
+                    Ok((x && y) as u8 as f64)
+                })?,
+                BinOp::Or => a.try_zip(&b, "|", |x, y| {
+                    let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
+                    Ok((x || y) as u8 as f64)
+                })?,
+                BinOp::AndAnd | BinOp::OrOr => unreachable!(),
             }
-            BinOp::Eq => a.zip(&b, "==", bool_op(|x, y| x == y))?,
-            BinOp::Ne => a.zip(&b, "~=", bool_op(|x, y| x != y))?,
-            BinOp::Lt => a.zip(&b, "<", bool_op(|x, y| x < y))?,
-            BinOp::Le => a.zip(&b, "<=", bool_op(|x, y| x <= y))?,
-            BinOp::Gt => a.zip(&b, ">", bool_op(|x, y| x > y))?,
-            BinOp::Ge => a.zip(&b, ">=", bool_op(|x, y| x >= y))?,
-            // Element-wise `&` and `|` convert each pair to logicals first,
-            // so `NaN & 1` is a refusal rather than `1`.
-            // Both elements are converted before either is looked at, since
-            // the conversion is what can fail: `1 | NaN` is a refusal even
-            // though a short-circuit would never have read the `NaN`.
-            BinOp::And => a.try_zip(&b, "&", |x, y| {
-                let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
-                Ok((x && y) as u8 as f64)
-            })?,
-            BinOp::Or => a.try_zip(&b, "|", |x, y| {
-                let (x, y) = (Matrix::logical_element(x)?, Matrix::logical_element(y)?);
-                Ok((x || y) as u8 as f64)
-            })?,
-            BinOp::AndAnd | BinOp::OrOr => unreachable!(),
         };
         // Arithmetic is always a double, whatever its operands were:
         // `true + true` is `2` and `'a' + 1` is `98`. Comparisons and the
@@ -1021,6 +1061,63 @@ impl Interp {
             _ => Class::Double,
         };
         Ok(Value::Mat(r.with_class(class)))
+    }
+
+    /// A binary operator with a complex operand (cycle 10). The arithmetic
+    /// is [`C`]'s; the matrix product, the solves and the matrix power are
+    /// `Matrix`'s own, which take complex operands. Following the MathWorks
+    /// relational-operators page, `==` and `~=` compare both parts and `<`,
+    /// `<=`, `>` and `>=` the real parts only. `&` and `|` refuse a complex
+    /// operand, as `if` does. Every result is stored by the flag rule.
+    fn complex_binary(&mut self, op: BinOp, a: &Matrix, b: &Matrix) -> R<Matrix> {
+        let test = |t: bool| C::real(t as u8 as f64);
+        let real = |m: &Matrix| m.real_part();
+        Ok(match op {
+            BinOp::Add => a.zip_c(b, "+", |x, y| x + y)?,
+            BinOp::Sub => a.zip_c(b, "-", |x, y| x - y)?,
+            BinOp::EMul => a.zip_c(b, ".*", |x, y| x * y)?,
+            BinOp::EDiv => a.zip_c(b, "./", |x, y| x / y)?,
+            BinOp::ELDiv => a.zip_c(b, ".\\", |x, y| y / x)?,
+            BinOp::EPow => a.zip_c(b, ".^", C::pow)?,
+            BinOp::Mul if a.is_scalar() || b.is_scalar() => a.zip_c(b, "*", |x, y| x * y)?,
+            BinOp::Mul => a.matmul(b)?,
+            BinOp::Div if b.is_scalar() => a.zip_c(b, "/", |x, y| x / y)?,
+            BinOp::Div => {
+                // a / b == (b.' \ a.').', with plain transposes.
+                let (x, w) = b.transpose().solve(&a.transpose())?;
+                self.warn(w)?;
+                x.transpose()
+            }
+            BinOp::LDiv if a.is_scalar() => a.zip_c(b, "\\", |x, y| y / x)?,
+            BinOp::LDiv => {
+                let (x, w) = a.solve(b)?;
+                self.warn(w)?;
+                x
+            }
+            BinOp::Pow if a.is_scalar() && b.is_scalar() => {
+                Matrix::from_c(1, 1, vec![a.c(0).pow(b.c(0))])
+            }
+            BinOp::Pow if b.is_scalar() && b.is_complex() => {
+                bail!(error::fractional_matrix_power())
+            }
+            BinOp::Pow => match b.scalar_value() {
+                Some(p) => {
+                    let (x, w) = matrix_power(a, p)?;
+                    self.warn(w)?;
+                    x
+                }
+                None => bail!(error::matrix_exponent()),
+            },
+            BinOp::Eq => a.zip_c(b, "==", |x, y| test(x == y))?,
+            BinOp::Ne => a.zip_c(b, "~=", |x, y| test(x != y))?,
+            BinOp::Lt => real(a).zip(&real(b), "<", |x, y| (x < y) as u8 as f64)?,
+            BinOp::Le => real(a).zip(&real(b), "<=", |x, y| (x <= y) as u8 as f64)?,
+            BinOp::Gt => real(a).zip(&real(b), ">", |x, y| (x > y) as u8 as f64)?,
+            BinOp::Ge => real(a).zip(&real(b), ">=", |x, y| (x >= y) as u8 as f64)?,
+            BinOp::And | BinOp::Or | BinOp::AndAnd | BinOp::OrOr => {
+                bail!(error::complex_to_logical())
+            }
+        })
     }
 
     fn build_matrix(&mut self, rows: &[Vec<Expr>]) -> R<Value> {
@@ -1533,9 +1630,16 @@ impl Interp {
     /// The function pointer is copied out of the registry before the call:
     /// `self.builtins.get` borrows `self` immutably while the builtin wants
     /// `&mut Interp`, and `BuiltinFn` being a plain `fn` makes the copy free.
+    ///
+    /// A complex argument reaches only the builtins that take one; every
+    /// other builtin refuses it here, before it runs (cycle 10, see
+    /// `builtins::TAKES_COMPLEX`).
     fn call_builtin(&mut self, name: &str, args: Vec<Value>, nargout: usize) -> R<Vec<Value>> {
         match self.builtins.get(name).map(|e| e.f) {
-            Some(f) => f(self, &args, nargout),
+            Some(f) => {
+                builtins::complex_gate(name, &args)?;
+                f(self, &args, nargout)
+            }
             None => Err(error::undefined(name)),
         }
     }
@@ -2455,6 +2559,17 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
 /// is also what a variable that does not exist yet starts as, takes the
 /// class of what is assigned into it, which is how `s = []; s(1) = 'a'`
 /// builds a char.
+///
+/// A complex right-hand side makes a double target complex, the analogue
+/// of the class rule for the imaginary parts (cycle 10); a logical or a
+/// char target refuses it, since neither converts a complex value. An
+/// indexed assignment keeps complex storage complex, even when every
+/// imaginary part it leaves is zero: it changes part of an array where it
+/// lies, and the next arithmetic result drops an all-zero imaginary part,
+/// as MathWorks documents for arithmetic. Rescanning the whole array after
+/// every write to find out made `z(end+1) = k*1i` in a loop quadratic
+/// (cycle 10's review); the imaginary parts are now scattered in place
+/// beside the real ones, so the loop is linear, as a real one is.
 fn assign_matrix(m: &mut Matrix, sel: &[Sel], rhs: Matrix) -> R<()> {
     let class = if m.class == Class::Double && m.rows == 0 && m.cols == 0 {
         rhs.class
@@ -2464,7 +2579,22 @@ fn assign_matrix(m: &mut Matrix, sel: &[Sel], rhs: Matrix) -> R<()> {
     let rhs = rhs.to_class(class)?;
     let plan = resolve_write(m.rows, m.cols, sel, (rhs.rows, rhs.cols))?;
     m.class = class;
-    scatter(m, &plan, &rhs);
+    let complex = m.is_complex() || rhs.is_complex();
+    if complex {
+        // The imaginary parts are laid out and written exactly as the real
+        // ones, through a matrix that holds the target's own storage for the
+        // length of the write: nothing is copied, and growth is the same
+        // amortised resize. A real target gains its zeros once, when it
+        // first becomes complex.
+        let n = m.data.len();
+        let im_data = m.im.take().unwrap_or_else(|| vec![0.0; n]);
+        let mut im = Matrix::new(m.rows, m.cols, im_data);
+        scatter(&mut im, &plan, &rhs.imag_part());
+        scatter(m, &plan, &rhs.real_part());
+        m.im = Some(im.data);
+    } else {
+        scatter(m, &plan, &rhs);
+    }
     Ok(())
 }
 
@@ -2480,6 +2610,11 @@ fn delete_in(v: &mut Value, sel: &[Sel]) -> R<()> {
     match v {
         Value::Mat(m) => {
             m.data = keep.pos.iter().map(|&p| m.data[p]).collect();
+            if let Some(im) = m.im.take() {
+                m.im = Some(keep.pos.iter().map(|&p| im[p]).collect());
+                let taken = std::mem::replace(m, Matrix::empty());
+                *m = taken.normalized();
+            }
             (m.rows, m.cols) = (keep.rows, keep.cols);
         }
         Value::Cell(rc) => {
@@ -2617,6 +2752,10 @@ fn mask_positions(v: &Matrix) -> Sel {
 /// positive integer. It becomes zero-based here; a position past `usize`
 /// saturates, and `max` keeps it exactly for growth to name.
 fn index_positions(v: &Matrix, pos: usize) -> R<Sel> {
+    // A complex subscript is not a position, whatever its real part.
+    if v.is_complex() {
+        bail!(error::index_not_positive_integer(pos));
+    }
     let mut idx = Vec::with_capacity(v.numel());
     let mut max = 0.0f64;
     for &x in &v.data {
@@ -2731,9 +2870,15 @@ fn resolve_read(rows: usize, cols: usize, sel: &[Sel]) -> R<Gather> {
 }
 
 /// Carries out a read, keeping the source's class.
+///
+/// A complex source gives its imaginary parts too, stored by the flag
+/// rule: `z(2)` of `[1+2i 3]` is the real `3` (cycle 10).
 fn gather(m: &Matrix, g: &Gather) -> Matrix {
     let data = g.pos.iter().map(|&p| m.data[p]).collect();
-    Matrix::new(g.rows, g.cols, data).with_class(m.class)
+    let im = m.im.as_ref().map(|v| g.pos.iter().map(|&p| v[p]).collect());
+    Matrix::new(g.rows, g.cols, data)
+        .with_class(m.class)
+        .with_im(im)
 }
 
 /// Where `m(sel) = rhs` stores into an array of `rows x cols`, and the shape
@@ -3086,9 +3231,18 @@ fn hcat(mut vals: Vec<Value>) -> R<Value> {
         data.extend_from_slice(&m.data);
         cols += m.cols;
     }
+    // A complex operand makes the whole result complex, every other
+    // operand's imaginary parts zero, and the flag rule then applies.
+    let im = mats.iter().any(Matrix::is_complex).then(|| {
+        mats.iter()
+            .flat_map(|m| m.imag_part().data)
+            .collect::<Vec<f64>>()
+    });
     // A number joining a char becomes the character with that code: `['a'
-    // 66]` is `'aB'`.
-    Ok(Value::Mat(Matrix::new(rows, cols, data).to_class(class)?))
+    // 66]` is `'aB'`. A complex one refuses to (`to_class`).
+    Ok(Value::Mat(
+        Matrix::new(rows, cols, data).with_im(im).to_class(class)?,
+    ))
 }
 
 fn vcat(mut vals: Vec<Value>) -> R<Value> {
@@ -3110,16 +3264,22 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     }
     let rows: usize = mats.iter().map(|m| m.rows).sum();
     let mut out = Matrix::filled(rows, cols, 0.0);
+    let complex = mats.iter().any(Matrix::is_complex);
+    let mut im = Matrix::filled(if complex { rows } else { 0 }, cols, 0.0);
     let mut r0 = 0;
     for m in &mats {
         for c in 0..cols {
             for r in 0..m.rows {
                 out.set(r0 + r, c, m.get(r, c));
+                if complex {
+                    im.set(r0 + r, c, m.c(c * m.rows + r).im);
+                }
             }
         }
         r0 += m.rows;
     }
-    Ok(Value::Mat(out.to_class(class)?))
+    let im = complex.then_some(im.data);
+    Ok(Value::Mat(out.with_im(im).to_class(class)?))
 }
 
 // ---- number formatting -----------------------------------------------
@@ -3676,39 +3836,135 @@ mod tests {
 
     /// Acceptance test 14, through both spellings of the power operator.
     #[test]
-    fn a_would_be_complex_result_is_an_error_not_a_nan() {
+    fn a_would_be_complex_result_is_the_complex_value() {
+        // Cycle 01d's refusals, replaced by the values in cycle 10: each is
+        // checked against what it must equal.
         for src in [
-            "sqrt(-4)",
-            "log(-1)",
-            "log2(-8)",
-            "log10(-10)",
-            "asin(2)",
-            "acos(-2)",
-            "(-8)^(1/3)",
-            "(-8).^(1/3)",
-            "power(-2, 0.5)",
-            "x = [1 -4]; sqrt(x)",
-            "[-8 1].^(1/3)",
+            "disp(sqrt(-4) == 2i)",
+            "disp(abs(log(-1) - pi*1i) < 1e-15)",
+            "disp(abs(log2(-8) - (3 + pi/log(2)*1i)) < 1e-14)",
+            "disp(abs(10^log10(-10) + 10) < 1e-12)",
+            "disp(abs(sin(asin(2)) - 2) < 1e-12)",
+            "disp(abs(cos(acos(-2)) + 2) < 1e-12)",
+            "disp(abs((-8)^(1/3) - (1 + sqrt(3)*1i)) < 1e-14)",
+            "disp(abs((-8).^(1/3) - (1 + sqrt(3)*1i)) < 1e-14)",
+            "disp(abs(power(-2, 0.5) - sqrt(2)*1i) < 1e-15)",
+            "x = [1 -4]; disp(isequal(sqrt(x), [1 2i]))",
+            "disp(abs(imag([-8 1].^(1/3))) > [1 -1])",
         ] {
-            let e = err_msg(src);
-            assert!(
-                e.starts_with("Complex results are not supported."),
-                "{src}: {e}"
-            );
+            let out = ok_out(src);
+            assert!(out.split_whitespace().all(|t| t == "1"), "{src}: {out}");
         }
-        // The real neighbours of each of those still compute.
+        // The real neighbours of each of those are unchanged, and real.
         assert_eq!(ok_out("disp(sqrt(4))"), "     2\n");
         assert_eq!(ok_out("disp(log(1))"), "     0\n");
         assert_eq!(ok_out("disp(asin(0))"), "     0\n");
         assert_eq!(ok_out("disp((-8)^2)"), "    64\n");
         assert_eq!(ok_out("disp((-8)^(1/1))"), "    -8\n");
         assert_eq!(ok_out("fprintf('%g\\n', (-2)^Inf)"), "Inf\n");
+        assert_eq!(ok_out("disp(isreal(sqrt([4 9])))"), "   1\n");
         // A NaN argument is in the real domain of all of them.
         assert_eq!(ok_out("fprintf('%g\\n', sqrt(NaN))"), "NaN\n");
         assert_eq!(ok_out("fprintf('%g\\n', asin(NaN))"), "NaN\n");
         assert_eq!(ok_out("fprintf('%g\\n', power(NaN, 0.5))"), "NaN\n");
         // -0 is not negative, so it keeps IEEE's real answers.
         assert_eq!(ok_out("fprintf('%g\\n', sqrt(-0))"), "0\n");
+    }
+
+    /// Cycle 10: the flag rule, the operators and the kernels that refuse.
+    #[test]
+    fn complex_values_follow_the_flag_rule_and_the_comparison_rules() {
+        for (src, want) in [
+            ("disp(isreal(1i * 0))", "   1\n"),
+            ("disp(isreal(complex(1, 0)))", "   0\n"),
+            ("disp(isreal((3+4i) + (5-4i)))", "   1\n"),
+            ("disp(isreal(0i))", "   1\n"),
+            ("disp(isreal(1i^2))", "   1\n"),
+            ("z = [1+2i 3]; disp(isreal(z(2)))", "   1\n"),
+            // An indexed assignment keeps complex storage (set at cycle 10's
+            // review, which found the rescan behind the old rule quadratic);
+            // the next arithmetic result drops the all-zero imaginary part.
+            ("z = [1+2i 3]; z(1) = 5; disp(isreal(z))", "   0\n"),
+            ("z = [1+2i 3]; z(1) = 5; disp(isreal(z + 0))", "   1\n"),
+            ("x = [1 2]; x(2) = 3i; disp(imag(x))", "     0     3\n"),
+            ("z = [1i 2 3i]; z([1 3]) = []; disp(isreal(z))", "   1\n"),
+            ("disp(isequal(complex(1, 0), 1))", "   1\n"),
+            ("disp((1+5i) < (2+0i))", "   1\n"),
+            ("disp((1+2i) ~= (1+3i))", "   1\n"),
+            (
+                "disp([1+2i; 3].')",
+                "   1.0000 + 2.0000i   3.0000 + 0.0000i\n",
+            ),
+            ("disp(-(2i))", "   0.0000 - 2.0000i\n"),
+            (
+                "z = 1+2i; for k = [z 3], disp(imag(k)), end",
+                "     2\n     0\n",
+            ),
+            (
+                "switch 1+2i, case 1+2i, disp(1), otherwise, disp(0), end",
+                "     1\n",
+            ),
+            ("f = @(x) x.'; disp(func2str(f))", "@(x)x.'\n"),
+            ("f = @() 2i'; disp(func2str(f))", "@()2i'\n"),
+            (
+                "disp(round(real(fft([1 2 3])) * 2))",
+                "    12    -3    -3\n",
+            ),
+            ("disp(isreal(fft([1 1 1 1])))", "   1\n"),
+            ("disp(abs(sum([1+1i 2-1i])))", "     3\n"),
+            ("disp(isreal([1i 2] * [1i; 1]))", "   1\n"),
+            (
+                "x = [2 1i; 1 3] \\ [1; 2i]; disp(norm(abs([2 1i; 1 3] * x - [1; 2i])) < 1e-14)",
+                "   1\n",
+            ),
+            ("x = [1 2i] / [2 1i; 1 3]; disp(size(x))", "     1     2\n"),
+            (
+                "A = [1 1i; 0 2]; disp(norm(abs(A^-1 * A - eye(2))) < 1e-14)",
+                "   1\n",
+            ),
+            (
+                "c = arrayfun(@(z) z * 1i, [1 2]); disp(imag(c))",
+                "     1     2\n",
+            ),
+            (
+                "c = cellfun(@(z) z, {1i, 2}); disp(imag(c))",
+                "     1     0\n",
+            ),
+            ("disp(imag(cell2mat({1i, 2})))", "     1     0\n"),
+        ] {
+            assert_eq!(ok_out(src), want, "{src}");
+        }
+        for (src, want) in [
+            (
+                "sort([1+2i 3])",
+                "Complex values are not supported by 'sort'.",
+            ),
+            ("max(1i)", "Complex values are not supported by 'max'."),
+            (
+                "fzero(@(x) x + 1i, 0)",
+                "Complex values are not supported by 'fzero'.",
+            ),
+            (
+                "if 1i, end",
+                "Complex values cannot be converted to logicals.",
+            ),
+            ("1i & 1", "Complex values cannot be converted to logicals."),
+            ("~1i", "Complex values cannot be converted to logicals."),
+            (
+                "x = true(1, 2); x(1) = 1i;",
+                "Complex values cannot be converted to logicals.",
+            ),
+            ("['a' 1i]", "Complex values are not supported by 'char'."),
+            ("1:2i", "Complex values are not supported by ':'."),
+            ("x = [1 2]; x(1i)", "Index in position 1 is invalid."),
+            (
+                "complex(1i, 2)",
+                "Complex values are not supported by 'complex'.",
+            ),
+        ] {
+            let e = err_msg(src);
+            assert!(e.starts_with(want), "{src}: {e}");
+        }
     }
 
     #[test]

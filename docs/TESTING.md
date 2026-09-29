@@ -213,7 +213,11 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   entry is callable; `args.rs` the message text of each helper and the size
   overflow guard; `core.rs` the constructors, `num2str` and `format_printf`;
   `math.rs` the reduction and scan dimension rules; `linalg.rs` sorting and
-  rearrangement.
+  rearrangement. Since cycle 10 `complex.rs` checks the complex arithmetic,
+  the powers and the branch cuts with tolerances, and `fft` against the
+  direct DFT for every length from 1 to 40 and at a prime length of
+  100,003; `factor.rs` checks complex eigenvalues by the residual
+  `A*v - lambda*v`; `mod.rs` checks the complex gate.
 - `json.rs`: a round trip of every value kind, each escape the writer makes
   and the parser reads, surrogate pairs, rejection of trailing garbage and of
   malformed numbers and strings, and the depth limit at and past its bound.

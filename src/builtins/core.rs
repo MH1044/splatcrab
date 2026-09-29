@@ -579,8 +579,10 @@ fn isequal(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 /// and identifier are; an `MException` equals no array.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
+        // Complex values compare both parts, as `==` does (cycle 10), so
+        // `complex(1, 0)` equals `1`: the storage is not the value.
         (Value::Mat(a), Value::Mat(b)) => {
-            a.rows == b.rows && a.cols == b.cols && a.data.iter().zip(&b.data).all(|(x, y)| x == y)
+            a.rows == b.rows && a.cols == b.cols && (0..a.numel()).all(|k| a.c(k) == b.c(k))
         }
         (Value::Exception(a), Value::Exception(b)) => {
             a.msg == b.msg && a.identifier() == b.identifier()

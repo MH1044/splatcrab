@@ -248,11 +248,156 @@ v =
 
 ```
 
-Every number is an IEEE 754 double. There are no integer classes, no `single`,
-and no complex numbers yet. Note `w`: a scalar that is not a whole number
+Every number is an IEEE 754 double. There are no integer classes and no
+`single`; complex numbers are the next section. Note `w`: a scalar that is not a whole number
 switches to short exponential form below 0.01 and from 1000 up, as MATLAB's
 does. [`disp` and automatic display](#disp-and-automatic-display) gives the
 rules.
+
+### Complex numbers
+
+Cycle 10. An `i` or a `j` straight after a number makes it imaginary: `1i`,
+`2.5j`, `1e3i`. A complex value is still of class `double`, and displays both
+parts with four decimals:
+
+```matlab
+z = 3 + 4i
+w = [1+2i 3-4i; 5 6i]
+```
+
+```
+z =
+
+   3.0000 + 4.0000i
+
+w =
+
+   1.0000 + 2.0000i   3.0000 - 4.0000i
+   5.0000 + 0.0000i   0.0000 + 6.0000i
+
+```
+
+`real imag conj angle abs isreal complex` take them apart. `'` is the
+conjugate transpose and `.'` the plain one:
+
+```matlab
+z = 3 + 4i;
+disp(abs(z)); disp(real(z)); disp(imag(z)); disp(conj(z))
+disp([1+2i 3]')
+disp([1+2i 3].')
+```
+
+```
+     5
+     3
+     4
+   3.0000 - 4.0000i
+   1.0000 - 2.0000i
+   3.0000 + 0.0000i
+   1.0000 + 2.0000i
+   3.0000 + 0.0000i
+```
+
+Every arithmetic operator takes complex operands: the element-wise ones, the
+matrix product, and `\`, `/` and an integer matrix power, which solve through
+the same LU and least-squares code as a real system. `angle` is the phase, in
+`[-pi, pi]`:
+
+```matlab
+a = (1+2i) * (3-1i)
+b = (5+5i) / (1+2i);
+c = [1+1i 2] * [3; 1i];
+fprintf('%.4f %.4f\n', real(b), imag(b), real(c), imag(c));
+disp(angle(1i) == pi/2)
+```
+
+```
+a =
+
+   5.0000 + 5.0000i
+
+3.0000 -1.0000
+3.0000 5.0000
+   1
+```
+
+An array is either real or complex as a whole. The rule is MathWorks': an
+operation whose imaginary parts all come out zero gives a real result, and
+`complex(a, b)` is the one way to keep a zero imaginary part. Indexing and
+concatenation follow the same rule, so `z(2)` of `[1+2i 3]` is the real `3`.
+An indexed assignment is the exception: `z(1) = 5` changes part of `z` where
+it lies and keeps it complex, even if no imaginary part is left, until the
+next arithmetic result drops it. `==` and `~=` compare both parts, `<`, `<=`, `>` and `>=` the
+real parts only, and the numeric conversions of `fprintf` and `sprintf` print
+only the real part:
+
+```matlab
+disp(isreal(1i * 0)); disp(isreal(complex(1, 0)))
+z = complex(1, 0)
+disp((1+2i) == (1+2i)); disp((1+5i) < (2+0i))
+fprintf('%d\n', 3+4i);
+s = sprintf('%.2f', 2.5-1i)
+```
+
+```
+   1
+   0
+z =
+
+   1.0000 + 0.0000i
+
+   1
+   1
+3
+s =
+
+    '2.50'
+
+```
+
+`fft` and `ifft` transform a row along the row and anything else down each
+column, for any length in O(n log n): a power of two by radix-2, every other
+length by Bluestein's algorithm. The round trip is exact only to rounding, so
+print it through `%.4f`:
+
+```matlab
+y = fft([1 2 3 4]);
+fprintf('%.4f ', abs(y)); fprintf('\n');
+x = ifft(fft([1 2 3]));
+fprintf('%.4f ', real(x)); fprintf('\n');
+```
+
+```
+10.0000 2.8284 2.0000 2.8284
+1.0000 2.0000 3.0000
+```
+
+`i` and `j` are the imaginary unit only while no variable of the name exists,
+by the usual resolution order, so a loop counter called `i` shadows it and
+`clear i` brings it back:
+
+```matlab
+i = 5; disp(i); clear i; disp(i)
+```
+
+```
+     5
+   0.0000 + 1.0000i
+```
+
+`sqrt`, `log`, `log2`, `log10`, `asin`, `acos` and a non-integer power of a
+negative number give the complex value on the principal branch, and so do
+`eig` and `roots` for a complex pair; `fft` and `ifft` transform any length in
+O(n log n). A builtin that does not take complex values, such as `sort`,
+`max` or `floor`, refuses one rather than drop its imaginary part:
+
+```matlab
+sort([1+2i 3])
+```
+
+```
+Error: Line 1: Complex values are not supported by 'sort'.
+```
 
 ### Strings
 
@@ -974,8 +1119,8 @@ I =
 `I` shows the difference between an exact zero, which prints as a bare `0`,
 and the roundoff residue below it, which is not zero and so keeps `0.0000`.
 
-Transpose is `'`, and `.'` is the same thing since there are no complex
-numbers. The lexer decides between transpose and a string delimiter by what
+Transpose is `'`, the conjugate transpose, and `.'` the plain one; they
+differ only for [complex numbers](#complex-numbers). The lexer decides between transpose and a string delimiter by what
 precedes the quote: after a value it is a transpose, otherwise it opens a
 string.
 
@@ -2904,9 +3049,12 @@ n =
 
 ```
 
-`round` breaks ties away from zero, as MATLAB does. Anything whose real answer
-would be complex — `sqrt(-4)`, `log(-1)`, `asin(2)` — is a clean error until
-complex numbers arrive in cycle 10; see [Numerics](#numerics).
+`round` breaks ties away from zero, as MATLAB does. `sqrt`, `exp`, `log`,
+`log2`, `log10`, `sin`, `cos`, `asin`, `acos` and `abs` take complex values,
+and a real argument whose answer is complex — `sqrt(-4)`, `log(-1)`,
+`asin(2)` — gives the complex value on the principal branch; see
+[Complex numbers](#complex-numbers). The rest of this list refuses a complex
+argument.
 
 ### Predicates
 
@@ -3219,16 +3367,25 @@ Warning: Matrix is singular to working precision.
 Warning: Matrix is singular to working precision.
 ```
 
-An eigenvalue problem whose answer is complex is refused until complex numbers
-arrive in cycle 10, never answered with a wrong real value; so is a `NaN` or
-`Inf` handed to `eig` or `svd`:
+A real matrix whose eigenvalues include a complex pair gives the pair as
+complex values, the one with the positive imaginary part first, and
+`[V, D] = eig(A)` gives complex eigenvectors for them. `eig` of a complex
+matrix, and a `NaN` or `Inf` handed to `eig` or `svd`, are refused:
 
 ```matlab
-e = eig([0 -1; 1 0])
+A = [0 -1; 1 0];
+e = eig(A)
+[V, D] = eig(A);
+disp(norm(abs(A * V - V * D)) < 1e-12)
 ```
 
 ```
-Error: Line 1: Complex results are not supported. The eigenvalues of this matrix are complex.
+e =
+
+   0.0000 + 1.0000i
+   0.0000 - 1.0000i
+
+   1
 ```
 
 Integer matrix powers work, negative ones by inverting:
@@ -3354,17 +3511,20 @@ rem =
 
 ```
 
-A polynomial with complex roots is refused until cycle 10 brings complex
-numbers, with the sentence every complex refusal opens with. So is a real
-root of multiplicity three or more, which the eigensolver finds as a
-complex pair a rounding error apart, as MATLAB's does:
+Complex roots come as complex values, a conjugate pair with the positive
+imaginary part first. A real root of multiplicity three or more comes back complex too, a pair a
+rounding error apart, as the eigensolver finds it and as MATLAB's does:
 
 ```matlab
 roots([1 0 1])
 ```
 
 ```
-Error: Line 1: Complex results are not supported. The polynomial has complex roots.
+ans =
+
+   0.0000 + 1.0000i
+   0.0000 - 1.0000i
+
 ```
 
 ### Samples
@@ -4920,17 +5080,19 @@ a =
    NaN
 ```
 
-A result that would be complex is refused rather than returned as a `NaN` that
-looks computed. MATLAB gives `0 + 2.0000i` for the first of these, and
-`0 + 3.1416i` and `1.0000 + 1.7321i` for `log(-1)` and `(-8)^(1/3)`. Until
-complex numbers arrive in cycle 10, the refusal is the honest answer:
+A result that would be complex was refused from cycle 01d, rather than
+returned as a `NaN` that looks computed; since cycle 10 it is the complex
+value:
 
 ```matlab
 sqrt(-4)
 ```
 
 ```
-Error: Line 1: Complex results are not supported. 'sqrt' of a negative number is complex.
+ans =
+
+   0.0000 + 2.0000i
+
 ```
 
 `trace([])` used to print `-0`, and `%d` used to saturate at 2^63. Both are
@@ -5099,7 +5261,6 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| Complex numbers, `1i`, `real`, `imag`, `abs` of a complex | 10 |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
 | `fprintf(fid, ...)`, `nbytes = fprintf(...)`, string functions | 11 |
 | Regular expressions, file I/O, `save` / `load` | 11 |

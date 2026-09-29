@@ -49,6 +49,13 @@ in the parser, because they need character-level context:
 - A quote is a transpose after a value and a string delimiter otherwise. The
   `ends_value` helper decides which.
 
+Since cycle 10 a number followed straight away by `i` or `j`, and not by
+more of a name, is an imaginary literal, `Token::Imag`: `1i`, `2.5j`, `1e3i`,
+while `2ix` is still `2` and the name `ix`. The bare names `i` and `j` stay
+identifiers, which the evaluator resolves by invariant 4, so a variable of
+the name shadows the builtin unit. `.'` became a token of its own,
+`DotTranspose`, the plain transpose, and `'` after a value the conjugate one.
+
 A `...` continuation is a gap between tokens exactly as whitespace is, and
 goes through the same separator check, which is what makes `[1 ...` newline
 `-2]` two elements. The number lexer's "do not swallow the dot" exclusion list
@@ -99,7 +106,8 @@ a transpose, so `@() 'hi'` is a function returning text.
 
 **`parser.rs`** is recursive descent with MATLAB's precedence, loosest first:
 `||`, `&&`, `|`, `&`, comparison, `:`, `+ -`, `* / \ .* ./ .\`, unary `- ~`,
-`^ .^`, transpose. `end` and a bare `:` are only accepted inside an index
+`^ .^`, transpose (`Expr::Transpose` for `'`, `Expr::DotTranspose` for `.'`,
+since cycle 10, beside the literal `Expr::Imag`). `end` and a bare `:` are only accepted inside an index
 argument list, tracked by the `in_index` counter. `Expr`, `Stmt`, `BinOp` and
 `Token` derive `PartialEq` so tests can compare trees directly. A block is a
 `Vec<Located>`, where `Located` is a `Stmt` plus the line it starts on; the
@@ -178,7 +186,9 @@ every error the interpreter raises itself.
 `A(:)`, `reshape`, and linear indexing produce MATLAB's answers, and every new
 operation must respect it. Every `Matrix` carries a `class` tag, `Double`,
 `Logical` or `Char`, over the same `f64` storage; a char element is one UTF-16
-code unit. `value.rs` also owns the display: `format` for the numeric body,
+code unit. Since cycle 10 a double can be complex: `im: Option<Vec<f64>>`
+holds the imaginary parts, column-major like `data`, and is `None` for real
+storage; see "Add a value type". `value.rs` also owns the display: `format` for the numeric body,
 `disp_text` for `disp`, and `display_body` for the class headers of a named
 display. Since cycle 04 `Value` has a second variant, `Exception`, the
 `MException` a `catch` binds; `Value::mat` and `Value::into_mat` return an
@@ -247,7 +257,9 @@ Since cycle 08 `factor.rs` holds the numerics of linear algebra, with no
 `singular` flag is the `Matrix::singular_tol` test with `<=`), Householder
 `qr` and the column-pivoted least-squares `lstsq`, `chol`, the cyclic Jacobi
 `eig_sym`, `eig_general` (EISPACK's `orthes` and `hqr2`, as JAMA transcribes
-them, refusing a complex pair) and the one-sided Jacobi `svd`, which returns
+them; since cycle 10 a complex pair is two complex values with complex
+vectors, from JAMA's complex back-substitution) and the one-sided Jacobi
+`svd`, which returns
 no vectors, thin ones or full ones as `Vectors` asks. Every iteration there
 takes its cap as a parameter (`JACOBI_SWEEPS`, `SVD_SWEEPS`,
 `qr_iterations(n)`) so that a unit test can reach the `no_convergence` error.
@@ -271,6 +283,18 @@ method (`fzero_solve`, `nelder_mead`, `quad`, `dopri`) that takes the user's
 function as a Rust closure and its caps as parameters, so a unit test can
 drive the numerics and reach every cap with no interpreter. The builtin's
 closure calls the user's function through `Interp::call_nested`.
+
+Cycle 10 added `complex.rs`: `C`, the complex scalar every complex kernel
+computes with (the arithmetic, `sqrt`, `ln`, `log2`, `log10`, `exp`, `sin`,
+`cos`, `asin`, `acos` and `pow`, each real wherever its real counterpart
+is, with the branch cuts its module comment records), the builtins of
+complex numbers (`real`, `imag`, `conj`, `angle`, `isreal`, `complex`, and
+`i` and `j`), and `fft` and `ifft`: a radix-2 Cooley-Tukey transform for a
+power-of-two length and Bluestein's algorithm, a chirp convolution through
+power-of-two transforms, for every other, so every length is O(n log n).
+`builtins::TAKES_COMPLEX` names the builtins that take a complex argument,
+and `complex_gate`, which `Interp::call_builtin` runs before every builtin,
+refuses one to any other; see "Add a value type".
 
 **`syntax.rs`** answers questions about source text short of parsing it.
 `is_complete` says whether an entry typed line by line has ended, by counting
@@ -406,6 +430,10 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 3. Bump `EXPECTED` in the registry test in `src/builtins/mod.rs`.
 4. Add a golden case exercising it, and an `err_*` case for each new error.
 5. Add a row to `docs/FEATURES.md` and the name to `README.md`.
+6. If it takes complex values (cycle 10), handle `Matrix::im` and add its
+   name to `builtins::TAKES_COMPLEX`. Otherwise do nothing: the registry
+   refuses a complex argument to it before it runs, so it can read `data`
+   as the real array it is.
 
 Use the helpers in `src/builtins/args.rs` for argument access; they produce
 the MATLAB-style messages. `need` and `at_most` bound the argument count,
@@ -479,6 +507,32 @@ the class: `Matrix::new` and every constructor built on it make a double,
 `NaN`; a char rounds and clamps to a code unit). A new class needs a
 `Class` variant, its name, its display in `display_body`, and its row in the
 propagation rules in `interp.rs` (`binary`, `concat_class`, `assign_index`).
+
+Cycle 10 gave `Matrix` a second storage field rather than a class:
+`im: Option<Vec<f64>>`, the imaginary parts, column-major like `data`,
+`None` for real storage. A complex value is still class `double`, so
+`class`, the class queries and the protocol's `workspace` need nothing new,
+and a complex logical or char never exists: `to_class` refuses to make one.
+The flag rule is MathWorks': every operation stores its result real when
+every imaginary part is zero, through `Matrix::with_im` (and `from_c`,
+`map_c`, `zip_c`), and `complex(a, b)`, `Matrix::complex_parts`, is the one
+way to keep a zero imaginary part. Indexing, concatenation, deletion,
+transposition and indexed assignment follow the same rule, so `z(2)` of
+`[1+2i 3]` is a real `3`; only a copy of a whole value (an assignment
+`y = x`, an argument, an element of a cell or a field) keeps a
+`complex(1, 0)` complex. A double target assigned a complex value becomes
+complex, the analogue of the class rule; a logical or a char target
+refuses one.
+
+A kernel that reads `data` alone would drop the imaginary part in silence,
+the one failure this design must never allow. Two guards stop it: the
+registry refuses a complex argument to every builtin not on
+`builtins::TAKES_COMPLEX`, and the interpreter's own consumers of `data`
+each handle `im` or refuse it (`truth` and `logical_scalar` for `if`,
+`while`, `&&` and `||`; `&`, `|` and `~`; a complex index or `:` operand;
+`to_class`). A solver refuses a complex value its function returns, and
+`args::scalar` a complex dimension, size or option of a builtin that takes
+complex data. Anything new that reads `data` must do one or the other.
 
 A container is a different kind of value, not a class of array. Cells and
 structs (cycle 07) become new `Value` variants beside `Mat`, as the
@@ -670,9 +724,9 @@ cycle named:
 | `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives | later (verify first) |
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | `who` and `whos` print the same typed table | Both produce byte-identical output. In MATLAB `who` is a bare list of names and `whos` is a table with size, bytes and class, so both deviate rather than only `who`, and neither has a bytes column | 13 |
-| Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `roots` refuses a real root of multiplicity three or more, which the eigensolver finds as a complex pair; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each | by design; the complex refusals 10 |
+| Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each. Cycle 10 replaced the complex refusals of `roots` with the values | by design |
 | Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where MATLAB is understood to say "close to singular or badly scaled" with an `RCOND`; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `eig([])` is 0x1. The Design notes of `docs/modules/08-linear-algebra.md` have each | later (verify first) |
-| A result that would be complex is a clean error; MATLAB returns the value | 10 |
+| Complex numbers, cycle 10: every builtin not on `builtins::TAKES_COMPLEX` refuses a complex argument (`sort`, `max`, `min`, `floor`, `mod`, `num2str`, `reshape`, `inv`, `det`, the solvers and every other), where MATLAB takes many of them; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` refuse a complex value; indexing, concatenation and assignment drop an all-zero imaginary part as arithmetic does, and a zero imaginary part of either sign is read as `+0`, on a branch cut and in the display; the complex display, its scale factor and the phase of complex eigenvectors are SplatCrab's; `eig` and `roots` of complex input are refused. The Design notes of `docs/modules/10-complex.md` have each | by design (verify first) |
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | Indexing into or growing a second page, `A(:, :, 2) = 5` or `A(:, :, [1 1])`, is "N-D arrays are not supported."; MATLAB builds the N-D array. Cycle 03 accepted it | later, with N-D arrays |
@@ -768,6 +822,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | An unexpected character is echoed raw into the message | `unexpected character '<c>'` writes the character itself, so a control character reaches stderr as a raw byte: running `01e-display-and-parser/err_utf16_file.m` writes a literal NUL between the quotes. A control character should be named, for instance as `U+0000`. Found while rebuilding the test inventory after cycle U0 | later, low impact |
+| An element-wise operation on an empty array with a huge dimension hangs | `x = zeros(0, 1e12); x + 1` does not return: the broadcast loop in `Matrix::try_zip` runs once per column even when there are no rows, so a 0x1e12 operand costs 1e12 iterations for an empty result. Cycle 10's complex paths copied the pattern (`x + 1i`, `x .* 1i`, `x == 1i`, `power(x, 0.5)`). It needs no allocation, so the size check does not catch it. Older than cycle 10; found by its review | later, a bug-fix pass |
 | `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
 

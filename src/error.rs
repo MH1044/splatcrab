@@ -660,34 +660,25 @@ pub fn nonsquare_inverse() -> MError {
     MError::new("Matrix must be square to invert.")
 }
 
-// ---- results that would be complex -----------------------------------
+// ---- complex values (cycle 10) --------------------------------------
 //
-// Cycle 01d turns each of these from a silent `NaN` into a refusal; cycle 10
-// replaces the refusal with the complex value itself. Every one of them opens
-// with the same sentence, so a golden case can match on it alone.
+// Cycle 01d refused every result that would have been complex, and cycles
+// 08 and 09 routed complex eigenvalues and roots through the same refusal;
+// cycle 10 replaced all of them with the values. What is left is the other
+// direction: a kernel that reads only real parts refuses a complex value
+// rather than drop its imaginary part in silence. SplatCrab's own wording.
 
-/// `sqrt(-4)`, `log(-1)`, `log2(-8)`, `log10(-10)`.
-pub fn complex_negative(name: &str) -> MError {
-    MError::new(format!(
-        "Complex results are not supported. '{}' of a negative number is complex.",
-        name
-    ))
+/// A complex argument to a builtin that does not take one, `sort([1+2i
+/// 3])`, a complex value returned to a solver, a complex operand of `:`
+/// and a complex value becoming a char.
+pub fn complex_argument(name: &str) -> MError {
+    MError::new(format!("Complex values are not supported by '{}'.", name))
 }
 
-/// `asin(2)`, `acos(-2)`.
-pub fn complex_outside_unit(name: &str) -> MError {
-    MError::new(format!(
-        "Complex results are not supported. '{}' of a value outside [-1, 1] is complex.",
-        name
-    ))
-}
-
-/// `(-8)^(1/3)`, `(-8).^(1/3)`, `power(-2, 0.5)`.
-pub fn complex_power() -> MError {
-    MError::new(
-        "Complex results are not supported. \
-         A negative number raised to a fractional power is complex.",
-    )
+/// A complex value where a logical is wanted: `if`, `while`, `&`, `|`,
+/// `~`, `&&`, `||` and an assignment into a logical array.
+pub fn complex_to_logical() -> MError {
+    MError::new("Complex values cannot be converted to logicals.")
 }
 
 pub fn nonsquare_determinant() -> MError {
@@ -898,15 +889,6 @@ pub fn no_convergence(name: &str) -> MError {
     ))
 }
 
-/// `eig` of a real matrix with a complex pair, until cycle 10. Opens with
-/// the sentence every complex refusal shares.
-pub fn complex_eigenvalues() -> MError {
-    MError::new(
-        "Complex results are not supported. \
-         The eigenvalues of this matrix are complex.",
-    )
-}
-
 /// `norm(A, p)` of a matrix for a `p` other than 1, 2, `Inf` and `'fro'`.
 pub fn matrix_norm_type() -> MError {
     MError::new("Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.")
@@ -1001,15 +983,6 @@ pub fn eps_class() -> MError {
 // SplatCrab's own wording throughout, as the spec asks where no source
 // settles MATLAB's, except `fzero_endpoints`, whose sentence is MATLAB's as
 // recalled and not confirmed against a MathWorks source.
-
-/// `roots` of a polynomial with a complex pair of roots, `roots([1 0 1])`,
-/// until cycle 10. Opens with the sentence every complex refusal shares.
-pub fn complex_roots() -> MError {
-    MError::new(
-        "Complex results are not supported. \
-         The polynomial has complex roots.",
-    )
-}
 
 /// An argument that must be a vector (or empty): `polyval([1 2; 3 4], 1)`.
 pub fn arg_not_a_vector(pos: usize, name: &str) -> MError {

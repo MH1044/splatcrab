@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use super::args::{
     at_most, check_shape, dim, fmt_dim, mat, need, option, shape, size_list, trailing_ones,
 };
+use super::complex::C;
 use super::core::eps_at;
 use super::factor::{self, JACOBI_SWEEPS, SVD_SWEEPS, Vectors, qr_iterations};
 use super::math::{reduce, sum0};
@@ -360,9 +361,10 @@ fn chol(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
 
 /// `e = eig(A)` and `[V, D] = eig(A)`. An exactly symmetric `A` goes to the
 /// Jacobi method and its eigenvalues are ascending; any other to the
-/// Hessenberg QR iteration, in the order it finds them. Complex eigenvalues
-/// are the complex refusal until cycle 10, and a `NaN` or `Inf` is refused
-/// before any iteration starts.
+/// Hessenberg QR iteration, in the order it finds them, a complex pair as
+/// two complex values with complex vectors (cycle 10; a refusal before it).
+/// A `NaN` or `Inf` is refused before any iteration starts, and a complex
+/// `A` by the registry's gate.
 fn eig(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 1, "eig")?;
     let m = mat(a, 0, "eig")?;
@@ -373,17 +375,19 @@ fn eig(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
         return Err(error::nonfinite_input("eig"));
     }
     let (vals, vecs) = if factor::is_symmetric(&m) {
-        factor::eig_sym(&m, JACOBI_SWEEPS)?
+        let (vals, vecs) = factor::eig_sym(&m, JACOBI_SWEEPS)?;
+        (vals.into_iter().map(C::real).collect(), vecs)
     } else {
         factor::eig_general(&m, qr_iterations(m.rows))?
     };
+    let n = vals.len();
     if nargout < 2 {
-        return one_mat(Matrix::col(vals));
+        return one_mat(Matrix::from_c(n, 1, vals));
     }
-    Ok(vec![
-        Value::Mat(vecs),
-        Value::Mat(diagonal(&vals, m.rows, m.rows)?),
-    ])
+    let re: Vec<f64> = vals.iter().map(|z| z.re).collect();
+    let im: Vec<f64> = vals.iter().map(|z| z.im).collect();
+    let d = diagonal(&re, n, n)?.with_im(Some(diagonal(&im, n, n)?.data));
+    Ok(vec![Value::Mat(vecs), Value::Mat(d)])
 }
 
 /// An `rows`-by-`cols` matrix with `v` down its diagonal.
@@ -1791,8 +1795,17 @@ mod tests {
         let vd = outputs(eig, &[mat(2, 2, &[2.0, 0.0, 0.0, 3.0])], 2);
         assert_eq!(vd[1], Matrix::new(2, 2, vec![2.0, 0.0, 0.0, 3.0]));
         assert_eq!(vd[0], Matrix::identity(2, 2));
-        let e = err(eig, &[mat(2, 2, &[0.0, -1.0, 1.0, 0.0])], 1);
-        assert!(e.starts_with("Complex results are not supported."), "{e}");
+        // A complex pair is a pair of complex values since cycle 10, and
+        // `[V, D]` gives complex vectors with `A * V = V * D`.
+        let e = call(eig, &[mat(2, 2, &[0.0, -1.0, 1.0, 0.0])]).unwrap();
+        assert_eq!(e.data, [0.0, 0.0]);
+        assert_eq!(e.im.as_deref(), Some(&[1.0, -1.0][..]));
+        let a = mat(2, 2, &[0.0, -1.0, 1.0, 0.0]).into_mat().unwrap();
+        let vd = outputs(eig, &[Value::Mat(a.clone())], 2);
+        let (av, vd) = (a.matmul(&vd[0]).unwrap(), vd[0].matmul(&vd[1]).unwrap());
+        for k in 0..4 {
+            assert!((av.c(k) - vd.c(k)).abs() < 1e-14);
+        }
         assert_eq!(
             err(eig, &[mat(2, 2, &[f64::NAN, 1.0, 1.0, 1.0])], 1),
             "Input to 'eig' must not contain NaN or Inf."

@@ -87,7 +87,12 @@ impl<'a> FreeNames<'a> {
     /// from, and the names inside its arguments. A field name is not a name.
     fn walk(&mut self, e: &'a Expr) {
         match e {
-            Expr::Num(_) | Expr::Str(_) | Expr::End | Expr::Colon | Expr::FuncHandle(_) => {}
+            Expr::Num(_)
+            | Expr::Imag(_)
+            | Expr::Str(_)
+            | Expr::End
+            | Expr::Colon
+            | Expr::FuncHandle(_) => {}
             Expr::Ident(n) => self.read(n),
             Expr::Access(n, chain) => {
                 self.read(n);
@@ -104,7 +109,11 @@ impl<'a> FreeNames<'a> {
             Expr::Matrix(rows) | Expr::Cell(rows) => {
                 rows.iter().flatten().for_each(|x| self.walk(x))
             }
-            Expr::Neg(a) | Expr::Pos(a) | Expr::Not(a) | Expr::Transpose(a) => self.walk(a),
+            Expr::Neg(a)
+            | Expr::Pos(a)
+            | Expr::Not(a)
+            | Expr::Transpose(a)
+            | Expr::DotTranspose(a) => self.walk(a),
             Expr::Binary(_, a, b) => {
                 self.walk(a);
                 self.walk(b);
@@ -124,6 +133,9 @@ impl<'a> FreeNames<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Num(f64),
+    /// An imaginary literal, `2.5i`: the number that multiplies the unit
+    /// (cycle 10).
+    Imag(f64),
     Str(String),
     Ident(String),
     /// `end` inside an index expression.
@@ -145,7 +157,10 @@ pub enum Expr {
     /// double `97` and `+true` the double `1`.
     Pos(Box<Expr>),
     Not(Box<Expr>),
+    /// `a'`, the conjugate transpose (cycle 10; a plain one before it).
     Transpose(Box<Expr>),
+    /// `a.'`, the plain transpose (cycle 10).
+    DotTranspose(Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `a:b` or `a:s:b`
     Range(Box<Expr>, Option<Box<Expr>>, Box<Expr>),
@@ -166,7 +181,7 @@ fn prec(e: &Expr) -> u8 {
         Expr::Binary(op, ..) => binop_prec(*op),
         Expr::Range(..) => 6,
         Expr::Neg(_) | Expr::Pos(_) | Expr::Not(_) => 9,
-        Expr::Transpose(_) => 11,
+        Expr::Transpose(_) | Expr::DotTranspose(_) => 11,
         _ => 12,
     }
 }
@@ -253,6 +268,10 @@ fn render_into(e: &Expr, s: &mut String) {
     }
     match e {
         Expr::Num(v) => s.push_str(&number_text(*v)),
+        Expr::Imag(v) => {
+            s.push_str(&number_text(*v));
+            s.push('i');
+        }
         Expr::Str(t) => {
             s.push('\'');
             s.push_str(&t.replace('\'', "''"));
@@ -312,6 +331,10 @@ fn render_into(e: &Expr, s: &mut String) {
         Expr::Transpose(a) => {
             child(a, 11, s);
             s.push('\'');
+        }
+        Expr::DotTranspose(a) => {
+            child(a, 11, s);
+            s.push_str(".'");
         }
         Expr::Binary(op, a, b) => {
             let p = binop_prec(*op);
@@ -1257,9 +1280,16 @@ impl Parser {
     fn parse_postfix(&mut self) -> R<Expr> {
         let save = self.depth;
         let mut e = self.parse_primary()?;
-        while self.eat(&Token::Transpose) {
+        loop {
+            let wrap: fn(Box<Expr>) -> Expr = if self.eat(&Token::Transpose) {
+                Expr::Transpose
+            } else if self.eat(&Token::DotTranspose) {
+                Expr::DotTranspose
+            } else {
+                break;
+            };
             self.deepen()?;
-            e = Expr::Transpose(Box::new(e));
+            e = wrap(Box::new(e));
         }
         self.depth = save;
         Ok(e)
@@ -1269,6 +1299,7 @@ impl Parser {
         let line = self.line();
         match self.next() {
             Token::Num(v) => Ok(Expr::Num(v)),
+            Token::Imag(v) => Ok(Expr::Imag(v)),
             Token::Str(s) => Ok(Expr::Str(s)),
             Token::LParen => {
                 let e = self.parse_expr()?;

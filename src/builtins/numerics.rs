@@ -14,6 +14,7 @@
 use std::f64::consts::PI;
 
 use super::args::{at_most, check_shape, dim, mat, need, option, scalar};
+use super::complex::C;
 use super::factor::{self, qr_iterations};
 use super::math::{reduce, sum0};
 use super::{Registry, add, one_as, one_mat};
@@ -222,9 +223,11 @@ pub fn horner(p: &[f64], t: f64) -> f64 {
 /// `roots(p)`: the eigenvalues of the companion matrix, from the general
 /// eigensolver of cycle 08, as a column, followed by a `0` for every
 /// trailing zero coefficient. Leading zeros are dropped. A constant or an
-/// empty `p` has no roots, `0x1`. A polynomial with a complex pair of roots
-/// is refused until cycle 10, and a `NaN` or `Inf` coefficient is refused
-/// as `eig` refuses one.
+/// empty `p` has no roots, `0x1`. A complex pair of roots is a pair of
+/// complex values (cycle 10; a refusal before it), and the column is
+/// stored by the flag rule, so real roots stay real. A `NaN` or `Inf`
+/// coefficient is refused as `eig` refuses one, and complex coefficients
+/// by the registry's gate.
 fn roots(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "roots")?;
     let p = vector(a, 0, "roots")?;
@@ -240,7 +243,7 @@ fn roots(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     };
     let core = &c[first..=last];
     let n = core.len() - 1;
-    let mut r = Vec::with_capacity(n + c.len() - 1 - last);
+    let mut r: Vec<C> = Vec::with_capacity(n + c.len() - 1 - last);
     if n >= 1 {
         let mut comp = factor::zeros(n, n)?;
         for j in 0..n {
@@ -249,18 +252,12 @@ fn roots(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         for i in 1..n {
             comp.set(i, i - 1, 1.0);
         }
-        let complex = error::complex_eigenvalues();
-        let (vals, _) = factor::eig_general(&comp, qr_iterations(n)).map_err(|e| {
-            if e.msg == complex.msg {
-                error::complex_roots()
-            } else {
-                e
-            }
-        })?;
+        let (vals, _) = factor::eig_general(&comp, qr_iterations(n))?;
         r.extend(vals);
     }
-    r.extend(std::iter::repeat_n(0.0, c.len() - 1 - last));
-    one_mat(Matrix::col(r))
+    r.extend(std::iter::repeat_n(C::real(0.0), c.len() - 1 - last));
+    let len = r.len();
+    one_mat(Matrix::from_c(len, 1, r))
 }
 
 /// The full convolution of `u` and `v`, `u.len() + v.len() - 1` values, or
@@ -1323,8 +1320,12 @@ mod tests {
         }
         let none = call(roots, &[num(5.0)]).unwrap();
         assert_eq!((none.rows, none.cols), (0, 1));
-        let e = err(roots, &[row(&[1.0, 0.0, 1.0])]);
-        assert!(e.starts_with("Complex results are not supported."), "{e}");
+        // A complex pair of roots is the pair since cycle 10.
+        let r = call(roots, &[row(&[1.0, 0.0, 1.0])]).unwrap();
+        assert!(near(&r.data, &[0.0, 0.0], 1e-15));
+        assert!(near(r.im.as_deref().unwrap(), &[1.0, -1.0], 1e-15));
+        // Real roots stay stored real.
+        assert!(!call(roots, &[row(&[1.0, -3.0, 2.0])]).unwrap().is_complex());
         assert!(err(roots, &[row(&[1.0, f64::NAN])]).contains("NaN or Inf"));
     }
 

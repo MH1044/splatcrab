@@ -17,6 +17,7 @@
 
 pub mod args;
 pub mod cells;
+pub mod complex;
 pub mod core;
 pub mod factor;
 pub mod linalg;
@@ -53,7 +54,97 @@ pub fn registry() -> Registry {
     numerics::register(&mut r);
     sets::register(&mut r);
     solvers::register(&mut r);
+    complex::register(&mut r);
     r
+}
+
+/// The builtins that take a complex argument (cycle 10). Every other
+/// builtin reads only the real parts of its arguments, so the registry
+/// refuses a complex argument to it before it runs, with
+/// `error::complex_argument`, rather than let it drop the imaginary part
+/// in silence: `sort([1+2i 3])` is that refusal. On this list are the
+/// functions of complex numbers themselves, the arithmetic that cycle 10
+/// taught complex values (`sum`, `prod`, `mean`, `cumsum`, `abs`, `exp`,
+/// `sin`, `cos`, `sqrt`, the logarithms, `asin`, `acos`, `power`), `fft`
+/// and `ifft`, the output functions (`fprintf` and `sprintf` print only
+/// the real parts, as MathWorks' `sprintf` page says), the shape and class
+/// queries, which read no elements, and the functions that pass a value
+/// through whole (the struct and cell functions, `deal`, `feval`,
+/// `arrayfun`, `cellfun`), `isequal`, `double` and the plain `transpose`.
+///
+/// Only a matrix argument is judged here. A builtin that finds a complex
+/// value inside a cell, or gets one back from a function it calls, judges
+/// it itself: `cell2mat` concatenates it as a bracket would, the uniform
+/// outputs of `cellfun` and `arrayfun` keep it, and a solver refuses it.
+pub const TAKES_COMPLEX: &[&str] = &[
+    // The functions of complex numbers, and the transforms.
+    "real",
+    "imag",
+    "conj",
+    "angle",
+    "isreal",
+    "fft",
+    "ifft",
+    // Arithmetic taught complex values in cycle 10.
+    "abs",
+    "sum",
+    "prod",
+    "mean",
+    "cumsum",
+    "exp",
+    "sin",
+    "cos",
+    "sqrt",
+    "log",
+    "log2",
+    "log10",
+    "asin",
+    "acos",
+    "power",
+    // Output: `disp` shows both parts, the printf family the real part.
+    "disp",
+    "fprintf",
+    "sprintf",
+    // Shape and class queries, which read no element.
+    "size",
+    "numel",
+    "length",
+    "isempty",
+    "isscalar",
+    "isvector",
+    "class",
+    "isa",
+    "islogical",
+    "ischar",
+    "isnumeric",
+    "iscell",
+    "isstruct",
+    // Values passed through whole.
+    "struct",
+    "getfield",
+    "setfield",
+    "deal",
+    "feval",
+    "arrayfun",
+    "cellfun",
+    "num2cell",
+    "cell2mat",
+    // Comparison, the class conversion to itself and the plain transpose.
+    "isequal",
+    "double",
+    "transpose",
+];
+
+/// The refusal of a complex argument to a builtin not on
+/// [`TAKES_COMPLEX`]; see there.
+pub fn complex_gate(name: &str, args: &[Value]) -> R<()> {
+    let complex = args
+        .iter()
+        .any(|v| matches!(v, Value::Mat(m) if m.is_complex()));
+    if complex && !TAKES_COMPLEX.contains(&name) {
+        return Err(crate::error::complex_argument(name));
+    }
+    Ok(())
 }
 
 fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
@@ -106,7 +197,9 @@ mod tests {
     /// `magic`. Cycle 09 added thirty-three: the polynomials, samples,
     /// statistics, number theory, grids and counts of `numerics.rs`, the
     /// five set functions of `sets.rs` and the five solvers of `solvers.rs`.
-    const EXPECTED: usize = 163;
+    /// Cycle 10 added ten: `i`, `j`, `real`, `imag`, `conj`, `angle`,
+    /// `isreal`, `complex`, `fft` and `ifft`.
+    const EXPECTED: usize = 173;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -263,12 +356,45 @@ mod tests {
             "integral",
             "ode45",
             "odeset",
+            "i",
+            "j",
+            "real",
+            "imag",
+            "conj",
+            "angle",
+            "isreal",
+            "complex",
+            "fft",
+            "ifft",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }
         // `exp(1)` is the MATLAB spelling; `e` is an Octave extension, and an
         // ordinary name here, free to be a variable.
         assert!(!r.contains_key("e"), "'e' is back in the registry");
+        // Every name the complex gate lets through is a builtin.
+        for name in TAKES_COMPLEX {
+            assert!(r.contains_key(name), "'{name}' is on TAKES_COMPLEX only");
+        }
+    }
+
+    /// Cycle 10: a complex argument reaches only the builtins that take one.
+    #[test]
+    fn the_gate_refuses_a_complex_argument_to_every_other_builtin() {
+        let z = Value::Mat(Matrix::complex_parts(1, 2, vec![1.0, 3.0], vec![2.0, 0.0]));
+        let e = complex_gate("sort", std::slice::from_ref(&z))
+            .unwrap_err()
+            .msg;
+        assert_eq!(e, "Complex values are not supported by 'sort'.");
+        assert!(complex_gate("abs", std::slice::from_ref(&z)).is_ok());
+        assert!(complex_gate("sort", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
+        // A builtin with its own complex arithmetic is on the list; one that
+        // reads only real parts, such as `max` or `mod`, is not.
+        for name in [
+            "max", "min", "floor", "mod", "fzero", "eig", "roots", "complex",
+        ] {
+            assert!(!TAKES_COMPLEX.contains(&name), "{name}");
+        }
     }
 
     #[test]

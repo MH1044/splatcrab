@@ -2,6 +2,7 @@
 
 use super::args::{Along, at_most, check_shape, dim, dim_or_all, mat, need, option};
 use super::{Registry, add, one_as, one_mat};
+use crate::builtins::complex::C;
 use crate::error;
 use crate::interp::R;
 use crate::value::{Class, Matrix, Value};
@@ -21,17 +22,17 @@ pub fn register(r: &mut Registry) {
     add(r, "cumprod", |_, a, _| cumulative(a, "cumprod", false), "cumprod(A), cumprod(A,dim) - cumulative product.");
 
     // ---- element-wise math -------------------------------------------
-    add(r, "abs", |_, a, _| unary(a, "abs", f64::abs), "abs(X) - absolute value.");
-    add(r, "sqrt", |_, a, _| real_unary(a, "sqrt", f64::sqrt, Real::NonNegative), "sqrt(X) - square root.");
-    add(r, "exp", |_, a, _| unary(a, "exp", f64::exp), "exp(X) - e raised to the power X.");
-    add(r, "log", |_, a, _| real_unary(a, "log", f64::ln, Real::NonNegative), "log(X) - natural logarithm.");
-    add(r, "log2", |_, a, _| real_unary(a, "log2", f64::log2, Real::NonNegative), "log2(X) - base 2 logarithm.");
-    add(r, "log10", |_, a, _| real_unary(a, "log10", f64::log10, Real::NonNegative), "log10(X) - base 10 logarithm.");
-    add(r, "sin", |_, a, _| unary(a, "sin", f64::sin), "sin(X) - sine of X in radians.");
-    add(r, "cos", |_, a, _| unary(a, "cos", f64::cos), "cos(X) - cosine of X in radians.");
+    add(r, "abs", |_, a, _| abs(a), "abs(X) - absolute value; of a complex number, its modulus.");
+    add(r, "sqrt", |_, a, _| complex_unary(a, "sqrt", C::sqrt), "sqrt(X) - square root; of a negative number, complex.");
+    add(r, "exp", |_, a, _| complex_unary(a, "exp", C::exp), "exp(X) - e raised to the power X.");
+    add(r, "log", |_, a, _| complex_unary(a, "log", C::ln), "log(X) - natural logarithm; of a negative number, complex.");
+    add(r, "log2", |_, a, _| complex_unary(a, "log2", C::log2), "log2(X) - base 2 logarithm; of a negative number, complex.");
+    add(r, "log10", |_, a, _| complex_unary(a, "log10", C::log10), "log10(X) - base 10 logarithm; of a negative number, complex.");
+    add(r, "sin", |_, a, _| complex_unary(a, "sin", C::sin), "sin(X) - sine of X in radians.");
+    add(r, "cos", |_, a, _| complex_unary(a, "cos", C::cos), "cos(X) - cosine of X in radians.");
     add(r, "tan", |_, a, _| unary(a, "tan", f64::tan), "tan(X) - tangent of X in radians.");
-    add(r, "asin", |_, a, _| real_unary(a, "asin", f64::asin, Real::UnitInterval), "asin(X) - inverse sine, in radians.");
-    add(r, "acos", |_, a, _| real_unary(a, "acos", f64::acos, Real::UnitInterval), "acos(X) - inverse cosine, in radians.");
+    add(r, "asin", |_, a, _| complex_unary(a, "asin", C::asin), "asin(X) - inverse sine, in radians; complex outside [-1, 1].");
+    add(r, "acos", |_, a, _| complex_unary(a, "acos", C::acos), "acos(X) - inverse cosine, in radians; complex outside [-1, 1].");
     add(r, "atan", |_, a, _| unary(a, "atan", f64::atan), "atan(X) - inverse tangent, in radians.");
     add(r, "sinh", |_, a, _| unary(a, "sinh", f64::sinh), "sinh(X) - hyperbolic sine.");
     add(r, "cosh", |_, a, _| unary(a, "cosh", f64::cosh), "cosh(X) - hyperbolic cosine.");
@@ -52,44 +53,42 @@ pub fn register(r: &mut Registry) {
     add(r, "rem", |_, a, _| binary(a, "rem", remainder), "rem(X,Y) - remainder after division, signed like X.");
     add(r, "atan2", |_, a, _| binary(a, "atan2", f64::atan2), "atan2(Y,X) - four-quadrant inverse tangent.");
     add(r, "hypot", |_, a, _| binary(a, "hypot", f64::hypot), "hypot(X,Y) - sqrt(X^2 + Y^2) without overflow.");
-    add(r, "power", |_, a, _| real_binary(a, "power", powf_real), "power(X,Y) - element-wise X raised to the power Y.");
+    add(r, "power", |_, a, _| power(a), "power(X,Y) - element-wise X raised to the power Y; complex where it must be.");
 }
 
-/// Where a real function stops being real. Until cycle 10 brings complex
-/// numbers, an argument outside the domain is a clean error rather than the
-/// `NaN` these used to hand back: `sqrt(-4)` is `2i` in MATLAB, and a `NaN`
-/// that looks like a computed answer is worse than a refusal.
-#[derive(Clone, Copy)]
-enum Real {
-    /// `sqrt`, `log`, `log2`, `log10`: a negative argument is complex.
-    NonNegative,
-    /// `asin`, `acos`: an argument outside [-1, 1] is complex.
-    UnitInterval,
+/// `power(X, Y)`, which is `X .^ Y`: `interp.rs` computes `^` and `.^`
+/// through the same [`C::pow`], so the three spellings `(-8)^(1/3)`,
+/// `(-8).^(1/3)` and `power(-8, 1/3)` agree, on `1 + 1.7321i` since cycle
+/// 10 (a refusal before it).
+fn power(args: &[Value]) -> R<Vec<Value>> {
+    at_most(args, 2, "power")?;
+    need(args, 2, "power")?;
+    let a = mat(args, 0, "power")?;
+    let b = mat(args, 1, "power")?;
+    one_mat(a.zip_c(&b, "power", C::pow)?)
 }
 
-impl Real {
-    /// `None` when `x` is in the real domain, and the error otherwise. `NaN`
-    /// is in the domain of both: `sqrt(NaN)` is `NaN` in MATLAB too.
-    fn check(self, name: &str, x: f64) -> Option<crate::error::MError> {
-        match self {
-            Real::NonNegative if x < 0.0 => Some(error::complex_negative(name)),
-            Real::UnitInterval if x.abs() > 1.0 => Some(error::complex_outside_unit(name)),
-            _ => None,
-        }
+/// `abs(X)`: the modulus of a complex element, the magnitude of a real one.
+fn abs(args: &[Value]) -> R<Vec<Value>> {
+    at_most(args, 1, "abs")?;
+    let m = mat(args, 0, "abs")?;
+    if !m.is_complex() {
+        return one_mat(m.map(f64::abs));
     }
+    let data = (0..m.numel()).map(|k| m.c(k).abs()).collect();
+    one_mat(Matrix::new(m.rows, m.cols, data))
 }
 
-/// `x^y` where the result would be complex: a negative base raised to a
-/// power that is neither an integer nor infinite. `(-8)^(1/3)` is complex in
-/// MATLAB, while `(-2)^Inf` is a real `Inf` and `(-2)^3` a real `-8`.
-///
-/// `interp.rs` uses this for both `^` and `.^`, so the three spellings
-/// `(-8)^(1/3)`, `(-8).^(1/3)` and `power(-8, 1/3)` agree.
-pub fn powf_real(x: f64, y: f64) -> R<f64> {
-    if x < 0.0 && y.is_finite() && y.fract() != 0.0 {
-        return Err(error::complex_power());
-    }
-    Ok(x.powf(y))
+/// A one-argument element-wise function of complex scalars (cycle 10),
+/// which is real wherever its [`C`] method is: `sqrt`, `exp`, `log`,
+/// `log2`, `log10`, `sin`, `cos`, `asin` and `acos`. A negative argument to
+/// `sqrt` or a logarithm, and one outside `[-1, 1]` to `asin` or `acos`,
+/// gives the complex value on the principal branch; the branch cuts are
+/// recorded in `builtins/complex.rs`. The result is stored by the flag
+/// rule, so `sqrt([4 9])` stays real.
+fn complex_unary(args: &[Value], name: &str, f: fn(C) -> C) -> R<Vec<Value>> {
+    at_most(args, 1, name)?;
+    one_mat(mat(args, 0, name)?.map_c(f))
 }
 
 /// MATLAB's `mod`: the result takes the sign of the divisor, and a zero
@@ -132,20 +131,6 @@ fn mask(args: &[Value], name: &str, test: fn(f64) -> bool) -> R<Vec<Value>> {
     one_as(m.with_class(Class::Logical))
 }
 
-/// [`unary`] for a function with a real domain smaller than the line. The
-/// whole argument is judged before any of it is mapped, so one complex
-/// element refuses the call rather than seeding the result with a `NaN`.
-fn real_unary(args: &[Value], name: &str, f: fn(f64) -> f64, domain: Real) -> R<Vec<Value>> {
-    at_most(args, 1, name)?;
-    let m = mat(args, 0, name)?;
-    for x in &m.data {
-        if let Some(e) = domain.check(name, *x) {
-            return Err(e);
-        }
-    }
-    one_mat(m.map(f))
-}
-
 /// Every two-argument element-wise function, with broadcasting.
 fn binary(args: &[Value], name: &str, f: fn(f64, f64) -> f64) -> R<Vec<Value>> {
     at_most(args, 2, name)?;
@@ -153,16 +138,6 @@ fn binary(args: &[Value], name: &str, f: fn(f64, f64) -> f64) -> R<Vec<Value>> {
     let a = mat(args, 0, name)?;
     let b = mat(args, 1, name)?;
     one_mat(a.zip(&b, name, f)?)
-}
-
-/// [`binary`] for a function that may refuse a pair of elements, which is
-/// `power` and its complex results.
-fn real_binary(args: &[Value], name: &str, f: fn(f64, f64) -> R<f64>) -> R<Vec<Value>> {
-    at_most(args, 2, name)?;
-    need(args, 2, name)?;
-    let a = mat(args, 0, name)?;
-    let b = mat(args, 1, name)?;
-    one_mat(a.try_zip(&b, name, f)?)
 }
 
 // ---- reductions ------------------------------------------------------
@@ -191,6 +166,9 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
     } else {
         None
     };
+    if m.is_complex() {
+        return one_mat(complex_reduction(&m, along, kind, name)?);
+    }
     let f: fn(&[f64]) -> f64 = match kind {
         Red::Sum => sum0,
         Red::Prod => |xs| xs.iter().product(),
@@ -211,6 +189,70 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
         Red::Any | Red::All => one_as(out.to_class(Class::Logical)?),
         _ => one_mat(out),
     }
+}
+
+/// `sum`, `prod` and `mean` of a complex array (cycle 10). A sum and a mean
+/// are linear, so each is the real reduction of the two parts; a product
+/// multiplies complex scalars. `any` and `all` refuse one, as the
+/// registry's gate already does before they run.
+fn complex_reduction(m: &Matrix, along: Option<Along>, kind: Red, name: &str) -> R<Matrix> {
+    let parts = |f: fn(&[f64]) -> f64| -> R<Matrix> {
+        let (re, im) = (m.real_part(), m.imag_part());
+        let (re, im) = match along {
+            None => (reduce(&re, None, f)?, reduce(&im, None, f)?),
+            Some(Along::Dim(d)) => (reduce(&re, Some(d), f)?, reduce(&im, Some(d), f)?),
+            Some(Along::All) => (reduce_all(&re, f), reduce_all(&im, f)),
+        };
+        Ok(re.with_im(Some(im.data)))
+    };
+    match kind {
+        Red::Sum => parts(sum0),
+        Red::Mean => parts(|xs| sum0(xs) / xs.len() as f64),
+        Red::Any | Red::All => Err(error::complex_argument(name)),
+        Red::Prod => {
+            let prod = |z: &[C]| z.iter().fold(C::real(1.0), |acc, &v| acc * v);
+            match along {
+                Some(Along::All) => {
+                    let z: Vec<C> = (0..m.numel()).map(|k| m.c(k)).collect();
+                    Ok(Matrix::from_c(1, 1, vec![prod(&z)]))
+                }
+                Some(Along::Dim(d)) => reduce_c(m, Some(d), prod),
+                None => reduce_c(m, None, prod),
+            }
+        }
+    }
+}
+
+/// [`reduce`] over complex scalars, with the same shapes and the same size
+/// checks, stored by the flag rule.
+fn reduce_c(m: &Matrix, dim: Option<usize>, f: impl Fn(&[C]) -> C) -> R<Matrix> {
+    let d = match dim {
+        Some(d) => d,
+        None if m.rows == 0 && m.cols == 0 => return Ok(Matrix::from_c(1, 1, vec![f(&[])])),
+        None if m.rows == 1 => 2,
+        None => 1,
+    };
+    if d >= 3 {
+        return Ok(m.clone());
+    }
+    let (rows, cols) = if d == 1 { (1, m.cols) } else { (m.rows, 1) };
+    check_shape(rows as f64, cols as f64)?;
+    let out = if d == 1 {
+        (0..m.cols)
+            .map(|c| {
+                let z: Vec<C> = (0..m.rows).map(|r| m.c(c * m.rows + r)).collect();
+                f(&z)
+            })
+            .collect()
+    } else {
+        (0..m.rows)
+            .map(|r| {
+                let z: Vec<C> = (0..m.cols).map(|c| m.c(c * m.rows + r)).collect();
+                f(&z)
+            })
+            .collect()
+    };
+    Ok(Matrix::from_c(rows, cols, out))
 }
 
 /// The reduction over `A(:)`, which is what `'all'` means: one 1x1 answer
@@ -509,6 +551,13 @@ fn cumulative(args: &[Value], name: &str, is_sum: bool) -> R<Vec<Value>> {
     } else {
         None
     };
+    if m.is_complex() {
+        // Only `cumsum` gets here, a running sum, which is linear: the
+        // registry's gate refuses a complex argument to `cumprod`.
+        let re = scan(&m.real_part(), d, is_sum);
+        let im = scan(&m.imag_part(), d, is_sum);
+        return one_mat(re.with_im(Some(im.data)));
+    }
     one_mat(scan(&m, d, is_sum))
 }
 
@@ -594,82 +643,110 @@ mod tests {
         );
     }
 
-    /// Acceptance test 14 at the level of the helpers: the domain test runs
-    /// over the whole argument before any of it is mapped.
+    fn out(v: R<Vec<Value>>) -> Matrix {
+        v.unwrap()[0].clone().into_mat().unwrap()
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-12 * b.abs().max(1.0)
+    }
+
+    /// Cycle 10 replaced cycle 01d's refusals with the complex values, on
+    /// the principal branch, and kept a real result stored real.
     #[test]
-    fn a_real_function_refuses_a_complex_result() {
-        let neg = |name: &str, f: fn(f64) -> f64, x: f64| {
-            real_unary(&[val(Matrix::scalar(x))], name, f, Real::NonNegative)
-        };
-        for (name, f) in [
-            ("sqrt", f64::sqrt as fn(f64) -> f64),
-            ("log", f64::ln),
-            ("log2", f64::log2),
-            ("log10", f64::log10),
-        ] {
-            let e = neg(name, f, -1.0).unwrap_err().msg;
-            assert_eq!(
-                e,
-                format!(
-                    "Complex results are not supported. '{name}' of a negative number is complex."
-                )
-            );
-            // On the domain, and at its edge, the value comes through.
-            assert!(neg(name, f, 1.0).is_ok());
-            assert!(neg(name, f, 0.0).is_ok());
-            assert!(neg(name, f, -0.0).is_ok());
-            assert!(neg(name, f, f64::NAN).is_ok());
-            assert!(neg(name, f, f64::INFINITY).is_ok());
-            assert!(neg(name, f, f64::NEG_INFINITY).is_err());
-        }
-        let unit = |name: &str, f: fn(f64) -> f64, x: f64| {
-            real_unary(&[val(Matrix::scalar(x))], name, f, Real::UnitInterval)
-        };
-        for (name, f) in [("asin", f64::asin as fn(f64) -> f64), ("acos", f64::acos)] {
-            let e = unit(name, f, 2.0).unwrap_err().msg;
-            assert_eq!(
-                e,
-                format!(
-                    "Complex results are not supported. \
-                     '{name}' of a value outside [-1, 1] is complex."
-                )
-            );
-            assert!(unit(name, f, -2.0).is_err());
-            assert!(unit(name, f, f64::INFINITY).is_err());
-            assert!(unit(name, f, 1.0).is_ok());
-            assert!(unit(name, f, -1.0).is_ok());
-            assert!(unit(name, f, f64::NAN).is_ok());
-        }
-        // One bad element in a matrix refuses the whole call.
-        let m = val(Matrix::row(vec![1.0, -4.0, 9.0]));
-        assert!(real_unary(&[m], "sqrt", f64::sqrt, Real::NonNegative).is_err());
+    fn the_functions_of_a_negative_number_are_complex() {
+        let pi = std::f64::consts::PI;
+        let s = out(complex_unary(&[val(Matrix::scalar(-4.0))], "sqrt", C::sqrt));
+        assert_eq!((s.data[0], s.im.as_deref()), (0.0, Some(&[2.0][..])));
+        let l = out(complex_unary(&[val(Matrix::scalar(-1.0))], "log", C::ln));
+        assert!(near(l.data[0], 0.0) && near(l.im.as_ref().unwrap()[0], pi));
+        let l2 = out(complex_unary(&[val(Matrix::scalar(-8.0))], "log2", C::log2));
+        assert!(near(l2.data[0], 3.0));
+        assert!(near(
+            l2.im.as_ref().unwrap()[0],
+            pi / std::f64::consts::LN_2
+        ));
+        let l10 = out(complex_unary(
+            &[val(Matrix::scalar(-100.0))],
+            "log10",
+            C::log10,
+        ));
+        assert!(near(l10.data[0], 2.0));
+        let a = out(complex_unary(&[val(Matrix::scalar(2.0))], "asin", C::asin));
+        assert!(near(a.data[0], pi / 2.0));
+        let a = out(complex_unary(&[val(Matrix::scalar(2.0))], "acos", C::acos));
+        assert!(near(a.data[0], 0.0) && a.im.as_ref().unwrap()[0] > 0.0);
+        // On the real domain the values are the real functions', stored
+        // real, and NaN stays NaN.
+        let r = out(complex_unary(
+            &[val(Matrix::row(vec![4.0, 0.0, f64::INFINITY]))],
+            "sqrt",
+            C::sqrt,
+        ));
+        assert!(!r.is_complex());
+        assert_eq!(r.data, [2.0, 0.0, f64::INFINITY]);
+        let n = out(complex_unary(
+            &[val(Matrix::scalar(f64::NAN))],
+            "log",
+            C::ln,
+        ));
+        assert!(!n.is_complex() && n.data[0].is_nan());
+        // One negative element makes the whole result complex.
+        let m = out(complex_unary(
+            &[val(Matrix::row(vec![1.0, -4.0, 9.0]))],
+            "sqrt",
+            C::sqrt,
+        ));
+        assert_eq!(m.data, [1.0, 0.0, 3.0]);
+        assert_eq!(m.im.as_deref(), Some(&[0.0, 2.0, 0.0][..]));
     }
 
     #[test]
     fn a_negative_base_with_a_fractional_exponent_is_complex() {
-        let e = powf_real(-8.0, 1.0 / 3.0).unwrap_err().msg;
-        assert_eq!(
-            e,
-            "Complex results are not supported. \
-             A negative number raised to a fractional power is complex."
-        );
-        assert!(powf_real(-2.0, 0.5).is_err());
-        // An integer exponent is real, whatever its sign.
-        assert_eq!(powf_real(-8.0, 2.0).unwrap(), 64.0);
-        assert_eq!(powf_real(-2.0, -2.0).unwrap(), 0.25);
-        assert_eq!(powf_real(-8.0, 0.0).unwrap(), 1.0);
-        // So is an infinite one, which IEEE answers without going complex.
-        assert_eq!(powf_real(-2.0, f64::INFINITY).unwrap(), f64::INFINITY);
-        assert_eq!(powf_real(-2.0, f64::NEG_INFINITY).unwrap(), 0.0);
-        // A non-negative base takes any exponent, and so does a NaN one.
-        assert_eq!(powf_real(8.0, 1.0 / 3.0).unwrap(), 8.0f64.powf(1.0 / 3.0));
-        assert_eq!(powf_real(-0.0, 0.5).unwrap(), 0.0);
-        assert!(powf_real(f64::NAN, 0.5).unwrap().is_nan());
-        assert!(powf_real(-2.0, f64::NAN).unwrap().is_nan());
-        // The `power` builtin broadcasts through the same test.
         let a = val(Matrix::row(vec![-8.0, 8.0]));
         let b = val(Matrix::scalar(1.0 / 3.0));
-        assert!(real_binary(&[a, b], "power", powf_real).is_err());
+        let p = out(power(&[a, b]));
+        assert!(near(p.data[0], 1.0) && near(p.im.as_ref().unwrap()[0], 3.0f64.sqrt()));
+        assert!(near(p.data[1], 2.0) && p.im.as_ref().unwrap()[1] == 0.0);
+        // An integer or infinite exponent of a negative base stays real.
+        let q = out(power(&[
+            val(Matrix::row(vec![-8.0, -2.0])),
+            val(Matrix::row(vec![2.0, f64::INFINITY])),
+        ]));
+        assert!(!q.is_complex());
+        assert_eq!(q.data, [64.0, f64::INFINITY]);
+    }
+
+    #[test]
+    fn complex_reductions_and_abs() {
+        let z = Matrix::complex_parts(2, 2, vec![1.0, 2.0, 3.0, 4.0], vec![1.0, -1.0, 2.0, 0.0]);
+        let s = out(reduction(&[val(z.clone())], "sum", Red::Sum));
+        assert_eq!(
+            (s.data.clone(), s.im.clone()),
+            (vec![3.0, 7.0], Some(vec![0.0, 2.0]))
+        );
+        let m = out(reduction(&[val(z.clone()), text("all")], "mean", Red::Mean));
+        assert_eq!((m.data[0], m.im.as_ref().unwrap()[0]), (2.5, 0.5));
+        // (1+1i)(2-1i) = 3+1i; (3+2i)(4) = 12+8i.
+        let p = out(reduction(&[val(z.clone())], "prod", Red::Prod));
+        assert_eq!(p.data, [3.0, 12.0]);
+        assert_eq!(p.im.as_deref(), Some(&[1.0, 8.0][..]));
+        // (1+1i)(1-1i) = 2, stored real by the flag rule.
+        let w = Matrix::complex_parts(1, 2, vec![1.0, 1.0], vec![1.0, -1.0]);
+        let p = out(reduction(&[val(w.clone())], "prod", Red::Prod));
+        assert!(!p.is_complex());
+        assert_eq!(p.data, [2.0]);
+        let c = out(cumulative(&[val(w)], "cumsum", true));
+        assert_eq!(c.data, [1.0, 2.0]);
+        assert_eq!(c.im.as_deref(), Some(&[1.0, 0.0][..]));
+        let a = out(abs(&[val(Matrix::complex_parts(
+            1,
+            1,
+            vec![3.0],
+            vec![-4.0],
+        ))]));
+        assert_eq!(a.data, [5.0]);
+        assert!(!a.is_complex());
     }
 
     #[test]

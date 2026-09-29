@@ -24,6 +24,7 @@
 //!   can reach the error.
 
 use super::args::check_shape;
+use super::complex::C;
 use crate::error;
 use crate::interp::R;
 use crate::value::Matrix;
@@ -539,11 +540,15 @@ fn rotate_cols(m: &mut Matrix, p: usize, q: usize, c: f64, s: f64) {
 /// order the iteration deflates them, which, as for MATLAB's
 /// non-symmetric `eig`, is no particular order.
 ///
-/// A complex pair is refused with the cycle-10 refusal as soon as it is
-/// found, never returned as a wrong real answer. `max_iter` bounds the
+/// Since cycle 10 a complex pair is returned as the pair of complex values
+/// (JAMA's `e`, the imaginary parts, which the iteration finds with each
+/// 2x2 block), the one with the positive imaginary part first, and its
+/// vectors are the complex columns the back-substitution gives, `V(:, j)
+/// +- V(:, j+1)*i`, each scaled to unit 2-norm. `max_iter` bounds the
 /// iterations spent on any one eigenvalue; past it the answer is
 /// `no_convergence`. The caller has refused a non-finite input already.
-pub fn eig_general(a: &Matrix, max_iter: usize) -> R<(Vec<f64>, Matrix)> {
+#[allow(clippy::needless_range_loop)]
+pub fn eig_general(a: &Matrix, max_iter: usize) -> R<(Vec<C>, Matrix)> {
     let nn = a.rows;
     let scale = max_abs(&a.data);
     let s = if scale > 0.0 { scale } else { 1.0 };
@@ -554,23 +559,40 @@ pub fn eig_general(a: &Matrix, max_iter: usize) -> R<(Vec<f64>, Matrix)> {
         .map(|i| (0..nn).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
         .collect();
     orthes(&mut h, &mut v);
-    let d = hqr2(&mut h, &mut v, max_iter)?;
-    let mut vecs = zeros(nn, nn)?;
-    for (i, row) in v.iter().enumerate() {
-        for (j, x) in row.iter().enumerate() {
-            vecs.set(i, j, *x);
-        }
-    }
-    // Unit 2-norm columns, as MATLAB normalises them.
+    let (d, e) = hqr2(&mut h, &mut v, max_iter)?;
+    let (mut re, mut im) = (zeros(nn, nn)?, zeros(nn, nn)?);
     for j in 0..nn {
-        let len = norm2(col(&vecs, j));
+        // A pair's vectors are `V(:, k) + V(:, k+1)*i` for the value with
+        // the positive imaginary part and its conjugate for the other.
+        let (k, sign) = match e[j] {
+            x if x > 0.0 => (Some(j + 1), 1.0),
+            x if x < 0.0 => (Some(j), -1.0),
+            _ => (None, 0.0),
+        };
+        let first = if e[j] < 0.0 { j - 1 } else { j };
+        for i in 0..nn {
+            re.set(i, j, v[i][first]);
+            if let Some(k) = k {
+                im.set(i, j, sign * v[i][k]);
+            }
+        }
+        // Unit 2-norm columns, as MATLAB normalises them.
+        let len = norm2(col(&re, j)).hypot(norm2(col(&im, j)));
         if len > 0.0 {
-            vecs.data[j * nn..(j + 1) * nn]
-                .iter_mut()
-                .for_each(|x| *x /= len);
+            for x in re.data[j * nn..(j + 1) * nn].iter_mut() {
+                *x /= len;
+            }
+            for x in im.data[j * nn..(j + 1) * nn].iter_mut() {
+                *x /= len;
+            }
         }
     }
-    Ok((d.iter().map(|x| x * s).collect(), vecs))
+    let vals = d
+        .iter()
+        .zip(&e)
+        .map(|(&x, &y)| C::new(x * s, y * s))
+        .collect();
+    Ok((vals, re.with_im(Some(im.data))))
 }
 
 /// Reduction to upper Hessenberg form by orthogonal similarity
@@ -643,14 +665,17 @@ fn orthes(h: &mut [Vec<f64>], v: &mut [Vec<f64>]) {
 }
 
 /// The shifted double QR iteration on a Hessenberg `h`, accumulating into
-/// `v`, then back-substitution for the eigenvectors. Real eigenvalues only:
-/// a complex pair is the complex refusal.
+/// `v`, then back-substitution for the eigenvectors: the real parts `d`
+/// and the imaginary parts `e` of the eigenvalues, a complex pair being
+/// `e = [z, -z]` on two neighbouring places (JAMA's convention), whose
+/// vectors take the two columns of `v` there.
 #[allow(clippy::needless_range_loop)]
-fn hqr2(h: &mut [Vec<f64>], v: &mut [Vec<f64>], max_iter: usize) -> R<Vec<f64>> {
+fn hqr2(h: &mut [Vec<f64>], v: &mut [Vec<f64>], max_iter: usize) -> R<(Vec<f64>, Vec<f64>)> {
     let nn = h.len();
     let mut d = vec![0.0; nn];
+    let mut e = vec![0.0; nn];
     if nn == 0 {
-        return Ok(d);
+        return Ok((d, e));
     }
     let high = nn - 1;
     let mut exshift = 0.0;
@@ -697,7 +722,15 @@ fn hqr2(h: &mut [Vec<f64>], v: &mut [Vec<f64>], max_iter: usize) -> R<Vec<f64>> 
             h[nu - 1][nu - 1] += exshift;
             x = h[nu][nu];
             if q < 0.0 {
-                return Err(error::complex_eigenvalues());
+                // A complex pair: the block is left as it is, and the
+                // back-substitution below reads it.
+                d[nu - 1] = x + p;
+                d[nu] = x + p;
+                e[nu - 1] = z;
+                e[nu] = -z;
+                n -= 2;
+                iter = 0;
+                continue;
             }
             z = if p >= 0.0 { p + z } else { p - z };
             d[nu - 1] = x + z;
@@ -861,29 +894,122 @@ fn hqr2(h: &mut [Vec<f64>], v: &mut [Vec<f64>], max_iter: usize) -> R<Vec<f64>> 
     }
     if norm == 0.0 {
         // The zero matrix: every vector is an eigenvector, and `v` is `I`.
-        return Ok(d);
+        return Ok((d, e));
     }
-    // Back-substitute for the vectors of the upper triangular form.
+    // Back-substitute for the vectors of the quasi-triangular form: a real
+    // vector for a real value, and for a pair a complex vector whose real
+    // and imaginary parts take the pair's two columns. A 2x2 block met on
+    // the way is solved as the small real or complex system it is.
     for nb in (0..nn).rev() {
-        let p = d[nb];
-        let mut l = nb;
-        h[nb][nb] = 1.0;
-        for i in (0..nb).rev() {
-            let w = h[i][i] - p;
-            let mut r = 0.0;
-            for j in l..=nb {
-                r += h[i][j] * h[j][nb];
+        let (p, q) = (d[nb], e[nb]);
+        if q == 0.0 {
+            let mut l = nb;
+            h[nb][nb] = 1.0;
+            // `w` and `r` of the second row of a block, kept for its first.
+            let (mut z, mut s) = (0.0, 0.0);
+            for i in (0..nb).rev() {
+                let w = h[i][i] - p;
+                let mut r = 0.0;
+                for j in l..=nb {
+                    r += h[i][j] * h[j][nb];
+                }
+                if e[i] < 0.0 {
+                    z = w;
+                    s = r;
+                    continue;
+                }
+                l = i;
+                if e[i] == 0.0 {
+                    h[i][nb] = if w != 0.0 { -r / w } else { -r / (EPS * norm) };
+                } else {
+                    // The real 2x2 system of a block.
+                    let x = h[i][i + 1];
+                    let y = h[i + 1][i];
+                    let den = (d[i] - p) * (d[i] - p) + e[i] * e[i];
+                    let t = (x * s - z * r) / den;
+                    h[i][nb] = t;
+                    h[i + 1][nb] = if x.abs() > z.abs() {
+                        (-r - w * t) / x
+                    } else {
+                        (-s - y * t) / z
+                    };
+                }
+                // Overflow control.
+                let t = h[i][nb].abs();
+                if (EPS * t) * t > 1.0 {
+                    for j in i..=nb {
+                        h[j][nb] /= t;
+                    }
+                }
             }
-            l = i;
-            h[i][nb] = if w != 0.0 { -r / w } else { -r / (EPS * norm) };
-            // Overflow control.
-            let t = h[i][nb].abs();
-            if (EPS * t) * t > 1.0 {
-                for j in i..=nb {
-                    h[j][nb] /= t;
+        } else if q < 0.0 {
+            // The second value of a pair: columns `n - 1` and `n` hold the
+            // real and imaginary parts of its vector.
+            let n = nb;
+            let mut l = n - 1;
+            if h[n][n - 1].abs() > h[n - 1][n].abs() {
+                h[n - 1][n - 1] = q / h[n][n - 1];
+                h[n - 1][n] = -(h[n][n] - p) / h[n][n - 1];
+            } else {
+                let c = C::new(0.0, -h[n - 1][n]) / C::new(h[n - 1][n - 1] - p, q);
+                h[n - 1][n - 1] = c.re;
+                h[n - 1][n] = c.im;
+            }
+            h[n][n - 1] = 0.0;
+            h[n][n] = 1.0;
+            let (mut z, mut r, mut s) = (0.0, 0.0, 0.0);
+            for i in (0..n - 1).rev() {
+                let (mut ra, mut sa) = (0.0, 0.0);
+                for j in l..=n {
+                    ra += h[i][j] * h[j][n - 1];
+                    sa += h[i][j] * h[j][n];
+                }
+                let w = h[i][i] - p;
+                if e[i] < 0.0 {
+                    z = w;
+                    r = ra;
+                    s = sa;
+                    continue;
+                }
+                l = i;
+                if e[i] == 0.0 {
+                    let c = C::new(-ra, -sa) / C::new(w, q);
+                    h[i][n - 1] = c.re;
+                    h[i][n] = c.im;
+                } else {
+                    // The complex 2x2 system of a block.
+                    let x = h[i][i + 1];
+                    let y = h[i + 1][i];
+                    let mut vr = (d[i] - p) * (d[i] - p) + e[i] * e[i] - q * q;
+                    let vi = (d[i] - p) * 2.0 * q;
+                    if vr == 0.0 && vi == 0.0 {
+                        vr = EPS * norm * (w.abs() + q.abs() + x.abs() + y.abs() + z.abs());
+                    }
+                    let c =
+                        C::new(x * r - z * ra + q * sa, x * s - z * sa - q * ra) / C::new(vr, vi);
+                    h[i][n - 1] = c.re;
+                    h[i][n] = c.im;
+                    if x.abs() > z.abs() + q.abs() {
+                        h[i + 1][n - 1] = (-ra - w * h[i][n - 1] + q * h[i][n]) / x;
+                        h[i + 1][n] = (-sa - w * h[i][n] - q * h[i][n - 1]) / x;
+                    } else {
+                        let c = C::new(-r - y * h[i][n - 1], -s - y * h[i][n]) / C::new(z, q);
+                        h[i + 1][n - 1] = c.re;
+                        h[i + 1][n] = c.im;
+                    }
+                }
+                // Overflow control.
+                let t = h[i][n - 1].abs().max(h[i][n].abs());
+                if (EPS * t) * t > 1.0 {
+                    for j in i..=n {
+                        h[j][n - 1] /= t;
+                        h[j][n] /= t;
+                    }
                 }
             }
         }
+        // `q > 0`: the first value of a pair, whose vector the second's
+        // columns already hold.
     }
     // Back-transform to the vectors of the original matrix.
     for j in (0..nn).rev() {
@@ -895,7 +1021,7 @@ fn hqr2(h: &mut [Vec<f64>], v: &mut [Vec<f64>], max_iter: usize) -> R<Vec<f64>> 
             v[i][j] = z;
         }
     }
-    Ok(d)
+    Ok((d, e))
 }
 
 // ---- SVD -------------------------------------------------------------
@@ -1364,7 +1490,8 @@ mod tests {
 
     #[test]
     fn the_qr_iteration_finds_real_eigenvalues() {
-        let (mut vals, v) = eig_general(&rmat(2, 2, &[4.0, 1.0, 2.0, 3.0]), 300).unwrap();
+        let (vals, v) = eig_general(&rmat(2, 2, &[4.0, 1.0, 2.0, 3.0]), 300).unwrap();
+        let mut vals = reals(vals, &v);
         check_eig(&rmat(2, 2, &[4.0, 1.0, 2.0, 3.0]), &vals, &v, 1e-13);
         vals.sort_by(f64::total_cmp);
         assert!((vals[0] - 2.0).abs() < 1e-14 && (vals[1] - 5.0).abs() < 1e-14);
@@ -1381,7 +1508,8 @@ mod tests {
             &mul(&s, &diag(&[1.0, 2.0, 3.0, 4.0], 4, 4)),
             &lu(&s).inverse().unwrap(),
         );
-        let (mut vals, v) = eig_general(&a, qr_iterations(4)).unwrap();
+        let (vals, v) = eig_general(&a, qr_iterations(4)).unwrap();
+        let mut vals = reals(vals, &v);
         check_eig(&a, &vals, &v, 1e-10);
         vals.sort_by(f64::total_cmp);
         for (got, want) in vals.iter().zip([1.0, 2.0, 3.0, 4.0]) {
@@ -1390,20 +1518,80 @@ mod tests {
         // Triangular and zero matrices deflate at once.
         let t = rmat(3, 3, &[1.0, 5.0, 7.0, 0.0, 2.0, 3.0, 0.0, 0.0, 3.0]);
         let (vals, v) = eig_general(&t, qr_iterations(3)).unwrap();
+        let vals = reals(vals, &v);
         check_eig(&t, &vals, &v, 1e-13);
-        let (vals, _) = eig_general(&Matrix::filled(3, 3, 0.0), qr_iterations(3)).unwrap();
-        assert_eq!(vals, [0.0, 0.0, 0.0]);
+        let (vals, v) = eig_general(&Matrix::filled(3, 3, 0.0), qr_iterations(3)).unwrap();
+        assert_eq!(reals(vals, &v), [0.0, 0.0, 0.0]);
     }
 
+    /// The values of a matrix with only real eigenvalues, which must come
+    /// with real vectors.
+    fn reals(vals: Vec<C>, v: &Matrix) -> Vec<f64> {
+        assert!(!v.is_complex(), "{v:?}");
+        vals.iter()
+            .map(|z| {
+                assert_eq!(z.im, 0.0, "{vals:?}");
+                z.re
+            })
+            .collect()
+    }
+
+    /// `A * v = lambda * v` for every column, over complex scalars, and
+    /// every column of unit 2-norm.
+    fn check_eig_c(a: &Matrix, vals: &[C], v: &Matrix, tol: f64) {
+        let n = a.rows;
+        let scale = max_abs(&a.data).max(1.0);
+        for (j, &lambda) in vals.iter().enumerate() {
+            let mut len = 0.0;
+            for i in 0..n {
+                let mut av = C::real(0.0);
+                for k in 0..n {
+                    av = av + C::real(a.get(i, k)) * v.c(j * n + k);
+                }
+                let r = av - lambda * v.c(j * n + i);
+                assert!(r.abs() < tol * scale, "{a:?}: {vals:?}, column {j}");
+                len += v.c(j * n + i).abs().powi(2);
+            }
+            assert!((len.sqrt() - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// Cycle 10: a complex pair is a pair of complex values with complex
+    /// vectors, the positive imaginary part first.
     #[test]
-    fn a_complex_pair_is_refused() {
-        let e = eig_general(&rmat(2, 2, &[0.0, -1.0, 1.0, 0.0]), 300)
-            .unwrap_err()
-            .msg;
-        assert!(e.starts_with("Complex results are not supported."), "{e}");
+    fn a_complex_pair_gives_complex_values_and_vectors() {
+        let a = rmat(2, 2, &[0.0, -1.0, 1.0, 0.0]);
+        let (vals, v) = eig_general(&a, 300).unwrap();
+        assert_eq!(vals.len(), 2);
+        assert!((vals[0].re).abs() < 1e-15 && (vals[0].im - 1.0).abs() < 1e-15);
+        assert_eq!(vals[1], vals[0].conj());
+        assert!(v.is_complex());
+        check_eig_c(&a, &vals, &v, 1e-14);
         // A 3x3 rotation about an axis has one real and two complex.
         let r = rmat(3, 3, &[0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0]);
-        assert!(eig_general(&r, 300).is_err());
+        let (vals, v) = eig_general(&r, 300).unwrap();
+        check_eig_c(&r, &vals, &v, 1e-13);
+        assert_eq!(vals.iter().filter(|z| z.im == 0.0).count(), 1);
+        // Mixed real values and pairs, with blocks the back-substitution
+        // must solve through, in a well-scaled non-normal matrix.
+        for seed in 0..8 {
+            let a = noise(6, 6, 40 + seed);
+            let (vals, v) = eig_general(&a, qr_iterations(6)).unwrap();
+            check_eig_c(&a, &vals, &v, 1e-10);
+            // The sum of the eigenvalues is the trace.
+            let tr: f64 = (0..6).map(|i| a.get(i, i)).sum();
+            let s = vals.iter().fold(C::real(0.0), |acc, &z| acc + z);
+            assert!((s.re - tr).abs() < 1e-10 && s.im.abs() < 1e-10);
+        }
+        // A companion matrix whose roots are 1 +- 2i and 3.
+        let c = rmat(3, 3, &[5.0, -11.0, 15.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let (mut vals, v) = eig_general(&c, qr_iterations(3)).unwrap();
+        check_eig_c(&c, &vals, &v, 1e-12);
+        vals.sort_by(|x, y| x.re.total_cmp(&y.re).then(x.im.total_cmp(&y.im)));
+        let want = [C::new(1.0, -2.0), C::new(1.0, 2.0), C::real(3.0)];
+        for (g, w) in vals.iter().zip(want) {
+            assert!((*g - w).abs() < 1e-12, "{vals:?}");
+        }
     }
 
     #[test]

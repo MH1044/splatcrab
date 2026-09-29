@@ -44,10 +44,13 @@ pub fn mat(args: &[Value], i: usize, name: &str) -> R<Matrix> {
         .into_mat()
 }
 
-/// Argument `i` as a scalar.
+/// Argument `i` as a real scalar. A complex one is refused rather than
+/// read by its real part (cycle 10), which is what keeps a dimension, a
+/// size or an option value of a builtin that takes complex data honest.
 pub fn scalar(args: &[Value], i: usize, name: &str) -> R<f64> {
-    mat(args, i, name)?
-        .scalar_value()
+    let m = mat(args, i, name)?;
+    m.require_real(name)?;
+    m.scalar_value()
         .ok_or_else(|| error::arg_not_a_scalar(i + 1, name))
 }
 
@@ -132,6 +135,9 @@ pub fn string(args: &[Value], i: usize, name: &str) -> R<String> {
 /// No arguments give an empty list; the caller knows whether that means 1x1.
 pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<Option<f64>>> {
     let rest = args.get(from..).unwrap_or(&[]);
+    for a in rest {
+        a.mat()?.require_real(name)?;
+    }
     if let [one] = rest {
         if one.is_char() {
             return Err(error::bad_size_arg(name));
