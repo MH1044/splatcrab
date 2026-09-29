@@ -1,0 +1,7 @@
+% covers: 10 - history and history_add over a fresh history file with no seed: history of no file is empty; history_add adds a new entry, refuses a repeat of the newest and an entry of whitespace only, and keeps a multi-line entry whole; history then lists the entries added, oldest first, decoded
+{"id":1,"op":"history"}
+{"id":2,"op":"history_add","entry":"x = 1"}
+{"id":3,"op":"history_add","entry":"x = 1"}
+{"id":4,"op":"history_add","entry":"   "}
+{"id":5,"op":"history_add","entry":"a\nb"}
+{"id":6,"op":"history"}

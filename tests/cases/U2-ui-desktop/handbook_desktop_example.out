@@ -1,0 +1,4 @@
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":true,"vars":[{"name":"name","size":[1,4],"class":"char","value":"'crab'"},{"name":"x","size":[1,1],"class":"double","value":"3"}]}
+{"id":3,"ok":true,"root":"U2-ui-desktop","path":"tree/sub","entries":[{"name":"deep.txt","dir":false,"size":3}],"truncated":false}
+{"id":4,"ok":false,"error":{"message":"Path '..' is outside the file root.","line":null}}

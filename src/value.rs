@@ -421,6 +421,19 @@ impl Func {
             Func::Anon { def, .. } => def.text(),
         }
     }
+
+    /// The first `chars` characters of [`Func::shown`], rendered no
+    /// further, so they cost time in proportion to `chars` and never to the
+    /// handle's size: what a workspace preview shows (cycle U2).
+    pub fn shown_up_to(&self, chars: usize) -> String {
+        match self {
+            Func::Named { name, .. } => std::iter::once('@')
+                .chain(name.chars())
+                .take(chars)
+                .collect(),
+            Func::Anon { def, .. } => def.text_up_to(chars),
+        }
+    }
 }
 
 impl Value {

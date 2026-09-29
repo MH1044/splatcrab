@@ -1,0 +1,3 @@
+% covers: 6 - files: path is required and a string, so a files request with no path, or with a path that is a number, is a malformed request that echoes the id
+{"id":1,"op":"files"}
+{"id":2,"op":"files","path":3}

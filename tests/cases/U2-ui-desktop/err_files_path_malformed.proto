@@ -1,0 +1,6 @@
+% covers: 4 - the confinement rule, step 1: a path that starts with /, or holds a \, a : or a NUL anywhere is a malformed request, so no absolute path (/etc), drive (C:/Windows), Windows separator (tree\sub), alternate data stream (tree/a.txt:zone) or NUL is ever joined to the root
+{"id":1,"op":"files","path":"/etc"}
+{"id":2,"op":"files","path":"C:/Windows"}
+{"id":3,"op":"files","path":"tree\\sub"}
+{"id":4,"op":"files","path":"tree/a.txt:zone"}
+{"id":5,"op":"files","path":"tree\u0000sub"}

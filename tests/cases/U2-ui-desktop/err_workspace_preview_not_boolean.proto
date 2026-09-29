@@ -1,0 +1,6 @@
+% covers: 9 - workspace without preview, or with "preview": false, answers exactly U0's bytes, with no value key; a preview that is not true or false (a number, a string) is a malformed request that echoes the id
+{"id":1,"op":"eval","code":"x = 3; s = 'ab';"}
+{"id":2,"op":"workspace"}
+{"id":3,"op":"workspace","preview":false}
+{"id":4,"op":"workspace","preview":1}
+{"id":5,"op":"workspace","preview":"yes"}

@@ -1773,6 +1773,37 @@ pub fn unknown_operation(op: &str) -> MError {
     MError::new(format!("Unknown operation '{}'.", op))
 }
 
+// The desktop's operations (cycle U2, docs/modules/U2-ui-desktop.md).
+
+/// `workspace` with a `preview` that is neither `true` nor `false`.
+pub fn request_preview() -> MError {
+    malformed("'preview' must be true or false")
+}
+
+/// A `files` path that could name something other than a path under the
+/// root: it starts with `/`, or holds a `\`, a `:` or a NUL.
+pub fn files_path_malformed() -> MError {
+    malformed("'path' must be a relative path with '/' separators")
+}
+
+/// A `files` path whose `..` climbs past the root, or whose canonical form
+/// lies outside it. `path` is the path as the request sent it.
+pub fn files_outside_root(path: &str) -> MError {
+    MError::new(format!("Path '{}' is outside the file root.", path))
+}
+
+/// A `files` path inside the root that does not exist, cannot be read or
+/// is not a folder.
+pub fn files_not_a_folder(path: &str) -> MError {
+    MError::new(format!("Path '{}' is not a folder.", path))
+}
+
+/// `history_add` could not append to the history file. No operating-system
+/// text, so the answer is the same on every platform.
+pub fn history_not_written() -> MError {
+    MError::new("The history file could not be written.")
+}
+
 // ---- the environment (cycle 13) ---------------------------------------
 
 /// `exit` or `quit` under `--protocol`, `--ui` or `--http-stdio`, where the
@@ -2031,8 +2062,9 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 29] = [
+        const FILES: [(&str, &str); 30] = [
             ("lexer.rs", include_str!("lexer.rs")),
+            ("files.rs", include_str!("files.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
             ("value.rs", include_str!("value.rs")),

@@ -1,5 +1,10 @@
-/* SplatCrab command window. Colours are defined once, here, as tokens: the
-   light set on :root and the dark set under prefers-color-scheme. */
+/* SplatCrab desktop: the command window, the workspace, the command history
+   and the file browser. The palette is defined once, here, as custom
+   properties: the light set in the :root rule and the dark set in the one
+   prefers-color-scheme block's :root rule. Nothing else in this file names
+   a colour; a unit test in src/http.rs holds it to that. Pane sizes are
+   custom properties too, which app.js sets through the CSS object model:
+   the page's policy allows no style attribute and no inline style. */
 
 :root {
   color-scheme: light dark;
@@ -11,7 +16,12 @@
   --focus: #3a7d5c;
   --err: #b3261e;
   --err-bg: #fcebea;
+  --pane: #f4f4f1;
+  --hover: #e9e9e4;
+  --accent: #2c6694;
+  --grip: #c9c9c2;
   --mono: ui-monospace, "Cascadia Mono", Consolas, Menlo, "DejaVu Sans Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -24,6 +34,10 @@
     --focus: #79c29c;
     --err: #ff938a;
     --err-bg: #3a1e1c;
+    --pane: #1b1b1e;
+    --hover: #28282c;
+    --accent: #8cbbe3;
+    --grip: #4a4a50;
   }
 }
 
@@ -38,15 +52,105 @@ body {
 }
 
 body {
-  display: flex;
-  flex-direction: column;
   background: var(--bg);
   color: var(--fg);
   font: 14px/1.45 var(--mono);
 }
 
+button {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: inherit;
+  cursor: pointer;
+}
+
+button:focus-visible,
+.splitter:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
+/* The four panes and three splitters. --left and --right are the side
+   columns' widths and --top the workspace's height, set by app.js; each
+   has a default here for the first layout. */
+
+#desktop {
+  display: grid;
+  height: 100%;
+  grid-template-columns: var(--left, 240px) 6px minmax(120px, 1fr) 6px var(--right, 360px);
+  grid-template-rows: 100%;
+}
+
+#side {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: var(--top, minmax(120px, 1fr)) 6px minmax(120px, 1fr);
+  grid-template-columns: 100%;
+}
+
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+#files,
+#workspace,
+#history {
+  background: var(--pane);
+}
+
+.pane-title {
+  margin: 0;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--muted);
+  font: 600 12px/1.4 var(--sans);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.pane-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.note {
+  padding: 8px 12px;
+  color: var(--muted);
+  font-family: var(--sans);
+}
+
+.splitter {
+  background: var(--rule);
+  touch-action: none;
+}
+
+.splitter:hover,
+.splitter.dragging {
+  background: var(--grip);
+}
+
+.splitter[aria-orientation="vertical"] {
+  cursor: col-resize;
+}
+
+.splitter[aria-orientation="horizontal"] {
+  cursor: row-resize;
+}
+
+/* The command window. */
+
 #transcript {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 16px 16px 8px;
 }
@@ -116,4 +220,148 @@ pre {
 
 #input[readonly] {
   color: var(--muted);
+}
+
+/* The workspace: name, value, size and class per variable. */
+
+#vars {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+#vars th {
+  position: sticky;
+  top: 0;
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--pane);
+  color: var(--muted);
+  font: 600 12px/1.4 var(--sans);
+  text-align: left;
+}
+
+#vars td {
+  padding: 3px 12px;
+  border-bottom: 1px solid var(--rule);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#vars .col-name {
+  width: 22%;
+}
+
+#vars .col-value {
+  width: 42%;
+}
+
+#vars .col-size {
+  width: 16%;
+}
+
+#vars .col-class {
+  width: 20%;
+}
+
+#vars td.class {
+  color: var(--muted);
+}
+
+/* The file browser and the command history: lists of one line each. */
+
+.path {
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.list {
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+}
+
+.list li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 12px;
+}
+
+.list li:hover {
+  background: var(--hover);
+}
+
+.list .name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.list .folder {
+  color: var(--accent);
+}
+
+.list .folder:not(.up)::after {
+  content: "/";
+}
+
+.list .size {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+#history-list .name {
+  white-space: pre;
+}
+
+/* A rule between entries, so a multi-line entry reads as one. */
+#history-list li + li {
+  border-top: 1px solid var(--rule);
+}
+
+/* Narrow windows: one column, the command window first, no splitters. */
+
+@media (max-width: 719.98px) {
+  #desktop {
+    height: auto;
+    min-height: 100%;
+    grid-template-columns: 100%;
+    grid-template-rows: auto;
+  }
+
+  #side {
+    grid-template-rows: auto;
+  }
+
+  .splitter {
+    display: none;
+  }
+
+  #command {
+    order: 1;
+    height: 70vh;
+    min-height: 240px;
+  }
+
+  #side {
+    order: 2;
+  }
+
+  #files {
+    order: 3;
+  }
+
+  #workspace,
+  #history,
+  #files {
+    height: 40vh;
+    min-height: 160px;
+    border-top: 1px solid var(--rule);
+  }
 }

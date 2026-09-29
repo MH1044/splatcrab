@@ -32,6 +32,7 @@ A case is a `.m` file with a sibling `.out`:
 | `<name>.repl` | a REPL session instead of a script. Line 1 is the marker; the rest is typed at the prompt |
 | `<name>.proto` | a protocol session instead of a script. Line 1 is the marker; the rest is one JSON request per line |
 | `<name>.http` | a UI server session instead of a script. Line 1 is the marker; the rest is HTTP requests one after another |
+| `<name>.history` | optional. The command history the case starts from, in the history file's own format (cycle U2); a folder of that name makes the history path an empty folder, a history file that cannot be written |
 
 A `.m` file is a case when it has a sibling `.out`, **or** when its first line
 is the `% covers:` marker. The marker is what makes a brand new case
@@ -105,7 +106,28 @@ never a Git Bash heredoc.
 
 A `.m` with no marker and no `.out` is a helper: a function or script file that
 a case next to it calls by name. Each case runs with its own directory as the
-working directory, so helpers resolve without a path.
+working directory, so helpers resolve without a path. Under `--protocol` and
+`--http-stdio` that directory is also the file root the `files` operation
+lists (cycle U2), so a `.proto` case names its fixtures relative to its own
+folder.
+
+### The command history
+
+No case touches the user's command history (cycle U2). The harness gives
+every case it spawns, of every kind, `SPLATCRAB_HISTORY` pointing at a fresh
+file of its own in the temporary folder, named by the harness's process id
+and the case's place in the run, and removes it before and after the run.
+When the case has a sibling `<name>.history`, its bytes are copied there
+first, so the case starts from a known history; without one the file does
+not exist, which is an empty history. When that sibling is a folder, the
+history path is made an empty folder instead and removed after the run as
+the file is, so a case can reach the history file that cannot be written;
+the folder's own content is ignored, and an empty `.keep` in it keeps it in
+git. The protocol's `history` and `history_add` read and write that path
+and nothing else. A `.history` file
+is in the format `src/history.rs` records, one entry per line with `\`,
+`\n` and `\r` escaped, so it holds backslashes: write it with the Write
+tool, never a Git Bash heredoc.
 
 ## The exit code
 
@@ -237,17 +259,37 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   included), brackets, an index's `end`, an open `%{`, and text that does not
   lex.
 - `env.rs`: `completions` ordering, the merge of variables and builtins, and
-  a shadowed builtin listed once.
+  a shadowed builtin listed once; since cycle U2 each rule of `preview`, the
+  display format, the cut at 80 scalar values, and a 2^20-element char row
+  previewed after decoding no more than 82 of its code units.
+- `files.rs` (cycle U2): the confinement rule at every step, the listing's
+  order and sizes, a name that is not Unicode left out, the entry bound
+  reached with a bound of 3, an uncanonical root refusing everything, a
+  path of 100,000 components judged in time linear in its length, and
+  links: on Unix a link inside the root pointing outside it, refused as a
+  path and listed with `dir` false and `size` null, one pointing inside,
+  listed as its target, and a dangling one; on Windows the same where a link
+  can be made.
 - `protocol.rs`: `serve` driven with an in-memory reader and writer, through
   every operation, every malformed-request text, blank lines, a `\r`, and the
-  flush after each response.
+  flush after each response; since cycle U2 the key order of `files`,
+  `workspace` with `preview`, `history` and `history_add`, each against a
+  folder or file of the test's own, never the user's history, and
+  `history_add` against a folder refused as not written.
 - `http.rs`: `handle` driven with byte strings, through every status, the
   header order, `Content-Length` against the body on every response, the
   static routes against the embedded files, the `Host`, `Origin` and token
   checks, a refused request leaving the interpreter untouched, and both size
   limits at and past their bounds; `read_request` and the stdio loop over
   in-memory streams.
-- `server.rs`: the token's form and freshness, and the URL.
+- `http.rs`, since cycle U2: the palette rule over the embedded `app.css`,
+  `index.html` and `app.js` (every CSS named colour listed, the system
+  colours and the colour functions), and a set of deliberately bad
+  stylesheets, each refused.
+- `server.rs`: the token's form and freshness, the URL, and since cycle U2
+  the connection bound (sixteen slots, the seventeenth refused, a slot freed
+  from another thread free again) and the interpreter loop answering jobs in
+  arrival order.
 
 ## The socket test
 
@@ -255,10 +297,17 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 `splatcrab --ui --port 0 --no-browser --token itest`, reads the port from the
 line the server prints, and talks to `127.0.0.1` over `std::net::TcpStream`:
 an `eval` round trip, a `403` without the token and for a foreign `Host`, and
-`GET /` with its `Content-Security-Policy`. The child is killed by a guard's
-`Drop`, so an assertion that fails still kills it, and the test binds nothing
-itself. It also runs the bad-option refusals of `--ui` and `--http-stdio`,
-which no golden case can reach, since every case runs with fixed flags.
+`GET /` with its `Content-Security-Policy`. Since cycle U2 it also checks
+that a connection opened and left idle, and one that sent half a head, do
+not stop an `eval` on another connection from being answered within 3
+seconds, and runs `files` and `workspace` with `preview` against a fixture
+folder it makes under the temporary folder and starts the server in, with
+the page, the script and the stylesheet still served. Every server it
+starts has `SPLATCRAB_HISTORY` pointing at a file of its own. The child is
+killed by a guard's `Drop`, so an assertion that fails still kills it, and
+the fixture is removed the same way; the test binds nothing itself. It also
+runs the bad-option refusals of `--ui` and `--http-stdio`, which no golden
+case can reach, since every case runs with fixed flags.
 
 ## The output rule
 

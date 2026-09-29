@@ -1,0 +1,4 @@
+% covers: 12 - history_add: entry is required and a string, so a history_add with no entry, or with an entry that is an array, is a malformed request that echoes the id and adds nothing: the history after them is still empty
+{"id":1,"op":"history_add"}
+{"id":2,"op":"history_add","entry":[]}
+{"id":3,"op":"history"}

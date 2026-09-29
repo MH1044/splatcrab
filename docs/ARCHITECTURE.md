@@ -20,21 +20,25 @@
                    │
                    ├──► interp.rs           eval, output captured
                    ├──► syntax.rs           complete: is the entry finished?
-                   └──► env.rs              completions: variables + path files + builtins
+                   ├──► env.rs              completions: variables + path files + builtins;
+                   │                        workspace's value previews
+                   ├──► files.rs            files: one folder under the file root
+                   └──► history.rs          history, history_add: the shared history file
 
- browser ──► server.rs ──► http.rs ──► protocol::respond
- 127.0.0.1   accept, read   limits, Host, Origin, token, routes
- only        one request,   │
-             write, close   └──► src/ui/    index.html, app.js, app.css,
-                                            embedded with include_str!
+ browser ──► server.rs ──────────────► http.rs ──► protocol::respond
+ 127.0.0.1   a reader thread per       limits, Host, Origin, token, routes
+ only        connection (16 at most),  │
+             a channel to the one      └──► src/ui/  index.html, app.js, app.css,
+             interpreter thread                      embedded with include_str!
  stdin ────► http::serve_stdio (--http-stdio): the same http::handle, no socket
 ```
 
-`src/lib.rs` exposes the fifteen modules: the six of the language (`lexer`,
+`src/lib.rs` exposes the sixteen modules: the six of the language (`lexer`,
 `parser`, `interp`, `value`, `builtins`, `error`), the four of the
 evaluation protocol that cycle U0 added (`json`, `syntax`, `env`,
 `protocol`), the two of the UI server that cycle U1 added (`http`,
-`server`), cycle 12's `plot`, and cycle 13's `editor` and `history`. `src/ui/` holds the page's three files, which `http.rs` embeds.
+`server`), cycle 12's `plot`, cycle 13's `editor` and `history`, and cycle
+U2's `files`. `src/ui/` holds the page's three files, which `http.rs` embeds.
 `src/main.rs` is the CLI and REPL and, with `src/term.rs`, the raw-mode
 terminal module only the binary compiles, is the only code allowed to use
 `print!`. It runs everything, `--protocol` and `--ui` included, on a thread
@@ -377,7 +381,24 @@ function file (`name.m`, listed as `name`) in the `path` folders and every
 builtin starting with `prefix`, sorted by byte order and deduplicated.
 `Interp::builtins` hands out the registry read-only for it and
 `Interp::path_dirs` the folders, the current one first. The protocol's
-`completions` and the terminal's Tab both call it (cycle 13).
+`completions` and the terminal's Tab both call it (cycle 13). Since cycle
+U2 `preview(value, format)` is the workspace pane's text for a value, which
+`workspace` with `"preview": true` answers: a small numeric or logical
+array written out element by element as `disp` prints each alone, a
+one-row char array quoted as a literal, a handle's text, or else the size
+and class, cut at 80 scalar values. It costs what it shows: at most 10
+elements are displayed, a char row is decoded lazily, only as far as the
+cut can keep, and a handle's text is rendered under a budget of one
+character past the cut (`Func::shown_up_to`), never whole.
+
+**`files.rs`** (cycle U2) is the file browser's listing: `list(root, path,
+bound)` lists one folder under the file root by the confinement rule its
+module comment records (the text refused or resolved first, with no disk
+access, then the canonical path judged inside the root before its kind),
+folders first and each group in byte order of name, at most `bound`
+entries, kept in a heap of that size so a huge folder costs a look at each
+name, and one resolution of each entry that is a link, and no more. A link
+is listed by its target only when that is inside the root. `session_root` is the root a client mode fixes as it starts.
 
 **`editor.rs`** (cycle 13) is the terminal's line editor as a pure state
 machine: `Decoder` turns the characters a terminal sends, ANSI escape
@@ -388,8 +409,10 @@ it is handed for Tab. It reads and writes nothing, so every key is unit
 tested. **`history.rs`** is the history file: UTF-8, one entry per line,
 oldest first, with `\`, `\n` and `\r` escaped so a multi-line entry stays
 one line; appended to one entry at a time and compacted on load past twice
-its 1000 entries, at `SPLATCRAB_HISTORY` or `~/.splatcrab_history`. It is
-the format the interface is to share. **`src/term.rs`**, a module of the
+its 1000 entries, at `SPLATCRAB_HISTORY` or `~/.splatcrab_history`. Since
+cycle U2 the protocol's `history` and `history_add` read and extend the same
+file through the same functions, so the browser's history pane and the
+terminal share one history. **`src/term.rs`**, a module of the
 binary alone, is the raw-mode shell around the editor: `LineReader`
 enters raw mode for one line at a time through raw declarations
 (`GetConsoleMode`, `SetConsoleMode` and `ReadConsoleW` with virtual-terminal
@@ -440,15 +463,28 @@ request off any `BufRead` under the head and body caps, shared by the socket
 and by `serve_stdio`, the `--http-stdio` loop the golden cases drive.
 
 **`server.rs`** is the socket around it: `bind` to `127.0.0.1`, the session
-token, the browser launch, and `serve`, which accepts one connection at a
-time on the interpreter thread, reads one request under a 10-second deadline
-for the whole of it, so a client trickling a byte at a time cannot hold the
-server, writes the answer and closes. It holds no policy: every check is in
-`http.rs`, where a unit test can reach it.
+token, the browser launch, and `serve`. Since cycle U2 a thread of its own
+accepts, and each connection is read on a thread of its own, at most
+`MAX_CONNECTIONS` (16) at once, a connection past that closed at once with
+no answer: the thread reads one request under a 10-second deadline for the
+whole of it, so a client trickling a byte at a time holds only its own
+thread, and hands the bytes through an `mpsc` channel to the interpreter
+thread, which runs `http::handle` one request at a time in the order they
+arrived whole and sends each answer back; the connection's thread writes
+it under its own deadline, lingers and closes. The `Interp` never leaves
+the thread that called `serve`, which it could not, since it holds `Rc`s.
+It holds no policy: every check is in `http.rs`, where a unit test can
+reach it.
 
-**`src/ui/`** is the page: `index.html`, `app.js` and `app.css`, a command
-window with no framework and no external resource, embedded with
-`include_str!` so the binary is the whole program.
+**`src/ui/`** is the page: `index.html`, `app.js` and `app.css`, embedded
+with `include_str!` so the binary is the whole program, with no framework
+and no external resource. Since cycle U2 it is a desktop of four panes, the
+file browser, the command window, the workspace and the command history,
+with three splitters whose sizes are CSS custom properties set from script.
+Every request goes through one promise queue in `app.js`, one at a time,
+and everything a request returns reaches the page as text, never as
+markup. The palette is defined once, as custom properties of the light and
+the dark `:root` rules, which a unit test in `http.rs` enforces.
 
 **`main.rs`** is the CLI. Since cycle 13 it answers `--help` and
 `--version` (the version is `env!("CARGO_PKG_VERSION")`, as the banner's
@@ -506,7 +542,12 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    input too, and has its own, smaller bound, `json::MAX_DEPTH`. The UI
    server reads a request under two caps, `http::MAX_HEAD` (16 KiB) and
    `http::MAX_BODY` (8 MiB), judged before the bytes are buffered, so no
-   client can make it allocate without bound. Anything
+   client can make it allocate without bound; since cycle U2 it reads at
+   most 16 connections at once, `files` judges a path in time linear in its
+   length and lists at most 10,000 entries of a folder, keeping no more
+   than that many in memory however large the folder, and a workspace
+   preview displays at most 10 elements, and decodes a char row and
+   renders a handle's text only as far as its 80-character cut. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
    the recipe below. An iteration that has no fixed trip count has a cap
@@ -812,11 +853,29 @@ is the design, and every part of it is in `http.rs` except the binding:
 - The page's `Content-Security-Policy: default-src 'self'; frame-ancestors
   'none'` forbids inline script, anything from another origin, and framing.
 
+Since cycle U2 the token guards the file system and the history too:
+`files` lists folders under the root and `history` returns everything typed
+in any session. Each connection is read on a thread of its own, at most 16
+at once, and only whole requests reach the interpreter thread, so an idle
+connection can no longer hold the interpreter.
+
 HTTP stays minimal: `Connection: close` on every response, no keep-alive, no
 chunked bodies, no `Expect: 100-continue`. The same `handle` is driven from
 stdin by `--http-stdio`, so the golden cases pin every byte without a socket,
 and `tests/ui_server.rs` covers the socket itself. The Design notes of
 `docs/modules/U1-ui-server.md` have the details.
+
+**The file root (cycle U2, in place).** Every client mode, `--protocol`,
+`--ui` and `--http-stdio`, fixes `Interp::file_root` once as it starts, to
+the process's working directory canonicalised, and nothing changes it
+afterwards: `files` lists relative to it, whatever `cd` does to
+`Interp::cwd`. A path is judged on its text first, a `..` past the root
+refused before anything on disk is touched, and then by its canonical form,
+which catches links and junctions, judged inside the root before its kind
+so a refusal says nothing about what lies outside. The token guards it as
+it guards `eval`. The file browser following `cd` is cycle U4's, which will
+add the current folder to the answer on purpose. The Design notes of
+`docs/modules/U2-ui-desktop.md` have the details.
 
 **The current folder (cycle 13, in place).** `Interp::cwd` is the one
 current folder: every path lookup, every file builtin, `ls`, `dir`, `run`
@@ -1009,6 +1068,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
+| The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found by cycle U2's review | later, needs a spec |
 
 **The process-killing family.** The two panics that used to head this list,
 `num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a
@@ -1048,7 +1108,10 @@ remove it.
 clean error by exit code, since that is the golden harness's main tripwire. A
 case with an `.err` file expects exit 1, so a panic reported as 1 could pass a
 test that was meant to prove the opposite. An allocator abort or a stack
-overflow exits 134, which is distinguishable from both. A new one belongs in
+overflow exits 134, which is distinguishable from both. Since cycle U2,
+`--ui` answers inside a thread scope that waits for ever on its accepting
+thread, so a panic could not unwind to that join: `server::serve` catches
+it on the interpreter thread and exits 101 itself. A new one belongs in
 this table, and a new golden case must assert the exit code and not only the
 message text — a case that checks the message alone would pass on the very
 abort it was written to catch.

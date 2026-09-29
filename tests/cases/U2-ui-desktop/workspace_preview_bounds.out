@@ -1,0 +1,2 @@
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":true,"vars":[{"name":"u","size":[1,78],"class":"char","value":"'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'"},{"name":"v10","size":[1,10],"class":"double","value":"[1,2,3,4,5,6,7,8,9,10]"},{"name":"w","size":[1,100],"class":"char","value":"'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa…"},{"name":"zc","size":[3,2],"class":"double","value":"[1.0000 + 2.0000i,3;4,5;6,7]"},{"name":"zl","size":[1,11],"class":"double","value":"1×11 complex double"}]}

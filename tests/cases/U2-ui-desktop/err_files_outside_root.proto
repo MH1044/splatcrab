@@ -1,0 +1,5 @@
+% covers: 3 - the confinement rule, step 2: a .. with nothing before it is outside the file root, judged on the text before the disk, so .., tree/../.. and ../U2-ui-desktop/tree (which would come back inside) are each refused, the message echoing the path as sent with line null, and a refusal is an answer: the next files still lists tree
+{"id":1,"op":"files","path":".."}
+{"id":2,"op":"files","path":"tree/../.."}
+{"id":3,"op":"files","path":"../U2-ui-desktop/tree"}
+{"id":4,"op":"files","path":"tree"}

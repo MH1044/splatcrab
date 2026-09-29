@@ -9,10 +9,38 @@
 <script src="/app.js" defer></script>
 </head>
 <body>
-<main id="transcript" aria-live="polite" aria-label="Command window"></main>
+<div id="desktop">
+<section id="files" class="pane" aria-labelledby="files-title">
+<h2 id="files-title" class="pane-title">Files</h2>
+<div id="files-path" class="path"></div>
+<div class="pane-body"><ul id="files-list" class="list"></ul></div>
+</section>
+<div id="split-left" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize the file browser" aria-controls="files" tabindex="0"></div>
+<section id="command" class="pane" aria-label="Command window">
+<main id="transcript" aria-live="polite" aria-label="Transcript"></main>
 <div id="prompt">
 <span class="marker" aria-hidden="true">&gt;&gt;</span>
 <textarea id="input" rows="1" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Command"></textarea>
+</div>
+</section>
+<div id="split-right" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize the workspace and the command history" aria-controls="side" tabindex="0"></div>
+<div id="side">
+<section id="workspace" class="pane" aria-labelledby="workspace-title">
+<h2 id="workspace-title" class="pane-title">Workspace</h2>
+<div class="pane-body">
+<table id="vars">
+<colgroup><col class="col-name"><col class="col-value"><col class="col-size"><col class="col-class"></colgroup>
+<thead><tr><th scope="col">Name</th><th scope="col">Value</th><th scope="col">Size</th><th scope="col">Class</th></tr></thead>
+<tbody id="vars-body"></tbody>
+</table>
+</div>
+</section>
+<div id="split-side" class="splitter" role="separator" aria-orientation="horizontal" aria-label="Resize the workspace against the command history" aria-controls="workspace" tabindex="0"></div>
+<section id="history" class="pane" aria-labelledby="history-title">
+<h2 id="history-title" class="pane-title">Command history</h2>
+<div class="pane-body" id="history-body"><ul id="history-list" class="list"></ul></div>
+</section>
+</div>
 </div>
 </body>
 </html>

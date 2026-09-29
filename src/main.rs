@@ -337,8 +337,10 @@ fn ui(opts: UiOptions) -> i32 {
         server::open_browser(&url);
     }
     let cfg = http::Config { port, token };
-    // Nothing is written outside an `eval`, which captures both sinks.
+    // Nothing is written outside an `eval`, which captures both sinks. The
+    // file browser's root is fixed now, once, whatever `cd` does later.
     let mut it = interp::Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+    it.file_root = Some(splatcrab::files::session_root());
     server::serve(&listener, &mut it, &cfg)
 }
 

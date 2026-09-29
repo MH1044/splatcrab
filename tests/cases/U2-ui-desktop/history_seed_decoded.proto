@@ -1,0 +1,2 @@
+% covers: 11 - history answers the entries of the history file, the harness's copy of the sibling .history seed, decoded from the file's own escapes: \\ is one backslash and \n a line feed, so a multi-line entry kept on one line of the file comes back as three lines
+{"id":1,"op":"history"}

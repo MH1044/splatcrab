@@ -65,9 +65,9 @@ leaves with exit code `n`. At a terminal the prompt is a line editor: the
 arrows move and recall history, Home and End jump, Tab completes names
 (variables, files on the path, builtins), Ctrl-C clears the line and Ctrl-D
 on an empty line leaves. The history is kept in `~/.splatcrab_history`, or
-wherever `SPLATCRAB_HISTORY` points. Piped input is read as plain lines.
-`splatcrab --help` lists the options and `splatcrab --version` prints the
-version.
+wherever `SPLATCRAB_HISTORY` points, and the browser desktop shares it.
+Piped input is read as plain lines. `splatcrab --help` lists the options and
+`splatcrab --version` prints the version.
 
 ```
 SplatCrab 0.1.0  (type 'exit' to quit)
@@ -98,15 +98,19 @@ It writes nothing to stderr and exits 0 at end of input, whatever the
 requests did: a failed evaluation and a line that is not a request are both
 answers, and the session goes on.
 
-There are four operations. `eval` runs `code` as a REPL entry, possibly
+There are seven operations. `eval` runs `code` as a REPL entry, possibly
 several lines, and answers with the output it would have printed (`out`)
 and, if it failed, an `error` holding the REPL's message and the one-based
 line within `code`. `complete` answers whether `code` is a finished entry or
 still inside an open block or bracket, the same test the REPL uses to decide
 whether to keep reading. `workspace` lists each variable's name, size and
-class, sorted by name. `completions` lists every variable, function file on
-the path and builtin whose name starts with `prefix`. Every response starts with the request's `id` (a
-number or a string, or `null` when it sent none) and `ok`.
+class, sorted by name, and with `"preview": true` a short `value` of each
+too. `completions` lists every variable, function file on the path and
+builtin whose name starts with `prefix`. `files` lists one folder under the
+file root, the folder the session started in. `history` returns the command
+history the terminal's line editor keeps, and `history_add` adds an entry
+to it. Every response starts with the request's `id` (a number or a string,
+or `null` when it sent none) and `ok`.
 
 This input, one request per line:
 
@@ -141,6 +145,46 @@ in `docs/modules/U0-ui-foundations.md`. The handbook check runs only
 `tests/cases/U0-ui-foundations/handbook_protocol_example`, which sends these
 six requests and expects these six lines.
 
+**The desktop's operations.** Three operations and one option serve the
+browser desktop below. `workspace` with `"preview": true` adds a `value`
+after each variable's class: the value itself when it is short (a number, a
+small array written `[1,2;3,4]`, a one-row char array quoted as a literal
+writes it, a function handle's text) and its size and class otherwise
+(`1×11 double`, `1×1 struct`), cut at 80 characters. `files` lists one
+folder of the file root, which is the folder the session was started in and
+stays there whatever `cd` does: `path` is relative to the root and `""` is
+the root itself, folders come first, each file has its size in bytes, and a
+path that would leave the root, by a `..`, a link or an absolute name, is
+refused. `history` returns the entries of the history file the terminal's
+line editor keeps, oldest first, and `history_add` adds one by the
+terminal's rule (not a blank one, not a repeat of the newest), so an entry
+typed in either place can be recalled in the other after a reload of the
+page or a restart of the terminal, since each loads the history once, as
+it starts. Started in a folder
+named `U2-ui-desktop` that holds `tree/sub/deep.txt`, a file of 3 bytes,
+these requests:
+
+```text
+{"id":1,"op":"eval","code":"x = 3; name = 'crab';"}
+{"id":2,"op":"workspace","preview":true}
+{"id":3,"op":"files","path":"tree/sub"}
+{"id":4,"op":"files","path":".."}
+```
+
+get exactly these answers:
+
+```text
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":true,"vars":[{"name":"name","size":[1,4],"class":"char","value":"'crab'"},{"name":"x","size":[1,1],"class":"double","value":"3"}]}
+{"id":3,"ok":true,"root":"U2-ui-desktop","path":"tree/sub","entries":[{"name":"deep.txt","dir":false,"size":3}],"truncated":false}
+{"id":4,"ok":false,"error":{"message":"Path '..' is outside the file root.","line":null}}
+```
+
+The keys, the preview rules, the confinement rule and every message are
+specified in `docs/modules/U2-ui-desktop.md`. This example is pinned by the
+golden case `tests/cases/U2-ui-desktop/handbook_desktop_example`, which
+sends these four requests from that folder and expects these four lines.
+
 **The command window in a browser.** `splatcrab --ui` serves a command
 window on your own machine and prints the one line you need:
 
@@ -150,10 +194,20 @@ SplatCrab UI: http://127.0.0.1:52817/#3f9c0a71d2e84b6c95a0f1e7c4d8b263
 
 It also opens that address in your default browser, unless you pass
 `--no-browser`; `--port N` picks the port instead of letting the system
-choose one. The page is an input with a transcript above it: Enter runs the
-entry when it is complete and adds a line when it is not, Up and Down walk
-the page's history, and each entry's output is shown exactly as the terminal
-would print it. The server runs until you stop it with Ctrl+C.
+choose one. The page is a desktop of four panes. In the middle is the
+command window, an input with a transcript above it: Enter runs the entry
+when it is complete and adds a line when it is not, Up and Down walk the
+command history, and each entry's output is shown exactly as the terminal
+would print it. On the left the file browser lists the folder the server
+was started in, one folder at a time, folders first: click a folder to open
+it and `..` to go back up. On the right the workspace lists every variable
+with a preview of its value, its size and its class, and below it the
+command history lists what has been run, in the page and at the terminal
+alike, oldest first: click an entry to put it in the input, double-click it
+to run it. The workspace and the file browser refresh after every entry.
+The splitters between the panes move with the pointer or, once focused,
+with the arrow keys, and a narrow window stacks the panes in one column,
+the command window first. The server runs until you stop it with Ctrl+C.
 
 The part after `#` is the session token, fresh on every run. The page reads
 it from the address and sends it back with every request; nothing without it
@@ -161,9 +215,10 @@ is ever run. The server listens on the loopback address `127.0.0.1` only,
 so no other machine can reach it, and because any web page you visit could
 still send requests to a local port, every request must name this server in
 its `Host` header and, when it sends an `Origin`, there too; a request to run
-code must also carry the token. Anything else is refused `403 Forbidden`
-before the interpreter sees it. The page, its script and its stylesheet need
-no token: they hold nothing secret.
+code, list a folder, or read or add to the history must also carry the
+token. Anything else is refused `403 Forbidden` before the interpreter sees
+it. The page, its script and its stylesheet need no token: they hold nothing
+secret.
 
 Under the page, the server speaks the evaluation protocol over HTTP: each
 request is one `POST /api` whose body is one protocol request and whose

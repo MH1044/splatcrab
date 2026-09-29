@@ -129,6 +129,13 @@ pub struct Interp {
     /// from `std::env` again; `cd` changes it through [`Interp::set_cwd`]
     /// (cycle 13), and nothing ever changes the process's own.
     pub cwd: PathBuf,
+    /// The folder the protocol's `files` lists under (cycle U2): fixed once
+    /// by each client mode as it starts, `--protocol`, `--ui` and
+    /// `--http-stdio`, to [`crate::files::session_root`], and never changed
+    /// afterwards, whatever `cd` does to `cwd`. `None` for a script, the
+    /// REPL and an interpreter a test builds, where `files` refuses every
+    /// path as outside the root.
+    pub file_root: Option<PathBuf>,
     /// The folders `addpath` added, first searched first. The current
     /// folder is searched before all of them.
     search_path: Vec<PathBuf>,
@@ -385,6 +392,7 @@ impl Interp {
             script,
             calls: 0,
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            file_root: None,
             search_path: Vec::new(),
             generation: 0,
             files: HashMap::new(),

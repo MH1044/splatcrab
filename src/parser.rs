@@ -43,9 +43,34 @@ impl AnonFn {
 
     /// `func2str`'s text: `@(x,y)` and the body rendered by [`render`].
     pub fn text(&self) -> String {
-        let mut s = format!("@({})", self.params.join(","));
-        render_into(&self.body, &mut s);
-        s
+        let mut out = Text::whole();
+        self.render_into(&mut out);
+        out.s
+    }
+
+    /// The first `chars` characters of [`AnonFn::text`], and no more: the
+    /// render stops once it has them, so it costs time in proportion to
+    /// `chars`, never to the function's size. What a workspace preview
+    /// shows of a handle (cycle U2).
+    pub fn text_up_to(&self, chars: usize) -> String {
+        let mut out = Text::up_to(chars);
+        self.render_into(&mut out);
+        out.s
+    }
+
+    fn render_into(&self, out: &mut Text) {
+        out.push_str("@(");
+        for (k, p) in self.params.iter().enumerate() {
+            if out.full() {
+                return;
+            }
+            if k > 0 {
+                out.push(',');
+            }
+            out.push_str(p);
+        }
+        out.push(')');
+        render_into(&self.body, out);
     }
 }
 
@@ -234,14 +259,86 @@ pub(crate) fn binop_text(op: BinOp) -> &'static str {
 /// `x+1*2`. Numbers are written in the shortest form that reads back as the
 /// same value; a string in single quotes with its quotes doubled.
 pub fn render(e: &Expr) -> String {
-    let mut s = String::new();
+    let mut s = Text::whole();
     render_into(e, &mut s);
-    s
+    s.s
 }
 
-fn render_into(e: &Expr, s: &mut String) {
+/// Where [`render_into`] writes: the text so far and, for a render with a
+/// budget, how many more characters it may take. Once the budget is spent
+/// every push is dropped and the walk goes no further: each node returns as
+/// it is reached and each list stops at its next element. Every node
+/// rendered writes at least one character, so a render with a budget visits
+/// at most about as many nodes as the budget, plus the path down to the
+/// first character, which [`MAX_DEPTH`] bounds.
+struct Text {
+    s: String,
+    left: Option<usize>,
+}
+
+impl Text {
+    /// A render of the whole tree, as `func2str` and the display make.
+    fn whole() -> Text {
+        Text {
+            s: String::new(),
+            left: None,
+        }
+    }
+
+    /// A render that stops after its first `chars` characters.
+    fn up_to(chars: usize) -> Text {
+        Text {
+            s: String::new(),
+            left: Some(chars),
+        }
+    }
+
+    /// True once the budget is spent: nothing more will be written.
+    fn full(&self) -> bool {
+        self.left == Some(0)
+    }
+
+    fn push(&mut self, c: char) {
+        match &mut self.left {
+            None => self.s.push(c),
+            Some(0) => {}
+            Some(n) => {
+                *n -= 1;
+                self.s.push(c);
+            }
+        }
+    }
+
+    fn push_str(&mut self, t: &str) {
+        if self.left.is_none() {
+            self.s.push_str(t);
+            return;
+        }
+        for c in t.chars() {
+            if self.full() {
+                break;
+            }
+            self.push(c);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many nodes [`render_into`] has been called on, on this thread:
+    /// what a unit test counts to show that a render with a budget visits
+    /// a bounded number of them.
+    pub(crate) static RENDERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn render_into(e: &Expr, s: &mut Text) {
+    #[cfg(test)]
+    RENDERED.with(|n| n.set(n.get() + 1));
+    if s.full() {
+        return;
+    }
     // A child that binds looser than `min` is parenthesised.
-    fn child(e: &Expr, min: u8, s: &mut String) {
+    fn child(e: &Expr, min: u8, s: &mut Text) {
         if prec(e) < min {
             s.push('(');
             render_into(e, s);
@@ -258,8 +355,11 @@ fn render_into(e: &Expr, s: &mut String) {
             e => prec(e) >= 11,
         }
     }
-    fn list(args: &[Expr], s: &mut String) {
+    fn list(args: &[Expr], s: &mut Text) {
         for (k, a) in args.iter().enumerate() {
+            if s.full() {
+                return;
+            }
             if k > 0 {
                 s.push(',');
             }
@@ -274,7 +374,16 @@ fn render_into(e: &Expr, s: &mut String) {
         }
         Expr::Str(t) => {
             s.push('\'');
-            s.push_str(&t.replace('\'', "''"));
+            for c in t.chars() {
+                if s.full() {
+                    break;
+                }
+                if c == '\'' {
+                    s.push_str("''");
+                } else {
+                    s.push(c);
+                }
+            }
             s.push('\'');
         }
         Expr::Ident(n) => s.push_str(n),
@@ -287,6 +396,9 @@ fn render_into(e: &Expr, s: &mut String) {
             };
             s.push(open);
             for (k, row) in rows.iter().enumerate() {
+                if s.full() {
+                    break;
+                }
                 if k > 0 {
                     s.push(';');
                 }
@@ -297,6 +409,9 @@ fn render_into(e: &Expr, s: &mut String) {
         Expr::Access(n, chain) => {
             s.push_str(n);
             for a in chain {
+                if s.full() {
+                    break;
+                }
                 match a {
                     Access::Paren(args) => {
                         s.push('(');
@@ -367,7 +482,7 @@ fn render_into(e: &Expr, s: &mut String) {
             s.push('@');
             s.push_str(n);
         }
-        Expr::AnonFn(f) => s.push_str(&f.text()),
+        Expr::AnonFn(f) => f.render_into(s),
     }
 }
 

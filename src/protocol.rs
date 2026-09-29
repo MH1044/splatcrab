@@ -5,14 +5,19 @@
 //! before the next request is read so that a client can interleave. All of
 //! them run against one [`Interp`], so a variable assigned by one `eval` is
 //! there for the next. The operations, their fields and the order of the keys
-//! in each response are fixed by `docs/modules/U0-ui-foundations.md`:
+//! in each response are fixed by `docs/modules/U0-ui-foundations.md` and,
+//! for the desktop's three and `workspace`'s `preview`,
+//! `docs/modules/U2-ui-desktop.md`:
 //!
 //! | `op` | needs | answers, after `id` and `ok` |
 //! |---|---|---|
 //! | `eval` | `code` | `out`, then `error` when it failed |
 //! | `complete` | `code` | `complete`, [`syntax::is_complete`] |
-//! | `workspace` | | `vars`, one `{name, size, class}` per variable |
+//! | `workspace` | `preview`, optional | `vars`, one `{name, size, class}` per variable, and `value`, [`env::preview`], after `class` when `preview` is `true` |
 //! | `completions` | `prefix` | `items`, [`env::completions`] |
+//! | `files` | `path` | `root`, `path`, `entries` (`{name, dir, size}`) and `truncated`, [`files::list`] under [`Interp::file_root`] |
+//! | `history` | | `items`, the history file's entries, [`history::load`] |
+//! | `history_add` | `entry` | `added`, whether [`history::remember`] kept it and it was appended |
 //!
 //! A request that cannot be acted on is answered with `"ok":false` and an
 //! `error` whose `line` is `null`, and the loop goes on: a session is not a
@@ -25,21 +30,26 @@
 
 use std::cell::RefCell;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::env;
 use crate::error::{self, MError};
+use crate::files;
+use crate::history;
 use crate::interp::{InputSource, Interp};
 use crate::json::{self, Json, ParseError};
 use crate::syntax;
 
-/// Serves requests from `input` until it ends, against a fresh interpreter.
+/// Serves requests from `input` until it ends, against a fresh interpreter
+/// whose file root is fixed now, to the working directory.
 ///
 /// `Ok` at end of input whatever the requests did; `Err` only when reading
 /// the input or writing a response fails, which is the transport failing
 /// rather than a request.
 pub fn serve(input: impl BufRead, output: impl Write) -> io::Result<()> {
     let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+    it.file_root = Some(files::session_root());
     serve_with(&mut it, input, output)
 }
 
@@ -102,21 +112,109 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
                 ("complete", Json::Bool(syntax::is_complete(code))),
             ])
         }),
-        "workspace" => Ok(workspace(it, id.clone())),
+        "workspace" => preview_flag(&req).map(|preview| workspace(it, id.clone(), preview)),
         "completions" => field(&req, "prefix").map(|prefix| {
             let items = env::completions(prefix, it.vars(), it.builtins(), &it.path_dirs());
-            Json::object([
-                ("id", id.clone()),
-                ("ok", Json::Bool(true)),
-                (
-                    "items",
-                    Json::Array(items.into_iter().map(Json::String).collect()),
-                ),
-            ])
+            items_answer(id.clone(), items)
         }),
+        "files" => field(&req, "path").and_then(|path| list_files(it, id.clone(), path)),
+        "history" => Ok(history_items(
+            id.clone(),
+            history::default_path().as_deref(),
+        )),
+        "history_add" => field(&req, "entry")
+            .and_then(|entry| history_add(id.clone(), history::default_path().as_deref(), entry)),
         other => Err(error::unknown_operation(other)),
     };
     result.unwrap_or_else(|e| refused(id, e))
+}
+
+/// `{"id", "ok", "items": [...]}`, the answer of `completions` and
+/// `history`.
+fn items_answer(id: Json, items: Vec<String>) -> Json {
+    Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        (
+            "items",
+            Json::Array(items.into_iter().map(Json::String).collect()),
+        ),
+    ])
+}
+
+/// `workspace`'s optional `preview`: absent is `false`, and anything but a
+/// JSON boolean is refused, `null` included.
+fn preview_flag(req: &Json) -> Result<bool, MError> {
+    match req.get("preview") {
+        None => Ok(false),
+        Some(Json::Bool(b)) => Ok(*b),
+        Some(_) => Err(error::request_preview()),
+    }
+}
+
+/// `files`: one folder of the file root, at most [`files::MAX_ENTRIES`]
+/// entries of it. With no root, which only an interpreter a test builds
+/// lacks, every path is outside it.
+fn list_files(it: &Interp, id: Json, path: &str) -> Result<Json, MError> {
+    let Some(root) = &it.file_root else {
+        // The text is still judged first, so a malformed path says so.
+        files::normalise(path)?;
+        return Err(error::files_outside_root(path));
+    };
+    let listing = files::list(root, path, files::MAX_ENTRIES)?;
+    let entries = listing
+        .entries
+        .into_iter()
+        .map(|e| {
+            let size = match e.size {
+                Some(n) => Json::Number(n as f64),
+                None => Json::Null,
+            };
+            Json::object([
+                ("name", Json::String(e.name)),
+                ("dir", Json::Bool(e.dir)),
+                ("size", size),
+            ])
+        })
+        .collect();
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("root", Json::String(listing.root)),
+        ("path", Json::String(listing.path)),
+        ("entries", Json::Array(entries)),
+        ("truncated", Json::Bool(listing.truncated)),
+    ]))
+}
+
+/// `history`: the entries of the history file at `path`, the one the
+/// terminal's line editor reads, oldest first; none when there is no file
+/// or no path at all.
+fn history_items(id: Json, path: Option<&Path>) -> Json {
+    items_answer(id, path.map(history::load).unwrap_or_default())
+}
+
+/// `history_add`: the entry is appended to the history file at `path` when
+/// [`history::remember`] keeps it against the file's entries. No history
+/// path at all adds nothing; a file that cannot be written is refused with
+/// no operating-system text, so the answer does not depend on the platform.
+fn history_add(id: Json, path: Option<&Path>, entry: &str) -> Result<Json, MError> {
+    let added = match path {
+        None => false,
+        Some(path) => {
+            let mut entries = history::load(path);
+            let new = history::remember(&mut entries, entry);
+            if new {
+                history::append(path, entry).map_err(|_| error::history_not_written())?;
+            }
+            new
+        }
+    };
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("added", Json::Bool(added)),
+    ]))
 }
 
 /// A string field the operation needs.
@@ -192,8 +290,10 @@ fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
     }
 }
 
-/// One `{name, size, class}` per variable, sorted by name.
-fn workspace(it: &Interp, id: Json) -> Json {
+/// One `{name, size, class}` per variable, sorted by name, and with
+/// `preview` a `value` after `class`: [`env::preview`] in the session's
+/// display format.
+fn workspace(it: &Interp, id: Json, preview: bool) -> Json {
     let mut names: Vec<&String> = it.vars().keys().collect();
     names.sort();
     let vars = names
@@ -201,14 +301,24 @@ fn workspace(it: &Interp, id: Json) -> Json {
         .map(|name| {
             let v = &it.vars()[name];
             let (rows, cols) = v.dims();
-            Json::object([
-                ("name", Json::String(name.clone())),
+            let mut pairs = vec![
+                ("name".to_string(), Json::String(name.clone())),
                 (
-                    "size",
+                    "size".to_string(),
                     Json::Array(vec![Json::Number(rows as f64), Json::Number(cols as f64)]),
                 ),
-                ("class", Json::String(v.class_name().to_string())),
-            ])
+                (
+                    "class".to_string(),
+                    Json::String(v.class_name().to_string()),
+                ),
+            ];
+            if preview {
+                pairs.push((
+                    "value".to_string(),
+                    Json::String(env::preview(v, it.format)),
+                ));
+            }
+            Json::Object(pairs)
         })
         .collect();
     Json::object([
@@ -493,6 +603,211 @@ mod tests {
         );
         assert_eq!(lines[1], "{\"id\":2,\"ok\":true,\"out\":\"     1\\n\"}");
         assert_eq!(lines[2], "{\"id\":3,\"ok\":true,\"out\":\"     3\\n\"}");
+    }
+
+    /// Cycle U2: `preview` adds `value` after `class`; absent or `false`
+    /// gives U0's bytes exactly; anything but a boolean is refused.
+    #[test]
+    fn workspace_preview_adds_value_after_class() {
+        let got = session(concat!(
+            "{\"op\":\"eval\",\"code\":\"x = 3; s = 'it''s';\"}\n",
+            "{\"id\":1,\"op\":\"workspace\",\"preview\":true}\n",
+            "{\"id\":2,\"op\":\"workspace\",\"preview\":false}\n",
+            "{\"id\":3,\"op\":\"workspace\"}\n",
+            "{\"id\":4,\"op\":\"workspace\",\"preview\":1}\n",
+            "{\"id\":5,\"op\":\"workspace\",\"preview\":null}\n",
+            "{\"id\":6,\"op\":\"workspace\",\"preview\":\"yes\"}\n",
+        ));
+        assert_eq!(
+            got[1],
+            "{\"id\":1,\"ok\":true,\"vars\":[\
+             {\"name\":\"s\",\"size\":[1,4],\"class\":\"char\",\"value\":\"'it''s'\"},\
+             {\"name\":\"x\",\"size\":[1,1],\"class\":\"double\",\"value\":\"3\"}]}"
+        );
+        let plain = "\"ok\":true,\"vars\":[\
+                     {\"name\":\"s\",\"size\":[1,4],\"class\":\"char\"},\
+                     {\"name\":\"x\",\"size\":[1,1],\"class\":\"double\"}]}";
+        assert_eq!(got[2], format!("{{\"id\":2,{plain}"));
+        assert_eq!(got[3], format!("{{\"id\":3,{plain}"));
+        for (k, id) in (4..=6).enumerate() {
+            assert_eq!(
+                got[4 + k],
+                format!(
+                    "{{\"id\":{id},\"ok\":false,\"error\":{{\"message\":\
+                     \"Malformed request: 'preview' must be true or false.\",\"line\":null}}}}"
+                )
+            );
+        }
+    }
+
+    /// The preview is made in the session's display format.
+    #[test]
+    fn a_preview_follows_format() {
+        let got = session(concat!(
+            "{\"op\":\"eval\",\"code\":\"p = pi; format long\"}\n",
+            "{\"id\":1,\"op\":\"workspace\",\"preview\":true}\n",
+        ));
+        assert!(
+            got[1].contains("\"value\":\"3.141592653589793\""),
+            "{}",
+            got[1]
+        );
+    }
+
+    /// A folder under the temporary folder, removed when dropped.
+    struct Dir(std::path::PathBuf);
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Dir {
+        let d = std::env::temp_dir().join(format!(
+            "splatcrab-protocol-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Dir(d)
+    }
+
+    /// Cycle U2: `files` answers `root`, `path`, `entries` and `truncated`
+    /// after `id` and `ok`, each entry `name`, `dir` and `size`, and every
+    /// refusal is an answer with `"line":null`.
+    #[test]
+    fn files_answers_its_keys_in_order() {
+        let d = scratch("files");
+        let root = d.0.join("desk");
+        std::fs::create_dir_all(root.join("tree").join("sub")).unwrap();
+        std::fs::write(root.join("tree").join("a.txt"), "hello").unwrap();
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        it.file_root = Some(std::fs::canonicalize(&root).unwrap());
+        let ask = |it: &mut Interp, line: &str| respond(it, line).to_string();
+        assert_eq!(
+            ask(&mut it, "{\"id\":1,\"op\":\"files\",\"path\":\"tree\"}"),
+            "{\"id\":1,\"ok\":true,\"root\":\"desk\",\"path\":\"tree\",\"entries\":[\
+             {\"name\":\"sub\",\"dir\":true,\"size\":null},\
+             {\"name\":\"a.txt\",\"dir\":false,\"size\":5}],\"truncated\":false}"
+        );
+        assert_eq!(
+            ask(&mut it, "{\"id\":2,\"op\":\"files\",\"path\":\"\"}"),
+            "{\"id\":2,\"ok\":true,\"root\":\"desk\",\"path\":\"\",\"entries\":[\
+             {\"name\":\"tree\",\"dir\":true,\"size\":null}],\"truncated\":false}"
+        );
+        let refusal = |id: u32, msg: &str| {
+            format!(
+                "{{\"id\":{id},\"ok\":false,\"error\":{{\"message\":\"{msg}\",\"line\":null}}}}"
+            )
+        };
+        for (id, line, msg) in [
+            (3, "\"path\":\"..\"", "Path '..' is outside the file root."),
+            (
+                4,
+                "\"path\":\"tree\\\\sub\"",
+                "Malformed request: 'path' must be a relative path with '/' separators.",
+            ),
+            (
+                5,
+                "\"path\":\"tree/a.txt\"",
+                "Path 'tree/a.txt' is not a folder.",
+            ),
+            (
+                6,
+                "\"path\":3",
+                "Malformed request: 'path' must be a string.",
+            ),
+            (7, "\"x\":1", "Malformed request: no 'path' field."),
+        ] {
+            let got = ask(&mut it, &format!("{{\"id\":{id},\"op\":\"files\",{line}}}"));
+            assert_eq!(got, refusal(id, msg), "{line}");
+        }
+        // `cd` moves the current folder, never the root.
+        ask(&mut it, "{\"op\":\"eval\",\"code\":\"cd tree\"}");
+        assert!(
+            ask(&mut it, "{\"id\":8,\"op\":\"files\",\"path\":\"tree/sub\"}")
+                .starts_with("{\"id\":8,\"ok\":true,\"root\":\"desk\",\"path\":\"tree/sub\"")
+        );
+        // With no root at all, every well-formed path is outside it.
+        let mut bare = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        assert_eq!(
+            ask(&mut bare, "{\"id\":9,\"op\":\"files\",\"path\":\"\"}"),
+            refusal(9, "Path '' is outside the file root.")
+        );
+        assert_eq!(
+            ask(&mut bare, "{\"id\":10,\"op\":\"files\",\"path\":\"/x\"}"),
+            refusal(
+                10,
+                "Malformed request: 'path' must be a relative path with '/' separators."
+            )
+        );
+    }
+
+    /// Cycle U2: `history` and `history_add` over a file of the test's own,
+    /// never the user's: the answers' keys, `remember`'s rule, and a
+    /// multi-line entry kept whole.
+    #[test]
+    fn history_and_history_add_follow_remember() {
+        let d = scratch("history");
+        let path = d.0.join("history");
+        let id = || Json::Number(1.0);
+        let items = |p: Option<&Path>| history_items(id(), p).to_string();
+        let add = |entry: &str| history_add(id(), Some(&path), entry).unwrap().to_string();
+        assert_eq!(items(Some(&path)), "{\"id\":1,\"ok\":true,\"items\":[]}");
+        assert_eq!(add("x = 1"), "{\"id\":1,\"ok\":true,\"added\":true}");
+        assert_eq!(add("x = 1"), "{\"id\":1,\"ok\":true,\"added\":false}");
+        assert_eq!(add("   "), "{\"id\":1,\"ok\":true,\"added\":false}");
+        assert_eq!(add("a\nb"), "{\"id\":1,\"ok\":true,\"added\":true}");
+        assert_eq!(
+            items(Some(&path)),
+            "{\"id\":1,\"ok\":true,\"items\":[\"x = 1\",\"a\\nb\"]}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "x = 1\na\\nb\n");
+        // No history path: nothing to read and nothing added.
+        assert_eq!(items(None), "{\"id\":1,\"ok\":true,\"items\":[]}");
+        assert_eq!(
+            history_add(id(), None, "y").unwrap().to_string(),
+            "{\"id\":1,\"ok\":true,\"added\":false}"
+        );
+    }
+
+    /// Acceptance test 15: a history path that is a folder cannot be
+    /// written, and says so with no operating-system text.
+    #[test]
+    fn history_add_against_a_folder_is_refused() {
+        let d = scratch("history-folder");
+        let e = history_add(Json::Number(3.0), Some(&d.0), "x = 1").unwrap_err();
+        assert_eq!(e.msg, "The history file could not be written.");
+        assert_eq!(
+            refused(Json::Number(3.0), e).to_string(),
+            "{\"id\":3,\"ok\":false,\"error\":{\"message\":\
+             \"The history file could not be written.\",\"line\":null}}"
+        );
+        // Reading a folder is simply no history.
+        assert_eq!(
+            history_items(Json::Null, Some(&d.0)).to_string(),
+            "{\"id\":null,\"ok\":true,\"items\":[]}"
+        );
+    }
+
+    /// `history_add` needs a string `entry`, judged before any file.
+    #[test]
+    fn history_add_needs_a_string_entry() {
+        let got = session(concat!(
+            "{\"id\":1,\"op\":\"history_add\"}\n",
+            "{\"id\":2,\"op\":\"history_add\",\"entry\":[]}\n",
+        ));
+        assert_eq!(
+            got,
+            [
+                "{\"id\":1,\"ok\":false,\"error\":{\"message\":\
+                 \"Malformed request: no 'entry' field.\",\"line\":null}}",
+                "{\"id\":2,\"ok\":false,\"error\":{\"message\":\
+                 \"Malformed request: 'entry' must be a string.\",\"line\":null}}",
+            ]
+        );
     }
 
     /// Every response is flushed before the next request is read, so a client

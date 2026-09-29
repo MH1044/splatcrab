@@ -1,0 +1,5 @@
+% covers: 5 - the confinement rule, step 3: a path inside the root that is a file (tree/a.txt), or that cannot be canonicalised because it does not exist (nope), is not a folder, the message echoing the path as the request sent it, unnormalised (tree/./a.txt) and JSON-escaped when written back (no"pe)
+{"id":1,"op":"files","path":"tree/a.txt"}
+{"id":2,"op":"files","path":"nope"}
+{"id":3,"op":"files","path":"tree/./a.txt"}
+{"id":4,"op":"files","path":"no\"pe"}

@@ -1,0 +1,4 @@
+{"id":1,"ok":false,"error":{"message":"Path 'tree/a.txt' is not a folder.","line":null}}
+{"id":2,"ok":false,"error":{"message":"Path 'nope' is not a folder.","line":null}}
+{"id":3,"ok":false,"error":{"message":"Path 'tree/./a.txt' is not a folder.","line":null}}
+{"id":4,"ok":false,"error":{"message":"Path 'no\"pe' is not a folder.","line":null}}

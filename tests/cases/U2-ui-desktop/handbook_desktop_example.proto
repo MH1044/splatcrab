@@ -1,0 +1,5 @@
+% covers: Scope: workspace with "preview": true and files - the desktop operations' example in docs/HANDBOOK.md, byte for byte: an eval, the workspace with value previews, a files listing of tree/sub and a files of .. refused as outside the file root, in one session
+{"id":1,"op":"eval","code":"x = 3; name = 'crab';"}
+{"id":2,"op":"workspace","preview":true}
+{"id":3,"op":"files","path":"tree/sub"}
+{"id":4,"op":"files","path":".."}

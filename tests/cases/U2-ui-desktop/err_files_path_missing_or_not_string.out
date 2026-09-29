@@ -1,0 +1,2 @@
+{"id":1,"ok":false,"error":{"message":"Malformed request: no 'path' field.","line":null}}
+{"id":2,"ok":false,"error":{"message":"Malformed request: 'path' must be a string.","line":null}}

@@ -105,21 +105,29 @@ arithmetic, indexing, growth on assignment, loops and formatted printing.
 graphical interface rather than something to type at: it reads one JSON
 request per line on stdin and answers each with one JSON line on stdout,
 against one session that keeps its variables between requests. The operations
-are `eval`, `complete` (is this entry finished?), `workspace` and
-`completions`; a failed evaluation or a malformed line is an answer, and the
-process exits 0 at end of input. `docs/modules/U0-ui-foundations.md` is
-the full description.
+are `eval`, `complete` (is this entry finished?), `workspace` (with value
+previews on request), `completions`, `files` (one folder under the folder
+the session started in), `history` and `history_add` (the command history
+the terminal keeps); a failed evaluation or a malformed line is an answer,
+and the process exits 0 at end of input. `docs/modules/U0-ui-foundations.md`
+and `docs/modules/U2-ui-desktop.md` are the full description.
 
 ```
 $ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
 {"id":1,"ok":true,"out":"x =\n\n     3\n\n"}
 ```
 
-**The command window.** `splatcrab --ui` serves a command window in your
-browser: type an entry, press Enter, and its output appears exactly as the
-terminal would print it. Enter inserts a newline instead while a `for`, an
-`if` or a bracket is still open, Shift+Enter always does, and Up and Down
-walk the entries you have run. It prints the address it serves and opens it:
+**The desktop.** `splatcrab --ui` serves a desktop in your browser. In the
+middle is the command window: type an entry, press Enter, and its output
+appears exactly as the terminal would print it. Enter inserts a newline
+instead while a `for`, an `if` or a bracket is still open, Shift+Enter
+always does, and Up and Down walk the command history. Around it are a file
+browser of the folder the server started in, a workspace listing every
+variable with a preview of its value, its size and its class, and the
+command history, shared with the terminal, where a click recalls an entry
+and a double-click runs it. The splitters between the panes move with the
+pointer or the arrow keys, and a narrow window stacks the panes. It prints
+the address it serves and opens it:
 
 ```
 $ splatcrab --ui
@@ -361,10 +369,14 @@ z
 - `splatcrab --protocol`, a JSON Lines request loop over one session, with
   `eval`, `complete`, `workspace` and `completions`: the groundwork for the
   interface, with its JSON hand-written rather than taken from a crate
-- `splatcrab --ui`, a command window in the browser, served on the loopback
+- `splatcrab --ui`, a desktop in the browser, served on the loopback
   interface only behind a session token and `Host` and `Origin` checks, over
   HTTP written from the standard library with its size limits enforced
-  before anything is buffered
+  before anything is buffered, each connection read on a thread of its own
+- the desktop's four panes: the command window, the workspace with value
+  previews, a read-only file browser confined to the folder the server
+  started in, and the command history shared with the terminal, with
+  resizable splitters and one palette for light and dark
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.

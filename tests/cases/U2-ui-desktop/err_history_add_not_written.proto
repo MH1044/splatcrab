@@ -1,0 +1,3 @@
+% covers: 12a - with a sibling .history folder the case's history path is a folder: history reads it as no history, and history_add cannot write it, which is an error answer with SplatCrab's own text and no operating-system text
+{"id":1,"op":"history"}
+{"id":2,"op":"history_add","entry":"x = 1"}

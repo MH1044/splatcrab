@@ -30,6 +30,17 @@
 //! appear on stderr; `.exit` holds the expected code when it is not the one
 //! the other files imply (1 with an `.err`, 0 without).
 //!
+//! No case touches the user's command history (cycle U2). Every case this
+//! runner spawns, of every kind, gets `SPLATCRAB_HISTORY` pointing at a
+//! fresh file of its own in the temporary folder, named by this process's
+//! id and the case's place in the run, removed before and after the run.
+//! When the case has a sibling `<name>.history`, its bytes are copied there
+//! first, so the case starts from a known history: the protocol's
+//! `history` and `history_add` read and write that file and nothing else.
+//! When that sibling is a folder (its content is ignored; an empty `.keep`
+//! keeps it in git), the history path is made an empty folder instead, a
+//! history file that cannot be written, and removed with it after the run.
+//!
 //!   cargo test --test golden
 //!   GOLDEN_FILTER=00-baseline cargo test --test golden    # path substring
 //!   UPDATE_GOLDEN=1 cargo test --test golden              # rewrite .out
@@ -42,6 +53,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,10 +162,64 @@ struct Outcome {
     timed_out: bool,
 }
 
+/// How many cases this run has given a history file, so each one's is new.
+static HISTORIES: AtomicUsize = AtomicUsize::new(0);
+
+/// A case's own history path: whatever is there removed when it is made
+/// and when it drops, and seeded from the case's sibling `.history` when
+/// there is one: a file's bytes are copied there, and for a folder the
+/// path is made an empty folder, a history file that cannot be written.
+struct History(PathBuf);
+
+impl History {
+    fn for_case(case: &Path) -> History {
+        let n = HISTORIES.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "splatcrab-golden-{}-{}.history",
+            std::process::id(),
+            n
+        ));
+        let history = History(path);
+        history.remove();
+        let seed = case.with_extension("history");
+        let made = if seed.is_dir() {
+            fs::create_dir(&history.0)
+        } else if seed.exists() {
+            fs::copy(&seed, &history.0).map(drop)
+        } else {
+            Ok(())
+        };
+        if let Err(e) = made {
+            panic!(
+                "cannot seed {} from {}: {e}",
+                history.0.display(),
+                seed.display()
+            );
+        }
+        history
+    }
+
+    /// Removes the file or the folder at the path, if there is either.
+    fn remove(&self) {
+        if self.0.is_dir() {
+            let _ = fs::remove_dir_all(&self.0);
+        } else {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+}
+
+impl Drop for History {
+    fn drop(&mut self) {
+        self.remove();
+    }
+}
+
 /// Spawns the binary. stdout and stderr are drained on threads so a large
 /// output cannot fill the pipe and deadlock while we poll for exit.
 fn run_case(path: &Path) -> Outcome {
     let dir = path.parent().expect("case has a parent directory");
+    let history = History::for_case(path);
     let stdin_data = if is_repl_case(path) || is_proto_case(path) || is_http_case(path) {
         Some(session_input(path))
     } else {
@@ -173,6 +239,7 @@ fn run_case(path: &Path) -> Outcome {
         cmd.arg(path);
     }
     cmd.current_dir(dir)
+        .env("SPLATCRAB_HISTORY", &history.0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(if stdin_data.is_some() {

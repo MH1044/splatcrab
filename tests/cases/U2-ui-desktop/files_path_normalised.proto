@@ -1,0 +1,4 @@
+% covers: 2 - the confinement rule, step 2: empty components and . are dropped and .. removes the component before it, so tree/./sub/../sub/ and tree//sub list tree/sub and tree/sub/.. lists tree, each answering the normalised path
+{"id":1,"op":"files","path":"tree/./sub/../sub/"}
+{"id":2,"op":"files","path":"tree//sub"}
+{"id":3,"op":"files","path":"tree/sub/.."}

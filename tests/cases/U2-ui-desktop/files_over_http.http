@@ -1,0 +1,8 @@
+% covers: 13 - the new operations pass through U1 unchanged: POST /api carrying a files request with the token is 200 OK whose body is the protocol's answer, less its newline, with a Content-Length counted from that body's bytes and every header in U1's order
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"files","path":"tree/sub"}

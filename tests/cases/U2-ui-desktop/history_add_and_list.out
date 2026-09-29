@@ -1,0 +1,6 @@
+{"id":1,"ok":true,"items":[]}
+{"id":2,"ok":true,"added":true}
+{"id":3,"ok":true,"added":false}
+{"id":4,"ok":true,"added":false}
+{"id":5,"ok":true,"added":true}
+{"id":6,"ok":true,"items":["x = 1","a\nb"]}

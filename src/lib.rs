@@ -22,11 +22,16 @@
 //! Since cycle 13, `editor` is the terminal line editor's key-event state
 //! machine and `history` the history file; the raw-mode terminal around
 //! them is the binary's own `term.rs`, which alone writes to the terminal.
+//!
+//! Since cycle U2, `files` lists one folder under the file root for the
+//! desktop's file browser, by the confinement rule its module comment
+//! records.
 
 pub mod builtins;
 pub mod editor;
 pub mod env;
 pub mod error;
+pub mod files;
 pub mod history;
 pub mod http;
 pub mod interp;

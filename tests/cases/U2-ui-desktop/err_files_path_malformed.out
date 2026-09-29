@@ -1,0 +1,5 @@
+{"id":1,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":2,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":3,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":4,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":5,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}

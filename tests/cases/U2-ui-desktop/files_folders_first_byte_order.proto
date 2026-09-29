@@ -1,0 +1,2 @@
+% covers: 1 - files lists one folder of the file root: root is the root folder's last component, folders first, then files, each group sorted by name in byte order (Z.txt before a.txt), size a file's length in bytes and null for a folder, truncated false
+{"id":1,"op":"files","path":"tree"}

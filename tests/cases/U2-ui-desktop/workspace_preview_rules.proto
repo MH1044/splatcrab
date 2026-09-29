@@ -1,0 +1,3 @@
+% covers: 7 - workspace with "preview": true adds a value after class to each variable, by the first rule that applies: 1. a small numeric or logical array, each element as disp prints it alone, trimmed, one standing alone and more in brackets with , and ;, a zero-imaginary element of a complex array shown real; 2. a one-row char array as a char literal, quotes doubled; 3. a function handle's func2str text; 4. anything else as its size and class
+{"id":1,"op":"eval","code":"x = 3; v = [1 2 3]; m = [1 2; 3 4]; s = 'it''s'; e = []; big = 1:11; z = 1+2i; zz = [1+2i 3]; t = true; c = {1}; f = @(x) x+1; st.a = 1; ch = ['ab'; 'cd'];"}
+{"id":2,"op":"workspace","preview":true}

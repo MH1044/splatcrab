@@ -14,9 +14,13 @@
 //!
 //! The file is `SPLATCRAB_HISTORY` when that variable is set, and otherwise
 //! `.splatcrab_history` in the home folder (`HOME`, or `USERPROFILE` on
-//! Windows). Only the terminal's line editor reads or writes it, and only
-//! when standard input and output are both terminals, so a script, a piped
-//! REPL, a golden case and `--protocol` never touch it.
+//! Windows). Two front ends read and write it: the terminal's line editor,
+//! only when standard input and output are both terminals, so a script and
+//! a piped REPL never touch it; and since cycle U2 the protocol's `history`
+//! and `history_add`, which the browser desktop's history pane asks for,
+//! under `--protocol`, `--ui` and `--http-stdio`. The golden harness points
+//! `SPLATCRAB_HISTORY` at a file of each case's own, so no case touches the
+//! user's history.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

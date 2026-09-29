@@ -12,3 +12,5 @@
 *.yml  text eol=lf
 *.toml text eol=lf
 src/ui/* text eol=lf
+tests/cases/U2-ui-desktop/tree/** binary
+*.history text eol=lf

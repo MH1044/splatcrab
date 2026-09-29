@@ -481,9 +481,12 @@ fn discard_head(input: &mut impl BufRead, tail: &[u8]) -> io::Result<()> {
     }
 }
 
-/// `splatcrab --http-stdio`: [`handle`] with no socket, over a fresh session.
+/// `splatcrab --http-stdio`: [`handle`] with no socket, over a fresh session
+/// whose file root is fixed now, to the working directory, as `--ui` fixes
+/// its own.
 pub fn serve_stdio(input: impl BufRead, output: impl Write, cfg: &Config) -> io::Result<()> {
     let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+    it.file_root = Some(crate::files::session_root());
     serve_stdio_with(&mut it, input, output, cfg)
 }
 
@@ -733,6 +736,593 @@ mod tests {
             assert!(!file.contains("http://") && !file.contains("https://"));
         }
         assert!(SCRIPT.contains(TOKEN_HEADER));
+    }
+
+    /// Every CSS named colour, CSS Color Module Level 4's list, in lower
+    /// case. `transparent` and `currentColor` are keywords outside it, and
+    /// allowed anywhere, as `inherit` is.
+    const NAMED_COLOURS: [&str; 148] = [
+        "aliceblue",
+        "antiquewhite",
+        "aqua",
+        "aquamarine",
+        "azure",
+        "beige",
+        "bisque",
+        "black",
+        "blanchedalmond",
+        "blue",
+        "blueviolet",
+        "brown",
+        "burlywood",
+        "cadetblue",
+        "chartreuse",
+        "chocolate",
+        "coral",
+        "cornflowerblue",
+        "cornsilk",
+        "crimson",
+        "cyan",
+        "darkblue",
+        "darkcyan",
+        "darkgoldenrod",
+        "darkgray",
+        "darkgreen",
+        "darkgrey",
+        "darkkhaki",
+        "darkmagenta",
+        "darkolivegreen",
+        "darkorange",
+        "darkorchid",
+        "darkred",
+        "darksalmon",
+        "darkseagreen",
+        "darkslateblue",
+        "darkslategray",
+        "darkslategrey",
+        "darkturquoise",
+        "darkviolet",
+        "deeppink",
+        "deepskyblue",
+        "dimgray",
+        "dimgrey",
+        "dodgerblue",
+        "firebrick",
+        "floralwhite",
+        "forestgreen",
+        "fuchsia",
+        "gainsboro",
+        "ghostwhite",
+        "gold",
+        "goldenrod",
+        "gray",
+        "green",
+        "greenyellow",
+        "grey",
+        "honeydew",
+        "hotpink",
+        "indianred",
+        "indigo",
+        "ivory",
+        "khaki",
+        "lavender",
+        "lavenderblush",
+        "lawngreen",
+        "lemonchiffon",
+        "lightblue",
+        "lightcoral",
+        "lightcyan",
+        "lightgoldenrodyellow",
+        "lightgray",
+        "lightgreen",
+        "lightgrey",
+        "lightpink",
+        "lightsalmon",
+        "lightseagreen",
+        "lightskyblue",
+        "lightslategray",
+        "lightslategrey",
+        "lightsteelblue",
+        "lightyellow",
+        "lime",
+        "limegreen",
+        "linen",
+        "magenta",
+        "maroon",
+        "mediumaquamarine",
+        "mediumblue",
+        "mediumorchid",
+        "mediumpurple",
+        "mediumseagreen",
+        "mediumslateblue",
+        "mediumspringgreen",
+        "mediumturquoise",
+        "mediumvioletred",
+        "midnightblue",
+        "mintcream",
+        "mistyrose",
+        "moccasin",
+        "navajowhite",
+        "navy",
+        "oldlace",
+        "olive",
+        "olivedrab",
+        "orange",
+        "orangered",
+        "orchid",
+        "palegoldenrod",
+        "palegreen",
+        "paleturquoise",
+        "palevioletred",
+        "papayawhip",
+        "peachpuff",
+        "peru",
+        "pink",
+        "plum",
+        "powderblue",
+        "purple",
+        "rebeccapurple",
+        "red",
+        "rosybrown",
+        "royalblue",
+        "saddlebrown",
+        "salmon",
+        "sandybrown",
+        "seagreen",
+        "seashell",
+        "sienna",
+        "silver",
+        "skyblue",
+        "slateblue",
+        "slategray",
+        "slategrey",
+        "snow",
+        "springgreen",
+        "steelblue",
+        "tan",
+        "teal",
+        "thistle",
+        "tomato",
+        "turquoise",
+        "violet",
+        "wheat",
+        "white",
+        "whitesmoke",
+        "yellow",
+        "yellowgreen",
+    ];
+
+    /// The system colours, which name a colour just as a named colour
+    /// does. All of them are checked in a stylesheet's values; the page and
+    /// the script are checked for all but [`ORDINARY_WORDS`].
+    const SYSTEM_COLOURS: [&str; 42] = [
+        "accentcolor",
+        "accentcolortext",
+        "activetext",
+        "buttonborder",
+        "buttonface",
+        "buttontext",
+        "canvas",
+        "canvastext",
+        "field",
+        "fieldtext",
+        "graytext",
+        "highlight",
+        "highlighttext",
+        "linktext",
+        "mark",
+        "marktext",
+        "selecteditem",
+        "selecteditemtext",
+        "visitedtext",
+        "activeborder",
+        "activecaption",
+        "appworkspace",
+        "background",
+        "buttonhighlight",
+        "buttonshadow",
+        "captiontext",
+        "inactiveborder",
+        "inactivecaption",
+        "inactivecaptiontext",
+        "infobackground",
+        "infotext",
+        "menu",
+        "menutext",
+        "scrollbar",
+        "threeddarkshadow",
+        "threedface",
+        "threedhighlight",
+        "threedlightshadow",
+        "threedshadow",
+        "window",
+        "windowframe",
+        "windowtext",
+    ];
+
+    /// The system colours that are also ordinary words of a script or a
+    /// page (`window`, a `field`, a `mark`), which the page and script
+    /// checks leave out; every other system colour they refuse.
+    const ORDINARY_WORDS: [&str; 7] = [
+        "background",
+        "canvas",
+        "field",
+        "highlight",
+        "mark",
+        "menu",
+        "window",
+    ];
+
+    /// The colour functions the spec names, and the two newer ones that
+    /// make a colour as surely.
+    const COLOUR_FUNCTIONS: [&str; 12] = [
+        "rgb",
+        "rgba",
+        "hsl",
+        "hsla",
+        "hwb",
+        "lab",
+        "lch",
+        "oklab",
+        "oklch",
+        "color",
+        "color-mix",
+        "light-dark",
+    ];
+
+    fn ident_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+    }
+
+    /// Every colour `text` names: a hexadecimal colour (`#` and 3, 4, 6 or
+    /// 8 hex digits ending there), a colour function called, or a named
+    /// colour or a system colour as a whole identifier, in any case. With
+    /// `every_system` false, the system colours that are ordinary words
+    /// ([`ORDINARY_WORDS`]) are not counted.
+    fn colours_in(text: &str, every_system: bool) -> Vec<String> {
+        let b = text.as_bytes();
+        let mut found = Vec::new();
+        let mut k = 0;
+        while k < b.len() {
+            if b[k] == b'#' {
+                let digits = b[k + 1..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_hexdigit())
+                    .count();
+                let end = k + 1 + digits;
+                if [3, 4, 6, 8].contains(&digits) && !b.get(end).is_some_and(|&c| ident_byte(c)) {
+                    found.push(text[k..end].to_string());
+                }
+                k = end.max(k + 1);
+            } else if ident_byte(b[k]) {
+                let start = k;
+                while k < b.len() && ident_byte(b[k]) {
+                    k += 1;
+                }
+                let word = text[start..k].to_ascii_lowercase();
+                let called = b.get(k) == Some(&b'(');
+                if (called && COLOUR_FUNCTIONS.contains(&word.as_str()))
+                    || NAMED_COLOURS.contains(&word.as_str())
+                    || (SYSTEM_COLOURS.contains(&word.as_str())
+                        && (every_system || !ORDINARY_WORDS.contains(&word.as_str())))
+                {
+                    found.push(text[start..k].to_string());
+                }
+            } else {
+                k += 1;
+            }
+        }
+        found
+    }
+
+    /// `css` without its comments and with every string emptied, so
+    /// neither can hide a brace or a semicolon from [`declarations`]. A
+    /// string ends at its first quote that no backslash escapes, as CSS
+    /// reads it, so `"a\""` cannot end early and swallow what follows it.
+    fn strip_css(css: &str) -> String {
+        let mut out = String::new();
+        let mut chars = css.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '/' if chars.peek() == Some(&'*') => {
+                    chars.next();
+                    let mut last = ' ';
+                    for d in chars.by_ref() {
+                        if last == '*' && d == '/' {
+                            break;
+                        }
+                        last = d;
+                    }
+                    out.push(' ');
+                }
+                '"' | '\'' => {
+                    while let Some(d) = chars.next() {
+                        if d == '\\' {
+                            // The escaped character, a quote included, is
+                            // part of the string.
+                            chars.next();
+                        } else if d == c || d == '\n' {
+                            // CSS ends an unterminated string at the line
+                            // end, so what follows is scanned, not hidden.
+                            break;
+                        }
+                    }
+                    out.push_str("\"\"");
+                }
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// A declaration with the preludes of the blocks around it.
+    type Declaration = (Vec<String>, String);
+
+    /// Every declaration of a stylesheet with the preludes of the blocks
+    /// around it, outermost first, and every block's prelude path: what
+    /// the palette rule is judged on.
+    fn declarations(css: &str) -> (Vec<Declaration>, Vec<Vec<String>>) {
+        let text = strip_css(css);
+        let mut decls = Vec::new();
+        let mut blocks = Vec::new();
+        let mut stack: Vec<String> = Vec::new();
+        let mut piece = String::new();
+        for c in text.chars() {
+            match c {
+                '{' => {
+                    stack.push(piece.split_whitespace().collect::<Vec<_>>().join(" "));
+                    blocks.push(stack.clone());
+                    piece.clear();
+                }
+                ';' | '}' => {
+                    if !piece.trim().is_empty() {
+                        decls.push((stack.clone(), piece.trim().to_string()));
+                    }
+                    piece.clear();
+                    if c == '}' {
+                        stack.pop();
+                    }
+                }
+                c => piece.push(c),
+            }
+        }
+        (decls, blocks)
+    }
+
+    const LIGHT: &str = ":root";
+    const DARK: &str = "@media (prefers-color-scheme: dark)";
+
+    /// What is wrong with a stylesheet's palette: every colour must be a
+    /// custom property in the one `:root` rule (light) or the one `:root`
+    /// rule of the one `prefers-color-scheme: dark` block, the two sets
+    /// naming the same properties, and no other declaration may hold a
+    /// colour. A backslash outside a string or a comment is refused
+    /// outright: a CSS escape can spell a colour (`r\65 d` is `red`) that
+    /// the scan would not see, and the page's own sheet has none. Empty
+    /// when all of it holds.
+    fn palette_problems(css: &str) -> Vec<String> {
+        let (decls, blocks) = declarations(css);
+        let mut problems = Vec::new();
+        if strip_css(css).contains('\\') {
+            problems.push("a backslash outside a string or a comment".to_string());
+        }
+        let count = |path: &[&str]| blocks.iter().filter(|b| *b == path).count();
+        if count(&[LIGHT]) != 1 {
+            problems.push(format!("{} top-level :root rules", count(&[LIGHT])));
+        }
+        if count(&[DARK]) != 1 || count(&[DARK, LIGHT]) != 1 {
+            problems.push("not exactly one dark block with one :root rule".to_string());
+        }
+        let mut light = Vec::new();
+        let mut dark = Vec::new();
+        for (path, decl) in &decls {
+            let (property, value) = decl.split_once(':').unwrap_or((decl, ""));
+            let property = property.trim();
+            let colours = colours_in(value, true);
+            if colours.is_empty() {
+                continue;
+            }
+            let palette = if path == &[LIGHT] {
+                Some(&mut light)
+            } else if path == &[DARK, LIGHT] {
+                Some(&mut dark)
+            } else {
+                None
+            };
+            match palette {
+                Some(set) if property.starts_with("--") => set.push(property.to_string()),
+                _ => problems.push(format!("{path:?} {decl}: {colours:?}")),
+            }
+        }
+        light.sort();
+        dark.sort();
+        if light != dark {
+            problems.push(format!("light {light:?} and dark {dark:?} differ"));
+        }
+        problems
+    }
+
+    /// Cycle U2: the palette is defined exactly once. Every colour of
+    /// `app.css` is a custom property of the light or the dark `:root`
+    /// rule, and the page and its script name no colour at all.
+    #[test]
+    fn the_palette_is_defined_once() {
+        assert_eq!(palette_problems(STYLE), Vec::<String>::new());
+        for (name, text) in [("index.html", PAGE), ("app.js", SCRIPT)] {
+            assert_eq!(colours_in(text, false), Vec::<String>::new(), "{name}");
+        }
+        // The page's sizes come from script through custom properties, never
+        // a style attribute.
+        assert!(SCRIPT.contains("style.setProperty('--left'"));
+        assert!(!SCRIPT.contains("innerHTML") && !SCRIPT.contains("outerHTML"));
+        assert!(!SCRIPT.contains("setAttribute('style'"));
+    }
+
+    /// The rule's teeth: each of these sheets breaks it one way, and each
+    /// is refused; the keywords that name no colour of their own pass.
+    #[test]
+    fn a_stylesheet_that_breaks_the_palette_is_refused() {
+        const GOOD: &str = ":root { --a: #fff; --b: rgb(0 0 0); --font: \"Menlo\"; }\n\
+             @media (prefers-color-scheme: dark) { :root { --a: #111; --b: black; } }\n\
+             a { color: var(--a); border: 1px solid transparent; fill: currentColor; \
+             background: inherit; white-space: pre-wrap; }\n\
+             #bad2 { content: \"red\"; quotes: \"\\\"\" 'it\\'s'; } /* a comment may say red */";
+        assert_eq!(palette_problems(GOOD), Vec::<String>::new());
+        assert_eq!(NAMED_COLOURS.len(), 148);
+        let dark = "@media (prefers-color-scheme: dark) { :root { --a: #111; } }";
+        for bad in [
+            format!(":root {{ --a: #fff; }} {dark} a {{ color: red; }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ color: #abc; }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ color: #AABBCCDD; }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ background: rgb(0 0 0); }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ color: HSL(0 0% 0%); }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ border: 1px solid ForestGreen; }}"),
+            format!(":root {{ --a: #fff; }} {dark} a {{ color: Canvas; }}"),
+            format!(
+                ":root {{ --a: #fff; }} {dark} a {{ color: color-mix(in srgb, var(--a), var(--a)); }}"
+            ),
+            // A colour in the light rule that is not a custom property.
+            format!(":root {{ --a: #fff; color: #000; }} {dark}"),
+            // A colour inside another media block.
+            format!(
+                ":root {{ --a: #fff; }} {dark} @media (max-width: 700px) {{ a {{ color: #123; }} }}"
+            ),
+            // A colour in a second :root rule.
+            format!(":root {{ --a: #fff; }} {dark} :root {{ --b: #000; }}"),
+            // Light and dark name different properties.
+            format!(":root {{ --a: #fff; --b: #000; }} {dark}"),
+            // No dark block, or two.
+            ":root { --a: #fff; }".to_string(),
+            format!(":root {{ --a: #fff; }} {dark} {dark}"),
+            // An escaped quote does not end a string early, so the string
+            // cannot swallow the colour after it (cycle U2's review).
+            format!(r#":root {{ --a: #fff; }} {dark} a {{ content: "a\""; color: red; }}"#),
+            format!(r":root {{ --a: #fff; }} {dark} a {{ content: 'it\'s'; color: red; }}"),
+            // A string left open ends at its line end, as CSS ends it, so
+            // it cannot hide the colour on the next line.
+            format!(":root {{ --a: #fff; }} {dark} a {{ content: \"x\n; color: red; }}"),
+            // A CSS escape spelling a colour, `r\65 d` for `red`, and any
+            // other backslash outside a string.
+            format!(r":root {{ --a: #fff; }} {dark} a {{ color: r\65 d; }}"),
+            format!(r":root {{ --a: #fff; }} {dark} a\{{ }} b {{ color: var(--a); }}"),
+        ] {
+            assert!(!palette_problems(&bad).is_empty(), "accepted: {bad}");
+        }
+        // And the page and script checks see a colour wherever one is,
+        // system colours included where they are not ordinary words.
+        for bad in [
+            "x.style.color = 'red';",
+            "// #fff",
+            "rgba(0,0,0,0)",
+            "<b class=\"navy\">",
+            "x.style.color = 'ButtonText';",
+            "GrayText",
+            "canvastext",
+            "<i class=\"AccentColor\">",
+        ] {
+            assert!(!colours_in(bad, false).is_empty(), "{bad}");
+        }
+        for fine in [
+            "#desktop",
+            "#input",
+            "white-space",
+            "--left",
+            "window.color_scheme",
+            "Field",
+            "mark",
+            "Menu",
+            "background",
+            "highlight",
+            "canvas",
+        ] {
+            assert_eq!(colours_in(fine, false), Vec::<String>::new(), "{fine}");
+        }
+        // Every system colour but the seven ordinary words is refused in
+        // the page and the script, and all of them in a stylesheet.
+        for word in SYSTEM_COLOURS {
+            assert_eq!(
+                colours_in(word, false).is_empty(),
+                ORDINARY_WORDS.contains(&word),
+                "{word}"
+            );
+            assert_eq!(colours_in(word, true), [word], "{word}");
+        }
+    }
+
+    /// Where `app.js`'s function `name` is, from its `function` keyword to
+    /// its closing brace, found by counting braces from the first one after
+    /// the signature: the functions it is asked for hold no brace in a
+    /// string or a comment. The script must define the name exactly once.
+    fn function_span(script: &str, name: &str) -> std::ops::Range<usize> {
+        let signature = format!("function {name}(");
+        assert_eq!(script.matches(&signature).count(), 1, "one {signature}");
+        let start = script.find(&signature).unwrap_or_default();
+        let open = start + script[start..].find('{').expect("a body");
+        let mut depth = 0;
+        for (k, c) in script[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return start..open + k + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the body of {name} is never closed");
+    }
+
+    /// Every byte offset where `word` stands in `text` as a whole
+    /// JavaScript identifier.
+    fn word_offsets(text: &str, word: &str) -> Vec<usize> {
+        let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+        text.match_indices(word)
+            .map(|(k, _)| k)
+            .filter(|&k| {
+                let before = text.as_bytes()[..k].last().copied();
+                let after = text.as_bytes().get(k + word.len()).copied();
+                !before.is_some_and(ident) && !after.is_some_and(ident)
+            })
+            .collect()
+    }
+
+    /// Cycle U2: every request goes through the one queue. `app.js` names
+    /// `fetch` exactly once, called inside the queue's `send`, and names
+    /// `send` only where it is defined and inside `call`, which chains each
+    /// request on the one before; no other way to reach the network
+    /// appears in the script at all.
+    #[test]
+    fn every_request_goes_through_the_one_queue() {
+        let send = function_span(SCRIPT, "send");
+        let call = function_span(SCRIPT, "call");
+        let fetches = word_offsets(SCRIPT, "fetch");
+        assert_eq!(fetches.len(), 1, "fetch is named once");
+        assert_eq!(SCRIPT.matches("fetch(").count(), 1);
+        assert!(SCRIPT[fetches[0]..].starts_with("fetch("));
+        assert!(send.contains(&fetches[0]), "fetch is called in send");
+        let defined = send.start + "function ".len();
+        let sends = word_offsets(SCRIPT, "send");
+        assert!(sends.contains(&defined));
+        for k in &sends {
+            assert!(
+                *k == defined || call.contains(k),
+                "send named outside call at byte {k}"
+            );
+        }
+        assert!(sends.len() >= 2, "call calls send");
+        assert!(SCRIPT[call.clone()].contains("queue.then("));
+        assert!(SCRIPT[call].contains("return send(request);"));
+        for other in [
+            "XMLHttpRequest",
+            "sendBeacon",
+            "WebSocket",
+            "EventSource",
+            "import(",
+        ] {
+            assert!(!SCRIPT.contains(other), "{other}");
+        }
     }
 
     #[test]
