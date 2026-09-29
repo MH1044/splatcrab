@@ -68,7 +68,7 @@ that get lost, and the transcript is ordinary selectable text.
 | U0 | [ui-foundations](modules/U0-ui-foundations.md) | The evaluation protocol as a stdin/stdout program, covered by the existing golden harness, with no network code at all | Done (2026-09-28) |
 | U1 | [ui-server](modules/U1-ui-server.md) | `splatcrab --ui` serves a loopback page that runs a line and shows its exact output; the HTTP bytes are pinned by golden cases | Done (2026-09-28) |
 | U2 | [ui-desktop](modules/U2-ui-desktop.md) | Four resizable panes: command window, workspace, file browser and command history, with the palette defined exactly once | Done (2026-09-29) |
-| U3 | ui-editor | An editor with tabs and line numbers, Run and Run Selection, and an error that jumps to its line | Planned |
+| U3 | [ui-editor](modules/U3-ui-editor.md) | An editor with tabs and line numbers, Run and Run Selection, and an error that jumps to its line | Planned |
 | U4 | ui-figures | Gated on 12 and 13: plots inline, path completion, and `cd` shared between the command window and the file pane | Planned |
 
 Built between 01e and 02, except U4, which waits for the modules it depends on.
