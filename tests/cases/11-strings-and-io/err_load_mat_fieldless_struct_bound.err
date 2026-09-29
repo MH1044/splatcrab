@@ -1,0 +1,1 @@
+Error: Line 23: Unable to read MAT-file 'err_load_mat_fieldless_struct_bound.mat': it holds a struct array with no fields and more than 1048576 elements.

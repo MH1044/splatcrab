@@ -1,0 +1,18 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 134
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":1,"ok":false,"out":"","error":{"message":"input is not available in this session: there is no terminal to read from.","line":1}}
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 38
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":2,"ok":true,"out":"e\n     1\n"}

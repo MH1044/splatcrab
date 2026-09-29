@@ -1056,6 +1056,26 @@ impl Parser {
         e
     }
 
+    /// The whole of a text that is one expression, with nothing after it
+    /// but line ends: what `input` evaluates and `str2num` reads (cycle
+    /// 11).
+    pub fn parse_whole_expr(&mut self) -> R<Expr> {
+        while matches!(self.peek(), Token::Newline) {
+            self.pos += 1;
+        }
+        let e = self.parse_expr()?;
+        while matches!(self.peek(), Token::Newline) {
+            self.pos += 1;
+        }
+        match self.peek() {
+            Token::Eof => Ok(e),
+            t => {
+                let line = self.line();
+                bail!(error::unexpected_token(t).at(line))
+            }
+        }
+    }
+
     fn parse_oror(&mut self) -> R<Expr> {
         let save = self.depth;
         let mut left = self.parse_andand()?;

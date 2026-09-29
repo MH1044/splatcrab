@@ -1,0 +1,3 @@
+% covers: 14 - under --protocol input is an error answer with SplatCrab's text that never reads stdin, so the next request is answered, and there fprintf(2, ...) lands in out, in order, with nothing on stderr
+{"id":1,"op":"eval","code":"x = input('n: ');"}
+{"id":2,"op":"eval","code":"fprintf(2, 'e\\n'); disp(1)"}

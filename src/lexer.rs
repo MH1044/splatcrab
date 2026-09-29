@@ -1442,6 +1442,20 @@ mod tests {
         assert!(lex("$").is_err());
     }
 
+    /// Cycle 11: a control character is named by its code point, never
+    /// written raw into the message; a printable one is quoted as itself.
+    #[test]
+    fn an_unexpected_control_character_is_named_not_echoed() {
+        let msg = |src: &str| lex(src).unwrap_err().msg;
+        assert_eq!(msg("x = \u{0}"), "unexpected character U+0000");
+        assert_eq!(msg("\u{7}"), "unexpected character U+0007");
+        assert_eq!(msg("x\u{1B}"), "unexpected character U+001B");
+        assert_eq!(msg("\u{200B}"), "unexpected character U+200B");
+        assert_eq!(msg("$"), "unexpected character '$'");
+        assert_eq!(msg("é"), "unexpected character 'é'");
+        assert!(!msg("\u{0}").contains('\u{0}'));
+    }
+
     // ---- line numbers ---------------------------------------------------
 
     #[test]

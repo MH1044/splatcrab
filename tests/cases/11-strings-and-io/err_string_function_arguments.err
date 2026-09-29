@@ -1,0 +1,1 @@
+Error: Line 10: The number of characters to compare in 'strncmp' must be a non-negative integer.

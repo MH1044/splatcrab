@@ -1,0 +1,7 @@
+Every element of a cell argument to 'strjoin' must be a character vector.
+A cell of delimiters for 'strjoin' must have one fewer element than the cell it joins.
+Inputs must be the same size or either one can be a scalar.
+All the character arrays given to 'strcat' must have the same number of rows.
+All the cell arrays given to 'strcat' must be the same size or have one element.
+Precision for 'mat2str' must be a positive integer.
+Input to 'mat2str' must be a numeric, logical or char matrix.

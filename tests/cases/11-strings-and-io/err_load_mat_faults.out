@@ -1,0 +1,7 @@
+Unable to read MAT-file 'err_load_mat_faults.mat': it is not a MAT-file of version 5.
+Unable to read MAT-file 'err_load_mat_faults.mat': it holds compressed data, which SplatCrab does not read (save with -v6).
+Unable to read MAT-file 'err_load_mat_faults.mat': its data is corrupt.
+Unable to read MAT-file 'err_load_mat_faults.mat': an array in it has more than two dimensions.
+Unable to read MAT-file 'err_load_mat_faults.mat': it holds a sparse array, which SplatCrab does not read.
+Unable to read MAT-file 'err_load_mat_faults.mat': it holds an object or a function handle, which SplatCrab does not read.
+Unable to read MAT-file 'err_load_mat_faults.mat': its cells and structs are nested too deeply.

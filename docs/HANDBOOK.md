@@ -3910,6 +3910,438 @@ n =
 
 ```
 
+### Strings and text
+
+`strcat strsplit strjoin strrep strtrim upper lower strfind strtok blanks`
+(cycle 11). `strcat` drops the trailing whitespace of a char argument,
+where `[...]` keeps it; `strsplit` collapses a run of delimiters into one
+unless `'CollapseDelimiters'` is false; `strrep` and `strfind` count
+overlapping occurrences.
+
+```matlab
+s = strcat('file', '_', 'name')
+c = strsplit('a,b,,c', ',')
+j = strjoin({'x', 'y', 'z'}, ' + ')
+r = strrep('one two two', 'two', '2')
+t = strtrim(sprintf('  padded\t'))
+u = upper('Mixed Case')
+k = strfind('abcabc', 'bc')
+[tok, rest] = strtok('first second third')
+```
+
+```
+s =
+
+    'file_name'
+
+c =
+
+  1×3 cell array
+
+    {'a'}    {'b'}    {'c'}
+
+j =
+
+    'x + y + z'
+
+r =
+
+    'one 2 2'
+
+t =
+
+    'padded'
+
+u =
+
+    'MIXED CASE'
+
+k =
+
+     2     5
+
+tok =
+
+    'first'
+
+rest =
+
+    ' second third'
+```
+
+The comparisons `strcmp strcmpi strncmp strncmpi` and the predicates
+`isspace isletter` return logicals. A cell of text compares element by
+element:
+
+```matlab
+a = strcmp('abc', 'abc')
+b = strcmpi('ABC', 'abc')
+c = strcmp({'red', 'green', 'red'}, 'red')
+d = strncmp('prefix_one', 'prefix_two', 7)
+e = isspace('a b')
+```
+
+```
+a =
+
+  logical
+
+   1
+
+b =
+
+  logical
+
+   1
+
+c =
+
+  1×3 logical array
+
+   1   0   1
+
+d =
+
+  logical
+
+   1
+
+e =
+
+  1×3 logical array
+
+   0   1   0
+```
+
+Numbers and text convert both ways. `num2str` of a matrix gives one row
+per matrix row, as MATLAB lays it out; `mat2str` writes MATLAB syntax;
+`str2double` gives `NaN` for text that is not a number; `str2num` reads
+literals and operators only, never a function call or a variable.
+
+```matlab
+a = num2str([1 2; 3 4])
+b = num2str([1.5 -2 10])
+c = int2str(2.5)
+d = mat2str([1 2; 3 4.5])
+e = str2double('1.5e3')
+f = str2double('twelve')
+g = str2num('[1 2 3] * 2')
+```
+
+```
+a =
+
+  2×4 char array
+
+    '1  2'
+    '3  4'
+
+b =
+
+    '1.5            -2            10'
+
+c =
+
+    '3'
+
+d =
+
+    '[1 2;3 4.5]'
+
+e =
+
+        1500
+
+f =
+
+   NaN
+
+g =
+
+     2     4     6
+```
+
+`num2str(A, n)` gives each element `n` significant digits and
+`num2str(A, format)` formats each row with the format, one char row per
+matrix row either way. `upper`, `lower`, `strtrim`, `strrep`, `strcat`,
+`strjoin`, `strfind`, `str2double` and the `strcmp` family take a cell of
+text too, element by element:
+
+```matlab
+a = num2str([pi; -2], 4)
+b = num2str([1 2; 3 4], '%d,')
+c = upper({'ab', 'cd'})
+d = strrep({'aa', 'ba'}, 'a', 'x')
+```
+
+```
+a =
+
+  2×5 char array
+
+    '3.142'
+    '   -2'
+
+b =
+
+  2×4 char array
+
+    '1,2,'
+    '3,4,'
+
+c =
+
+  1×2 cell array
+
+    {'AB'}    {'CD'}
+
+d =
+
+  1×2 cell array
+
+    {'xx'}    {'bx'}
+```
+
+### Regular expressions
+
+`regexp` and `regexprep` run on SplatCrab's own engine, which takes time
+linear in its input whatever the pattern, so a pattern that makes a
+backtracking engine hang, `(a*)*b` on a long run of `a`s, returns at once.
+The outputs are asked for by name, `'match'`, `'tokens'`, `'names'`,
+`'start'`, `'end'`, `'split'` and `'tokenExtents'`, in the order
+given; `'once'` gives the first match alone. `$N` in a replacement is
+token `N`.
+
+```matlab
+m = regexp('x=12, y=345', '\d+', 'match')
+[tok, pos] = regexp('x=12, y=345', '(\w)=(\d+)', 'tokens', 'start');
+disp(tok{2}{1})
+disp(pos)
+n = regexp('key=value', '(?<k>\w+)=(?<v>\w+)', 'names')
+s = regexprep('2024-01-31', '(\d+)-(\d+)-(\d+)', '$3/$2/$1')
+f = regexp('one two', '\w+', 'match', 'once')
+```
+
+```
+m =
+
+  1×2 cell array
+
+    {'12'}    {'345'}
+
+y
+     1     7
+n =
+
+  struct with fields:
+
+    k: 'key'
+    v: 'value'
+
+s =
+
+    '31/01/2024'
+
+f =
+
+    'one'
+```
+
+The syntax the engine takes:
+
+| Syntax | Meaning |
+|---|---|
+| `abc`, `\.`, `\(`, `\\` | literals; `\` before any other character is that character |
+| `.` | any character, the newline included |
+| `[abc]`, `[a-z]`, `[^...]` | classes; `\d \w \s` and the escapes work inside one |
+| `\d \w \s`, `\D \W \S` | digit, word character (`_` included), whitespace, and their negations |
+| `\n \t \r \f \v \a \e \0`, `\b` | escapes; `\b` is the backspace, as in MATLAB, not a word boundary |
+| `\xN`, `\x{N}`, `\oN`, `\o{N}` | a character by its hexadecimal or octal code, up to U+FFFF |
+| `^`, `$`, `\<`, `\>` | the start and end of the text, and of a word |
+| `a\|b`, `(...)`, `(?:...)`, `(?<name>...)`, `(?#...)` | alternation, groups, non-capturing and named groups, comments |
+| `*`, `+`, `?`, `{n}`, `{n,}`, `{n,m}` | quantifiers, each lazy with a `?` after it; a count is at most 1000 |
+
+`'ignorecase'` folds case, `'emptymatch'` keeps empty matches, and
+`regexprep`'s replacement takes `$0`, `$N` and `$<name>`. A cell of text
+gives a cell of answers, one per element:
+
+```matlab
+p = regexp('a1,b22;c333', '[,;]', 'split')
+[s, e] = regexp('say HELLO hello', 'hello', 'ignorecase')
+w = regexprep('one two', '\<(\w)', '<$1>')
+t = regexp('ab12', '(?<letters>[a-z]+)(?<digits>\d+)', 'names');
+disp(t.digits)
+try
+    regexp('aa', '(a)\1')
+catch err
+    disp(err.message)
+end
+```
+
+```
+p =
+
+  1×3 cell array
+
+    {'a1'}    {'b22'}    {'c333'}
+
+s =
+
+     5    11
+
+e =
+
+     9    15
+
+w =
+
+    '<o>ne <t>wo'
+
+12
+Backreferences are not supported in regular expressions.
+```
+
+A backreference, `(a)\1` or `\k<name>`, cannot be matched in linear time
+and is an error, as are lookahead and lookbehind, atomic groups,
+possessive quantifiers, conditionals and inline flags such as `(?i)`; use
+the `'ignorecase'` option for the last. A pattern nested more than 250
+deep, or one whose compiled form is past 20,000 instructions, is `The
+regular expression is too large.`
+
+### Files
+
+`fopen fclose fgetl fgets fprintf fread fwrite feof fileread readmatrix
+writematrix csvread csvwrite delete save load input`. A relative name is
+found from the current folder. `fopen` returns `-1` for a file it cannot
+open; `fgetl` returns `-1` at the end of the file, which is not a char.
+`fprintf(1, ...)` writes to the output and `fprintf(2, ...)` to stderr,
+and `n = fprintf(...)` is the number of bytes written.
+
+```matlab
+fid = fopen('notes.txt', 'w');
+n = fprintf(fid, 'line %d\n', 1:3);
+fclose(fid);
+disp(n)
+fid = fopen('notes.txt');
+while true
+    l = fgetl(fid);
+    if ~ischar(l), break, end
+    disp(upper(l))
+end
+fclose(fid);
+disp(fileread('notes.txt'))
+delete('notes.txt')
+```
+
+```
+    21
+LINE 1
+LINE 2
+LINE 3
+line 1
+line 2
+line 3
+```
+
+`writematrix` and `readmatrix` write and read comma-separated numbers, and
+`save` and `load` a MAT-file of version 5, uncompressed, which MATLAB
+reads. `load` with an output gives a struct:
+
+```matlab
+A = [1 2.5; 3 4];
+writematrix(A, 'a.csv');
+disp(fileread('a.csv'))
+B = readmatrix('a.csv')
+x = magic(3);
+label = 'three';
+save('work.mat', 'x', 'label');
+clear
+load('work.mat')
+disp(label)
+disp(x(2, :))
+S = load('work.mat', 'x');
+disp(fieldnames(S))
+delete('a.csv', 'work.mat')
+```
+
+```
+1,2.5
+3,4
+
+B =
+
+    1.0000    2.5000
+    3.0000    4.0000
+
+three
+     3     5     7
+    {'x'}
+```
+
+`fwrite` and `fread` move binary data, `uint8` unless a precision such as
+`'uint16'`, `'int32'` or `'double'` is named, little-endian; `fread` gives
+a column and the count. `feof` is `1` once a read has reached the end of
+the file. `csvwrite` writes five significant digits and `csvread` skips a
+number of rows and columns; `save -ascii` writes each value `%.7e` and
+`load` of a text file names the variable after the file:
+
+```matlab
+fid = fopen('bytes.bin', 'w');
+count = fwrite(fid, [1 2 300], 'uint16')
+fclose(fid);
+fid = fopen('bytes.bin');
+[v, n] = fread(fid, Inf, 'uint16');
+disp(v')
+disp(feof(fid))
+fclose(fid);
+csvwrite('c.csv', [1/3 2; 3 4]);
+disp(fileread('c.csv'))
+m = csvread('c.csv', 1, 0)
+x = [1 -2.5];
+save('x.txt', 'x', '-ascii');
+disp(fileread('x.txt'))
+load('x.txt');
+disp(x)
+delete('bytes.bin', 'c.csv', 'x.txt')
+```
+
+```
+count =
+
+     3
+
+     1     2   300
+     1
+0.33333,2
+3,4
+
+m =
+
+     3     4
+
+   1.0000000e+00  -2.5000000e+00
+
+    1.0000   -2.5000
+```
+
+`delete` takes one or more files, each by its full name: a wildcard,
+`delete('*.txt')`, is an error rather than expanded, and a file that is
+not there is a warning.
+`load` checks every size a MAT-file claims before it allocates anything,
+so a truncated or corrupt file is an error. A compressed MAT-file,
+MATLAB's default since version 7, is not read: save it there with `-v6`.
+`save` in an empty workspace is an error, since the file would hold no
+variable. An error about a file names it and gives the reason in words
+that are the same on every platform, `No such file or directory` or `It is
+a directory`.
+
+`input(prompt)` writes its prompt, reads a line and evaluates it, and
+`input(prompt, 's')` returns the line as text. Under `--protocol`, `--ui`
+and `--http-stdio` there is no terminal and it is an error, `input is not
+available in this session: there is no terminal to read from.`, with the
+session going on; at the end of standard input it is `'input' reached the
+end of standard input.`
+
 ### Workspace
 
 `clear clc who whos`. `clear()` with no arguments empties the workspace, and
@@ -4303,8 +4735,8 @@ h =
 ```
 
 `round(x, n, 'decimals')` is the two-argument form spelled out. `num2str` of a
-non-scalar still returns one row in column-major order; that waits for cycle
-11.
+non-scalar gives one char row per matrix row since cycle 11; see
+[Strings and text](#strings-and-text).
 
 ### `'all'` on the reductions
 
@@ -4595,7 +5027,8 @@ switches the console to UTF-8 so that it renders.
 
 ### `fprintf` conversions
 
-`%d %i %u %f %e %g %c %s`, with flags, width and precision.
+`%d %i %u %f %F %e %E %g %G %x %X %o %c %s`, with flags, width and
+precision.
 
 ```matlab
 fprintf('%d %i %u\n', 7, 8, 9);
@@ -4669,10 +5102,37 @@ fprintf('[%-10s]|\n', 'hi');
 [hi        ]|
 ```
 
-Precision on `%s` is currently ignored, `#` is ignored, `%x` `%X` `%o` and a
-`*` width are errors, and `\x` `\a` `\b` `\f` `\v` and octal escapes are not
-processed. A very large width or precision panics; see
-[Errors and exit codes](#errors-and-exit-codes).
+The `#` flag keeps the point, `0` never pads `Inf` or `NaN` with zeros,
+`%x`, `%X`, `%o` and a `*` width or precision exist, and the escapes
+`\xN`, `\N` (octal), `\a`, `\b`, `\f` and `\v` are processed (cycle 11).
+`%E` and `%G` write an upper-case `E`, and `%s` of a number that is not a
+character code is `%e`. An invalid conversion ends the output, the text
+before it printed, as MATLAB does:
+
+```matlab
+fprintf('%x %X %o\n', 255, 255, 8);
+fprintf('[%*d] [%.*f]\n', 5, 42, 2, pi);
+fprintf('%E %G\n', 12345.678, 1e-10);
+fprintf('[%#.0f] [%05d]\n', 3, -Inf);
+fprintf('\x41\102\n');
+fprintf('%s\n', pi);
+fprintf('abc%q def\n', 1);
+fprintf('\n');
+fprintf(1, 'to stdout\n');
+```
+
+```
+ff FF 10
+[   42] [3.14]
+1.234568E+04 1E-10
+[3.] [ -Inf]
+AB
+3.141593e+00
+abc
+to stdout
+```
+
+A width or precision past 8192, written or given by `*`, is an error.
 
 ### Format cycling
 
@@ -5112,28 +5572,26 @@ fprintf('%d\n', 1e30);
 
 Indexed assignment, growth, concatenation and the rearrangement builtins keep
 a char, and unary plus gives a double, as in MATLAB; see [Classes](#classes).
-Two builtins still lose the class, because cycle 02 named only the
-rearrangements:
+Since cycle 11 a range between two chars and `diag` of a char keep it too:
 
 ```matlab
-r = 'a':'c'
-d = diag('ab')
+r = 'a':'e'
+d = diag('ab');
+disp(class(d))
+disp(size(d))
 ```
 
 ```
 r =
 
-    97    98    99
+    'abcde'
 
-d =
-
-    97     0
-     0    98
-
+char
+     2     2
 ```
 
-MATLAB gives `'abc'` and a 2x2 char. `logical('a')` and `char(true)` convert
-here, where MATLAB is understood to refuse both.
+`logical('a')` and `char(true)` convert here, where MATLAB is understood to
+refuse both.
 
 ### Syntax not recognised
 
@@ -5196,7 +5654,6 @@ a = size(find([]))
 b = size(diag([]))
 c = size('')
 disp([])
-d = num2str([1 2; 3 4])
 ```
 
 ```
@@ -5212,13 +5669,42 @@ c =
 
      0     0
 
-d =
-
-    '1  3  2  4'
 ```
 
-`num2str` of a matrix gives one row in column-major order; MATLAB gives a
-2x4 char array of `'1  2'` and `'3  4'`.
+### Strings and files
+
+The string and file functions of cycle 11 differ in these recorded ways,
+each safer or simpler than MATLAB's: `delete` refuses a wildcard rather
+than expand it; the regular-expression engine refuses backreferences,
+lookaround, atomic groups, possessive quantifiers, conditionals and inline
+flags, and there is no `regexpi`; `str2num` reads literals and operators
+and never hands its text to `eval`, so text from a file cannot run code;
+`input` of text that is not an expression is an error, where MATLAB asks
+again; `save` in an empty workspace is an error; a compressed MAT-file is
+refused, and the integer and `single` classes load as doubles; `fopen`
+takes no machine format or encoding, and text is UTF-8 both ways.
+
+```matlab
+[x, ok] = str2num('disp(1)')
+y = str2num('[1 2] * 3')
+```
+
+```
+x =
+
+     []
+
+ok =
+
+  logical
+
+   0
+
+y =
+
+     3     6
+
+```
 
 ### Error text
 
@@ -5262,8 +5748,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 |---|---|
 | `global`, `persistent`, nested functions | later |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
-| `fprintf(fid, ...)`, `nbytes = fprintf(...)`, string functions | 11 |
-| Regular expressions, file I/O, `save` / `load` | 11 |
+| Compressed MAT-files, `regexpi`, backreferences | not scheduled |
 | Plotting | 12 |
 | `exit` in a script, `exit(code)`, `format`, `help`, `eval` | 13 |
 | Integer classes and `single` | not scheduled |

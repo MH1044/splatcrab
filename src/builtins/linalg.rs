@@ -12,7 +12,7 @@ use super::math::{reduce, sum0};
 use super::{Registry, add, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R};
-use crate::value::{Matrix, Value};
+use crate::value::{Class, Matrix, Value};
 
 /// One line per builtin; see the note on `core::register`.
 #[rustfmt::skip]
@@ -105,8 +105,18 @@ fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     } else {
         0.0
     };
+    // A char keeps its class, as in MATLAB (cycle 11): `diag('ab')` is a
+    // 2x2 char, its zeros the character with code 0. Every other class is a
+    // double, as before.
+    let keep = |d: Matrix| {
+        if m.class == Class::Char {
+            one_as(d.with_class(Class::Char))
+        } else {
+            one_mat(d)
+        }
+    };
     if m.rows == 0 && m.cols == 0 {
-        return one_mat(Matrix::empty());
+        return keep(Matrix::empty());
     }
     if m.is_vector() {
         let n = m.numel();
@@ -121,7 +131,7 @@ fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         for (i, v) in m.data.iter().enumerate() {
             out.set(i + dr, i + dc, *v);
         }
-        one_mat(out)
+        keep(out)
     } else {
         // Row and column of the diagonal's first element. They stay `f64`
         // until they are known to lie inside the matrix, so `diag(A, 1e300)`
@@ -138,7 +148,7 @@ fn diag(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         } else {
             0
         };
-        one_mat(Matrix::col(
+        keep(Matrix::col(
             (0..len).map(|i| m.get(r0 + i, c0 + i)).collect(),
         ))
     }

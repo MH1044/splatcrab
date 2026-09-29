@@ -7,6 +7,7 @@
 *.repl text eol=lf
 *.proto text eol=lf
 *.http text eol=lf
+*.stdin text eol=lf
 *.md   text eol=lf
 *.yml  text eol=lf
 *.toml text eol=lf

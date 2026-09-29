@@ -1,0 +1,7 @@
+Lookahead and lookbehind are not supported in regular expressions.
+Lookahead and lookbehind are not supported in regular expressions.
+Invalid regular expression: a possessive quantifier is not supported.
+Invalid regular expression: an atomic group is not supported.
+Invalid regular expression: a conditional is not supported.
+Invalid regular expression: an inline flag is not supported.
+Backreferences are not supported in regular expressions.

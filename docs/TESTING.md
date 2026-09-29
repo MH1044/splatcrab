@@ -152,8 +152,9 @@ Interior blank lines and leading whitespace are compared exactly. MATLAB's
 column alignment is part of the specification, not incidental formatting.
 
 `.gitattributes` forces LF for `.m`, `.out`, `.err`, `.exit`, `.repl`,
-`.proto` and `.http`, so the Windows and Ubuntu CI jobs compare identical
-bytes.
+`.proto`, `.http` and `.stdin`, so the Windows and Ubuntu CI jobs compare
+identical bytes, and a script reading its `.stdin` sees the same lines on
+both.
 
 ## A .out file is the specification, not a cache
 
@@ -211,13 +212,24 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 - `builtins/`: the builtins themselves, called directly as functions.
   `mod.rs` checks the registry holds every name exactly once and that every
   entry is callable; `args.rs` the message text of each helper and the size
-  overflow guard; `core.rs` the constructors, `num2str` and `format_printf`;
+  overflow guard; `core.rs` the constructors;
   `math.rs` the reduction and scan dimension rules; `linalg.rs` sorting and
   rearrangement. Since cycle 10 `complex.rs` checks the complex arithmetic,
   the powers and the branch cuts with tolerances, and `fft` against the
   direct DFT for every length from 1 to 40 and at a prime length of
   100,003; `factor.rs` checks complex eigenvalues by the residual
-  `A*v - lambda*v`; `mod.rs` checks the complex gate.
+  `A*v - lambda*v`; `mod.rs` checks the complex gate. Since cycle 11
+  `printf.rs` checks every conversion, flag and escape and the width and
+  precision bound, `*` fields included; `strings.rs` the `num2str` layouts,
+  the string functions, `regexp`'s outputs and the refusal of a result too
+  large to build; `regex.rs` the syntax, leftmost-first answers, the
+  refusals and the bounds, and a pathological pattern on a 100,000-unit
+  subject finishing at once; `mat.rs` a round trip of every value kind and
+  every cut of a good file, a header claiming 1e12 elements and nesting
+  past its bound, each a clean error; `io.rs` the file-identifier table,
+  lines, bytes and the end-of-file flag, `save` and `load` in both formats,
+  and `input` from a reader and refused, each in a temporary folder of its
+  own.
 - `json.rs`: a round trip of every value kind, each escape the writer makes
   and the parser reads, surrogate pairs, rejection of trailing garbage and of
   malformed numbers and strings, and the depth limit at and past its bound.

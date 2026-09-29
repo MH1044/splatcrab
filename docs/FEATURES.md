@@ -21,11 +21,13 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Matrix literals, space/comma/newline separators | 00 | `matrix_ops` | `[1 -2]` is two elements, `[1 - 2]` is one |
 | Nested concatenation `[A; B]`, `[a' b']` | 00 | `builtins_sample` | |
 | Ranges `a:b` and `a:s:b` | 00 | `ranges` | Descending and fractional steps |
+| A range between two chars is a char | 11 | `char_range_and_diag_keep_char` | `'a':'e'` is `'abcde'`, and `diag('ab')` is a 2x2 char; both used to be doubles |
 | A range that would not fit is a clean error | 01b | `err_range_too_large` | `1:1e15` used to abort in the allocator; same limit and wording as `check_shape` |
 | A range lands exactly on its end point | 01d | `range_hits_end_point` | `x = 0:0.1:0.3; x(end) == 0.3` is `1`, and `-1:0.01:1` is symmetric: the upper half is computed from the right-hand end point, not by repeated addition |
 | An infinite range end point is refused | 01d | `err_range_end_inf`, `err_range_start_neg_inf` | `0:Inf` and `-Inf:1:0` report `1xInf` rather than quietly giving a 1x0. `1:NaN` is still an empty, and still in Known bugs |
 | An infinite range *step* follows the documented count | 01e | `range_infinite_step` | `1:Inf:5` is the 1x1 `1`: `fix((k-j)/i)` is `fix(4/Inf)`, which is `0`, and a count of `0` is one element. It used to be a 1x0. A range that runs against its step is still empty, `5:Inf:1` included |
 | Chained ranges `1:2:3:4` | 01e | `err_chained_range` | Reads as `(1:2:3):4`, as MATLAB reads it; `parse_range` took at most two colons and did not loop, so it was a parse error. Both spellings then meet the same refusal, since a colon start that is not a scalar is an error here (Known bugs) |
+| An unexpected character is named, not echoed | 11 | `err_lexer_control_character_named`, `err_lexer_printable_character_quoted` | A control or invisible character is written as its code point, `unexpected character U+0000`, so no raw byte reaches the terminal; a printable one is still quoted, `unexpected character '$'` |
 | A leading UTF-8 byte-order mark is skipped | 01e | `bom_is_skipped` | The three bytes `EF BB BF` a Windows editor writes are an encoding marker, not source. A file that is not valid UTF-8 is now decoded leniently rather than refused, so a Windows-1252 comment runs; UTF-16 is still unread (Known bugs) |
 | The tokens `{ }`, the field `.` and `@` | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `c{1}`, `s.a` and `s.(n)` lex and parse, alone or chained (`c{1}(2).b`), without disturbing `1.5`, `.5`, `x.^2`, `x.*y`, `x./y`, `x.\y`, `x.'` or a `...` continuation. Inside brackets a brace or an `@` after a space starts an element. An `@` that starts no handle is `unexpected '@' in expression`. Since cycle 07 a `{` that does not follow a value opens a cell literal |
 | An anonymous function's body inside `[]` or `{}` is one element | 06 | `err_handle_in_brackets` | The whitespace rule does not split the body: in `{@(x) x + 1, 2}` the body is `x + 1` and ends at the comma, as it would at a `;`, a newline or the closer. A quote straight after the parameter list opens a string, `@() 'hi'`. A handle cannot be an element of a bracket, so `[@(x) x+1]` is `Nonscalar arrays of function handles are not allowed; use cell arrays instead.`, as a parse error |
@@ -143,7 +145,7 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-173 names, each an ordinary function in `src/builtins/` registered by name in
+211 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -164,7 +166,10 @@ polynomials, samples, statistics, number theory, grids, sets and solvers,
 exercised by the `09-numerics` cases (see [Numerics](#numerics)). Cycle 10
 added ten, `i`, `j`, `real`, `imag`, `conj`, `angle`, `isreal`, `complex`,
 `fft` and `ifft`, exercised by the `10-complex` cases (see
-[Complex numbers](#complex-numbers)). Cycle 01c removed `e`, which
+[Complex numbers](#complex-numbers)). Cycle 11 added thirty-eight, the
+string, regular-expression and file functions, exercised by the
+`11-strings-and-io` cases (see
+[Strings, regular expressions and files](#strings-regular-expressions-and-files)). Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -191,7 +196,10 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Grids and counts | `logspace meshgrid histc` | 09 | `numerics.rs` |
 | Sets | `unique ismember setdiff intersect union` | 09 | `sets.rs` |
 | Solvers | `fzero fminsearch integral ode45 odeset` | 09 | `solvers.rs` |
-| Output | `disp fprintf sprintf num2str` | 00 | `core.rs` |
+| Output | `disp fprintf sprintf num2str` | 00 | `core.rs`; `printf.rs` the formatter, `fprintf` in `io.rs` and `num2str` in `strings.rs` since 11 |
+| Strings | `strcat strsplit strjoin strrep strtrim upper lower strcmp strcmpi strncmp strncmpi strfind strtok int2str str2double str2num mat2str isspace isletter blanks` | 11 | `strings.rs` |
+| Regular expressions | `regexp regexprep` | 11 | `strings.rs`, over `regex.rs` |
+| Files | `input fopen fclose fgetl fgets fread fwrite feof fileread readmatrix writematrix csvread csvwrite delete save load` | 11 | `io.rs`, over `mat.rs` for MAT-files |
 | Errors and warnings | `error rethrow lasterr warning assert` | 00, 04 | `core.rs` |
 | Comparison | `isequal` | 04 | `core.rs` |
 | Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04 |
@@ -263,7 +271,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | A matrix takes its own norms since cycle 08 (see [Linear algebra](#linear-algebra)). `p = 0` and a negative finite `p` are refused |
 | `norm` without overflow; an empty sum is `+0` | 01c | `norm_scaled_and_empty_sum` | `norm([1e200 1e200])` is `1.4142e+200`, not `Inf`. `sum([])`, `norm([])` and `dot([], [])` print `0.0000`, not `-0.0000` |
 | `diag(v, k)` and `diag(A, k)` | 01c | `diag_offset`, `err_diag_offset` | A `k` past the matrix gives a 0x1 |
-| `num2str(x, n)` and `num2str(x, formatSpec)` | 01c | `num2str_precision`, `err_num2str_precision` | `%.{n}g`, and `sprintf` with the leading spaces trimmed. A non-scalar keeps its one-row output until cycle 11 |
+| `num2str(x, n)` and `num2str(x, formatSpec)` | 01c | `num2str_precision`, `err_num2str_precision` | `%.{n}g`, and `sprintf` with the leading spaces trimmed. Since cycle 11 a non-scalar gives one row per matrix row, with a format each row formatted on its own |
 | `round(x, n)`, `round(x, n, 'decimals')`, `round(x, n, 'significant')` | 01c | `round_digits`, `err_round_digits`, `err_round_significant_digits`, `err_round_type` | Any integer `n`, ties away from zero. `round(pi, 20)` is `pi` and `round(5, -400)` is `0` |
 | `max` and `min` of an empty follow MATLAB's rule | 01c | `max_min_empty_shape` | `max(zeros(3, 0))` is 1x0, `max(zeros(0, 3))` is 0x3 |
 | `dot(A, B)` of matrices, and `dot(A, B, dim)` | 01c | `dot_matrices`, `err_dot_sizes`, `err_dot_vector_length`, `err_dot_dim_orientation` | Column-wise; two vectors of equal length may differ in orientation, but not with `dim` |
@@ -342,6 +350,36 @@ Cycle 10. `Matrix` holds the imaginary parts in `im`, column-major like
 | A builtin that does not take complex input refuses it | 10 | `err_sort_complex_input`, `err_max_complex_input`, `err_min_complex_input`, `err_floor_complex_input`, `err_mod_complex_input`, `err_fzero_complex_start`, `err_fzero_complex_value`, `err_if_complex_condition`, `err_colon_complex_operand`, `err_char_target_complex_assign` | `Complex values are not supported by 'sort'.`, from the registry's gate for every builtin not on `builtins::TAKES_COMPLEX`, and from a solver for a complex value its function returns; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` say `Complex values cannot be converted to logicals.`, a complex operand of `:` is refused as `':'`, and a complex value assigned into a char array as `'char'`. Never an answer from the real parts alone |
 | Complex values in cells, structs and the workspace | 10 | `cell_and_struct_hold_complex`, `workspace_lists_complex_as_double` | Under `--protocol`, `workspace` lists a complex variable with class `double`, in U0's `vars` shape |
 
+## Strings, regular expressions and files
+
+Cycle 11. The string functions are in `src/builtins/strings.rs`, the
+regular-expression engine in `regex.rs`, the formatter in `printf.rs`, the
+file functions in `io.rs` and the MAT-file reader and writer in `mat.rs`.
+Cases in `tests/cases/11-strings-and-io/`.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `strcat` | 11 | `strcat_trailing_space` | A char argument loses its trailing whitespace, where `[...]` keeps it; with a cell among the arguments the result is a cell and nothing is trimmed |
+| `strsplit` and `strjoin` | 11 | `strsplit_strjoin` | Whitespace by default; a run of delimiters collapses into one unless `'CollapseDelimiters'` is false; a delimiter may be a cell, and its escapes are processed. `[C, matches] = strsplit(...)` |
+| `strrep`, `upper`, `lower`, `strtrim`, `strfind` | 11 | `strrep_upper_strtrim_strfind`, `string_lower_strncmp_isspace_blanks` | `strrep` and `strfind` count overlapping occurrences, as MATLAB does: `strrep('2222', '22', '*')` is `'***'`. Each maps over a cell of text |
+| The `strcmp` family | 11 | `strcmp_family_logical`, `string_lower_strncmp_isspace_blanks` | `strcmp`, `strcmpi`, `strncmp` and `strncmpi` return logicals; a cell compares element by element, and anything that is not text compares false |
+| `strtok`, `isspace`, `isletter`, `blanks` | 11 | `regexprep_strtok`, `string_lower_strncmp_isspace_blanks` | `[tok, rest] = strtok(s)`: the remainder keeps its leading delimiter |
+| `num2str` of a matrix (QA D13) | 11 | `num2str_matrix_rows`, `str2double_str2num_num2str_int2str` | One char row per matrix row: `num2str([1 2; 3 4])` is the 2x4 `'1  2'` / `'3  4'`, where it was the 1x10 `'1  3  2  4'`. An integer column is its widest magnitude plus two wide; any other element is `%g` at the significant digits of the largest magnitude, in a column seven wider, one more with a negative element |
+| `int2str`, `mat2str`, `str2double`, `str2num` | 11 | `str2double_str2num_num2str_int2str`, `mat2str_sprintf_fprintf_percent`, `str2num_constants_ignore_the_path` | `mat2str` is `%.15g` MATLAB syntax; `str2double` is `NaN` for anything but a number's text; `str2num` reads literals and operators only, never a call or a variable, and its constants (`pi`, `Inf`, `NaN`, `eps`, `true`, `false`, `i`, `j`) are the builtins' values, never a file on the path of that name |
+| The string functions refuse a complex argument | 11 | `err_num2str_complex_input`, `err_mat2str_complex_input` | Cycle 10's gate: `Complex values are not supported by 'num2str'.` |
+| `regexp` and `regexprep` | 11 | `regexprep_strtok`, `err_regexprep_long_replacement` | Outputs by name in the order given, `'once'`, `'ignorecase'`, `'emptymatch'`; `$0`, `$N` and `$<name>` in a replacement, read in linear time, and a result sized by its tokens before it is built. The syntax is listed in the spec's Design notes |
+| The regular-expression engine runs in linear time | 11 | `regexp_nested_star_linear_time`, `err_regexp_class_too_large` | A Pike VM: `regexp(repmat('a', 1, 1e5), '(a*)*b', 'match')` returns at once. All the matches are found in one pass, so a pattern whose preferred branch runs far past each match is linear too. A class is built once into sorted ranges and bisected, whatever repeats it, and its ranges count against the program's size |
+| A backreference is refused | 11 | `err_regexp_backreference` | `Backreferences are not supported in regular expressions.`; so are lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, each with a message of its own |
+| `input` | 11 | `input_number_and_string`, `err_input_refused_under_protocol`, `err_input_refused_under_http_stdio` | `input(prompt)` evaluates the line, `input(prompt, 's')` returns it; the prompt has no newline after it. Under `--protocol`, `--ui` and `--http-stdio` it is refused before the prompt, since standard input is the protocol's or there is no terminal |
+| `fopen`, `fclose`, `fgetl`, `fgets`, `feof` | 11 | `fopen_fprintf_fgetl`, `fgets_feof` | Identifiers from 3 up, the lowest free first; `fopen` of a file it cannot open is `-1` and a reason; `fgetl` and `fgets` are `-1` at the end |
+| `fprintf(fid, ...)` and its byte count (QA D25) | 11 | `fprintf_fid1_and_byte_count`, `fprintf_fid2_to_stderr`, `err_fprintf_invalid_fid` | `1` is stdout and `2` stderr, through `Interp.err`, so under `--protocol` it lands in `out`; `n = fprintf(...)` is the number of bytes; an identifier that names no open file is `Invalid file identifier.` |
+| `fread` and `fwrite` | 11 | `fwrite_fread_round_trip` | `uint8` by default, and the integer, `single` and `double` precisions; `'*char'` reads chars |
+| `fileread`, `readmatrix`, `writematrix`, `csvread`, `csvwrite` | 11 | `writematrix_readmatrix_fileread`, `csvwrite_csvread` | `writematrix` writes 15 significant digits, `csvwrite` five; the size of a matrix read from text is judged before it is allocated |
+| `delete` | 11 | `err_delete_wildcard`, `delete_and_load_missing_warn` | One or more files, each by its full name; a file that is not there is the warning `File 'x' not found.` and the others are still deleted; a name with a wildcard is `Wildcards are not supported by 'delete'.` before anything is deleted, rather than expanded, a recorded deviation |
+| `save` and `load` | 11 | `save_load_mat_round_trip`, `save_load_ascii`, `err_save_fieldless_struct_bound` | Uncompressed MAT-files of version 5: doubles (complex too), logicals, chars, cells and structs, and on reading also the integer and `single` classes, as doubles. `-ascii` writes MATLAB's `%.7e` columns. `S = load(...)` gives a struct. `save` refuses a variable past the 4 GiB an element can hold and a struct array with no fields past 1,048,576 elements, which `load` would refuse |
+| `load` treats a MAT-file as untrusted | 11 | `err_load_mat_truncated`, `err_load_mat_huge_dims`, `err_load_mat_fieldless_struct_bound` | Every length is checked against the bytes there and every size goes through `check_shape` before anything is allocated, so a truncated file is `Unable to read MAT-file ...` and a header claiming 1e12 elements is `Requested 1000000x1000000 array exceeds the maximum array size.` A struct array with no fields, which its bytes cannot bound, may have at most 1,048,576 elements (`mat::MAX_FIELDLESS`), a recorded deviation |
+| A file path resolves against the current folder | 11 | every file case | `fopen`, `fileread`, `readmatrix`, `writematrix`, `csvread`, `csvwrite`, `save`, `load` and `delete` all go through `Interp::cwd` |
+
 ## Output and formatting
 
 | Feature | Since | Golden case | Notes |
@@ -361,7 +399,8 @@ Cycle 10. `Matrix` holds the imaginary parts in `im`, column-major like
 | `who` and `whos` show the class | 02 | | A logical is `logical` and a char has its real shape, `2x2 char`; they used to be `double` and `1xN char` |
 | `disp([])` prints nothing | 01e | `empty_result_shapes` | It used to print `     []`. `disp('')` is still a line with nothing on it |
 | Empty results have MATLAB's shapes | 01e | `empty_result_shapes` | `find([])` and `diag([])` are `0x0`, not `0x1`; `size('')` is `0 0`, not `1 0`, and `num2str([])` follows it. A shape with an orientation to keep still keeps it: `find([0 0])` is `1x0` |
-| `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %e %g %c %s`, flags, width, precision |
+| `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %F %e %E %g %G %x %X %o %c %s`, flags, width, precision |
+| The rest of `printf` (QA D16) | 11 | `printf_upper_exponent_and_s_of_fraction`, `printf_hash_flag_and_zero_pad_nonfinite`, `printf_escapes_hex_octal_control`, `printf_hex_octal_and_star`, `printf_invalid_conversion_truncates`, `err_printf_star_width_bounded`, `err_printf_star_precision_bounded` | `%E` and `%G` write an upper-case `E`; `%s` of a non-integer is `%e`, the MATLAB page's `3.141593e+00`; `#` keeps the point, `sprintf('%#.0f', 3)` is `3.`; `0` pads `Inf` and `NaN` with spaces; `\xN`, `\N` (octal), `\a`, `\b`, `\f` and `\v` are processed; `%x`, `%X`, `%o` and a `*` width or precision exist, the `*` ones bounded like written ones; an invalid conversion or a trailing `%` ends the output, `sprintf('abc%q', 1)` being `abc`. The formatter moved to `printf.rs` |
 | Format cycling over all elements | 00 | `fprintf_vector` | |
 | The `+` and space flags, and precision on integers | 01 | `printf_plus_space_and_int_precision` | `%+d`, `% d`, `%.3d` |
 | `%d` of a non-integer switches to `%e` | 01 | `printf_d_nonintegral` | MATLAB's rule; it used to fall back to `%g` |

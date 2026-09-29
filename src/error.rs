@@ -194,8 +194,27 @@ pub fn unterminated_string() -> MError {
     MError::new("unterminated string")
 }
 
+/// A character the lexer has no use for. A printable one is quoted as
+/// itself; one that would not show, a control character or an invisible
+/// format character, is named by its code point instead, `unexpected
+/// character U+0000`, so the message never carries a raw control byte to
+/// the terminal (cycle 11; a UTF-16 file used to write a literal NUL).
 pub fn unexpected_char(c: char) -> MError {
-    MError::new(format!("unexpected character '{}'", c))
+    let invisible = c.is_control()
+        || (c.is_whitespace() && c != ' ')
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{FEFF}'
+        );
+    if invisible {
+        MError::new(format!("unexpected character U+{:04X}", c as u32))
+    } else {
+        MError::new(format!("unexpected character '{}'", c))
+    }
 }
 
 // ---- parser ----------------------------------------------------------
@@ -1196,6 +1215,382 @@ pub fn option_value(opt: &str, name: &str) -> MError {
     ))
 }
 
+// ---- strings, regular expressions and files (cycle 11) ---------------
+
+/// `regexp('aa', '(a)\1')`: a backreference, which no engine can match in
+/// linear time. SplatCrab's own text.
+pub fn regex_backreference() -> MError {
+    MError::new("Backreferences are not supported in regular expressions.")
+}
+
+/// `(?=...)`, `(?!...)`, `(?<=...)` and `(?<!...)`. SplatCrab's own text.
+pub fn regex_lookaround() -> MError {
+    MError::new("Lookahead and lookbehind are not supported in regular expressions.")
+}
+
+/// A construct of Perl's the regular-expression engine does not take,
+/// beside backreferences and lookaround.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegexUnsupported {
+    Possessive,
+    Atomic,
+    Conditional,
+    InlineFlag,
+}
+
+/// A way a pattern fails to parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegexFault {
+    NothingToRepeat,
+    MissingParen,
+    UnmatchedParen,
+    MissingBracket,
+    TrailingBackslash,
+    RepeatOrder,
+    GroupName,
+    GroupNameEnd,
+    BadCode,
+    CodeTooLarge,
+    RangeOrder,
+}
+
+/// `a*+`, `(?>a)`, `(?(1)a)`, `(?i)a`.
+pub fn regex_unsupported(what: RegexUnsupported) -> MError {
+    let what = match what {
+        RegexUnsupported::Possessive => "a possessive quantifier",
+        RegexUnsupported::Atomic => "an atomic group",
+        RegexUnsupported::Conditional => "a conditional",
+        RegexUnsupported::InlineFlag => "an inline flag",
+    };
+    MError::new(format!(
+        "Invalid regular expression: {} is not supported.",
+        what
+    ))
+}
+
+/// A pattern that does not parse, and why.
+pub fn regex_syntax(fault: RegexFault) -> MError {
+    let what = match fault {
+        RegexFault::NothingToRepeat => "nothing to repeat",
+        RegexFault::MissingParen => "missing ')'",
+        RegexFault::UnmatchedParen => "an unmatched ')'",
+        RegexFault::MissingBracket => "missing ']'",
+        RegexFault::TrailingBackslash => "a trailing backslash",
+        RegexFault::RepeatOrder => "a repetition's maximum is below its minimum",
+        RegexFault::GroupName => {
+            "a group name must be a letter followed by letters, digits or underscores"
+        }
+        RegexFault::GroupNameEnd => "missing '>' after a group name",
+        RegexFault::BadCode => "a malformed \\x or \\o escape",
+        RegexFault::CodeTooLarge => "a character code past U+FFFF",
+        RegexFault::RangeOrder => "a class range out of order",
+    };
+    MError::new(format!("Invalid regular expression: {}.", what))
+}
+
+/// A pattern past the engine's bounds: nested too deeply, a repetition
+/// count past 1000, or a compiled program past its size limit, the ranges
+/// of its character classes counted in it.
+pub fn regex_too_large() -> MError {
+    MError::new("The regular expression is too large.")
+}
+
+/// `input` under `--protocol`, `--ui` or `--http-stdio`, where standard
+/// input is the protocol's channel or there is no terminal at all.
+pub fn input_unavailable() -> MError {
+    MError::new("input is not available in this session: there is no terminal to read from.")
+}
+
+/// `input` after standard input has ended.
+pub fn input_ended() -> MError {
+    MError::new("'input' reached the end of standard input.")
+}
+
+/// `input('', 'x')`: the second argument is not `'s'`.
+pub fn input_option() -> MError {
+    MError::new("The second argument to 'input' must be 's'.")
+}
+
+/// A file identifier that names no open file: `fprintf(7, 'x')`, and every
+/// file function given `-1` after a failed `fopen`. MATLAB's first sentence.
+pub fn invalid_fid() -> MError {
+    MError::new("Invalid file identifier.")
+}
+
+/// `fopen('f', 'q')`: a permission that is not one of `r w a r+ w+ a+`,
+/// with an optional `t` or `b`.
+pub fn fopen_permission(mode: &str) -> MError {
+    MError::new(format!("Invalid permission '{}' for 'fopen'.", mode))
+}
+
+/// A read from a file opened only for writing.
+pub fn file_not_readable() -> MError {
+    MError::new("The file is not open for reading.")
+}
+
+/// A write to a file opened only for reading.
+pub fn file_not_writable() -> MError {
+    MError::new("The file is not open for writing.")
+}
+
+/// The reason an operation on a file failed, in words that are the same on
+/// every platform, so a golden case can pin them.
+pub fn io_reason(e: &std::io::Error) -> &'static str {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => "No such file or directory",
+        std::io::ErrorKind::PermissionDenied => "Permission denied",
+        std::io::ErrorKind::AlreadyExists => "The file already exists",
+        std::io::ErrorKind::IsADirectory => "It is a directory",
+        _ => "The operation failed",
+    }
+}
+
+/// `fileread`, `readmatrix`, `csvread` or `load` of a file that cannot be
+/// read.
+pub fn cannot_read_file(name: &str, e: &std::io::Error) -> MError {
+    MError::new(format!("Unable to read file '{}': {}.", name, io_reason(e)))
+}
+
+/// `writematrix`, `csvwrite`, `save`, `fprintf(fid, ...)` or `fwrite`
+/// failing to write.
+pub fn cannot_write_file(name: &str, e: &std::io::Error) -> MError {
+    MError::new(format!(
+        "Unable to write file '{}': {}.",
+        name,
+        io_reason(e)
+    ))
+}
+
+/// `delete('*.txt')`: SplatCrab's `delete` takes each file by its full
+/// name, which is safer than expanding a pattern (a recorded deviation).
+/// SplatCrab's own text.
+pub fn delete_wildcard() -> MError {
+    MError::new("Wildcards are not supported by 'delete'.")
+}
+
+/// The warning `delete` gives for a file that is not there, which it then
+/// goes on from, as MATLAB does.
+pub fn delete_not_found(name: &str) -> String {
+    format!("File '{}' not found.", name)
+}
+
+/// `delete` of a file that is there and could not be removed.
+pub fn cannot_delete(name: &str, e: &std::io::Error) -> MError {
+    MError::new(format!(
+        "Unable to delete file '{}': {}.",
+        name,
+        io_reason(e)
+    ))
+}
+
+/// `fread(fid, n, 'int9')` or `fwrite(fid, x, 'int9')`.
+pub fn bad_precision(precision: &str, name: &str) -> MError {
+    MError::new(format!("Invalid precision '{}' for '{}'.", precision, name))
+}
+
+/// A way a MAT file fails to load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatFault {
+    /// It ends inside its header or inside a data element.
+    Truncated,
+    /// It ends right after its header, with no variable.
+    HeaderOnly,
+    /// Its header is not a version 5 header.
+    NotVersion5,
+    /// It holds compressed data (MATLAB's default since v7).
+    Compressed,
+    /// A length, a type, a size or a name in it is inconsistent.
+    Corrupt,
+    /// An array of more than two dimensions.
+    NDims,
+    /// Cells and structs nested past `mat::MAX_DEPTH`.
+    TooDeep,
+    /// A sparse array.
+    Sparse,
+    /// An object or a function handle.
+    Object,
+    /// A struct array with no fields and more elements than
+    /// `mat::MAX_FIELDLESS`, the bound it carries.
+    FieldlessTooLarge(usize),
+}
+
+/// A MAT file that cannot be loaded, and why.
+pub fn mat_file(name: &str, fault: MatFault) -> MError {
+    let bound;
+    let what = match fault {
+        MatFault::FieldlessTooLarge(limit) => {
+            bound = format!(
+                "it holds a struct array with no fields and more than {} elements",
+                limit
+            );
+            &bound
+        }
+        MatFault::Truncated => "the file is truncated",
+        MatFault::HeaderOnly => "the file is truncated after its header",
+        MatFault::NotVersion5 => "it is not a MAT-file of version 5",
+        MatFault::Compressed => {
+            "it holds compressed data, which SplatCrab does not read (save with -v6)"
+        }
+        MatFault::Corrupt => "its data is corrupt",
+        MatFault::NDims => "an array in it has more than two dimensions",
+        MatFault::TooDeep => "its cells and structs are nested too deeply",
+        MatFault::Sparse => "it holds a sparse array, which SplatCrab does not read",
+        MatFault::Object => {
+            "it holds an object or a function handle, which SplatCrab does not read"
+        }
+    };
+    MError::new(format!("Unable to read MAT-file '{}': {}.", name, what))
+}
+
+/// `save('f.mat', 'q')` with no variable `q`.
+pub fn save_no_variable(name: &str) -> MError {
+    MError::new(format!("Variable '{}' not found.", name))
+}
+
+/// `save` with no variable to write, in an empty workspace: a MAT-file of
+/// a header alone is one `load` refuses as truncated (spec item 16), so
+/// `save` does not write one. SplatCrab's own text.
+pub fn save_nothing() -> MError {
+    MError::new("There are no variables to save.")
+}
+
+/// The warning `load('f.mat', 'q')` gives for a variable the file does not
+/// hold, which it then goes on from.
+pub fn load_no_variable(name: &str) -> String {
+    format!("Variable '{}' not found.", name)
+}
+
+/// `save` of a value the MAT writer has no form for: a function handle
+/// or an `MException`.
+pub fn save_unsupported(var: &str, class: &str) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}': a value of class '{}' cannot be saved.",
+        var, class
+    ))
+}
+
+/// `save` of a variable holding more than the 4 GiB a MAT-file of version
+/// 5 can give one element, whose length is a 32-bit count: a cell of
+/// several 2 GB arrays. SplatCrab's own text.
+pub fn save_too_large(var: &str) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}': it is larger than the 4 GiB a MAT-file of version 5 can hold in one element.",
+        var
+    ))
+}
+
+/// `save` of a struct array with no fields and more than `limit`
+/// (`mat::MAX_FIELDLESS`) elements, which `load` would refuse. SplatCrab's
+/// own text.
+pub fn save_fieldless_too_large(var: &str, limit: usize) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}': a struct array with no fields and more than {} elements cannot be saved.",
+        var, limit
+    ))
+}
+
+/// `save` of cells or structs nested past `mat::MAX_DEPTH` levels.
+pub fn save_too_deep(var: &str) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}': its cells and structs are nested too deeply.",
+        var
+    ))
+}
+
+/// `save('f.txt', 'c', '-ascii')` of a value that is not a numeric,
+/// logical or char array.
+pub fn save_ascii_unsupported(var: &str, class: &str) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}' as text: a value of class '{}' is not a numeric array.",
+        var, class
+    ))
+}
+
+/// A text file `load -ascii` cannot read: a value that is not a number
+/// on line `line`.
+pub fn text_not_number(name: &str, line: usize) -> MError {
+    MError::new(format!(
+        "Unable to read file '{}': line {} holds a value that is not a number.",
+        name, line
+    ))
+}
+
+/// A text file whose line `line` has a different number of values from
+/// the lines before it, which `load -ascii` cannot make a matrix of.
+pub fn text_ragged(name: &str, line: usize) -> MError {
+    MError::new(format!(
+        "Unable to read file '{}': line {} does not have as many values as the lines before it.",
+        name, line
+    ))
+}
+
+/// A file name argument that is empty.
+pub fn empty_file_name(name: &str) -> MError {
+    MError::new(format!("The file name given to '{}' is empty.", name))
+}
+
+/// `writematrix(c, 'f.csv')` of a value that is not an array.
+pub fn write_unsupported(class: &str, name: &str) -> MError {
+    MError::new(format!(
+        "'{}' cannot write a value of class '{}'.",
+        name, class
+    ))
+}
+
+/// `strjoin({1, 'a'})`, `strcat({'a'}, {2})` and the other string
+/// functions given a cell that holds something other than text.
+pub fn cell_not_text(name: &str) -> MError {
+    MError::new(format!(
+        "Every element of a cell argument to '{}' must be a character vector.",
+        name
+    ))
+}
+
+/// `strjoin({'a', 'b', 'c'}, {'-'})`: a cell of delimiters that is not
+/// one shorter than the cell it joins.
+pub fn strjoin_delimiters() -> MError {
+    MError::new(
+        "A cell of delimiters for 'strjoin' must have one fewer element than the cell it joins.",
+    )
+}
+
+/// `strcmp({'a', 'b'}, {'a', 'b', 'c'})`: two cells of different sizes,
+/// neither of them one element. MATLAB's text as recalled.
+pub fn strcmp_sizes() -> MError {
+    MError::new("Inputs must be the same size or either one can be a scalar.")
+}
+
+/// `strcat` of char arrays whose row counts differ.
+pub fn strcat_rows() -> MError {
+    MError::new("All the character arrays given to 'strcat' must have the same number of rows.")
+}
+
+/// `strcat` of cells whose sizes differ.
+pub fn strcat_cells() -> MError {
+    MError::new("All the cell arrays given to 'strcat' must be the same size or have one element.")
+}
+
+/// `mat2str(A, 0)`: a precision that is not a positive integer.
+pub fn precision_arg(name: &str) -> MError {
+    MError::new(format!(
+        "Precision for '{}' must be a positive integer.",
+        name
+    ))
+}
+
+/// `mat2str` of a cell, a struct, a handle or an `MException`.
+pub fn mat2str_input() -> MError {
+    MError::new("Input to 'mat2str' must be a numeric, logical or char matrix.")
+}
+
+/// `strncmp(a, b, -1)`: a count that is not a non-negative integer.
+pub fn strncmp_count(name: &str) -> MError {
+    MError::new(format!(
+        "The number of characters to compare in '{}' must be a non-negative integer.",
+        name
+    ))
+}
+
 // ---- protocol --------------------------------------------------------
 
 // A request the protocol cannot act on is answered, not fatal. Every text
@@ -1399,7 +1794,7 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 17] = [
+        const FILES: [(&str, &str); 22] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
@@ -1417,6 +1812,11 @@ mod tests {
             ("builtins/numerics.rs", include_str!("builtins/numerics.rs")),
             ("builtins/sets.rs", include_str!("builtins/sets.rs")),
             ("builtins/solvers.rs", include_str!("builtins/solvers.rs")),
+            ("builtins/strings.rs", include_str!("builtins/strings.rs")),
+            ("builtins/regex.rs", include_str!("builtins/regex.rs")),
+            ("builtins/printf.rs", include_str!("builtins/printf.rs")),
+            ("builtins/io.rs", include_str!("builtins/io.rs")),
+            ("builtins/mat.rs", include_str!("builtins/mat.rs")),
         ];
         // Anything whose argument becomes the error value.
         const MAKERS: [&str; 5] = ["Err(", "ok_or(", "ok_or_else(||", "map_err(|e|", "bail!("];

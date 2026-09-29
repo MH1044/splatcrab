@@ -1,0 +1,13 @@
+Invalid regular expression: nothing to repeat.
+Invalid regular expression: missing ')'.
+Invalid regular expression: an unmatched ')'.
+Invalid regular expression: missing ']'.
+Invalid regular expression: a trailing backslash.
+Invalid regular expression: a repetition's maximum is below its minimum.
+Invalid regular expression: a group name must be a letter followed by letters, digits or underscores.
+Invalid regular expression: missing '>' after a group name.
+Invalid regular expression: a malformed \x or \o escape.
+Invalid regular expression: a character code past U+FFFF.
+Invalid regular expression: a class range out of order.
+The regular expression is too large.
+The regular expression is too large.

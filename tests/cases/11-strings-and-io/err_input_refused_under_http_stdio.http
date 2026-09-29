@@ -1,0 +1,15 @@
+% covers: 14 - (Scope, --http-stdio, the transport --ui serves) input is refused there with the same text as under --protocol and never reads stdin, so the next request is answered, and fprintf(2, ...) lands in that answer's out, in order, with nothing on stderr
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 47
+
+{"id":1,"op":"eval","code":"x = input('n: ');"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 57
+
+{"id":2,"op":"eval","code":"fprintf(2, 'e\\n'); disp(1)"}

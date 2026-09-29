@@ -1,0 +1,2 @@
+{"id":1,"ok":false,"out":"","error":{"message":"input is not available in this session: there is no terminal to read from.","line":1}}
+{"id":2,"ok":true,"out":"e\n     1\n"}

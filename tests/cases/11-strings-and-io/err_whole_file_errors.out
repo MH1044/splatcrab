@@ -1,0 +1,7 @@
+The file name given to 'fileread' is empty.
+Unable to read file 'err_whole_file_missing.txt': No such file or directory.
+Unable to read file '.': It is a directory.
+Unable to read file 'err_whole_file_missing.txt': No such file or directory.
+'writematrix' cannot write a value of class 'cell'.
+Unable to write file 'err_whole_file_no_dir/m.csv': No such file or directory.
+Unable to delete file '.': It is a directory.

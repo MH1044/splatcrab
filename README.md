@@ -29,8 +29,9 @@ matrices, the double, logical and char classes, indexing, control flow with
 function files on a path, function handles and anonymous functions, cell
 arrays and structs, linear algebra, numerics (polynomials, interpolation,
 statistics, sets, root finding, minimisation, quadrature and ODEs), formatted
-output, complex numbers with `fft` and 173 builtins. Plotting is not there
-yet. See
+output, complex numbers with `fft`, string functions, regular expressions,
+file input and output with `save` and `load`, and 211 builtins. Plotting is
+not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -264,7 +265,7 @@ z
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 173 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 211 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -278,7 +279,29 @@ z
   clear error "N-D arrays are not supported."
 - `fprintf` and `sprintf` with a bounded width and precision, so no format
   specifier can panic or build a pad it cannot afford; `%d` prints an integer
-  past `2^63` in full, and `%.Ns` truncates a string before padding it
+  past `2^63` in full, and `%.Ns` truncates a string before padding it.
+  Since cycle 11 `%x %X %o`, a `*` width or precision, the `#` flag, the
+  escapes `\xN`, octal, `\a \b \f \v`, an upper-case `E` for `%E` and
+  `%G`, and MATLAB's rule that an invalid conversion ends the output
+- Strings (cycle 11): `strcat`, `strsplit`, `strjoin`, `strrep`,
+  `strtrim`, `upper`, `lower`, `strcmp`, `strcmpi`, `strncmp`,
+  `strncmpi`, `strfind`, `strtok`, `isspace`, `isletter`, `blanks`, and
+  the conversions `num2str` (one row per matrix row), `int2str`,
+  `mat2str`, `str2double` and `str2num`, taking cells of text where MATLAB
+  does. A range between chars, `'a':'e'`, and `diag` of a char keep the
+  char class
+- Regular expressions: `regexp` with `'match'`, `'tokens'`, `'names'`,
+  `'start'`, `'end'`, `'split'` and `'once'`, and `regexprep` with `$N`
+  tokens, on an engine of SplatCrab's own that runs in time linear in its
+  input, so `(a*)*b` on a long subject returns at once; a backreference is
+  refused rather than matched in exponential time
+- Files: `input`, `fopen`, `fclose`, `fgetl`, `fgets`, `fprintf(fid, ...)`
+  with its byte count, `fread`, `fwrite`, `feof`, `fileread`, `readmatrix`,
+  `writematrix`, `csvread`, `csvwrite`, `delete`, and `save` and `load` for
+  uncompressed MAT-files of version 5 and for `-ascii` text. `fprintf(2,
+  ...)` writes to stderr. `load` reads a MAT-file as untrusted input: every
+  size it claims is checked before anything is allocated, so a truncated or
+  hostile file is a clean error
 - Complex numbers (cycle 10): `1i`, `2.5j` and `1e3i` literals, with `i`
   and `j` the imaginary unit unless a variable of the name exists; the
   operators, `'` as the conjugate and `.'` as the plain transpose, matrix
@@ -326,7 +349,7 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-N-D arrays, integer classes and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
+N-D arrays, integer classes, compressed MAT-files and plotting. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
 
 ## How it is built
@@ -337,7 +360,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 173 builtins,
+                                         builtins/    the 211 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

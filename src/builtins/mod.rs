@@ -20,11 +20,16 @@ pub mod cells;
 pub mod complex;
 pub mod core;
 pub mod factor;
+pub mod io;
 pub mod linalg;
+pub mod mat;
 pub mod math;
 pub mod numerics;
+pub mod printf;
+pub mod regex;
 pub mod sets;
 pub mod solvers;
+pub mod strings;
 
 use std::collections::HashMap;
 
@@ -55,6 +60,8 @@ pub fn registry() -> Registry {
     sets::register(&mut r);
     solvers::register(&mut r);
     complex::register(&mut r);
+    strings::register(&mut r);
+    io::register(&mut r);
     r
 }
 
@@ -198,8 +205,11 @@ mod tests {
     /// statistics, number theory, grids and counts of `numerics.rs`, the
     /// five set functions of `sets.rs` and the five solvers of `solvers.rs`.
     /// Cycle 10 added ten: `i`, `j`, `real`, `imag`, `conj`, `angle`,
-    /// `isreal`, `complex`, `fft` and `ifft`.
-    const EXPECTED: usize = 173;
+    /// `isreal`, `complex`, `fft` and `ifft`. Cycle 11 added thirty-eight:
+    /// the twenty-one string functions of `strings.rs` beside `num2str`,
+    /// which moved there, and the sixteen file functions of `io.rs` beside
+    /// `fprintf`, which moved there, and `input`.
+    const EXPECTED: usize = 211;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -366,6 +376,44 @@ mod tests {
             "complex",
             "fft",
             "ifft",
+            "strcat",
+            "strsplit",
+            "strjoin",
+            "strrep",
+            "strtrim",
+            "upper",
+            "lower",
+            "strcmp",
+            "strcmpi",
+            "strncmp",
+            "strncmpi",
+            "strfind",
+            "strtok",
+            "int2str",
+            "str2double",
+            "str2num",
+            "mat2str",
+            "isspace",
+            "isletter",
+            "blanks",
+            "regexp",
+            "regexprep",
+            "input",
+            "fopen",
+            "fclose",
+            "fgetl",
+            "fgets",
+            "fread",
+            "fwrite",
+            "feof",
+            "fileread",
+            "readmatrix",
+            "writematrix",
+            "csvread",
+            "csvwrite",
+            "delete",
+            "save",
+            "load",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }
@@ -400,10 +448,18 @@ mod tests {
     #[test]
     fn every_entry_is_callable_and_documented() {
         let mut it = Interp::with_output(Box::new(std::io::sink()));
+        // A bare `save` writes `matlab.mat` and a bare `load` reads it (cycle
+        // 11), so the calls run in a folder of their own, not the crate's.
+        let dir = std::env::temp_dir().join(format!("splatcrab-registry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        it.cwd = dir.clone();
+        // With no terminal, a bare `input` is refused rather than waiting.
+        it.input = crate::interp::InputSource::Refused;
         for (name, e) in &registry() {
             assert!(!e.help.is_empty(), "'{name}' has no help line");
             // Calling with no arguments must return or fail, never panic.
             let _ = (e.f)(&mut it, &[], 0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

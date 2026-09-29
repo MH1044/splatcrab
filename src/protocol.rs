@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use crate::env;
 use crate::error::{self, MError};
-use crate::interp::Interp;
+use crate::interp::{InputSource, Interp};
 use crate::json::{self, Json, ParseError};
 use crate::syntax;
 
@@ -171,9 +171,15 @@ fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
     // nothing reaches stderr.
     let saved = std::mem::replace(&mut it.out, Box::new(Capture(buf.clone())));
     let saved_err = std::mem::replace(&mut it.err, Box::new(Capture(buf.clone())));
+    // Standard input is the protocol's channel, or under `--ui` and
+    // `--http-stdio` there is no terminal at all: `input` is refused for
+    // the length of the call rather than swallow the next request (cycle
+    // 11).
+    let saved_input = std::mem::replace(&mut it.input, InputSource::Refused);
     let result = it.run_command(code);
     it.out = saved;
     it.err = saved_err;
+    it.input = saved_input;
     let out = Json::String(String::from_utf8_lossy(&buf.borrow()).into_owned());
     match result {
         Ok(()) => Json::object([("id", id), ("ok", Json::Bool(true)), ("out", out)]),

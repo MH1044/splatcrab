@@ -1,7 +1,7 @@
 //! Tree-walking interpreter.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime};
@@ -162,6 +162,26 @@ pub struct Interp {
     /// The message of the last error raised, caught or not: what `lasterr`
     /// returns. Empty before the first.
     pub(crate) last_err: String,
+    /// Where `input` reads a line from (cycle 11): standard input for a
+    /// script and the REPL, and nowhere under `--protocol`, `--ui` and
+    /// `--http-stdio`, whose `eval` refuses `input` for the length of the
+    /// call, since standard input is the protocol's channel there or there
+    /// is no terminal at all.
+    pub input: InputSource,
+    /// The files `fopen` has open, by identifier (cycle 11).
+    pub(crate) open_files: crate::builtins::io::FileTable,
+}
+
+/// Where [`Interp::input`] reads from.
+pub enum InputSource {
+    /// The process's standard input, read a line at a time through the one
+    /// shared buffer, so the REPL and `input` never steal each other's
+    /// lines.
+    Stdin,
+    /// No terminal: `input` is a clean error.
+    Refused,
+    /// A reader of the caller's, for tests.
+    Reader(Box<dyn io::BufRead>),
 }
 
 enum Flow {
@@ -355,6 +375,8 @@ impl Interp {
             out,
             err,
             last_err: String::new(),
+            input: InputSource::Stdin,
+            open_files: crate::builtins::io::FileTable::default(),
         }
     }
 
@@ -414,9 +436,117 @@ impl Interp {
     /// first, so that when the two sinks are two streams that end up on one
     /// terminal, what was printed before the warning shows before it.
     pub(crate) fn emit_err(&mut self, s: &str) -> R<()> {
+        self.emit_err_bytes(s.as_bytes())
+    }
+
+    /// [`emit`](Interp::emit) for bytes that need not be text: what
+    /// `fwrite(1, ...)` writes (cycle 11).
+    pub(crate) fn emit_bytes(&mut self, b: &[u8]) -> R<()> {
+        self.out.write_all(b).map_err(error::output)
+    }
+
+    /// [`emit_err`](Interp::emit_err) for bytes: `fprintf(2, ...)` and
+    /// `fwrite(2, ...)` (cycle 11).
+    pub(crate) fn emit_err_bytes(&mut self, b: &[u8]) -> R<()> {
         self.out.flush().map_err(error::output)?;
-        self.err.write_all(s.as_bytes()).map_err(error::output)?;
+        self.err.write_all(b).map_err(error::output)?;
         self.err.flush().map_err(error::output)
+    }
+
+    /// True where `input` has no terminal to read from.
+    pub(crate) fn input_refused(&self) -> bool {
+        matches!(self.input, InputSource::Refused)
+    }
+
+    /// One line from [`Interp::input`], without its line ending; `None` at
+    /// the end of input. Output is flushed first, so a prompt shows before
+    /// the read waits (cycle 11).
+    pub(crate) fn read_input_line(&mut self) -> R<Option<String>> {
+        self.out.flush().map_err(error::output)?;
+        let mut line = String::new();
+        // A line past what a char row could hold is refused once that much
+        // is read, not buffered whole (invariant 6).
+        let limit = crate::builtins::io::MAX_TEXT_BYTES as u64 + 1;
+        let n = match &mut self.input {
+            InputSource::Refused => bail!(error::input_unavailable()),
+            InputSource::Stdin => io::Read::take(io::stdin().lock(), limit).read_line(&mut line),
+            InputSource::Reader(r) => io::Read::take(r.as_mut(), limit).read_line(&mut line),
+        }
+        .map_err(error::output)?;
+        if n == 0 {
+            return Ok(None);
+        }
+        if n as u64 >= limit && !line.ends_with('\n') {
+            let units = line.encode_utf16().count() as f64;
+            let e = crate::builtins::args::check_shape(1.0, units).err();
+            return Err(e.unwrap_or_else(|| error::size_overflow("1", &units.to_string())));
+        }
+        if line.ends_with('\n') {
+            line.pop();
+            if line.ends_with('\r') {
+                line.pop();
+            }
+        }
+        Ok(Some(line))
+    }
+
+    /// A file name as a file function names it, resolved against
+    /// [`Interp::cwd`] when it is relative (cycle 11): every path `fopen`,
+    /// `fileread`, `readmatrix`, `writematrix`, `csvread`, `csvwrite`,
+    /// `save`, `load` and `delete` touch goes through here.
+    pub(crate) fn resolve_path(&self, name: &str) -> PathBuf {
+        self.resolve_dir(name)
+    }
+
+    /// Marks every cached file lookup stale, after a builtin has written or
+    /// deleted a file: a `.m` file a script writes is then found.
+    pub(crate) fn files_changed(&mut self) {
+        self.generation += 1;
+    }
+
+    /// The expression `text` evaluated in the running workspace: what
+    /// `input` does with the line it reads (cycle 11). A parse error
+    /// carries no line of its own, since the line would be the text's.
+    pub(crate) fn eval_text(&mut self, text: &str) -> R<Value> {
+        let unlined = |mut e: error::MError| {
+            e.line = None;
+            e
+        };
+        let vars = self.vars();
+        let lexed = scan_known(text, &|name| vars.contains_key(name)).map_err(unlined)?;
+        let e = Parser::with_lines(lexed)
+            .at_depth(self.depth)
+            .parse_whole_expr()
+            .map_err(unlined)?;
+        self.eval(&e).map_err(unlined)
+    }
+
+    /// `str2num(text)` (cycle 11): the text read as the elements of a
+    /// matrix, `[text]`, when it is made of literals and operators alone,
+    /// and `None` when it is not or fails. MATLAB's `str2num` hands its text
+    /// to `eval`; this reads numbers, strings, the constants `pi`, `Inf`,
+    /// `NaN`, `eps`, `true`, `false`, `i` and `j`, brackets, ranges and
+    /// operators, and nothing that calls a function or reads a variable,
+    /// so text from a file cannot run code. It is evaluated in a workspace
+    /// of its own that holds only the constants it names, each the
+    /// builtin's value, so no variable shadows one and no file on the path
+    /// is called for one: a `pi.m` beside the script does not run.
+    pub(crate) fn str2num_value(&mut self, text: &str) -> Option<Value> {
+        let src = format!("[{}]", text);
+        let lexed = scan(&src).ok()?;
+        let e = Parser::with_lines(lexed)
+            .at_depth(self.depth)
+            .parse_whole_expr()
+            .ok()?;
+        let mut frame = Frame::new(self.frame().unit.clone(), None);
+        for name in literal_constants(&e)? {
+            let v = self.call_builtin(name, Vec::new(), 1).ok()?;
+            frame.vars.insert(name.to_string(), v.into_iter().next()?);
+        }
+        self.frames.push(frame);
+        let v = self.eval(&e);
+        self.frames.pop();
+        v.ok()
     }
 
     /// Runs `src` as a script in the base workspace: statements, then any
@@ -848,14 +978,21 @@ impl Interp {
             // `'` conjugates as it transposes and `.'` does not (cycle 10).
             Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.ctranspose())),
             Expr::DotTranspose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
+            // A range between two chars is a char (cycle 11): `'a':'e'` is
+            // `'abcde'`, as in MATLAB. Any other range is a double.
             Expr::Range(a, step, b) => {
-                let a = self.eval_scalar(a, "range start")?;
-                let b = self.eval_scalar(b, "range end")?;
+                let (a, a_char) = self.eval_range_end(a, "range start")?;
+                let (b, b_char) = self.eval_range_end(b, "range end")?;
                 let s = match step {
                     Some(s) => self.eval_scalar(s, "range step")?,
                     None => 1.0,
                 };
-                Ok(Value::Mat(range(a, s, b)?))
+                let r = range(a, s, b)?;
+                Ok(Value::Mat(if a_char && b_char {
+                    r.to_class(Class::Char)?
+                } else {
+                    r
+                }))
             }
             Expr::Binary(op, a, b) => self.binary(*op, a, b),
             Expr::FuncHandle(name) => Ok(self.named_handle(name)),
@@ -903,9 +1040,15 @@ impl Interp {
     /// One real number: a range's start, step or end. A complex operand of
     /// `:` is refused rather than read by its real part.
     fn eval_scalar(&mut self, e: &Expr, what: &str) -> R<f64> {
+        Ok(self.eval_range_end(e, what)?.0)
+    }
+
+    /// A range's start or end, and whether it is a char.
+    fn eval_range_end(&mut self, e: &Expr, what: &str) -> R<(f64, bool)> {
         let m = self.eval_mat(e)?;
         m.require_real(":")?;
-        m.scalar_value().ok_or_else(|| error::not_a_scalar(what))
+        let v = m.scalar_value().ok_or_else(|| error::not_a_scalar(what))?;
+        Ok((v, m.is_char()))
     }
 
     /// The arguments of a call. A cs-list among them, `f(c{:})` or
@@ -2146,10 +2289,54 @@ fn is_exact_file(p: &Path) -> bool {
 }
 
 /// True for a MATLAB identifier: a letter, then letters, digits and `_`.
-fn is_identifier(name: &str) -> bool {
+pub(crate) fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The constants `str2num` reads, each resolved to its builtin alone.
+const STR2NUM_CONSTANTS: [&str; 10] = [
+    "pi", "Inf", "inf", "NaN", "nan", "eps", "true", "false", "i", "j",
+];
+
+/// The constants `e` names, once each, when it is made of literals, those
+/// constants and operators alone, and `None` otherwise; see
+/// [`Interp::str2num_value`]. Walked with a stack of its own, since the
+/// tree can be as deep as the parser allows.
+fn literal_constants(e: &Expr) -> Option<Vec<&'static str>> {
+    let mut named: Vec<&'static str> = Vec::new();
+    let mut todo = vec![e];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Num(_) | Expr::Imag(_) | Expr::Str(_) => {}
+            Expr::Ident(n) => {
+                let c = STR2NUM_CONSTANTS.iter().find(|c| **c == n.as_str())?;
+                if !named.contains(c) {
+                    named.push(c);
+                }
+            }
+            Expr::Matrix(rows) => todo.extend(rows.iter().flatten()),
+            Expr::Neg(a)
+            | Expr::Pos(a)
+            | Expr::Not(a)
+            | Expr::Transpose(a)
+            | Expr::DotTranspose(a) => todo.push(a),
+            Expr::Binary(_, a, b) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            Expr::Range(a, s, b) => {
+                todo.push(a);
+                todo.push(b);
+                if let Some(s) = s {
+                    todo.push(s);
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(named)
 }
 
 // ---- helpers ---------------------------------------------------------
@@ -5416,6 +5603,31 @@ mod tests {
 
     fn take(buf: &Rc<RefCell<Vec<u8>>>) -> String {
         String::from_utf8(std::mem::take(&mut *buf.borrow_mut())).unwrap()
+    }
+
+    /// Cycle 11's review: `str2num('pi')` ran a `pi.m` on the path. Its
+    /// constants are the builtins' values, whatever the path or the
+    /// caller's workspace holds.
+    #[test]
+    fn str2num_reads_its_constants_from_the_builtins_never_the_path() {
+        let dir = TempDir::new("str2num");
+        dir.write("pi.m", "function y = pi\ny = 42;\nend\n");
+        dir.write("true.m", "function y = true\ny = 7;\nend\n");
+        dir.write("eps.m", "function y = eps\nerror('eps.m ran');\nend\n");
+        let (mut it, buf) = in_dir(&dir);
+        it.run(concat!(
+            "disp(pi)\n",
+            "fprintf('%.4f\\n', str2num('pi'))\n",
+            "disp(class(str2num('true')))\n",
+            "disp(str2num('eps') == 2^-52)\n",
+            "pi = 5; fprintf('%.4f\\n', str2num('2*pi'))\n",
+            "[x, ok] = str2num('pi2'); disp(isempty(x)); disp(ok)\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            take(&buf),
+            "    42\n3.1416\nlogical\n   1\n6.2832\n   1\n   0\n"
+        );
     }
 
     #[test]
