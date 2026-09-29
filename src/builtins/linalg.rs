@@ -535,6 +535,11 @@ fn kron(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     let (x, y) = (mat(a, 0, "kron")?, mat(a, 1, "kron")?);
     let (rows, cols) = check_shape(x.rows as f64 * y.rows as f64, x.cols as f64 * y.cols as f64)?;
     let mut out = Matrix::filled(rows, cols, 0.0);
+    if out.data.is_empty() {
+        // No block to fill, and a factor's other dimension alone can be
+        // enormous (cycle 13b).
+        return one_mat(out);
+    }
     for j in 0..x.cols {
         for i in 0..x.rows {
             let v = x.get(i, j);
@@ -595,7 +600,9 @@ fn triangle(a: &[Value], name: &str, keep: fn(f64, f64) -> bool) -> R<Vec<Value>
     at_most(a, 2, name)?;
     let mut m = mat(a, 0, name)?;
     let k = tri_offset(a, name)?;
-    for j in 0..m.cols {
+    // Nothing to zero in an empty matrix, however many columns (cycle 13b).
+    let cols = if m.data.is_empty() { 0 } else { m.cols };
+    for j in 0..cols {
         for i in 0..m.rows {
             if !keep(j as f64 - i as f64, k) {
                 m.set(i, j, 0.0);
@@ -743,7 +750,9 @@ fn repmat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     // 10000000000x20000000000 array requested.
     let (rows, cols) = check_shape(m.rows as f64 * r, m.cols as f64 * c)?;
     let mut out = Matrix::filled(rows, cols, 0.0).with_class(m.class);
-    for j in 0..out.cols {
+    // An empty result has no columns worth visiting (cycle 13b).
+    let out_cols = if out.data.is_empty() { 0 } else { out.cols };
+    for j in 0..out_cols {
         for i in 0..out.rows {
             out.set(i, j, m.get(i % m.rows.max(1), j % m.cols.max(1)));
         }
@@ -755,7 +764,9 @@ fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "fliplr")?;
     let m = mat(a, 0, "fliplr")?;
     let mut out = m.clone();
-    for c in 0..m.cols {
+    // An empty matrix is its own flip (cycle 13b).
+    let cols = if m.data.is_empty() { 0 } else { m.cols };
+    for c in 0..cols {
         for r in 0..m.rows {
             out.set(r, m.cols - 1 - c, m.get(r, c));
         }
@@ -767,7 +778,9 @@ fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "flipud")?;
     let m = mat(a, 0, "flipud")?;
     let mut out = m.clone();
-    for c in 0..m.cols {
+    // An empty matrix is its own flip (cycle 13b).
+    let cols = if m.data.is_empty() { 0 } else { m.cols };
+    for c in 0..cols {
         for r in 0..m.rows {
             out.set(m.rows - 1 - r, c, m.get(r, c));
         }
@@ -894,6 +907,9 @@ fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     // Each slice as its linear positions: a column is `rows` consecutive
     // elements, a row is every `rows`-th.
     let slices: Vec<Vec<usize>> = match along {
+        // An empty matrix has no slices worth sorting, however long its
+        // other dimension (cycle 13b).
+        _ if rows * cols == 0 => Vec::new(),
         1 => (0..cols)
             .map(|c| (c * rows..(c + 1) * rows).collect())
             .collect(),

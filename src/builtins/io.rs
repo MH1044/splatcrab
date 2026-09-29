@@ -707,7 +707,11 @@ fn fileread(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     if bytes.len() > MAX_TEXT_BYTES {
         return Err(text_too_long(bytes.len()));
     }
-    one(text_value(&bytes)?)
+    // Source text, so decoded as a source file is: UTF-16 is recognised
+    // (cycle 13b).
+    let text = crate::lexer::decode_source(&bytes);
+    check_shape(1.0, text.encode_utf16().count() as f64)?;
+    one(Value::str(&text))
 }
 
 /// How a text file's fields are separated.

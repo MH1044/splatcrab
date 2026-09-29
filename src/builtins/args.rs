@@ -215,6 +215,42 @@ pub fn check_shape(rows: f64, cols: f64) -> R<(usize, usize)> {
     Err(error::size_overflow(&fmt_dim(rows), &fmt_dim(cols)))
 }
 
+/// The memory budget of any one array: what a double array at
+/// [`MAX_ELEMS`] takes, 2^28 elements of 8 bytes, 2 GiB (cycle 13b).
+pub const MAX_BYTES: usize = MAX_ELEMS * std::mem::size_of::<f64>();
+
+/// The bytes one element of a cell array is counted as: a whole value.
+pub const CELL_UNIT: usize = std::mem::size_of::<Value>();
+
+/// The bytes one element of a struct array with `fields` fields is counted
+/// as: a value per field, and one more for the element's own field list.
+pub fn struct_unit(fields: usize) -> usize {
+    CELL_UNIT.saturating_mul(fields.saturating_add(1))
+}
+
+/// [`check_shape`] for an array whose elements take `unit` bytes each: the
+/// element cap, and then the byte budget a double array has. A cell or a
+/// struct element costs many times a double, so the element cap alone let
+/// `cell(1, 2^27)` ask for gigabytes (cycle 13b). The refusal is
+/// `check_shape`'s own, naming the size that was asked for.
+pub fn check_bytes(rows: f64, cols: f64, unit: usize) -> R<(usize, usize)> {
+    let (r, c) = check_shape(rows, cols)?;
+    if (r * c).checked_mul(unit).is_some_and(|b| b <= MAX_BYTES) {
+        return Ok((r, c));
+    }
+    Err(error::size_overflow(&fmt_dim(rows), &fmt_dim(cols)))
+}
+
+/// [`check_bytes`] for a cell array of `rows x cols`.
+pub fn check_cell(rows: usize, cols: usize) -> R<(usize, usize)> {
+    check_bytes(rows as f64, cols as f64, CELL_UNIT)
+}
+
+/// [`check_bytes`] for a struct array of `rows x cols` with `fields` fields.
+pub fn check_struct(rows: usize, cols: usize, fields: usize) -> R<(usize, usize)> {
+    check_bytes(rows as f64, cols as f64, struct_unit(fields))
+}
+
 /// One requested dimension as a message names it. An integer below 2^53 is
 /// exact in an `f64` and prints in full, so `10000000000x10000000000` and
 /// `1x1000000000000000` read as they always have. Anything else prints in
@@ -454,5 +490,44 @@ mod tests {
         assert!(msg(0.0, 1e300).contains("0x1e+300"));
         assert!(check_shape(MAX_ELEMS as f64, 1.0).is_ok());
         assert!(check_shape(MAX_ELEMS as f64 + 1.0, 1.0).is_err());
+    }
+
+    /// Cycle 13b: a cell or struct array is held to the bytes a double
+    /// array at the element cap takes, 2^28 x 8 bytes.
+    #[test]
+    fn cells_and_structs_are_bounded_by_bytes() {
+        assert_eq!(MAX_BYTES, 1 << 31);
+        assert_eq!(CELL_UNIT, std::mem::size_of::<Value>());
+        assert_eq!(struct_unit(0), CELL_UNIT);
+        assert_eq!(struct_unit(2), 3 * CELL_UNIT);
+        assert_eq!(struct_unit(usize::MAX), usize::MAX);
+        let most = MAX_BYTES / CELL_UNIT;
+        assert_eq!(check_cell(1, most).unwrap(), (1, most));
+        let msg = check_cell(1, most + 1).unwrap_err().msg;
+        assert_eq!(
+            msg,
+            format!(
+                "Requested 1x{} array exceeds the maximum array size.",
+                most + 1
+            )
+        );
+        assert!(check_cell(1, 1 << 27).is_err());
+        assert!(check_cell(1000, 1).is_ok());
+        assert!(check_cell(0, 1 << 40).is_ok());
+        // A struct element costs a value per field and one more.
+        let per = MAX_BYTES / struct_unit(1);
+        assert!(check_struct(per, 1, 1).is_ok());
+        assert!(check_struct(per + 1, 1, 1).is_err());
+        assert!(check_struct(1, 1 << 27, 1).is_err());
+        assert!(check_struct(1000, 1, 50).is_ok());
+        // The element cap still comes first, with its own message.
+        assert!(
+            check_bytes(1e300, 1.0, 1)
+                .unwrap_err()
+                .msg
+                .contains("1e+300x1")
+        );
+        // A double array is judged the same by both.
+        assert!(check_bytes(MAX_ELEMS as f64, 1.0, 8).is_ok());
     }
 }

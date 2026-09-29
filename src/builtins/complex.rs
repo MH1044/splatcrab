@@ -369,6 +369,9 @@ fn fourier(args: &[Value], name: &str, inverse: bool) -> R<Vec<Value>> {
     } else {
         (m.rows, m.cols, false)
     };
+    // No transform to run on an empty matrix, however many columns it has
+    // (cycle 13b).
+    let count = if m.numel() == 0 { 0 } else { count };
     let mut re = vec![0.0; m.numel()];
     let mut im = vec![0.0; m.numel()];
     for c in 0..count {

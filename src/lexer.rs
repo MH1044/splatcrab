@@ -412,6 +412,73 @@ fn header_names(line: &[Token]) -> Vec<String> {
     names
 }
 
+/// The text of a source file's bytes (cycle 13b). A file that starts with a
+/// UTF-16 byte-order mark, `FF FE` little-endian or `FE FF` big-endian, is
+/// UTF-16 and the mark is dropped; so is one without a mark whose first 64
+/// bytes show the UTF-16 pattern of ASCII text, a zero byte in every odd
+/// (little-endian) or every even (big-endian) position and none in the
+/// others. Everything else is read as it always was: UTF-8, invalid bytes
+/// decoded leniently as U+FFFD, and a leading UTF-8 mark left for
+/// [`scan_known`] to skip. A lone surrogate or an odd trailing byte of a
+/// UTF-16 file is U+FFFD too, so no file is ever refused for its encoding.
+pub fn decode_source(bytes: &[u8]) -> String {
+    let (body, big) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, false),
+        [0xFE, 0xFF, rest @ ..] => (rest, true),
+        _ => match utf16_pattern(bytes) {
+            Some(big) => (bytes, big),
+            None => return String::from_utf8_lossy(bytes).into_owned(),
+        },
+    };
+    let units = body.chunks(2).map(|p| match (p, big) {
+        ([a, b], false) => Ok(u16::from_le_bytes([*a, *b])),
+        ([a, b], true) => Ok(u16::from_be_bytes([*a, *b])),
+        // The odd byte out has no partner to make a code unit with.
+        _ => Err(()),
+    });
+    let mut out = String::with_capacity(body.len() / 2);
+    let mut pending = Vec::new();
+    let flush = |pending: &mut Vec<u16>, out: &mut String| {
+        out.extend(
+            char::decode_utf16(pending.drain(..)).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)),
+        );
+    };
+    for u in units {
+        match u {
+            Ok(u) => pending.push(u),
+            Err(()) => {
+                flush(&mut pending, &mut out);
+                out.push(char::REPLACEMENT_CHARACTER);
+            }
+        }
+    }
+    flush(&mut pending, &mut out);
+    out
+}
+
+/// Whether bytes without a mark look like UTF-16 ASCII text: `Some(false)`
+/// for little-endian, `Some(true)` for big-endian. Only the first 64 bytes
+/// are looked at, an even number of them, and at least one pair.
+fn utf16_pattern(bytes: &[u8]) -> Option<bool> {
+    let n = bytes.len().min(64) & !1;
+    if n < 2 {
+        return None;
+    }
+    let head = &bytes[..n];
+    let zero_at = |parity: usize| {
+        head.iter()
+            .enumerate()
+            .all(|(k, &b)| (b == 0) == (k % 2 == parity))
+    };
+    if zero_at(1) {
+        Some(false)
+    } else if zero_at(0) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// A UTF-8 byte-order mark, which a Windows editor or `Out-File` writes at the
 /// start of a file. It is an encoding marker, not source, and MATLAB and
 /// Octave both skip it; SplatCrab used to report
@@ -2199,5 +2266,52 @@ mod tests {
                 Token::Eof
             ]
         );
+    }
+
+    /// Cycle 13b: a UTF-16 file is decoded as UTF-16, with a mark or by the
+    /// zero-byte pattern of ASCII text, and anything else as lenient UTF-8.
+    #[test]
+    fn decode_source_reads_utf16_and_leaves_utf8_alone() {
+        let le: Vec<u8> = "disp(7)\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let be: Vec<u8> = "disp(7)\n"
+            .encode_utf16()
+            .flat_map(u16::to_be_bytes)
+            .collect();
+        let with = |mark: &[u8], body: &[u8]| [mark, body].concat();
+        assert_eq!(decode_source(&with(&[0xFF, 0xFE], &le)), "disp(7)\n");
+        assert_eq!(decode_source(&with(&[0xFE, 0xFF], &be)), "disp(7)\n");
+        assert_eq!(decode_source(&le), "disp(7)\n");
+        assert_eq!(decode_source(&be), "disp(7)\n");
+        // A character outside the BMP is a surrogate pair, and survives.
+        let smile: Vec<u8> = "\u{1F600}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode_source(&with(&[0xFF, 0xFE], &smile)), "\u{1F600}");
+        // An odd byte out and a lone surrogate are U+FFFD, never a refusal.
+        assert_eq!(decode_source(&[0xFF, 0xFE, b'a', 0, b'b']), "a\u{FFFD}");
+        assert_eq!(
+            decode_source(&[0xFF, 0xFE, 0x00, 0xD8, b'a', 0]),
+            "\u{FFFD}a"
+        );
+        assert_eq!(decode_source(&[0xFF, 0xFE]), "");
+        // UTF-8 is read as it always was: the UTF-8 mark stays for the
+        // lexer to skip, a stray byte is U+FFFD, and NULs that do not make
+        // the UTF-16 pattern stay NULs.
+        assert_eq!(decode_source(b"\xEF\xBB\xBFx"), "\u{FEFF}x");
+        assert_eq!(decode_source(b"caf\xE9"), "caf\u{FFFD}");
+        assert_eq!(decode_source(b"a\0b\0cd"), "a\0b\0cd");
+        assert_eq!(decode_source(b"disp(7)\0\n"), "disp(7)\0\n");
+        assert_eq!(decode_source(b"\0\0\0\0"), "\0\0\0\0");
+        assert_eq!(decode_source(b"1"), "1");
+        assert_eq!(decode_source(b""), "");
+        // Only the first 64 bytes are judged: a later non-ASCII character
+        // does not stop the file being UTF-16.
+        let long = format!("{}\u{4E2D}", "a".repeat(40));
+        let long16: Vec<u8> = long.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_source(&long16), long);
     }
 }

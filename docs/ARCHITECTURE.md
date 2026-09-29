@@ -601,6 +601,29 @@ requested shape into allocation lengths. Indexed growth uses it too since
 cycle 03, with the grown size kept as an `f64` until it is judged; the
 `usize`-only `check_size` that growth used before went with it.
 
+A cell or struct element is far larger than a double, so since pass 13b a
+cell or struct array is judged in bytes too, by `check_bytes` (through
+`check_cell` and `check_struct`): the same 2 GiB budget, `MAX_BYTES`, that
+`MAX_ELEMS` doubles take, with a cell element counted as
+`size_of::<Value>()` and a struct element as that times its field count plus
+one. It comes after `check_shape` and refuses in `check_shape`'s own words.
+Every place that makes or grows one calls it before allocating: `cell`,
+`struct`, `num2cell`, `cellfun` and `arrayfun` with `UniformOutput` false, a
+cell literal, `c(idx)` and `s(idx)` reads, every indexed growth (a new field
+of a struct array included), concatenation, and `load` (where a cell the
+file's bytes cannot hold still fails as the truncation it is). `repmat`
+takes no cell, and `deal` makes none of its own.
+
+The mirror rule is that an empty result costs nothing. Since pass 13b every
+element-wise kernel, real and complex (`try_zip`, `zip_c`, `transpose`),
+the running scans, `fft`, `sort`, `kron`, `repmat`, `fliplr`, `flipud`,
+`triu`, `tril`, `numerics::map_slices`, vertical concatenation, and the
+index resolvers (`resolve_read`, `resolve_write`, `resolve_delete`,
+`Sel::covers`) loop over the elements they produce or read, never over a
+dimension of an empty operand, so `zeros(0, 1e12) + 1` returns at once and
+`x(:, :)` of it lists no positions. `for` over an array with no rows still
+iterates its columns, which is the open question of its own Known bugs row.
+
 A shape the user never spells out goes through `check_shape` too. Since cycle
 01d, any operation whose result shape is computed from its operands' shapes
 calls it before allocating: `Matrix::try_zip` (and so `zip`), `Matrix::matmul`,
@@ -963,6 +986,12 @@ deviations row for a char range and `diag` of a char.
 Cycle 13 fixed the two rows scheduled to it, `clc` writing its escapes into
 captured output and `exit` and `quit` working only as bare REPL lines
 (QA D28), and discharged the Known deviations row for `who` and `whos`.
+Bug-fix pass 13b fixed the three rows left to a bug-fix pass: the hang of an
+element-wise operation on an empty array with a huge dimension, the struct
+array's memory that the element cap did not bound (now a byte budget for
+every cell and struct array), and the non-UTF-8 row, which it closed for
+UTF-16, the only half left; other encodings stay out of scope, a leniently
+decoded file being read rather than refused.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -975,12 +1004,9 @@ spec also lists, it removes the row from that spec in the same commit.
 |---|---|---|
 | `1:NaN` is an empty, verify first | `1:NaN` is 1x0; Octave 8.4 gives the 1x1 `NaN` and MATLAB is unverified, so cycle 01d deliberately left it as it found it while refusing the infinite end points beside it. No golden case asserts either way | later (verify first) |
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
-| A non-UTF-8 file is unread (was part of QA D29) | A UTF-16LE file is `Error: Line 2: unexpected character U+0000` on a NUL, the high byte of its first ASCII character (`err_utf16_file` pins the text up to the code point, and its exit code 1; since cycle 11 the character is named rather than written raw); MATLAB and Octave read it. Cycle 01e skipped the leading UTF-8 byte-order mark and swapped the strict read for a lossy one, which fixed the Windows-1252 half (a `% caf<E9>` comment now runs) and brought the failure inside the `Error:` format; a UTF-16 file still decodes to replacement characters rather than to its text, because that needs encoding detection and not a lossy decode | later |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
-| An element-wise operation on an empty array with a huge dimension hangs | `x = zeros(0, 1e12); x + 1` does not return: the broadcast loop in `Matrix::try_zip` runs once per column even when there are no rows, so a 0x1e12 operand costs 1e12 iterations for an empty result. Cycle 10's complex paths copied the pattern (`x + 1i`, `x .* 1i`, `x == 1i`, `power(x, 0.5)`). It needs no allocation, so the size check does not catch it. Older than cycle 10; found by its review | later, a bug-fix pass |
-| A struct array's memory is not bounded by the element cap | `check_shape` counts elements, not bytes, and each element of a struct array is far larger than a double: a field list of its own, 24 bytes before any field, and a whole value per field. So `s(2^27).a = 1` is within the element limit and can allocate many gigabytes, or abort in the allocator (exit 134) on a smaller machine. Cycle 11 bounded the one way a file could ask for it in a few bytes, a MAT-file's struct array with no fields (`mat::MAX_FIELDLESS`); a script can still ask directly. Found at cycle 11's review | later, a bug-fix pass |
 | `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
 

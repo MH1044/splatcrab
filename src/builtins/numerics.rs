@@ -123,6 +123,11 @@ pub fn map_slices(m: &Matrix, d: usize, out: usize, f: impl Fn(&[f64]) -> Vec<f6
     match d {
         1 => {
             let (r, c) = check_shape(out as f64, m.cols as f64)?;
+            if r * c == 0 {
+                // Either there are no slices or each gives nothing: a
+                // 0x1e12 argument must not visit 1e12 of them (cycle 13b).
+                return Ok(Matrix::new(r, c, Vec::new()));
+            }
             let mut data = Vec::with_capacity(r * c);
             for j in 0..m.cols {
                 let s = f(&m.data[j * m.rows..(j + 1) * m.rows]);

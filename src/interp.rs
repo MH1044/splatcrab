@@ -311,6 +311,9 @@ impl Sel {
     fn covers(&self, n: usize) -> bool {
         match self {
             Sel::All => true,
+            // Fewer subscripts than positions cannot cover them, and the
+            // test must not cost a dimension of an empty array (cycle 13b).
+            Sel::List { idx, .. } if idx.len() < n => false,
             Sel::List { idx, .. } => {
                 let mut seen = vec![false; n];
                 for &k in idx {
@@ -1455,6 +1458,7 @@ impl Interp {
         // Row-major as written; column-major as stored.
         let mut cells: Vec<std::vec::IntoIter<Value>> =
             grid.into_iter().map(Vec::into_iter).collect();
+        crate::builtins::args::check_cell(nr, nc)?;
         let mut data = Vec::with_capacity(nr * nc);
         for _ in 0..nc {
             for r in cells.iter_mut() {
@@ -1689,12 +1693,15 @@ impl Interp {
             (Value::Cell(c), Access::Paren(args)) => {
                 let sel = self.eval_index_args(c.rows, c.cols, args)?;
                 let g = resolve_read(c.rows, c.cols, &sel)?;
+                // `c(ones(1, 2^27))` makes a cell of its own (cycle 13b).
+                crate::builtins::args::check_cell(g.rows, g.cols)?;
                 let data = pick(&c.data, &g.pos);
                 Ok(vec![Value::cell(CellArray::new(g.rows, g.cols, data))])
             }
             (Value::Struct(s), Access::Paren(args)) => {
                 let sel = self.eval_index_args(s.rows, s.cols, args)?;
                 let g = resolve_read(s.rows, s.cols, &sel)?;
+                crate::builtins::args::check_struct(g.rows, g.cols, s.fields.len())?;
                 Ok(vec![Value::strukt(StructArray::new(
                     g.rows,
                     g.cols,
@@ -2320,7 +2327,8 @@ impl Interp {
         };
         let bytes =
             std::fs::read(path).map_err(|e| error::cannot_read(&path.display().to_string(), &e))?;
-        let src = String::from_utf8_lossy(&bytes);
+        // UTF-16 is recognised, anything else read as lenient UTF-8.
+        let src = crate::lexer::decode_source(&bytes);
         // Parsed on the evaluator's stack, so counted from its depth.
         let depth = self.depth;
         let prog = scan(&src)
@@ -2806,6 +2814,8 @@ fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
             if (plan.rows, plan.cols) == (rc.rows, rc.cols) {
                 return assign_chain(&mut Rc::make_mut(rc).data[p], rest, rhs);
             }
+            // Growth is judged in bytes before it allocates (cycle 13b).
+            crate::builtins::args::check_cell(plan.rows, plan.cols)?;
             let mut child = blank();
             assign_chain(&mut child, rest, rhs)?;
             let c = Rc::make_mut(rc);
@@ -2828,7 +2838,14 @@ fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
                 bail!(error::cs_list_count(plan.pos.len()));
             };
             let grows = (plan.rows, plan.cols) != (rc.rows, rc.cols);
-            match (grows, rc.field_index(f)) {
+            let known = rc.field_index(f);
+            if grows || known.is_none() {
+                // `s(2^27).a = 1` is within the element cap and far past the
+                // bytes a double array may take (cycle 13b).
+                let nf = rc.fields.len() + usize::from(known.is_none());
+                crate::builtins::args::check_struct(plan.rows, plan.cols, nf)?;
+            }
+            match (grows, known) {
                 (false, Some(i)) => assign_chain(&mut Rc::make_mut(rc).elems[p][i], rest, rhs),
                 _ => {
                     let mut child = blank();
@@ -2872,6 +2889,7 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
         }
         (Value::Cell(rc), Value::Cell(r)) => {
             let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
+            crate::builtins::args::check_cell(plan.rows, plan.cols)?;
             let c = Rc::make_mut(rc);
             regrid(&mut c.data, (c.rows, c.cols), (plan.rows, plan.cols), blank);
             (c.rows, c.cols) = (plan.rows, plan.cols);
@@ -2885,6 +2903,7 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
                 bail!(error::dissimilar_structs());
             }
             let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
+            crate::builtins::args::check_struct(plan.rows, plan.cols, rc.fields.len())?;
             let s = Rc::make_mut(rc);
             let nf = s.fields.len();
             regrid(
@@ -3221,6 +3240,15 @@ fn resolve_read(rows: usize, cols: usize, sel: &[Sel]) -> R<Gather> {
     // subscript is still reported as one.
     let (nr, nc) = (sel[0].count(rows), sel[1].count(cols));
     crate::builtins::args::check_shape(nr as f64, nc as f64)?;
+    if nr * nc == 0 {
+        // Nothing to read, and a colon over the other dimension must not
+        // list its positions: `x(:, :)` of a 0x1e12 `x` (cycle 13b).
+        return Ok(Gather {
+            pos: Vec::new(),
+            rows: nr,
+            cols: nc,
+        });
+    }
     let (rs, cs) = (sel[0].positions(rows), sel[1].positions(cols));
     let mut pos = Vec::with_capacity(nr * nc);
     for &c in &cs {
@@ -3286,6 +3314,17 @@ fn resolve_write(rows: usize, cols: usize, sel: &[Sel], (rr, rc): (usize, usize)
         let r = sel[0].extent(rspan).max(rows as f64);
         let c = sel[1].extent(cspan).max(cols as f64);
         let (nr, nc) = crate::builtins::args::check_shape(r, c)?;
+        if sel[0].count(rspan) * sel[1].count(cspan) == 0 {
+            // Nowhere to store, so no positions to list (cycle 13b).
+            if rr * rc > 1 {
+                bail!(error::assignment_size(0, rr * rc));
+            }
+            return Ok(Scatter {
+                rows: nr,
+                cols: nc,
+                pos: Vec::new(),
+            });
+        }
         let (rs, cs) = (sel[0].positions(rspan), sel[1].positions(cspan));
         let mut pos = Vec::with_capacity(rs.len() * cs.len());
         for &c in &cs {
@@ -3420,6 +3459,33 @@ fn resolve_delete(rows: usize, cols: usize, sel: &[Sel]) -> R<Keep> {
     } else {
         (&sel[0], rows)
     };
+    if numel == 0 {
+        // No elements to keep, only a size to work out, which must not
+        // cost the length of the other dimension: `x(:, 5) = []` of a
+        // 0x1e12 `x` (cycle 13b).
+        let lost = match dim_sel {
+            Sel::All => n,
+            Sel::List { idx, .. } => {
+                let mut k = idx.clone();
+                k.sort_unstable();
+                k.dedup();
+                k.len()
+            }
+        };
+        if lost == 0 {
+            return Ok(unchanged());
+        }
+        let (r, c) = if by_cols {
+            (rows, n - lost)
+        } else {
+            (n - lost, cols)
+        };
+        return Ok(Keep {
+            pos: Vec::new(),
+            rows: r,
+            cols: c,
+        });
+    }
     let mut gone = vec![false; n];
     for k in dim_sel.positions(n) {
         gone[k] = true;
@@ -3493,6 +3559,12 @@ fn concat_containers(vals: &mut Vec<Value>, vertical: bool) -> Option<R<Value>> 
             return parts.iter().flat_map(|p| p.2.iter().cloned()).collect();
         }
         let mut out = Vec::new();
+        // Parts with no elements add nothing, whatever the width (cycle 13b).
+        let cols = if parts.iter().all(|p| p.2.is_empty()) {
+            0
+        } else {
+            cols
+        };
         for c in 0..cols {
             for &(r, _, items) in parts {
                 out.extend_from_slice(&items[c * r..(c + 1) * r]);
@@ -3520,6 +3592,9 @@ fn concat_containers(vals: &mut Vec<Value>, vertical: bool) -> Option<R<Value>> 
             .iter()
             .map(|c| (c.rows, c.cols, c.data.as_slice()))
             .collect();
+        if let Err(e) = crate::builtins::args::check_cell(shape.0, shape.1) {
+            return Some(Err(e));
+        }
         let data = lay(&parts, vertical, shape.1);
         return Some(Ok(Value::cell(CellArray::new(shape.0, shape.1, data))));
     }
@@ -3544,6 +3619,9 @@ fn concat_containers(vals: &mut Vec<Value>, vertical: bool) -> Option<R<Value>> 
             Ok(s) => s,
             Err(e) => return Some(Err(e)),
         };
+        if let Err(e) = crate::builtins::args::check_struct(shape.0, shape.1, first.fields.len()) {
+            return Some(Err(e));
+        }
         // Every part's elements in the first part's field order.
         let reordered: Vec<Vec<Vec<Value>>> = structs
             .iter()
@@ -3634,7 +3712,9 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     let mut im = Matrix::filled(if complex { rows } else { 0 }, cols, 0.0);
     let mut r0 = 0;
     for m in &mats {
-        for c in 0..cols {
+        // A part with no rows adds nothing, whatever its width (cycle 13b).
+        let part_cols = if m.rows == 0 { 0 } else { cols };
+        for c in 0..part_cols {
             for r in 0..m.rows {
                 out.set(r0 + r, c, m.get(r, c));
                 if complex {
@@ -7093,5 +7173,50 @@ mod tests {
         assert_eq!(one_position(2, 2, &[Sel::row(vec![3])]), Some(3));
         assert_eq!(one_position(2, 2, &[Sel::row(vec![4])]), None);
         assert_eq!(one_position(2, 2, &[Sel::row(vec![0, 1])]), None);
+    }
+
+    /// Cycle 13b: reading, writing and deleting through a colon over an
+    /// empty array's huge dimension lists no positions.
+    #[test]
+    fn indexing_an_empty_array_with_a_huge_dimension_costs_nothing() {
+        let big = 1usize << 40;
+        let g = resolve_read(0, big, &[Sel::All, Sel::All]).unwrap();
+        assert_eq!((g.rows, g.cols, g.pos.len()), (0, big, 0));
+        let g = resolve_read(big, 0, &[Sel::All, Sel::row(vec![])]).unwrap();
+        assert_eq!((g.rows, g.cols, g.pos.len()), (big, 0, 0));
+        let w = resolve_write(0, big, &[Sel::All, Sel::All], (0, 0)).unwrap();
+        assert_eq!((w.rows, w.cols, w.pos.len()), (0, big, 0));
+        let k = resolve_delete(0, big, &[Sel::All, Sel::row(vec![4, 4, 7])]).unwrap();
+        assert_eq!((k.rows, k.cols, k.pos.len()), (0, big - 2, 0));
+        let k = resolve_delete(big, 0, &[Sel::row(vec![0]), Sel::All]).unwrap();
+        assert_eq!((k.rows, k.cols), (big - 1, 0));
+        assert!(!Sel::row(vec![0, 1]).covers(big));
+    }
+
+    /// Cycle 13b: every way of making or growing a cell or struct array is
+    /// judged in bytes, and arrays within the budget are as before.
+    #[test]
+    fn cell_and_struct_arrays_are_bounded_by_bytes() {
+        let refused = |src: &str, size: &str| {
+            let (r, _) = run(src);
+            let msg = r.expect_err(src).msg;
+            let want = format!("Requested {} array exceeds the maximum array size.", size);
+            assert_eq!(msg, want, "{}", src);
+        };
+        refused("s(2^27).a = 1;", "1x134217728");
+        refused("c = cell(1, 2^27);", "1x134217728");
+        refused("c = {}; c{2^27} = 1;", "1x134217728");
+        refused("c = {}; c(2^27) = {1};", "1x134217728");
+        refused("x = num2cell(zeros(1, 2^27));", "1x134217728");
+        refused("c = {1}; d = c(ones(1, 2^27));", "1x134217728");
+        refused("s = struct('a', 1); s(2^26) = s;", "1x67108864");
+        refused("c = cell(1, 2^24); d = [c c];", "1x33554432");
+        refused(
+            "x = arrayfun(@(v) v, zeros(1, 2^27), 'UniformOutput', false);",
+            "1x134217728",
+        );
+        let (r, out) = run("s(1000).a = 1; disp(numel(s)); c = cell(1, 1000); disp(numel(c))");
+        r.unwrap();
+        assert_eq!(out, "        1000\n        1000\n");
     }
 }

@@ -217,7 +217,8 @@ fn help(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     let text = if let Some(path) = it.find_file(&name) {
         let bytes = std::fs::read(&path)
             .map_err(|e| error::cannot_read(&path.display().to_string(), &e))?;
-        file_help(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|| error::no_help_text(&name))
+        file_help(&crate::lexer::decode_source(&bytes))
+            .unwrap_or_else(|| error::no_help_text(&name))
     } else if let Some(e) = it.builtins().get(name.as_str()) {
         format!("{}\n", e.help)
     } else {

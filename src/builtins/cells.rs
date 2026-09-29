@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::args::{at_most, check_shape, need, scalar, shape, string};
+use super::args::{
+    CELL_UNIT, at_most, check_bytes, check_cell, check_struct, need, scalar, shape, string,
+};
 use super::{Registry, add, none, one, one_as};
 use crate::bail;
 use crate::error;
@@ -37,7 +39,8 @@ fn cell(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         return one(Value::cell(CellArray::default()));
     }
     let (r, c) = shape(args, 0, "cell", 2)?;
-    let (r, c) = check_shape(r, c)?;
+    // Judged in bytes as well as elements (cycle 13b).
+    let (r, c) = check_bytes(r, c, CELL_UNIT)?;
     one(Value::cell(CellArray::blanks(r, c)))
 }
 
@@ -95,6 +98,7 @@ fn strukt(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         }
     }
     let (rows, cols) = dims.unwrap_or((1, 1));
+    check_struct(rows, cols, fields.len())?;
     let elems = (0..rows * cols)
         .map(|k| {
             values
@@ -237,6 +241,7 @@ fn num2cell(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "num2cell")?;
     let v = &args[0];
     let (r, c) = v.dims();
+    check_cell(r, c)?;
     let data = (0..r * c).map(|k| v.element(k)).collect();
     one(Value::cell(CellArray::new(r, c, data)))
 }
@@ -350,6 +355,10 @@ pub(crate) fn map_elements(
         bail!(error::arrayfun_size());
     }
     let outs = nargout.max(1);
+    if !uniform {
+        // Each output is a cell of the inputs' size (cycle 13b).
+        check_cell(rows, cols)?;
+    }
     let mut results: Vec<Vec<Value>> = vec![Vec::with_capacity(rows * cols); outs];
     // Whether `f` gives values; a statement's call finds out from the
     // first call.

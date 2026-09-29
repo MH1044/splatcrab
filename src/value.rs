@@ -893,12 +893,13 @@ impl Matrix {
         };
         let mut re = Vec::with_capacity(rows * cols);
         let mut im = Vec::with_capacity(rows * cols);
-        for c in 0..cols {
-            for r in 0..rows {
-                let z = f(at(self, r, c), at(o, r, c));
-                re.push(z.re);
-                im.push(z.im);
-            }
+        // One pass per element produced, never per column: a 0x1e12
+        // operand has no elements and must cost nothing (cycle 13b).
+        for k in 0..rows * cols {
+            let (r, c) = (k % rows, k / rows);
+            let z = f(at(self, r, c), at(o, r, c));
+            re.push(z.re);
+            im.push(z.im);
         }
         Ok(Matrix::new(rows, cols, re).with_im(Some(im)))
     }
@@ -1136,18 +1137,19 @@ impl Matrix {
         let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
         crate::builtins::args::check_shape(rows as f64, cols as f64)?;
         let mut data = Vec::with_capacity(rows * cols);
-        for c in 0..cols {
-            for r in 0..rows {
-                let a = self.get(
-                    if self.rows == 1 { 0 } else { r },
-                    if self.cols == 1 { 0 } else { c },
-                );
-                let b = o.get(
-                    if o.rows == 1 { 0 } else { r },
-                    if o.cols == 1 { 0 } else { c },
-                );
-                data.push(f(a, b)?);
-            }
+        // One pass per element produced, never per column: `zeros(0, 1e12)
+        // + 1` used to spin 1e12 times for an empty result (cycle 13b).
+        for k in 0..rows * cols {
+            let (r, c) = (k % rows, k / rows);
+            let a = self.get(
+                if self.rows == 1 { 0 } else { r },
+                if self.cols == 1 { 0 } else { c },
+            );
+            let b = o.get(
+                if o.rows == 1 { 0 } else { r },
+                if o.cols == 1 { 0 } else { c },
+            );
+            data.push(f(a, b)?);
         }
         Ok(Matrix::new(rows, cols, data))
     }
@@ -1155,14 +1157,13 @@ impl Matrix {
     /// `A.'`, the plain transpose: the imaginary parts move with the real
     /// ones and keep their signs.
     pub fn transpose(&self) -> Matrix {
-        let flip = |v: &[f64]| {
-            let mut out = Vec::with_capacity(v.len());
-            for r in 0..self.rows {
-                for c in 0..self.cols {
-                    out.push(v[c * self.rows + r]);
-                }
-            }
-            out
+        let flip = |v: &[f64]| -> Vec<f64> {
+            // Output element `k` is row `k % cols`, column `k / cols` of the
+            // result, which is element (`k / cols`, `k % cols`) of this one.
+            // One pass per element, so a 1e12x0 matrix costs nothing.
+            (0..v.len())
+                .map(|k| v[(k % self.cols) * self.rows + k / self.cols])
+                .collect()
         };
         let im = self.im.as_deref().map(flip);
         // Rearrangement keeps the class: `'ab'.'` is a char column.
@@ -2793,5 +2794,34 @@ mod tests {
         let other = v.clone();
         drop(v);
         drop(other);
+    }
+
+    /// Cycle 13b: an element-wise operation on an empty operand with a huge
+    /// dimension costs nothing. Each used to loop once per column; in a
+    /// debug build these would not return.
+    #[test]
+    fn empty_operands_with_a_huge_dimension_cost_nothing() {
+        let wide = Matrix::new(0, 1 << 40, Vec::new());
+        let tall = Matrix::new(1 << 40, 0, Vec::new());
+        let one = Matrix::scalar(1.0);
+        for m in [&wide, &tall] {
+            let y = m.zip(&one, "+", |a, b| a + b).unwrap();
+            assert_eq!((y.rows, y.cols, y.data.len()), (m.rows, m.cols, 0));
+            let z = m.zip_c(&one, "+", |a, b| a + b).unwrap();
+            assert_eq!((z.rows, z.cols, z.numel()), (m.rows, m.cols, 0));
+            let t = m.transpose();
+            assert_eq!((t.rows, t.cols), (m.cols, m.rows));
+        }
+        // The rewritten loops still visit every element in column-major
+        // order, broadcasting as before.
+        let a = Matrix::new(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let col = Matrix::new(2, 1, vec![10.0, 20.0]);
+        assert_eq!(
+            a.zip(&col, "+", |x, y| x + y).unwrap().data,
+            [11.0, 22.0, 13.0, 24.0, 15.0, 26.0]
+        );
+        let t = a.transpose();
+        assert_eq!((t.rows, t.cols), (3, 2));
+        assert_eq!(t.data, [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
     }
 }

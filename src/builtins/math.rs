@@ -565,7 +565,9 @@ fn cumulative(args: &[Value], name: &str, is_sum: bool) -> R<Vec<Value>> {
 /// be read and then ignored, which always gave the down-the-columns answer.
 pub fn scan(m: &Matrix, dim: Option<usize>, is_sum: bool) -> Matrix {
     let d = dim.unwrap_or(if m.rows == 1 { 2 } else { 1 });
-    if d >= 3 {
+    // An empty matrix has nothing to scan, and its other dimension alone
+    // can be enormous (cycle 13b).
+    if d >= 3 || m.numel() == 0 {
         return m.clone();
     }
     let step = |acc: f64, v: f64| if is_sum { acc + v } else { acc * v };

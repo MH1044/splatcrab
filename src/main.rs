@@ -139,7 +139,8 @@ fn run() -> i32 {
         // is an ordinary `unexpected character` error anywhere else. A
         // leading UTF-8 byte-order mark is skipped by the lexer.
         let src = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            // Since cycle 13b a UTF-16 file is recognised and decoded too.
+            Ok(bytes) => splatcrab::lexer::decode_source(&bytes),
             Err(e) => {
                 eprintln!("Error: {}", error::cannot_read(path, &e));
                 return 1;

@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::args::check_shape;
+use super::args::{check_cell, check_shape, check_struct};
 use crate::error::{self, MError, MatFault, R};
 use crate::value::{CellArray, Class, Matrix, StructArray, Value};
 
@@ -421,6 +421,12 @@ impl<'a> Reader<'a> {
             .to_string();
         let value = match class {
             MX_CELL => {
+                // Each element takes at least a tag in the file, so a cell
+                // the file cannot hold is left to fail as the truncation it
+                // is; one it can hold is judged in bytes (cycle 13b).
+                if numel <= self.left() / 8 {
+                    check_cell(rows, cols)?;
+                }
                 let mut items = Vec::with_capacity(numel.min(self.left() / 8));
                 for _ in 0..numel {
                     items.push(self.child(depth)?);
@@ -534,6 +540,8 @@ impl<'a> Reader<'a> {
         if total > self.left() / 8 {
             return Err(self.truncated());
         }
+        // Judged in bytes, as a script's struct array is (cycle 13b).
+        check_struct(rows, cols, fields.len())?;
         let mut elems = Vec::with_capacity(numel);
         for _ in 0..numel {
             let mut e = Vec::with_capacity(fields.len());

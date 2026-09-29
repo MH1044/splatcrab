@@ -349,7 +349,8 @@ z
 - A REPL with multi-line continuation, and a script runner. REPL diagnostics
   go to stderr like a script's, a block left open at end of input is reported
   rather than discarded, and a script file may start with a UTF-8 byte-order
-  mark or hold bytes that are not valid UTF-8
+  mark, hold bytes that are not valid UTF-8, or be UTF-16, with a byte-order
+  mark or without one (pass 13b)
 - The environment (cycle 13): `cd`, `pwd`, `ls` and `dir` against the
   interpreter's own current folder, never the process's; `help` (a builtin's
   help line, or a file's leading comment block), `which`, `who` and `whos`

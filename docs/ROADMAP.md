@@ -42,6 +42,7 @@ and the table names the cycle that owns it.
 | 11 | [strings-and-io](modules/11-strings-and-io.md) | String functions, regular expressions, file reading and writing, `save`/`load` | Done (2026-09-29) |
 | 12 | [plotting](modules/12-plotting.md) | `plot`, `scatter`, `bar`, `histogram`, `subplot`, labels and legends, SVG and PNG output | Done (2026-09-29) |
 | 13 | [environment](modules/13-environment.md) | REPL line editing and history, tab completion, `help`, `which`, `eval`, `format` | Done (2026-09-29) |
+| 13b | [three-defects](modules/13b-three-defects.md) | The three Known bugs rows that were real defects: an empty result costs nothing however large a dimension, cells and structs are bounded by bytes as well as elements, and UTF-16 source files are read | Done (2026-09-29) |
 
 ## The U series: the interface
 

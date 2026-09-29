@@ -14,7 +14,7 @@
 //! outputs. `strsplit`, `strtok`, `blanks`, `mat2str`, `int2str`,
 //! `num2str` and `str2num` take a single array.
 
-use super::args::{MAX_ELEMS, at_most, check_shape, mat, need};
+use super::args::{MAX_ELEMS, at_most, check_cell, check_shape, check_struct, mat, need};
 use super::printf::{escapes, format_printf};
 use super::regex::{Groups, Regex};
 use super::{Registry, add, one, one_as};
@@ -297,32 +297,54 @@ fn strsplit(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         }
         collapse = pair[1].mat()?.truth()?;
     }
-    let (mut pieces, mut matches) = (Vec::new(), Vec::new());
+    // Two passes: the first counts the pieces, so that a cell past the byte
+    // budget is refused before any piece is copied. `strsplit` of a long
+    // run of delimiters made one cell element per character (cycle 13b's
+    // review).
+    let mut count = 1;
+    split_runs(s, &delims, collapse, |_, _, _| count += 1);
+    check_cell(1, count)?;
+    let (mut pieces, mut matches) = (Vec::with_capacity(count), Vec::with_capacity(count - 1));
+    let last = split_runs(s, &delims, collapse, |start, from, to| {
+        pieces.push(chars(s[start..from].to_vec()));
+        matches.push(chars(s[from..to].to_vec()));
+    });
+    pieces.push(chars(s[last..].to_vec()));
+    Ok(vec![
+        Value::cell(CellArray::row(pieces)),
+        Value::cell(CellArray::row(matches)),
+    ])
+}
+
+/// `strsplit`'s walk over `s`: `visit(start, from, to)` for each run of
+/// delimiters `from..to`, which ends the piece `start..from`. Answers where
+/// the last piece starts.
+fn split_runs(
+    s: &[f64],
+    delims: &[Vec<f64>],
+    collapse: bool,
+    mut visit: impl FnMut(usize, usize, usize),
+) -> usize {
     let (mut start, mut i) = (0, 0);
     while i < s.len() {
-        let Some(n) = delimiter_at(s, i, &delims) else {
+        let Some(n) = delimiter_at(s, i, delims) else {
             i += 1;
             continue;
         };
-        pieces.push(chars(s[start..i].to_vec()));
         let from = i;
         i += n;
         if collapse {
             while i < s.len() {
-                match delimiter_at(s, i, &delims) {
+                match delimiter_at(s, i, delims) {
                     Some(n) => i += n,
                     None => break,
                 }
             }
         }
-        matches.push(chars(s[from..i].to_vec()));
+        visit(start, from, i);
         start = i;
     }
-    pieces.push(chars(s[start..].to_vec()));
-    Ok(vec![
-        Value::cell(CellArray::row(pieces)),
-        Value::cell(CellArray::row(matches)),
-    ])
+    start
 }
 
 /// `strjoin(C, delim)`: the texts of `C` in order, `delim` (escapes
@@ -1193,6 +1215,25 @@ fn regexp_one(re: &Regex, s: &[f64], o: &Options) -> R<Vec<Value>> {
     let fields: Vec<String> = re.names.iter().map(|(n, _)| n.clone()).collect();
     let name_values =
         |g: &Groups| -> Vec<Value> { re.names.iter().map(|(_, k)| piece(s, g[*k])).collect() };
+    // A cell or struct output holds an element per match, and a pattern that
+    // matches the empty text matches at every position (cycle 13b's review).
+    if !o.once {
+        let n = found.len();
+        for out in &outs {
+            match out {
+                Out::TokenExtents | Out::Match | Out::Tokens => {
+                    check_cell(1, n)?;
+                }
+                Out::Split => {
+                    check_cell(1, n + 1)?;
+                }
+                Out::Names if !fields.is_empty() && n > 1 => {
+                    check_struct(1, n, fields.len())?;
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(outs
         .iter()
         .map(|out| match (out, o.once) {
@@ -1506,6 +1547,34 @@ fn regexprep(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `strsplit` counts its pieces in a first pass, so the byte budget is
+    /// judged before any piece is copied (cycle 13b's review). The count
+    /// must agree with the pieces the second pass makes; the refusal itself
+    /// is `err_strsplit_over_byte_budget`, too large for a unit test.
+    #[test]
+    fn strsplit_counts_its_pieces_before_copying_them() {
+        let comma = vec![units(",")];
+        for (text, collapse, pieces) in [
+            ("a,b,,c", true, 3),
+            ("a,b,,c", false, 4),
+            (",,", false, 3),
+            ("", false, 1),
+        ] {
+            let s = units(text);
+            let mut count = 1;
+            split_runs(&s, &comma, collapse, |_, _, _| count += 1);
+            assert_eq!(count, pieces, "{text} {collapse}");
+            let mut it = Interp::with_output(Box::new(std::io::sink()));
+            let mut args = vec![Value::str(text), Value::str(",")];
+            if !collapse {
+                args.push(Value::str("CollapseDelimiters"));
+                args.push(Value::Mat(Matrix::scalar(0.0)));
+            }
+            let out = strsplit(&mut it, &args, 1).unwrap();
+            assert_eq!(out[0].dims(), (1, pieces), "{text} {collapse}");
+        }
+    }
 
     fn num(v: f64) -> Value {
         Value::Mat(Matrix::scalar(v))
