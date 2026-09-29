@@ -48,7 +48,7 @@ pub fn register(r: &mut Registry) {
 
     // ---- search and sort ---------------------------------------------
     add(r, "find", find, "find(A), find(A,n), find(A,n,'last'), [r,c,v] = find(...) - indices of the non-zero elements.");
-    add(r, "sort", sort, "sort(v), sort(v,dim), sort(v,'descend'), [s,i] = sort(...) - a sorted vector, NaN at the high end.");
+    add(r, "sort", sort, "sort(A), sort(A,dim), sort(A,'descend'), [s,i] = sort(...) - sorted vectors, columns or rows, NaN at the high end.");
 }
 
 // ---- linear algebra --------------------------------------------------
@@ -842,19 +842,22 @@ fn sort_cmp(a: &f64, b: &f64) -> Ordering {
     }
 }
 
-/// `sort(v)`, `sort(v, direction)`, `sort(v, dim)` and
-/// `sort(v, dim, direction)` for a vector. Along a dimension the vector does
-/// not extend in, every slice has one element and nothing moves.
+/// `sort(A)`, `sort(A, direction)`, `sort(A, dim)` and
+/// `sort(A, dim, direction)`. Since cycle 09 `A` may be a matrix: each
+/// column is sorted on its own by default (the first dimension that is not
+/// a singleton, so a row vector sorts along its length), and each row with
+/// `dim` 2. Along a dimension past the second every slice has one element
+/// and nothing moves.
 ///
 /// Descending is `sort_cmp` reversed rather than the ascending result
 /// reversed: that keeps it stable, as the MATLAB page requires "regardless of
 /// sorting direction", and puts `NaN` first, the documented placement.
 ///
-/// Asked for two outputs, the second is the permutation, a double of the
-/// same shape: `s = v(i)`. The sort is of the positions, keyed by value, so
-/// the order the values take and the order the indices record are one and
-/// the same. Along a dimension the vector does not extend in, every index is
-/// `1`.
+/// Asked for two outputs, the second is the permutation within each slice,
+/// a double of the same shape: for a matrix sorted along its columns,
+/// `s(:, j) = A(i(:, j), j)`. The sort is of the positions, keyed by value,
+/// so the order the values take and the order the indices record are one
+/// and the same. Along a dimension past the second every index is `1`.
 fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 3, "sort")?;
     let m = mat(a, 0, "sort")?;
@@ -872,34 +875,35 @@ fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
         Some(Some(s)) if s.eq_ignore_ascii_case("descend") => true,
         Some(_) => return Err(error::sort_direction()),
     };
-    if !m.is_vector() && !m.is_empty() {
-        return Err(error::sort_vectors_only());
-    }
     let along = d.unwrap_or(if m.rows == 1 { 2 } else { 1 });
-    let extent = match along {
-        1 => m.rows,
-        2 => m.cols,
-        _ => 1,
+    let (rows, cols) = (m.rows, m.cols);
+    // Each slice as its linear positions: a column is `rows` consecutive
+    // elements, a row is every `rows`-th.
+    let slices: Vec<Vec<usize>> = match along {
+        1 => (0..cols)
+            .map(|c| (c * rows..(c + 1) * rows).collect())
+            .collect(),
+        2 => (0..rows)
+            .map(|r| (0..cols).map(|c| c * rows + r).collect())
+            .collect(),
+        _ => Vec::new(),
     };
     let mut out = m;
-    let n = out.numel();
-    let mut perm: Vec<usize> = (0..n).collect();
-    if extent == n {
-        let data = &out.data;
+    let mut index = vec![1.0; out.numel()];
+    let data = out.data.clone();
+    for pos in &slices {
+        let mut perm: Vec<usize> = (0..pos.len()).collect();
         if descend {
-            perm.sort_by(|&x, &y| sort_cmp(&data[y], &data[x]));
+            perm.sort_by(|&x, &y| sort_cmp(&data[pos[y]], &data[pos[x]]));
         } else {
-            perm.sort_by(|&x, &y| sort_cmp(&data[x], &data[y]));
+            perm.sort_by(|&x, &y| sort_cmp(&data[pos[x]], &data[pos[y]]));
         }
-        out.data = perm.iter().map(|&k| data[k]).collect();
-    } else {
-        perm = vec![0; n];
+        for (k, &p) in perm.iter().enumerate() {
+            out.data[pos[k]] = data[pos[p]];
+            index[pos[k]] = (p + 1) as f64;
+        }
     }
-    let index = Matrix::new(
-        out.rows,
-        out.cols,
-        perm.iter().map(|&k| (k + 1) as f64).collect(),
-    );
+    let index = Matrix::new(rows, cols, index);
     // A sorted char is a char: `sort('cab')` is `'abc'`.
     if nargout < 2 {
         return one_as(out);
@@ -1091,8 +1095,55 @@ mod tests {
         // bad dimension, never a character code.
         let e = call(sort, &[v, text("x"), text("ascend")]).unwrap_err().msg;
         assert!(e.contains("Dimension argument"), "{e}");
-        // A matrix is still refused, whatever the options.
-        assert!(call(sort, &[mat(2, 2, &[1.0, 2.0, 3.0, 4.0]), text("descend")]).is_err());
+    }
+
+    /// Cycle 09: a matrix sorts each column by default, each row along
+    /// dimension 2, and the permutation is per slice.
+    #[test]
+    fn sort_of_a_matrix_sorts_each_slice() {
+        // [3 1; 2 4], column-major [3 2 1 4].
+        let a = mat(2, 2, &[3.0, 1.0, 2.0, 4.0]);
+        assert_eq!(
+            call(sort, std::slice::from_ref(&a)).unwrap().data,
+            [2.0, 3.0, 1.0, 4.0]
+        );
+        assert_eq!(
+            call(sort, &[a.clone(), num(2.0)]).unwrap().data,
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(
+            call(sort, &[a.clone(), text("descend")]).unwrap().data,
+            [3.0, 2.0, 4.0, 1.0]
+        );
+        assert_eq!(
+            call(sort, &[a.clone(), num(2.0), text("descend")])
+                .unwrap()
+                .data,
+            [3.0, 4.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            call(sort, &[a.clone(), num(3.0)]).unwrap().data,
+            [3.0, 2.0, 1.0, 4.0]
+        );
+        let out = outputs(sort, std::slice::from_ref(&a), 2);
+        assert_eq!(out[1].data, [2.0, 1.0, 1.0, 2.0]);
+        let out = outputs(sort, &[a, num(2.0)], 2);
+        assert_eq!(out[1].data, [2.0, 1.0, 1.0, 2.0]);
+        // NaN goes last in each column ascending, first descending, and the
+        // sort is stable within a column.
+        let n = mat(3, 2, &[f64::NAN, 5.0, 1.0, f64::NAN, 1.0, 5.0]);
+        let up = call(sort, std::slice::from_ref(&n)).unwrap();
+        assert_eq!(up.data[..2], [1.0, 1.0]);
+        assert!(up.data[2].is_nan());
+        assert_eq!(up.data[3..5], [5.0, 5.0]);
+        let down = call(sort, &[n, text("descend")]).unwrap();
+        assert!(down.data[0].is_nan());
+        assert_eq!(down.data[1..3], [1.0, 1.0]);
+        // A char matrix stays a char; an empty stays its shape.
+        let c = call(sort, &[text("ba")]).unwrap();
+        assert!(c.is_char());
+        let e = call(sort, &[Value::Mat(Matrix::new(0, 3, vec![]))]).unwrap();
+        assert_eq!((e.rows, e.cols), (0, 3));
     }
 
     #[test]

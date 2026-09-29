@@ -1,0 +1,1 @@
+Error: Line 3: Edges for 'histc' must be monotonically non-decreasing, with no NaN.

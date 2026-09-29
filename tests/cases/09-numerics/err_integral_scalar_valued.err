@@ -1,0 +1,1 @@
+Error: Line 3: The function passed to 'integral' must return a value for every point of its input; write it with element-wise operators such as .* and ./

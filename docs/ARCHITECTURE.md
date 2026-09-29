@@ -235,8 +235,9 @@ matches.
 
 **`builtins/`** is the library: `mod.rs` holds the registry, `args.rs` the
 argument helpers, and `core.rs`, `math.rs`, `linalg.rs` and, since cycle 07,
-`cells.rs` (cells, structs, `cellfun` and the map `arrayfun` shares) the
-builtins themselves. Every one has the same shape,
+`cells.rs` (cells, structs, `cellfun` and the map `arrayfun` shares) and,
+since cycle 09, `numerics.rs`, `sets.rs` and `solvers.rs` the builtins
+themselves. Every one has the same shape,
 `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`, where the `usize` is
 `nargout` and an empty `Vec` means the builtin produced no value.
 
@@ -254,6 +255,22 @@ A computation that warns returns its warning text beside its result, as
 `Matrix::solve` and `Matrix::inv` return `(Matrix, Option<String>)`, and the
 caller writes it with `Interp::warn`, through `Interp.err`; `factor.rs` and
 `value.rs` never write anything themselves.
+
+Cycle 09 added three files. `numerics.rs` holds the builtins on data:
+the polynomials (`polyfit` over `factor::lstsq`, `roots` over
+`factor::eig_general` of the companion matrix), interpolation, the
+trapezoidal rule, differences, `filter`, the statistics, the number theory
+and the grids. Its `map_slices` is the one way a function there works
+along a dimension: it hands each column (or each row, through a
+transpose) to a closure, and judges the result's shape with `check_shape`
+first; `first_dim` is MATLAB's default dimension. `sets.rs` holds the five
+set functions over a `Set`, either an array compared as numbers or a cell of
+character vectors compared as code-unit texts. `solvers.rs` holds `fzero`,
+`fminsearch`, `integral` and `ode45`, each a thin builtin around a pure
+method (`fzero_solve`, `nelder_mead`, `quad`, `dopri`) that takes the user's
+function as a Rust closure and its caps as parameters, so a unit test can
+drive the numerics and reach every cap with no interpreter. The builtin's
+closure calls the user's function through `Interp::call_nested`.
 
 **`syntax.rs`** answers questions about source text short of parsing it.
 `is_complete` says whether an entry typed line by line has ended, by counting
@@ -360,7 +377,11 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    too, and a clean error past it: since cycle 08 the Jacobi sweeps, the
    one-sided Jacobi SVD and the shifted QR iteration of `factor.rs`, whose
    callers refuse a `NaN` or `Inf` before the first sweep, so no input can
-   make one spin.
+   make one spin; since cycle 09 the solvers of `solvers.rs`: `fzero`'s
+   search for a sign change and its Brent iterations, `fminsearch`'s
+   iterations and evaluations, `integral`'s subintervals and `ode45`'s
+   steps and minimum step, each past its cap a clean error rather than a
+   `NaN` handed back.
 
 ## Recipes
 
@@ -371,7 +392,9 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    `math.rs` for element-wise and reducing numerics; `linalg.rs` for linear
    algebra, rearrangement, search and sort, with the numerics of a
    factorisation in `factor.rs` and only the argument handling in
-   `linalg.rs`. The signature is
+   `linalg.rs`; `numerics.rs` for polynomials, samples, statistics and
+   number theory, `sets.rs` for the set functions, and `solvers.rs` for a
+   builtin that iterates on a user's function. The signature is
    `fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`; return `one_mat(m)`
    for a numeric value and `none()` for a builtin that produces none.
    `one_mat` makes its result a double whatever `m`'s class, which is MATLAB's
@@ -398,7 +421,9 @@ a `Callee::Name` or a `Callee::Handle`, never through `call_function` or
 nesting budget every frame shares, which is what bounds a function that calls
 a builtin that calls the function (cycle 05's review found `feval` re-entering
 uncounted and overflowing the stack). `feval` and `arrayfun` do so since
-cycle 06, and `cellfun` since cycle 07.
+cycle 06, `cellfun` since cycle 07, and the solvers `fzero`, `fminsearch`,
+`integral` and `ode45` since cycle 09, once per evaluation, so a solver
+calling a solver, or a function calling a solver on itself, stays bounded.
 
 A shape the user asks for goes through the size helpers and stays `f64` until
 it is judged, so that an oversized request is named as asked. `shape` reads a
@@ -419,7 +444,12 @@ the two-subscript branch of `resolve_read` and `math::reduce`, and since cycle
 08 `kron` and every shape `factor.rs` computes (through `factor::zeros` and
 `factor::eye`: the `n`-by-`k` answer of a system with no rows, the `m`-by-`m`
 `Q` of `qr` and `U` of `svd`, `lu`'s `P`), which is why `svd` of a long
-column asks for its `U` only when the full decomposition was requested. The operands can
+column asks for its `U` only when the full decomposition was requested.
+Cycle 09's shapes go the same way: `numerics::map_slices`, the
+Vandermonde matrix of `polyfit`, the combinations of `nchoosek(v, k)`
+(counted exactly first), the sieve of `primes`, `meshgrid`, `histc`,
+`interp1` of a matrix and `ode45`'s output, judged before each step adds
+its points. The operands can
 be tiny and the result enormous — `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
 elements from 2e5 — so "the operands fit, therefore the result fits" is never
 true. A new operation of that kind belongs on the same list.
@@ -640,7 +670,7 @@ cycle named:
 | `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives | later (verify first) |
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | `who` and `whos` print the same typed table | Both produce byte-identical output. In MATLAB `who` is a bare list of names and `whos` is a table with size, bytes and class, so both deviate rather than only `who`, and neither has a bytes column | 13 |
-| `sort` accepts vectors only | 09 |
+| Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `roots` refuses a real root of multiplicity three or more, which the eigensolver finds as a complex pair; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each | by design; the complex refusals 10 |
 | Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where MATLAB is understood to say "close to singular or badly scaled" with an `RCOND`; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `eig([])` is 0x1. The Design notes of `docs/modules/08-linear-algebra.md` have each | later (verify first) |
 | A result that would be complex is a clean error; MATLAB returns the value | 10 |
 | A char range and `diag` of a char return doubles: `'a':'c'` is `97 98 99` and `diag('abc')` is numeric, where MATLAB keeps char. Cycle 02's Scope named six rearrangements and these were not among them | 11 |

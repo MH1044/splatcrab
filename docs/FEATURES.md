@@ -143,7 +143,7 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-130 names, each an ordinary function in `src/builtins/` registered by name in
+163 names, each an ordinary function in `src/builtins/` registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
 `02-classes-and-display`; the shared-arm groups also by the `*_shared_arm`
@@ -159,7 +159,9 @@ cases. Cycle 07 added thirteen, `cell`, `struct`, `fieldnames`, `isfield`,
 cases. Cycle 08 added fifteen, `lu`, `qr`, `chol`, `eig`, `svd`, `rank`,
 `pinv`, `null`, `orth`, `cond`, `kron`, `cross`, `triu`, `tril` and `magic`,
 exercised by the `08-linear-algebra` cases (see
-[Linear algebra](#linear-algebra)). Cycle 01c removed `e`, which
+[Linear algebra](#linear-algebra)). Cycle 09 added thirty-three, the
+polynomials, samples, statistics, number theory, grids, sets and solvers,
+exercised by the `09-numerics` cases (see [Numerics](#numerics)). Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -178,7 +180,14 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Linear algebra | `transpose inv det trace diag norm dot` | 00 | `linalg.rs` |
 | Factorisations | `lu qr chol eig svd rank pinv null orth cond` | 08 | `linalg.rs`, over `factor.rs` |
 | Constructions | `kron cross triu tril magic` | 08 | `linalg.rs` |
-| Search and sort | `find sort` | 00 | `linalg.rs` |
+| Search and sort | `find sort` | 00 | `linalg.rs`; `sort` of a matrix since 09 |
+| Polynomials | `polyfit polyval roots conv deconv filter` | 09 | `numerics.rs`, over `factor.rs` |
+| Samples | `interp1 trapz cumtrapz diff` | 09 | `numerics.rs` |
+| Statistics | `std var median mode` | 09 | `numerics.rs` |
+| Number theory | `factorial nchoosek primes isprime gcd lcm` | 09 | `numerics.rs` |
+| Grids and counts | `logspace meshgrid histc` | 09 | `numerics.rs` |
+| Sets | `unique ismember setdiff intersect union` | 09 | `sets.rs` |
+| Solvers | `fzero fminsearch integral ode45 odeset` | 09 | `solvers.rs` |
 | Output | `disp fprintf sprintf num2str` | 00 | `core.rs` |
 | Errors and warnings | `error rethrow lasterr warning assert` | 00, 04 | `core.rs` |
 | Comparison | `isequal` | 04 | `core.rs` |
@@ -192,7 +201,8 @@ Reductions, and `cumsum` and `cumprod`, take an optional dimension argument;
 a dimension past the array's returns the input unchanged and `0` is an error.
 `sum`, `prod`, `mean`, `any` and `all` also take `'all'`, and so do `max` and
 `min` as their third argument. `max` and `min` also take two arrays. `sort`
-accepts vectors only, until cycle 09; `norm` takes a matrix since cycle 08. `sort` puts `NaN` last
+takes a matrix since cycle 09, sorting each column (or each row along
+dimension 2), and `norm` since cycle 08. `sort` puts `NaN` last
 when ascending and first when descending.
 
 Every numeric builtin returns a double, whatever its argument's class:
@@ -245,6 +255,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | `linspace` floors its count | 01c | `linspace_floor_count` | `linspace(0, 1, 2.7)` is two points; a count below 1 is 1x0 |
 | `linspace` includes both end points exactly | 01d | `range_hits_end_point` | The last element is the end point itself, not `a + (b-a)*(n-1)/(n-1)` |
 | `sort(v, 'descend')`, `sort(v, dim)`, `sort(v, dim, direction)` | 01c | `sort_direction`, `sort_descend_stable`, `err_sort_direction` | Stable in both directions; `NaN` first when descending |
+| `sort(A)`, `sort(A, dim)`, `sort(A, 'descend')`, `[s, i] = sort(A)` of a matrix | 09 | `sort_matrix_columns`, `sort_matrix_along_rows`, `sort_matrix_descend`, `sort_matrix_permutation` | Each column on its own by default, each row along dimension 2; `i` is each slice's permutation. Was "'sort' currently supports vectors only." |
 | `find(X, n)`, `find(X, n, 'first')`, `find(X, n, 'last')` | 01c | `find_count`, `err_find_count_zero`, `err_find_count_fraction`, `err_find_direction` | The last `n` stay in ascending order; `n` must be a positive integer |
 | `norm(v, p)`: `1`, `2`, any `p > 0`, `Inf`, `-Inf`, `'fro'`, `'inf'` | 01c | `norm_order`, `err_norm_type` | A matrix takes its own norms since cycle 08 (see [Linear algebra](#linear-algebra)). `p = 0` and a negative finite `p` are refused |
 | `norm` without overflow; an empty sum is `+0` | 01c | `norm_scaled_and_empty_sum` | `norm([1e200 1e200])` is `1.4142e+200`, not `Inf`. `sum([])`, `norm([])` and `dot([], [])` print `0.0000`, not `-0.0000` |
@@ -276,6 +287,34 @@ record every choice.
 | Matrix `norm` | 08 | `norm_matrix_and_cond`, `err_norm_matrix_type`, `err_norm_matrix_order` | `norm(A)` and `norm(A, 2)` the largest singular value, `norm(A, 1)` the largest column sum, `norm(A, Inf)` the largest row sum, `norm(A, 'fro')` the root sum of squares. Other orders are `Matrix norm type for 'norm' must be 1, 2, Inf or 'fro'.` A `NaN` gives `NaN`; an `Inf` gives an `Inf` 2-norm |
 | `kron cross triu tril magic` | 08 | `kron_two_vectors`, `cross_unit_vectors`, `triu_tril`, `magic_three` | `cross` works along the first dimension of length 3 of two same-sized arrays; `triu` and `tril` keep the class; `magic(n)` is MATLAB's construction for odd, doubly even and singly even `n` |
 | Every iteration terminates | 08 | `err_eig_nan_input`, `err_svd_inf_input`, `err_chol_nan_input` | The Jacobi sweeps (100), the SVD sweeps (100) and the QR iteration (`30 * max(10, n)` per eigenvalue) have caps, past which the answer is `'eig' did not converge within its iteration limit.` (or `'svd'`); no input known reaches one. `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `lu`, `qr`, `det`, `inv` and `\` let it spread to a `NaN` result |
+
+## Numerics
+
+Cycle 09. The builtins on data are in `src/builtins/numerics.rs`, the set
+functions in `sets.rs` and the solvers in `solvers.rs`; the Design notes of
+`docs/modules/09-numerics.md` record every choice. A function that works
+along a dimension takes MATLAB's default, the first that is not a
+singleton, so a matrix is worked on column by column.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| `polyfit(x, y, n)`, `polyval(p, x)` | 09 | `polyfit_line_fit`, `polyval_scalar` | Least squares through the column-pivoted QR of cycle 08; too few distinct points warns with the rank-deficient text. `[p, S, mu]` is not provided |
+| `roots(p)` | 09 | `roots_real_distinct`, `err_roots_complex` | Eigenvalues of the companion matrix, a column, then a `0` per trailing zero. Complex roots, a real root of multiplicity three or more among them, are `Complex results are not supported. The polynomial has complex roots.` until cycle 10 |
+| `conv(u, v, shape)`, `[q, r] = deconv(b, a)` | 09 | `conv_polynomials`, `deconv_quotient_remainder` | `'full'`, `'same'` and `'valid'`. `r` has the shape of `b`, its leading coefficients exactly `0` |
+| `filter(b, a, x)` | 09 | `filter_iir_impulse`, `filter_fir_moving_average` | Direct form II transposed from rest, normalised by `a(1)`, along the first non-singleton dimension; `zi`, `zf` and `dim` are not provided |
+| `interp1(x, v, xq, method, extrap)`, `interp1(v, xq)` | 09 | `interp1_linear_inside`, `interp1_nearest`, `interp1_outside_is_nan` | `'linear'`, `'nearest'` (a tie takes the upper point), `'previous'`, `'next'`; `NaN` outside unless `'extrap'` or a value. `'spline'` and `'pchip'` are refused |
+| `trapz`, `cumtrapz` | 09 | `trapz_unit_spacing`, `trapz_with_x`, `cumtrapz_unit_spacing` | `(y)`, `(x, y)`, `(y, dim)`, `(x, y, dim)`; `x` a spacing or the points |
+| `diff(X, n, dim)` | 09 | `diff_vector`, `diff_second_order`, `diff_matrix_columns` | Without `dim`, each round works along the first non-singleton dimension of what the last left |
+| `std var median mode` | 09 | `std_var_sample`, `median_odd_count`, `mode_most_frequent` | Column-wise, with a dimension; `std(X, 1)` normalises by `N`. `median` of a `NaN` is `NaN`; `mode` ignores `NaN`, takes the smallest of a tie, and gives the count second |
+| `factorial nchoosek primes isprime gcd lcm` | 09 | `factorial_five`, `factorial_overflow_inf`, `nchoosek_five_two`, `primes_to_twenty`, `isprime_row`, `gcd_scalars`, `lcm_scalars`, `err_primes_huge_bound` | `nchoosek(v, k)` lists the combinations; `isprime` is Miller-Rabin; `gcd` and `lcm` take integers of either sign |
+| `logspace meshgrid histc` | 09 | `logspace_decades`, `meshgrid_size`, `meshgrid_grid_values`, `histc_bin_counts`, `err_logspace_huge_count`, `err_meshgrid_huge_size` | `logspace(a, pi)` ends at `pi`; `[n, bin] = histc(x, edges)` |
+| `unique ismember setdiff intersect union` | 09 | `unique_sorted_row`, `ismember_tf_loc`, `setdiff_sorted_row`, `intersect_sorted_row`, `union_sorted_row` | Sorted, or `'stable'`; index outputs `[C, ia, ic]`, `[tf, loc]`, `[C, ia]` and `[C, ia, ib]`, each a column. `NaN` is never equal to itself |
+| Cells of char in the set functions | 09 | `unique_cellstr`, `unique_cellstr_char_code_order`, `ismember_char_in_cellstr`, `ismember_cellstr_two_outputs`, `setdiff_cellstr`, `intersect_cellstr`, `union_cellstr`, `err_unique_cell_of_numbers`, `err_ismember_cell_of_numbers` | Sorted by character code; a character vector beside a cell is one word; any other cell content is refused |
+| `fzero(f, x0)`, `fzero(f, [a b])` | 09 | `fzero_scalar_start`, `fzero_bracket`, `fzero_nested_in_fzero`, `err_fzero_no_sign_change` | MATLAB's outward search for a sign change, then Brent's method to `2 eps abs(x)`. No sign change is a clean error, exit 1 |
+| `fminsearch(f, x0)` | 09 | `fminsearch_quadratic_bowl`, `err_fminsearch_unbounded` | Nelder-Mead with MATLAB's simplex, coefficients and tolerances; `200 * numel(x0)` iterations and evaluations, past which it is an error |
+| `integral(f, a, b)` | 09 | `integral_finite_interval`, `integral_infinite_limits`, `err_integral_divergent` | Global adaptive Gauss-Kronrod 7-15, `AbsTol` 1e-10 and `RelTol` 1e-6; an infinite limit is mapped onto a finite interval; 650 subintervals at most |
+| `ode45(f, tspan, y0, opts)`, `odeset` | 09 | `ode45_scalar_decay`, `ode45_oscillator_system`, `ode45_output_columns`, `odeset_tolerances`, `err_ode45_blowup` | Dormand-Prince 5(4) with MATLAB's step control and `Refine` 4; `RelTol`, `AbsTol`, `MaxStep`, `InitialStep`, `Refine`. 50,000 steps at most, and a step below `16 eps(t)` is an error |
+| Every solver call is counted | 09 | `err_fzero_recursion_limit`, `err_fminsearch_recursion_limit`, `err_integral_recursion_limit`, `err_ode45_recursion_limit` | Through `Interp::call_nested`, so a function that calls a solver on itself meets the recursion limit, a clean error |
 
 ## Output and formatting
 

@@ -856,10 +856,6 @@ pub fn nonsquare_trace() -> MError {
     MError::new("Matrix must be square for 'trace'.")
 }
 
-pub fn sort_vectors_only() -> MError {
-    MError::new("'sort' currently supports vectors only.")
-}
-
 pub fn dot_size_mismatch() -> MError {
     ab_size_mismatch("dot")
 }
@@ -998,6 +994,233 @@ pub fn toc_without_tic() -> MError {
 
 pub fn eps_class() -> MError {
     MError::new("Only 'double' is supported as a class name for 'eps'.")
+}
+
+// ---- numerics (cycle 09) ---------------------------------------------
+//
+// SplatCrab's own wording throughout, as the spec asks where no source
+// settles MATLAB's, except `fzero_endpoints`, whose sentence is MATLAB's as
+// recalled and not confirmed against a MathWorks source.
+
+/// `roots` of a polynomial with a complex pair of roots, `roots([1 0 1])`,
+/// until cycle 10. Opens with the sentence every complex refusal shares.
+pub fn complex_roots() -> MError {
+    MError::new(
+        "Complex results are not supported. \
+         The polynomial has complex roots.",
+    )
+}
+
+/// An argument that must be a vector (or empty): `polyval([1 2; 3 4], 1)`.
+pub fn arg_not_a_vector(pos: usize, name: &str) -> MError {
+    MError::new(format!("Argument {} to '{}' must be a vector.", pos, name))
+}
+
+/// `polyfit(x, y, n)`, `interp1(x, v, xq)` and `trapz(x, y)` with a different
+/// number of sample points and values.
+pub fn sample_length(name: &str) -> MError {
+    MError::new(format!(
+        "The sample points and the values for '{}' must have the same length.",
+        name
+    ))
+}
+
+/// A degree, an order, a count or an element that must be a non-negative
+/// integer: `polyfit(x, y, 1.5)`, `diff(x, -1)`, `factorial(2.5)`,
+/// `isprime(-3)`, `nchoosek(4.5, 2)`.
+pub fn arg_nonneg_int(pos: usize, name: &str) -> MError {
+    MError::new(format!(
+        "Argument {} to '{}' must be a non-negative integer.",
+        pos, name
+    ))
+}
+
+/// `gcd(2.5, 5)`, `lcm(4, NaN)`: elements that must be integers.
+pub fn arg_integers(pos: usize, name: &str) -> MError {
+    MError::new(format!(
+        "Argument {} to '{}' must hold integers.",
+        pos, name
+    ))
+}
+
+/// `nchoosek(3, 5)`.
+pub fn nchoosek_k() -> MError {
+    MError::new("K must be an integer between 0 and N for 'nchoosek'.")
+}
+
+/// `filter(1, [0 1], x)` and `deconv(b, [0 1])`: a leading coefficient
+/// that is zero, or no coefficient at all.
+pub fn leading_zero(name: &str) -> MError {
+    MError::new(format!(
+        "The first coefficient of the denominator for '{}' must be non-zero.",
+        name
+    ))
+}
+
+/// `conv(u, v, 'middle')`.
+pub fn conv_shape() -> MError {
+    MError::new("Shape for 'conv' must be 'full', 'same' or 'valid'.")
+}
+
+/// `interp1(x, v, xq, 'spline')`: a method this cycle does not provide.
+pub fn interp_method() -> MError {
+    MError::new("Method for 'interp1' must be 'linear', 'nearest', 'previous' or 'next'.")
+}
+
+/// `interp1(x, v, xq, 'linear', 'x')`.
+pub fn interp_extrap() -> MError {
+    MError::new("Extrapolation for 'interp1' must be 'extrap' or a scalar.")
+}
+
+/// `interp1([1 1 2], v, xq)`, a `NaN` sample point, or fewer than two.
+pub fn interp_points() -> MError {
+    MError::new(
+        "The sample points for 'interp1' must be at least two distinct values, none of them NaN.",
+    )
+}
+
+/// `histc(x, [3 1 2])`.
+pub fn histc_edges() -> MError {
+    MError::new("Edges for 'histc' must be monotonically non-decreasing, with no NaN.")
+}
+
+/// `std(x, 2)`: a weight other than `0`, `1` or `[]`.
+pub fn std_weight(name: &str) -> MError {
+    MError::new(format!("Weight for '{}' must be 0 or 1.", name))
+}
+
+/// `unique({1, 'a'})`: a cell holding anything but character vectors.
+pub fn set_cell_contents(name: &str) -> MError {
+    MError::new(format!(
+        "Cell arrays for '{}' must hold character vectors only.",
+        name
+    ))
+}
+
+/// `ismember(1, {'a'})`: a cell of character vectors with a numeric array.
+pub fn set_mixed(name: &str) -> MError {
+    MError::new(format!(
+        "A cell array of character vectors for '{}' can be combined only with another one or with a character vector.",
+        name
+    ))
+}
+
+/// `unique(x, 'rows')` or any other option the set functions do not take.
+pub fn set_option(name: &str) -> MError {
+    MError::new(format!(
+        "Option for '{}' must be 'sorted' or 'stable'.",
+        name
+    ))
+}
+
+/// A solver's function that returned the wrong kind of value: `what` says
+/// what it should have returned.
+/// A solver's function returned something other than one real number.
+pub fn solver_not_scalar(name: &str) -> MError {
+    solver_output(name, "a real scalar")
+}
+
+/// `integral`'s function returned fewer or more values than points: it was
+/// written with `*` where it needed `.*`.
+pub fn integral_not_elementwise() -> MError {
+    solver_output(
+        "integral",
+        "a value for every point of its input; write it with element-wise operators such as .* and ./",
+    )
+}
+
+/// `ode45`'s function returned a vector of the wrong length.
+pub fn ode_value_length() -> MError {
+    solver_output("ode45", "a vector with one element per component of y0")
+}
+
+fn solver_output(name: &str, what: &str) -> MError {
+    MError::new(format!(
+        "The function passed to '{}' must return {}.",
+        name, what
+    ))
+}
+
+/// A solver's function that returned `NaN` (or, where a value must be
+/// finite, `Inf`).
+pub fn solver_nonfinite(name: &str) -> MError {
+    MError::new(format!(
+        "The function passed to '{}' returned NaN or Inf.",
+        name
+    ))
+}
+
+/// `fzero(f, x0)` whose search for an interval found no sign change before
+/// the function or the interval stopped being finite, or before its cap.
+pub fn fzero_no_sign_change() -> MError {
+    MError::new("'fzero' found no sign change of the function in its search for an interval.")
+}
+
+/// `fzero(f, [a b])` where `f(a)` and `f(b)` have the same sign.
+/// SplatCrab's own text: the wording follows MATLAB's as recalled, which no
+/// MathWorks source here confirms (cycle 09's review).
+pub fn fzero_endpoints() -> MError {
+    MError::new("The function values at the interval endpoints must differ in sign.")
+}
+
+/// `fzero(f, [1 2 3])`.
+pub fn fzero_start() -> MError {
+    MError::new("The starting point for 'fzero' must be a scalar or a two-element interval.")
+}
+
+/// `integral` that reached its subinterval cap, or subintervals too narrow
+/// to split, without meeting its tolerance: a divergent or singular
+/// integral, `integral(@(x) 1 ./ x, 0, 1)`.
+pub fn integral_limit(max: usize) -> MError {
+    MError::new(format!(
+        "'integral' reached its limit of {} subintervals without meeting the tolerance; the integral may not exist.",
+        max
+    ))
+}
+
+/// `ode45` past its step cap.
+pub fn ode_step_limit(max: usize) -> MError {
+    MError::new(format!(
+        "'ode45' reached its limit of {} steps before the end of the time span.",
+        max
+    ))
+}
+
+/// `ode45` whose step fell below `16 * eps(t)`. `t` arrives rendered.
+pub fn ode_min_step(t: &str) -> MError {
+    MError::new(format!(
+        "'ode45' cannot meet the tolerances without a step below the smallest allowed, at t = {}.",
+        t
+    ))
+}
+
+/// `ode45(f, [0 0], y0)`, `ode45(f, [0 2 1], y0)`, `ode45(f, 1, y0)`.
+pub fn ode_tspan() -> MError {
+    MError::new(
+        "The time span for 'ode45' must be a vector of at least two distinct, monotonic, finite times.",
+    )
+}
+
+/// A name-value option a builtin does not know: `odeset('Foo', 1)`,
+/// `integral(f, 0, 1, 'Waypoints', 1)`.
+pub fn unrecognized_option(opt: &str, name: &str) -> MError {
+    MError::new(format!("Unrecognized option '{}' for '{}'.", opt, name))
+}
+
+/// `odeset('RelTol')`: an option name with no value after it.
+pub fn option_pairs(name: &str) -> MError {
+    MError::new(format!("Options for '{}' must be name-value pairs.", name))
+}
+
+/// `odeset('RelTol', -1)`, `integral(f, 0, 1, 'AbsTol', 'x')`: a
+/// tolerance that is negative or not a real number, a step or a refinement
+/// that is not positive, a refinement that is not an integer, or an
+/// `AbsTol` with neither one value nor one per component.
+pub fn option_value(opt: &str, name: &str) -> MError {
+    MError::new(format!(
+        "The value of option '{}' for '{}' is not valid.",
+        opt, name
+    ))
 }
 
 // ---- protocol --------------------------------------------------------
@@ -1203,7 +1426,7 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 14] = [
+        const FILES: [(&str, &str); 17] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
@@ -1218,6 +1441,9 @@ mod tests {
             ("builtins/core.rs", include_str!("builtins/core.rs")),
             ("builtins/math.rs", include_str!("builtins/math.rs")),
             ("builtins/linalg.rs", include_str!("builtins/linalg.rs")),
+            ("builtins/numerics.rs", include_str!("builtins/numerics.rs")),
+            ("builtins/sets.rs", include_str!("builtins/sets.rs")),
+            ("builtins/solvers.rs", include_str!("builtins/solvers.rs")),
         ];
         // Anything whose argument becomes the error value.
         const MAKERS: [&str; 5] = ["Err(", "ok_or(", "ok_or_else(||", "map_err(|e|", "bail!("];

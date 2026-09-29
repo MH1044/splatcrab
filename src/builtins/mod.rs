@@ -21,6 +21,9 @@ pub mod core;
 pub mod factor;
 pub mod linalg;
 pub mod math;
+pub mod numerics;
+pub mod sets;
+pub mod solvers;
 
 use std::collections::HashMap;
 
@@ -47,6 +50,9 @@ pub fn registry() -> Registry {
     cells::register(&mut r);
     math::register(&mut r);
     linalg::register(&mut r);
+    numerics::register(&mut r);
+    sets::register(&mut r);
+    solvers::register(&mut r);
     r
 }
 
@@ -95,7 +101,12 @@ mod tests {
     /// `str2func`. Cycle 07 added thirteen: `cell`, `struct`,
     /// `fieldnames`, `isfield`, `rmfield`, `getfield`, `setfield`,
     /// `iscell`, `isstruct`, `cellfun`, `num2cell`, `cell2mat` and `deal`.
-    const EXPECTED: usize = 130;
+    /// Cycle 08 added fifteen: `lu`, `qr`, `chol`, `eig`, `svd`, `rank`,
+    /// `pinv`, `null`, `orth`, `cond`, `kron`, `cross`, `triu`, `tril` and
+    /// `magic`. Cycle 09 added thirty-three: the polynomials, samples,
+    /// statistics, number theory, grids and counts of `numerics.rs`, the
+    /// five set functions of `sets.rs` and the five solvers of `solvers.rs`.
+    const EXPECTED: usize = 163;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -219,6 +230,39 @@ mod tests {
             "num2cell",
             "cell2mat",
             "deal",
+            "polyfit",
+            "polyval",
+            "roots",
+            "conv",
+            "deconv",
+            "filter",
+            "interp1",
+            "trapz",
+            "cumtrapz",
+            "diff",
+            "std",
+            "var",
+            "median",
+            "mode",
+            "factorial",
+            "nchoosek",
+            "primes",
+            "isprime",
+            "gcd",
+            "lcm",
+            "logspace",
+            "meshgrid",
+            "histc",
+            "unique",
+            "ismember",
+            "setdiff",
+            "intersect",
+            "union",
+            "fzero",
+            "fminsearch",
+            "integral",
+            "ode45",
+            "odeset",
         ] {
             assert!(r.contains_key(name), "'{name}' is missing");
         }

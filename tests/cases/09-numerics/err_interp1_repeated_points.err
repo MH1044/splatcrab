@@ -1,0 +1,1 @@
+Error: Line 3: The sample points for 'interp1' must be at least two distinct values, none of them NaN.

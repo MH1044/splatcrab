@@ -120,7 +120,7 @@ gets exactly these bytes on stdout, and the exit code is 0:
 {"id":2,"ok":false,"out":"     6\n","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":2}}
 {"id":3,"ok":true,"complete":false}
 {"id":4,"ok":true,"vars":[{"name":"x","size":[1,1],"class":"double"}]}
-{"id":5,"ok":true,"items":["diag","disp"]}
+{"id":5,"ok":true,"items":["diag","diff","disp"]}
 {"id":6,"ok":false,"error":{"message":"Unknown operation 'fly'.","line":null}}
 ```
 
@@ -2434,7 +2434,7 @@ supported in this context.` Define functions in a script or a function file.
 
 ## Builtins
 
-102 names, each an ordinary function registered by name. Every one rejects
+163 names, each an ordinary function registered by name. Every one rejects
 arguments it does not understand with `Too many input arguments.` rather than
 ignoring them. A builtin that produces no value (`disp`, `fprintf`, `clc`,
 `clear`, `who`, bare `tic`, bare `toc`) is legal as a statement and is
@@ -3258,7 +3258,7 @@ b =
 
 ### Search and sort
 
-`find sort`. `sort` is vectors only until cycle 09.
+`find sort`. Since cycle 09 `sort` takes a matrix too.
 
 ```matlab
 x = [0 3 0 7 5];
@@ -3283,12 +3283,352 @@ c =
 
 ```
 
+A matrix is sorted column by column, each column on its own, or row by row
+with `sort(A, 2)`. The second output is each column's (or row's)
+permutation, so `s(:, j)` is `A(i(:, j), j)`. `NaN` placement, stability and
+the class rules are the vector's.
+
 ```matlab
-s = sort([3 1; 2 4]);
+A = [3 1; 2 4];
+a = sort(A)
+b = sort(A, 2, 'descend')
+[s, i] = sort(A);
+i
 ```
 
 ```
-Error: Line 1: 'sort' currently supports vectors only.
+a =
+
+     2     1
+     3     4
+
+b =
+
+     3     1
+     4     2
+
+i =
+
+     2     1
+     1     2
+
+```
+
+### Polynomials
+
+`polyfit polyval roots conv deconv` (cycle 09). A polynomial is a row of
+coefficients, highest power first. `polyfit` solves its Vandermonde system
+by the column-pivoted QR of `\`; `roots` takes the eigenvalues of the
+companion matrix, as MATLAB's does, so their order is the eigensolver's and
+a script that needs an order sorts them. `[q, r] = deconv(b, a)` divides,
+with `b = conv(a, q) + r`.
+
+```matlab
+p = polyfit([0 1 2 3], [1 3 5 7], 1);
+fprintf('%.4f ', p); fprintf('\n');
+r = sort(roots([1 -6 11 -6]));
+fprintf('%.4f ', r); fprintf('\n');
+a = polyval([1 0 -1], [2 3])
+c = conv([1 2], [1 3])
+[q, rem] = deconv([1 5 7], [1 2])
+```
+
+```
+2.0000 1.0000
+1.0000 2.0000 3.0000
+a =
+
+     3     8
+
+c =
+
+     1     5     6
+
+q =
+
+     1     3
+
+rem =
+
+     0     0     1
+
+```
+
+A polynomial with complex roots is refused until cycle 10 brings complex
+numbers, with the sentence every complex refusal opens with. So is a real
+root of multiplicity three or more, which the eigensolver finds as a
+complex pair a rounding error apart, as MATLAB's does:
+
+```matlab
+roots([1 0 1])
+```
+
+```
+Error: Line 1: Complex results are not supported. The polynomial has complex roots.
+```
+
+### Samples
+
+`interp1 trapz cumtrapz diff filter` (cycle 09). `interp1(x, v, xq)`
+interpolates linearly by default, or with `'nearest'`, `'previous'` or
+`'next'`; a query outside the sample points is `NaN` unless `'extrap'` or a
+value follows the method. `trapz` and `cumtrapz` integrate by the
+trapezoidal rule, with unit spacing or the sample points given first.
+`diff(X, n)` differences `n` times. `filter(b, a, x)` applies the
+difference equation with `a(1)` normalising. Each works down the columns of
+a matrix, and all but `interp1` and `filter` take a dimension.
+
+```matlab
+a = interp1([1 2 3], [10 20 30], [1.5 2.5 4])
+b = interp1([1 2 3], [10 20 30], 2.4, 'nearest')
+c = interp1([1 2 3], [10 20 30], 4, 'linear', 'extrap')
+d = trapz([0 1 2], [0 1 4])
+e = cumtrapz([1 2 3])
+f = diff([1 4 9 16], 2)
+g = filter(1, [1 -0.5], [1 0 0 0])
+```
+
+```
+a =
+
+    15    25   NaN
+
+b =
+
+    20
+
+c =
+
+    40
+
+d =
+
+     3
+
+e =
+
+         0    1.5000    4.0000
+
+f =
+
+     2     2
+
+g =
+
+    1.0000    0.5000    0.2500    0.1250
+
+```
+
+### Statistics and number theory
+
+`std var median mode factorial nchoosek primes isprime gcd lcm` (cycle 09).
+`std` and `var` normalise by `N - 1`, or by `N` with a weight of `1`
+second. `median` of anything holding a `NaN` is `NaN`; `mode` ignores `NaN`
+and gives the smallest of a tie. All four work down the columns of a
+matrix and take a dimension. `nchoosek(v, k)` of a vector lists the
+combinations, one per row.
+
+```matlab
+x = [2 4 4 4 5 5 7 9];
+fprintf('%.4f %.4f\n', std(x), var(x, 1));
+a = median(x)
+b = mode(x)
+c = median([1 3; 2 8])
+d = factorial(5)
+e = nchoosek(5, 2)
+f = nchoosek([1 2 3], 2)
+g = primes(20)
+h = isprime([2 9 11])
+k = [gcd(12, 18), lcm(4, 6)]
+```
+
+```
+2.1381 4.0000
+a =
+
+    4.5000
+
+b =
+
+     4
+
+c =
+
+    1.5000    5.5000
+
+d =
+
+   120
+
+e =
+
+    10
+
+f =
+
+     1     2
+     1     3
+     2     3
+
+g =
+
+     2     3     5     7    11    13    17    19
+
+h =
+
+  1×3 logical array
+
+   1   0   1
+
+k =
+
+     6    12
+
+```
+
+### Sets
+
+`unique ismember setdiff intersect union` (cycle 09), over arrays and over
+cells of character vectors, which sort by character code as `sort` sorts
+chars. A result is sorted, or in the order of first occurrence with
+`'stable'`; it is a row when the inputs are rows. `[C, ia, ic] = unique(A)`
+gives each value's first position and every element's place in `C`, and
+`[tf, loc] = ismember(A, S)` the lowest position in `S`. A character
+vector beside a cell is one word.
+
+```matlab
+[u, ia] = unique([3 1 2 1])
+[tf, loc] = ismember([2 5], [1 2 3])
+names = unique({'bob', 'al', 'bob'})
+d = setdiff({'a', 'b', 'c'}, {'b'})
+i = intersect([5 1 3], [3 4 5])
+w = union([3 1], [2 1])
+```
+
+```
+u =
+
+     1     2     3
+
+ia =
+
+     2
+     3
+     1
+
+tf =
+
+  1×2 logical array
+
+   1   0
+
+loc =
+
+     2     0
+
+names =
+
+  1×2 cell array
+
+    {'al'}    {'bob'}
+
+d =
+
+  1×2 cell array
+
+    {'a'}    {'c'}
+
+i =
+
+     3     5
+
+w =
+
+     1     2     3
+
+```
+
+### Grids and counts
+
+`logspace meshgrid histc` (cycle 09). `histc(x, edges)` counts
+`edges(k) <= x < edges(k+1)`, the last bin `x == edges(end)`.
+
+```matlab
+v = logspace(0, 2, 3)
+[X, Y] = meshgrid(1:3, 1:2)
+n = histc([1 2 2 3 5], [1 2 3 4])
+```
+
+```
+v =
+
+     1    10   100
+
+X =
+
+     1     2     3
+     1     2     3
+
+Y =
+
+     1     1     1
+     2     2     2
+
+n =
+
+     1     2     1     0
+
+```
+
+### Solvers
+
+`fzero fminsearch integral ode45 odeset` (cycle 09). Each takes a function
+handle (or a function's name) and calls it through the interpreter, so it
+may be anonymous, local or on the path, and may call a solver itself.
+`fzero(f, x0)` searches outward from `x0` for a sign change and then runs
+Brent's method; `fzero(f, [a b])` starts from the bracket. `fminsearch` is
+Nelder-Mead. `integral` is adaptive Gauss-Kronrod quadrature with
+MATLAB's tolerances, and takes infinite limits; its function is called
+with a row of points, so write it with `.*`, `./` and `.^`. `ode45` is the
+Dormand-Prince pair with `odeset`'s `RelTol`, `AbsTol`, `MaxStep`,
+`InitialStep` and `Refine`, and gives `[t, y]` with one row of `y` per time.
+
+A solver stops at a tolerance, so its last digits are roundoff: print a
+few places, or compare against the tolerance, as these do.
+
+```matlab
+fprintf('%.6f\n', fzero(@(x) x^2 - 2, 1));
+fprintf('%.6f\n', fzero(@(x) cos(x) - x, [0 1]));
+x = fminsearch(@(x) (x(1) - 1)^2 + (x(2) - 2)^2, [0 0]);
+disp(norm(x - [1 2]) < 1e-3)
+fprintf('%.4f\n', integral(@(x) x.^2, 0, 1));
+fprintf('%.4f\n', integral(@(x) exp(-x.^2), -Inf, Inf));
+opts = odeset('RelTol', 1e-6);
+[t, y] = ode45(@(t, y) [y(2); -y(1)], [0 pi], [0; 1], opts);
+disp(abs(y(end, 1)) < 1e-4)
+```
+
+```
+1.414214
+0.739085
+   1
+0.3333
+1.7725
+   1
+```
+
+Every solver has a cap, and meeting it is a clean error rather than a hang
+or a `NaN` handed back as an answer: `fzero` with no sign change to find,
+`fminsearch` past `200 * numel(x0)` iterations or evaluations, `integral`
+past 650 subintervals, and `ode45` past 50,000 steps or below its smallest
+step. MATLAB warns and returns a value in some of these cases.
+
+```matlab
+integral(@(x) 1 ./ x, 0, 1)
+```
+
+```
+Error: Line 1: 'integral' reached its limit of 650 subintervals without meeting the tolerance; the integral may not exist.
 ```
 
 ### Multiple return values
@@ -4662,7 +5002,15 @@ Error: Line 2: 'break' is only valid inside a loop.
 
 ### Builtin behaviour
 
-`sort` takes vectors only (cycle 09). A system that is singular only to
+The numerics of cycle 09 differ in a few recorded ways: a solver that
+fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent
+`integral`, an `ode45` below its smallest step) is an error, where MATLAB
+warns and returns what it has; `polyfit` with fewer distinct points than
+coefficients warns with the rank-deficient text of `\`; and `ode45` asked
+for one output gives a struct with `solver`, `x` and `y` only. The Design
+notes of `docs/modules/09-numerics.md` list every choice.
+
+A system that is singular only to
 working precision warns with MATLAB's "singular" text, where MATLAB's is "close
 to singular or badly scaled" with an `RCOND`, and a rank-deficient
 least-squares system warns with SplatCrab's own text. `eig`, `svd` and the
@@ -4751,7 +5099,6 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| Matrix `sort`, and `[s, i] = sort(...)` of a matrix | 09 |
 | Complex numbers, `1i`, `real`, `imag`, `abs` of a complex | 10 |
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
 | `fprintf(fid, ...)`, `nbytes = fprintf(...)`, string functions | 11 |

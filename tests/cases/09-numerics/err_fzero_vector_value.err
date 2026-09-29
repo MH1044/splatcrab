@@ -1,0 +1,1 @@
+Error: Line 3: The function passed to 'fzero' must return a real scalar.

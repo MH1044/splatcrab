@@ -1,0 +1,1 @@
+Error: Line 3: A cell array of character vectors for 'ismember' can be combined only with another one or with a character vector.

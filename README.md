@@ -27,7 +27,9 @@ SplatCrab is early software (version 0.1.0). The core language works:
 matrices, the double, logical and char classes, indexing, control flow with
 `switch` and `try`/`catch`, command syntax, user functions in scripts and in
 function files on a path, function handles and anonymous functions, cell
-arrays and structs, linear algebra, formatted output and 130 builtins.
+arrays and structs, linear algebra, numerics (polynomials, interpolation,
+statistics, sets, root finding, minimisation, quadrature and ODEs), formatted
+output and 163 builtins.
 Complex numbers and
 plotting are not there yet. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
@@ -190,7 +192,7 @@ z
   `x(i) = []`, `A(:, j) = []` and `A(i, :) = []` follows MATLAB's shape
   rules. A failed indexed assignment leaves its variable untouched
 - Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
-  `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(v)`,
+  `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(A)`,
   `[r, c] = size(A)` and `[r, c, v] = find(X)`. On a matrix, `c{1}`, `s.a`
   and `s.(n)` are MATLAB's clean errors
 - Cell arrays: `{1, 'two'; [3 4], {5}}` literals, brace and paren indexing,
@@ -250,7 +252,20 @@ z
   `norm(A, 1)`, `norm(A, Inf)` and `norm(A, 'fro')`. Every iteration has a cap
   and a `NaN` or `Inf` never makes one hang. Also `kron`, `cross`, `triu`,
   `tril` and `magic`
-- 130 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- Numerics: `polyfit`, `polyval`, `roots` (real roots; complex ones are a
+  clean refusal until cycle 10), `conv`, `deconv` and `filter`;
+  `interp1` (linear, nearest, previous, next), `trapz`, `cumtrapz` and
+  `diff`; `std`, `var`, `median` and `mode`, column by column on a matrix;
+  `factorial`, `nchoosek`, `primes`, `isprime`, `gcd` and `lcm`; `logspace`,
+  `meshgrid` and `histc`; and the set functions `unique`, `ismember`,
+  `setdiff`, `intersect` and `union`, on arrays and on cells of character
+  vectors. `sort` sorts a matrix column by column, or along `dim`
+- Solvers that call your function: `fzero` (a sign change, then Brent's
+  method), `fminsearch` (Nelder-Mead), `integral` (adaptive Gauss-Kronrod,
+  infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
+  Each call is counted against the nesting limit, so a solver can call a
+  solver, and each has a cap, so no function can make one hang
+- 163 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -313,7 +328,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 130 builtins,
+                                         builtins/    the 163 builtins,
                                                       behind a registry
 
                             error.rs: MError, and every message text

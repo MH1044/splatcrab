@@ -1,0 +1,1 @@
+Error: Line 3: Shape for 'conv' must be 'full', 'same' or 'valid'.
