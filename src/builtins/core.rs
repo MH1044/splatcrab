@@ -61,9 +61,9 @@ pub fn register(r: &mut Registry) {
 
     // ---- workspace ---------------------------------------------------
     add(r, "clear", clear, "clear, clear('a'), clear all - remove variables from the workspace.");
-    add(r, "clc", clc, "clc - clear the screen.");
-    add(r, "who", who, "who - list the variables in the workspace.");
-    add(r, "whos", who, "whos - list the workspace variables with their sizes.");
+    add(r, "clc", clc, "clc - clear the terminal; writes nothing when the output is not a terminal.");
+    add(r, "who", who, "who - list the names of the variables in the workspace.");
+    add(r, "whos", whos, "whos - list the workspace variables with their size, bytes and class.");
 
     // ---- functions and the path (cycle 05) ---------------------------
     add(r, "nargin", nargin, "nargin - how many arguments the running function was called with.");
@@ -405,7 +405,7 @@ fn double(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 fn disp(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "disp")?;
     need(args, 1, "disp")?;
-    let text = args[0].disp_text();
+    let text = it.disp_text(&args[0]);
     it.emit(&text)?;
     none()
 }
@@ -564,29 +564,129 @@ fn clear(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     none()
 }
 
+/// `clc` writes the terminal's clear only when standard output is a
+/// terminal (cycle 13): a script piped or redirected, `--protocol`, `--ui`,
+/// `--http-stdio` and `evalc` get nothing, since the escape bytes would be
+/// output rather than a clear.
 fn clc(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 0, "clc")?;
-    it.emit("\x1B[2J\x1B[H")?;
+    if it.stdout_tty {
+        it.emit("\x1B[2J\x1B[H")?;
+    }
     none()
 }
 
-fn who(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(args, 0, "who")?;
+/// The running workspace's variable names, in byte order.
+fn sorted_names(it: &Interp) -> Vec<String> {
     let mut names: Vec<String> = it.vars().keys().cloned().collect();
     names.sort();
+    names
+}
+
+/// `who` (cycle 13): the names alone, after MATLAB's heading, as many to a
+/// line as fit in the display's width, two spaces apart. An empty
+/// workspace prints nothing.
+fn who(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 0, "who")?;
+    let names = sorted_names(it);
     if names.is_empty() {
         return none();
     }
+    it.emit(&who_text(&names))?;
+    none()
+}
+
+/// The text `who` prints for `names`.
+fn who_text(names: &[String]) -> String {
     let mut text = String::from("Your variables are:\n\n");
-    for n in &names {
-        let v = &it.vars()[n];
-        let (rows, cols) = v.dims();
-        let row = format!("  {:<12} {}x{} {}\n", n, rows, cols, v.class_name());
-        text.push_str(&row);
+    let mut line = String::new();
+    for n in names {
+        if !line.is_empty() && line.len() + 2 + n.len() > crate::value::TERM_WIDTH {
+            text.push_str(&line);
+            text.push('\n');
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push_str("  ");
+        }
+        line.push_str(n);
+    }
+    text.push_str(&line);
+    text.push_str("\n\n");
+    text
+}
+
+/// `whos` (cycle 13): one row per variable, in byte order, of its name,
+/// size, bytes and class. The layout is SplatCrab's own, the columns of
+/// the typed table `who` printed before cycle 13 with a bytes column added:
+/// two spaces, the names left-aligned to the widest and at least twelve
+/// wide, a space, the sizes right-aligned to the widest, the bytes
+/// right-aligned three past the widest, two spaces and the class, so
+/// `x = 1:3` is `  x            1x3   24  double`. There is no heading
+/// row. An empty workspace prints nothing.
+fn whos(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 0, "whos")?;
+    let rows: Vec<[String; 4]> = sorted_names(it)
+        .into_iter()
+        .map(|n| {
+            let v = &it.vars()[&n];
+            let (r, c) = v.dims();
+            [
+                n.clone(),
+                format!("{}x{}", r, c),
+                bytes(v).to_string(),
+                v.class_name().to_string(),
+            ]
+        })
+        .collect();
+    if rows.is_empty() {
+        return none();
+    }
+    it.emit(&whos_text(&rows))?;
+    none()
+}
+
+/// The table `whos` prints for rows of name, size, bytes and class.
+fn whos_text(rows: &[[String; 4]]) -> String {
+    let width = |k: usize| rows.iter().map(|r| r[k].len()).max().unwrap_or(0);
+    let (wn, ws, wb) = (width(0).max(12), width(1), width(2) + 3);
+    let mut text = String::new();
+    for [name, size, bytes, class] in rows {
+        text.push_str(&format!(
+            "  {:<wn$} {:>ws$}{:>wb$}  {}\n",
+            name, size, bytes, class
+        ));
     }
     text.push('\n');
-    it.emit(&text)?;
-    none()
+    text
+}
+
+/// The bytes `whos` reports for a value (cycle 13): 8 for each element of
+/// a double, twice that when it is complex, 1 for each logical and 2 for
+/// each char; a cell or a struct is the sum of the values it holds, and a
+/// function handle or an `MException` holds no array and counts 0. A
+/// nested container is walked with a worklist rather than recursion, so no
+/// nesting depth can exhaust the stack.
+pub(crate) fn bytes(v: &Value) -> u64 {
+    let mut total = 0u64;
+    let mut pending = vec![v];
+    while let Some(v) = pending.pop() {
+        match v {
+            Value::Mat(m) => {
+                let per = match m.class {
+                    Class::Double if m.is_complex() => 16,
+                    Class::Double => 8,
+                    Class::Logical => 1,
+                    Class::Char => 2,
+                };
+                total = total.saturating_add(per * m.numel() as u64);
+            }
+            Value::Cell(c) => pending.extend(c.data.iter()),
+            Value::Struct(st) => pending.extend(st.elems.iter().flatten()),
+            Value::Func(_) | Value::Exception(_) => {}
+        }
+    }
+    total
 }
 
 // ---- functions and the path -----------------------------------------
@@ -1131,9 +1231,10 @@ mod tests {
         assert_eq!(class_name(inf, &[]), "double");
     }
 
-    /// `who` names each variable's class.
+    /// `who` is the names alone, and `whos` the table of size, bytes and
+    /// class (cycle 13).
     #[test]
-    fn who_shows_the_class_column() {
+    fn who_names_and_whos_bytes() {
         let buf = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         struct Shared(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
         impl std::io::Write for Shared {
@@ -1149,9 +1250,43 @@ mod tests {
         it.run("c = ['ab'; 'cd']; t = true(1, 3); x = 1;").unwrap();
         who(&mut it, &[], 0).unwrap();
         let out = String::from_utf8(buf.borrow().clone()).unwrap();
-        assert!(out.contains("  c            2x2 char\n"), "{out}");
-        assert!(out.contains("  t            1x3 logical\n"), "{out}");
-        assert!(out.contains("  x            1x1 double\n"), "{out}");
+        assert_eq!(out, "Your variables are:\n\nc  t  x\n\n");
+        buf.borrow_mut().clear();
+        whos(&mut it, &[], 0).unwrap();
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            out,
+            "  c            2x2   8  char\n  t            1x3   3  logical\n  x            1x1   8  double\n\n"
+        );
+        // The spec's example: 8 per double, 2 per char.
+        let rows = [
+            ["s".to_string(), "1x2".into(), "4".into(), "char".into()],
+            ["x".to_string(), "1x3".into(), "24".into(), "double".into()],
+        ];
+        assert_eq!(
+            whos_text(&rows),
+            "  s            1x2    4  char\n  x            1x3   24  double\n\n"
+        );
+        // Complex is twice a double; containers sum what they hold,
+        // nested ones included; a handle holds no array.
+        let z = Value::Mat(Matrix::complex_parts(1, 2, vec![1.0, 2.0], vec![1.0, 0.0]));
+        assert_eq!(bytes(&z), 32);
+        let inner = Value::cell(crate::value::CellArray::row(vec![
+            num(1.0),
+            Value::str("ab"),
+        ]));
+        let outer = Value::cell(crate::value::CellArray::row(vec![inner, z]));
+        assert_eq!(bytes(&outer), 8 + 4 + 32);
+        let st = Value::strukt(crate::value::StructArray::scalar(
+            vec!["a".into()],
+            vec![Value::Mat(Matrix::filled(2, 2, 0.0))],
+        ));
+        assert_eq!(bytes(&st), 32);
+        // A long list of names wraps at the display's width.
+        let names: Vec<String> = (0..30).map(|k| format!("name{k:02}")).collect();
+        let text = who_text(&names);
+        assert!(text.lines().all(|l| l.len() <= crate::value::TERM_WIDTH));
+        assert_eq!(text.lines().count(), 2 + 3 + 1);
     }
 
     /// `[r, c] = size(A)`, and the last output's product rule: outputs past

@@ -1,0 +1,18 @@
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 116
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":1,"ok":false,"out":"","error":{"message":"exit is not available here: the client ends the session.","line":1}}
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 35
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+Connection: close
+
+{"id":2,"ok":true,"out":"     2\n"}

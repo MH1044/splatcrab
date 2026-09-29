@@ -87,7 +87,7 @@ fn text_arg<'a>(args: &'a [Value], i: usize, name: &str) -> R<&'a [f64]> {
 
 /// A char matrix from rows of code units, the shorter ones padded on the
 /// right with spaces.
-fn char_rows(rows: &[Vec<f64>]) -> Matrix {
+pub(crate) fn char_rows(rows: &[Vec<f64>]) -> Matrix {
     let r = rows.len();
     let c = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut data = vec![32.0; r * c];

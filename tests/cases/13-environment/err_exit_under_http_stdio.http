@@ -1,0 +1,15 @@
+% covers: 13 - (--http-stdio, the transport --ui serves) exit is refused with the same text as under --protocol and the server answers the next request
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 37
+
+{"id":1,"op":"eval","code":"exit(2)"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 37
+
+{"id":2,"op":"eval","code":"disp(2)"}

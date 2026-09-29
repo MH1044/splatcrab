@@ -1,7 +1,10 @@
 //! SplatCrab: a small MATLAB-compatible interpreter.
 //!
-//!   splatcrab              start the REPL
+//!   splatcrab              start the REPL, with the line editor at a
+//!                          terminal (cycle 13, `term.rs`)
 //!   splatcrab script.m     run a script file
+//!   splatcrab --help       print the usage and exit 0
+//!   splatcrab --version    print `SplatCrab <version>` and exit 0
 //!   splatcrab --protocol   serve the evaluation protocol on stdin/stdout:
 //!                          one JSON request per line, one JSON response
 //!                          per line, one session (docs/modules/U0-ui-foundations.md)
@@ -16,10 +19,32 @@
 //!                          another, each response followed by a newline
 //!                          (docs/modules/U1-ui-server.md)
 
+mod term;
+
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use splatcrab::error::{self, MError};
-use splatcrab::{http, interp, protocol, server, syntax};
+use splatcrab::{env, http, interp, protocol, server, syntax};
+
+/// The version, from `Cargo.toml`.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// What `--help` prints.
+const USAGE: &str = "\
+Usage:
+  splatcrab                 start the REPL
+  splatcrab <script.m>      run a script file
+  splatcrab --protocol      serve the evaluation protocol on stdin and stdout
+                            (one JSON request per line, one response per line)
+  splatcrab --ui [--port N] [--no-browser] [--token T]
+                            serve the command window on 127.0.0.1 and open it
+  splatcrab --http-stdio --port N --token T
+                            answer HTTP requests read from stdin, as --ui would
+  splatcrab --help          print this text
+  splatcrab --version       print the version
+
+In the REPL, 'exit' or 'quit' ends the session, and exit(n) exits with code n.
+";
 
 /// The interpreter recurses through the precedence chain once per nesting
 /// level, in the parser and again in the evaluator, so a deeply nested
@@ -64,6 +89,17 @@ fn run() -> i32 {
     console_utf8();
     let args: Vec<String> = std::env::args().collect();
 
+    match args.get(1).map(String::as_str) {
+        Some("--help" | "-h") => {
+            print!("{}", USAGE);
+            return 0;
+        }
+        Some("--version" | "-V") => {
+            println!("SplatCrab {}", VERSION);
+            return 0;
+        }
+        _ => {}
+    }
     if args.get(1).is_some_and(|a| a == "--protocol") {
         // Exits 0 at end of input whatever the requests did, and writes
         // nothing to stderr: every failure a request can meet is an answer
@@ -88,6 +124,9 @@ fn run() -> i32 {
 
     // Output to stdout and warnings to stderr, for a script and the REPL.
     let mut it = interp::Interp::new();
+    // `clc` writes only to a terminal, and a bare `pause` waits only at one.
+    it.stdout_tty = io::stdout().is_terminal();
+    it.stdin_tty = io::stdin().is_terminal();
 
     if args.len() > 1 {
         let path = &args[1];
@@ -111,6 +150,10 @@ fn run() -> i32 {
         // longer returns normally, so nothing else will.
         let _ = it.out.flush();
         if let Err(e) = result {
+            // `exit(n)` ends the script with its code; it is not an error.
+            if let Some(code) = e.exit_code() {
+                return code;
+            }
             // `MError`'s Display supplies the `Line N: ` part when a line is
             // known, so the prefix is spelled in exactly one place. The
             // line is the script's own; the functions the error came out of
@@ -122,29 +165,56 @@ fn run() -> i32 {
         return 0;
     }
 
-    println!("SplatCrab 0.1.0  (type 'exit' to quit)\n");
+    println!("SplatCrab {}  (type 'exit' to quit)\n", VERSION);
     let stdin = io::stdin();
     // Figures are shown only to a person at a terminal (cycle 12).
     let interactive = stdin.is_terminal();
+    // The line editor, only when a person is at a terminal on both ends
+    // (cycle 13); anything piped reads plain lines exactly as before.
+    let mut editor = if interactive && io::stdout().is_terminal() {
+        term::LineReader::new()
+    } else {
+        None
+    };
     let mut buf = String::new();
     loop {
-        print!("{}", if buf.is_empty() { ">> " } else { "   " });
-        io::stdout().flush().ok();
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-        let trimmed = line.trim();
-        if buf.is_empty() && (trimmed == "exit" || trimmed == "quit") {
-            break;
-        }
+        let prompt = if buf.is_empty() { ">> " } else { "   " };
+        let line = match &mut editor {
+            Some(ed) => {
+                let mut complete =
+                    |p: &str| env::completions(p, it.vars(), it.builtins(), &it.path_dirs());
+                match ed.read_line(prompt, &mut complete) {
+                    term::Line::Text(t) => t + "\n",
+                    // Ctrl-C drops the whole unfinished entry.
+                    term::Line::Cleared => {
+                        buf.clear();
+                        continue;
+                    }
+                    term::Line::Eof => break,
+                }
+            }
+            None => {
+                print!("{}", prompt);
+                io::stdout().flush().ok();
+                let mut line = String::new();
+                match stdin.lock().read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => line,
+                }
+            }
+        };
         buf.push_str(&line);
         if !syntax::is_complete(&buf) {
             continue;
         }
-        // A command-line entry: a `function` block is refused.
+        // A command-line entry: a `function` block is refused. `exit` and
+        // `quit` are statements since cycle 13, wherever they are in the
+        // entry, and `exit(n)` ends the session with code `n`.
         if let Err(e) = it.run_command(&buf) {
+            if let Some(code) = e.exit_code() {
+                let _ = it.out.flush();
+                return code;
+            }
             report(&mut it, &e);
         }
         if interactive {

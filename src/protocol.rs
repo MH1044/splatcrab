@@ -104,7 +104,7 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
         }),
         "workspace" => Ok(workspace(it, id.clone())),
         "completions" => field(&req, "prefix").map(|prefix| {
-            let items = env::completions(prefix, it.vars(), it.builtins());
+            let items = env::completions(prefix, it.vars(), it.builtins(), &it.path_dirs());
             Json::object([
                 ("id", id.clone()),
                 ("ok", Json::Bool(true)),
@@ -474,14 +474,25 @@ mod tests {
         assert!(one("{\"op\":\"workspace\"}").starts_with("{\"id\":null,"));
     }
 
+    /// Cycle 13: `exit` and `quit` are statements now, and the session
+    /// belongs to the client, so they are a clean error in an `eval` and
+    /// the session answers the next request.
     #[test]
-    fn exit_is_not_special_in_an_eval() {
-        let got = one("{\"id\":1,\"op\":\"eval\",\"code\":\"exit\"}");
-        assert!(got.contains("\"ok\":false"), "{got}");
+    fn exit_is_refused_in_an_eval_and_the_session_goes_on() {
+        let lines = session(concat!(
+            "{\"id\":1,\"op\":\"eval\",\"code\":\"exit\"}\n",
+            "{\"id\":2,\"op\":\"eval\",\"code\":\"try, quit(2), catch e, disp(1), end\"}\n",
+            "{\"id\":3,\"op\":\"eval\",\"code\":\"disp(3)\"}\n",
+        ));
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].contains("\"ok\":false"), "{}", lines[0]);
         assert!(
-            got.contains("Unrecognized function or variable 'exit'."),
-            "{got}"
+            lines[0].contains("exit is not available here: the client ends the session."),
+            "{}",
+            lines[0]
         );
+        assert_eq!(lines[1], "{\"id\":2,\"ok\":true,\"out\":\"     1\\n\"}");
+        assert_eq!(lines[2], "{\"id\":3,\"ok\":true,\"out\":\"     3\\n\"}");
     }
 
     /// Every response is flushed before the next request is read, so a client

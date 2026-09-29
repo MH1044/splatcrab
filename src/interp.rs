@@ -16,7 +16,9 @@ use crate::parser::{
     Access, AnonFn, BinOp, CaseArm, Expr, Function, LValue, Located, MAX_DEPTH, Parser, Program,
     Stmt,
 };
-use crate::value::{CellArray, Class, Func, Matrix, StructArray, Value, blank, nonfinite};
+use crate::value::{
+    CellArray, Class, Format, Func, Matrix, StructArray, Value, blank, nonfinite, with_format,
+};
 
 /// Every fallible path in the interpreter returns this. It lives in
 /// `error.rs`; the re-export is what let cycle 01b swap `String` for `MError`
@@ -122,8 +124,10 @@ pub struct Interp {
     /// How many user calls are running: the recursion count.
     calls: usize,
     /// The directory every path lookup resolves against: function files,
-    /// `addpath` and `rmpath`. Seeded from the process's working directory
-    /// and never read from `std::env` again; cycle 13's `cd` changes it.
+    /// `addpath` and `rmpath`, every file builtin, `ls`, `dir` and
+    /// `system`. Seeded from the process's working directory and never read
+    /// from `std::env` again; `cd` changes it through [`Interp::set_cwd`]
+    /// (cycle 13), and nothing ever changes the process's own.
     pub cwd: PathBuf,
     /// The folders `addpath` added, first searched first. The current
     /// folder is searched before all of them.
@@ -174,6 +178,18 @@ pub struct Interp {
     /// `plot::figure`. Read from outside through [`Interp::figure_svg`] and
     /// [`Interp::figure_numbers`].
     pub(crate) figures: crate::plot::figure::Figures,
+    /// The numeric display format, `format short` or `format long` (cycle
+    /// 13). Every display the interpreter writes is made in it.
+    pub(crate) format: Format,
+    /// True when standard output is a terminal a person reads: what `clc`
+    /// needs before it writes the terminal's clear (cycle 13). `main.rs`
+    /// sets it for a script and the REPL; it is false everywhere else,
+    /// under `--protocol`, `--ui` and `--http-stdio` and inside `evalc`.
+    pub stdout_tty: bool,
+    /// True when standard input is a terminal a person types at: what a
+    /// bare `pause` needs before it waits for a key (cycle 13). Set by
+    /// `main.rs` as `stdout_tty` is.
+    pub stdin_tty: bool,
 }
 
 /// Where [`Interp::input`] reads from.
@@ -382,6 +398,9 @@ impl Interp {
             input: InputSource::Stdin,
             open_files: crate::builtins::io::FileTable::default(),
             figures: crate::plot::figure::Figures::default(),
+            format: Format::Short,
+            stdout_tty: false,
+            stdin_tty: false,
         }
     }
 
@@ -605,7 +624,9 @@ impl Interp {
         self.generation += 1;
         let result = self.run_entry(src, functions);
         if let Err(e) = &result {
-            self.last_err = e.msg.clone();
+            if e.exit_code().is_none() {
+                self.last_err = e.msg.clone();
+            }
         }
         result
     }
@@ -629,6 +650,111 @@ impl Interp {
         self.frames[0].unit = base;
         // A `return` at the top ends the script, which is all it can do.
         result.map(|_| ())
+    }
+
+    // ---- the environment (cycle 13) ------------------------------------
+
+    /// `v` displayed under `name` in the current `format`.
+    pub(crate) fn display(&self, v: &Value, name: &str) -> String {
+        with_format(self.format, || v.display(name))
+    }
+
+    /// What `disp(v)` prints, in the current `format`.
+    pub(crate) fn disp_text(&self, v: &Value) -> String {
+        with_format(self.format, || v.disp_text())
+    }
+
+    /// Moves the interpreter to `dir`, which must be a folder: what `cd`
+    /// does (cycle 13). `dir` is resolved against [`Interp::cwd`] and
+    /// normalised by its components, so `cd ..` goes up one folder and
+    /// `pwd` never shows a `..`; the process's own working directory is
+    /// never touched. Every cached file lookup is stale afterwards, since
+    /// the current folder is the first folder of the path.
+    pub(crate) fn set_cwd(&mut self, dir: &str) -> R<()> {
+        let target = normalize(&self.resolve_dir(dir));
+        if !target.is_dir() {
+            bail!(error::cd_not_a_folder(dir));
+        }
+        self.cwd = target;
+        self.generation += 1;
+        Ok(())
+    }
+
+    /// The folders a name is looked up in, in order: the current folder,
+    /// then the ones `addpath` added. What `env::completions` lists the
+    /// `.m` files of.
+    pub fn path_dirs(&self) -> Vec<PathBuf> {
+        std::iter::once(self.cwd.clone())
+            .chain(self.search_path.iter().cloned())
+            .collect()
+    }
+
+    /// `eval(text)` (cycle 13): `text` run in the running workspace. Asked
+    /// for no values, it runs as statements, so `eval('q = 1;')` assigns
+    /// and `eval('1+2')` displays `ans`; asked for values, it is one
+    /// expression, asked for that many. It counts one level of the nesting
+    /// budget every frame shares, and its text is parsed from the depth the
+    /// evaluator is at, so an `eval` inside an `eval` is bounded like any
+    /// other nesting. A `function` in the text is refused. An error carries
+    /// no line of its own, since the line would be the text's; the
+    /// statement that called `eval` records its own.
+    pub(crate) fn eval_code(&mut self, text: &str, nargout: usize) -> R<Vec<Value>> {
+        let depth = self.depth;
+        let loop_depth = std::mem::take(&mut self.loop_depth);
+        let result = self
+            .deepen()
+            .and_then(|()| self.eval_code_at(text, nargout));
+        self.depth = depth;
+        self.loop_depth = loop_depth;
+        result.map_err(|mut e| {
+            e.line = None;
+            e
+        })
+    }
+
+    fn eval_code_at(&mut self, text: &str, nargout: usize) -> R<Vec<Value>> {
+        let vars = self.vars();
+        let lexed = scan_known(text, &|name| vars.contains_key(name))?;
+        let mut parser = Parser::with_lines(lexed).at_depth(self.depth);
+        if nargout > 0 {
+            let e = parser.parse_whole_expr()?;
+            return Ok(self.eval_request(&e, nargout)?.0);
+        }
+        let prog = parser.parse_program()?;
+        if let Some(f) = prog.functions.first() {
+            bail!(error::function_not_supported_here().at(f.line));
+        }
+        // A `return` in the text ends the text, which is all it can do.
+        self.exec_block(&prog.stmts)?;
+        Ok(Vec::new())
+    }
+
+    /// `run(path)` (cycle 13): the script file at `path`, called `name`,
+    /// run in the caller's workspace as a script on the path runs, counted
+    /// against the nesting budget and the recursion limit. A function file
+    /// is called with no arguments. The interpreter moves to the file's
+    /// folder for the length of the run, so the script finds the files
+    /// beside it, and moves back however the run ends.
+    pub(crate) fn run_path(&mut self, path: &Path, name: &str) -> R<()> {
+        let unit = self.load(path, name)?;
+        let home = self.cwd.clone();
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            if normalize(dir) != home {
+                self.cwd = normalize(dir);
+                self.generation += 1;
+            }
+        }
+        let depth = self.depth;
+        let result = self.deepen().and_then(|()| match unit.entry.clone() {
+            Some(f) => self.call_user(unit, f, name, Vec::new(), 0).map(|_| ()),
+            None => self.run_script(unit, name, Vec::new(), 0).map(|_| ()),
+        });
+        self.depth = depth;
+        if self.cwd != home {
+            self.cwd = home;
+            self.generation += 1;
+        }
+        result
     }
 
     // ---- statements --------------------------------------------------
@@ -667,7 +793,8 @@ impl Interp {
                     for v in result {
                         self.vars_mut().insert("ans".to_string(), v.clone());
                         if *show {
-                            self.emit(&v.display("ans"))?;
+                            let shown = self.display(&v, "ans");
+                            self.emit(&shown)?;
                         }
                     }
                     return Ok(Flow::Normal);
@@ -681,7 +808,8 @@ impl Interp {
                         self.vars_mut().insert(name.clone(), v.clone());
                     }
                     if *show {
-                        self.emit(&v.display(&name))?;
+                        let shown = self.display(&v, &name);
+                        self.emit(&shown)?;
                     }
                 }
                 Ok(Flow::Normal)
@@ -790,6 +918,8 @@ impl Interp {
                     (self.depth, self.loop_depth, self.frame().end_stack.len());
                 match self.exec_block(body) {
                     Ok(flow) => Ok(flow),
+                    // `exit` is not an error, and no `catch` stops it.
+                    Err(e) if e.exit_code().is_some() => Err(e),
                     Err(e) => {
                         self.depth = depth;
                         self.loop_depth = loop_depth;
@@ -1408,8 +1538,9 @@ impl Interp {
 
     /// Shows a variable under its own name, after an assignment to it.
     fn show_var(&mut self, name: &str) -> R<()> {
+        let format = self.format;
         let shown = match self.vars().get(name) {
-            Some(v) => v.display(name),
+            Some(v) => with_format(format, || v.display(name)),
             None => return Ok(()),
         };
         self.emit(&shown)
@@ -2147,7 +2278,7 @@ impl Interp {
     /// outside the path. The answer is kept for the rest of the generation,
     /// which is what keeps a builtin call in a loop from asking the file
     /// system every time.
-    fn find_file(&mut self, name: &str) -> Option<PathBuf> {
+    pub(crate) fn find_file(&mut self, name: &str) -> Option<PathBuf> {
         if let Some((generation, found)) = self.lookups.get(name) {
             if *generation == self.generation {
                 return found.clone();
@@ -2291,6 +2422,29 @@ impl Interp {
 fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
     let meta = std::fs::metadata(path).ok()?;
     Some((meta.modified().ok()?, meta.len()))
+}
+
+/// `p` with its `.` components dropped and each `..` taking the component
+/// before it away, without asking the file system: `cd ..` goes up a
+/// folder, and `pwd` never shows a `..`. A `..` at the root stays there.
+pub(crate) fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// True when `p` is a file whose name is spelled exactly as asked.
@@ -5535,6 +5689,129 @@ mod tests {
         assert_eq!(both("warning('')"), "");
     }
 
+    /// Cycle 13: `format long` keeps every layout and writes fifteen
+    /// decimals; `format` alone and `format short` go back.
+    #[test]
+    fn format_long_display() {
+        assert_eq!(
+            ok_out("format long; disp(pi); format short; disp(pi)"),
+            "   3.141592653589793\n    3.1416\n"
+        );
+        assert_eq!(
+            ok_out("format long; x = -pi"),
+            "x =\n\n  -3.141592653589793\n\n"
+        );
+        assert_eq!(
+            ok_out("format long; disp([1 2.5])"),
+            "   1.000000000000000   2.500000000000000\n"
+        );
+        // Integers and logicals are untouched; the e format and the scale
+        // factor take fifteen decimals too.
+        assert_eq!(
+            ok_out("format long; disp([1 2]); disp(true)"),
+            "     1     2\n   1\n"
+        );
+        assert_eq!(
+            ok_out("format long; disp(12345.5)"),
+            "   1.234550000000000e+04\n"
+        );
+        assert_eq!(
+            ok_out("format long; disp([1e5 2.5])"),
+            "   1.0e+05 *\n\n   1.000000000000000   0.000025000000000\n"
+        );
+        assert_eq!(ok_out("format long; format; disp(pi)"), "    3.1416\n");
+        assert_eq!(ok_out("format LONG; disp(0.5)"), "   0.500000000000000\n");
+        assert_eq!(
+            err_msg("format loose"),
+            "Unsupported format 'loose'; SplatCrab has 'short' and 'long'."
+        );
+    }
+
+    /// Cycle 13: `exit` travels as an error no `try` catches, with its
+    /// code; `eval` and `evalc` run text in the workspace.
+    #[test]
+    fn exit_passes_every_frame_and_eval_runs_text() {
+        assert_eq!(err("disp(1)\nexit\ndisp(2)").exit_code(), Some(0));
+        assert_eq!(
+            err("try, exit(3), catch, disp(9), end").exit_code(),
+            Some(3)
+        );
+        assert_eq!(
+            err("for k = 1:3, if k == 2, quit(4), end, end").exit_code(),
+            Some(4)
+        );
+        assert_eq!(err("eval('exit(5)', 'disp(1)')").exit_code(), Some(5));
+        assert_eq!(err("exit force").exit_code(), Some(0));
+        for bad in ["exit(256)", "exit(-1)", "exit(1.5)", "exit('now')"] {
+            assert_eq!(err(bad).exit_code(), None, "{bad}");
+        }
+        assert_eq!(
+            err_msg("exit(1.5)"),
+            "The code exit exits with must be a whole number from 0 to 255."
+        );
+        assert_eq!(ok_out("eval('q = 6 * 7;'); disp(q)"), "    42\n");
+        assert_eq!(ok_out("v = eval('1 + 2'); disp(v)"), "     3\n");
+        assert_eq!(ok_out("eval('1 + 2')"), "ans =\n\n     3\n\n");
+        assert_eq!(ok_out("eval('error(''x'')', 'disp(lasterr)')"), "x\n");
+        assert_eq!(ok_out("s = evalc('disp(1)'); disp(numel(s))"), "     6\n");
+        assert_eq!(ok_out("s = evalc('x = 2'); disp(size(s, 1))"), "     1\n");
+        // An error inside carries no line of the text; the caller's
+        // statement records its own.
+        assert_eq!(err("x = 1;\neval('y = 1;\nnosuch')").line, Some(2));
+        assert_eq!(
+            err_msg("eval('function f, end')"),
+            "Function definitions are not supported in this context."
+        );
+        // A `break` in the text is not the loop's around the `eval`.
+        assert_eq!(
+            err_msg("for k = 1:2, eval('break'), end"),
+            "'break' is only valid inside a loop."
+        );
+    }
+
+    /// Cycle 13: `eval` counts against the nesting budget, from the depth
+    /// the evaluator is at, and leaves the depth where it found it.
+    #[test]
+    fn eval_goes_through_the_nesting_budget() {
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.depth = MAX_DEPTH;
+        assert_eq!(it.eval_code("1;", 0).unwrap_err().msg, TOO_DEEP);
+        assert_eq!(it.depth, MAX_DEPTH);
+        it.depth = MAX_DEPTH - 3;
+        assert_eq!(it.eval_code("((1));", 0).unwrap_err().msg, TOO_DEEP);
+        it.depth = 0;
+        assert!(it.eval_code("((1));", 0).is_ok());
+        assert_eq!(it.depth, 0);
+    }
+
+    /// Cycle 13: `cd` moves `Interp::cwd` and never the process, and a
+    /// file lookup follows it.
+    #[test]
+    fn cd_moves_the_interpreter_not_the_process() {
+        let dir = std::env::temp_dir().join(format!("splatcrab-cd-{}", std::process::id()));
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("inner.m"), "disp(7)\n").unwrap();
+        let process = std::env::current_dir().unwrap();
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.cwd = dir.clone();
+        assert_eq!(it.exist("inner"), 0.0);
+        it.set_cwd("sub").unwrap();
+        assert_eq!(it.cwd, sub);
+        assert_eq!(it.exist("inner"), 2.0);
+        it.set_cwd("..").unwrap();
+        assert_eq!(it.cwd, dir);
+        assert_eq!(
+            it.set_cwd("nope").unwrap_err().msg,
+            "Cannot CD to nope (Name is nonexistent or not a directory)."
+        );
+        assert_eq!(it.cwd, dir);
+        assert_eq!(std::env::current_dir().unwrap(), process);
+        assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(normalize(Path::new("/..")), PathBuf::from("/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn command_syntax_calls_the_name_with_char_arguments() {
         assert_eq!(ok_out("disp hello"), "hello\n");
@@ -5543,11 +5820,11 @@ mod tests {
         assert_eq!(ok_out("x = 3; x -1"), "ans =\n\n     2\n\n");
         assert_eq!(ok_out("class hello"), "ans =\n\n    'char'\n\n");
         assert_eq!(ok_out("class hello;"), "");
-        // `hold` is a builtin since cycle 12; `format` arrives in 13.
+        // `hold` is a builtin since cycle 12, and `format` since 13.
         assert_eq!(ok_out("hold on"), "");
         assert_eq!(
-            err_msg("format long"),
-            "Unrecognized function or variable 'format'."
+            ok_out("format long; disp(1/4); format"),
+            "   0.250000000000000\n"
         );
         assert_eq!(
             err_msg("x = 1; clear x\nx"),

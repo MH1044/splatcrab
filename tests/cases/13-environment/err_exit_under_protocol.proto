@@ -1,0 +1,3 @@
+% covers: 13 - exit under --protocol is an error answer and never ends the server, so the next request is still answered
+{"id":1,"op":"eval","code":"exit"}
+{"id":2,"op":"eval","code":"disp(2)"}

@@ -20,7 +20,7 @@
                    │
                    ├──► interp.rs           eval, output captured
                    ├──► syntax.rs           complete: is the entry finished?
-                   └──► env.rs              completions: variables + builtins
+                   └──► env.rs              completions: variables + path files + builtins
 
  browser ──► server.rs ──► http.rs ──► protocol::respond
  127.0.0.1   accept, read   limits, Host, Origin, token, routes
@@ -30,12 +30,13 @@
  stdin ────► http::serve_stdio (--http-stdio): the same http::handle, no socket
 ```
 
-`src/lib.rs` exposes the thirteen modules: the six of the language (`lexer`,
+`src/lib.rs` exposes the fifteen modules: the six of the language (`lexer`,
 `parser`, `interp`, `value`, `builtins`, `error`), the four of the
 evaluation protocol that cycle U0 added (`json`, `syntax`, `env`,
 `protocol`), the two of the UI server that cycle U1 added (`http`,
-`server`) and cycle 12's `plot`. `src/ui/` holds the page's three files, which `http.rs` embeds.
-`src/main.rs` is the CLI and REPL and is the only file allowed to use
+`server`), cycle 12's `plot`, and cycle 13's `editor` and `history`. `src/ui/` holds the page's three files, which `http.rs` embeds.
+`src/main.rs` is the CLI and REPL and, with `src/term.rs`, the raw-mode
+terminal module only the binary compiles, is the only code allowed to use
 `print!`. It runs everything, `--protocol` and `--ui` included, on a thread
 with a 256 MB stack, because Windows gives the main thread 1 MB and the
 parser and the evaluator each recurse once per nesting level.
@@ -371,10 +372,43 @@ unfinished; since cycle 05 `function` too, so a definition is read whole
 before it is refused.
 
 **`env.rs`** is the environment as seen from outside the evaluator.
-`completions(prefix, &vars, &registry)` lists every variable and builtin
-starting with `prefix`, sorted by byte order and deduplicated; cycle 13 adds
-path files to it and builds the terminal's tab completion on it.
-`Interp::builtins` hands out the registry read-only for it.
+`completions(prefix, &vars, &registry, &path)` lists every variable, every
+function file (`name.m`, listed as `name`) in the `path` folders and every
+builtin starting with `prefix`, sorted by byte order and deduplicated.
+`Interp::builtins` hands out the registry read-only for it and
+`Interp::path_dirs` the folders, the current one first. The protocol's
+`completions` and the terminal's Tab both call it (cycle 13).
+
+**`editor.rs`** (cycle 13) is the terminal's line editor as a pure state
+machine: `Decoder` turns the characters a terminal sends, ANSI escape
+sequences included, into `Key`s, and `Editor::key` turns a key into a new
+buffer, cursor and history place, or an `Action` (submit, cleared by
+Ctrl-C, end of input, a list of completions), asking a completion function
+it is handed for Tab. It reads and writes nothing, so every key is unit
+tested. **`history.rs`** is the history file: UTF-8, one entry per line,
+oldest first, with `\`, `\n` and `\r` escaped so a multi-line entry stays
+one line; appended to one entry at a time and compacted on load past twice
+its 1000 entries, at `SPLATCRAB_HISTORY` or `~/.splatcrab_history`. It is
+the format the interface is to share. **`src/term.rs`**, a module of the
+binary alone, is the raw-mode shell around the editor: `LineReader`
+enters raw mode for one line at a time through raw declarations
+(`GetConsoleMode`, `SetConsoleMode` and `ReadConsoleW` with virtual-terminal
+input and output on Windows; `tcgetattr`, `tcsetattr` and `cfmakeraw`
+elsewhere), feeds the decoder, draws the line with `print!`, and restores
+the terminal in a guard's `Drop`, so every exit path restores it.
+
+**`builtins/environ.rs`** (cycle 13) holds `cd`, `pwd`, `ls`, `dir`,
+`help`, `which`, `format`, `eval`, `evalc`, `run`, `datestr`, `now`,
+`clock`, `pause`, `getenv`, `system`, `version`, `exit` and `quit`; `who`,
+`whos` and `clc` stay in `core.rs`. `now` and `clock` read local time
+through `GetLocalTime` or `localtime_r`, declared raw like the terminal's
+calls. `eval` and `run` are `Interp::eval_code` and `Interp::run_path`,
+each counting one level of the nesting budget; `evalc` swaps both sinks
+for a buffer, as a protocol `eval` does. `exit` is `MError::exit(n)`, an
+error value that is not an error: it leaves every frame and builtin as an
+error does, `try` and `eval`'s fallback let it through, and `main.rs`
+exits with its code; where `Interp::input` is `Refused`, under
+`--protocol`, `--ui` and `--http-stdio`, it is a clean error instead.
 
 **`json.rs`** is hand-written JSON: a `Json` value whose objects keep their
 keys in written order (a `Vec` of pairs, not a map), a parser and a writer.
@@ -416,7 +450,14 @@ server, writes the answer and closes. It holds no policy: every check is in
 window with no framework and no external resource, embedded with
 `include_str!` so the binary is the whole program.
 
-**`main.rs`** is the CLI. Since cycle 12 its REPL shows figures: when
+**`main.rs`** is the CLI. Since cycle 13 it answers `--help` and
+`--version` (the version is `env!("CARGO_PKG_VERSION")`, as the banner's
+is), sets `Interp::stdout_tty` and `Interp::stdin_tty` from
+`IsTerminal`, which `clc` and a bare `pause` read, exits with the code of
+an `exit(n)` that reaches it in a script or at the prompt, and reads the
+REPL's lines through `term::LineReader` when standard input and standard
+output are both terminals, and as plain lines otherwise, exactly as before.
+Since cycle 12 its REPL shows figures: when
 standard input is a terminal (`std::io::IsTerminal`), after each entry it
 asks `Interp::take_changed_figures` for the figures the entry changed,
 writes each to `splatcrab-<pid>-figure-<n>.svg` in the temporary folder
@@ -754,6 +795,19 @@ stdin by `--http-stdio`, so the golden cases pin every byte without a socket,
 and `tests/ui_server.rs` covers the socket itself. The Design notes of
 `docs/modules/U1-ui-server.md` have the details.
 
+**The current folder (cycle 13, in place).** `Interp::cwd` is the one
+current folder: every path lookup, every file builtin, `ls`, `dir`, `run`
+and `system` resolve against it, and `cd` changes it through
+`Interp::set_cwd`, which normalises `.` and `..` by their components,
+refuses a path that is not a folder, and bumps the lookup generation. The
+process's working directory is never changed, so the golden harness's
+per-case folder and the interface's file root hold whatever the code does.
+
+**Display format (cycle 13, in place).** `format` is `Interp::format`; the
+display reads it through `value::with_format`, which sets a thread-local
+for the length of one display and puts the old value back, so a display
+built outside the interpreter, as a unit test builds one, is always short.
+
 **Frames (cycle 05, in place).** A stack of `Frame { vars, end_stack, unit,
 func_name, nargin, nargout }` with `frames[0]` as the base workspace, never
 popped; `Interp::vars()` is the running frame's. Moving `end_stack` into the
@@ -823,7 +877,6 @@ cycle named:
 |---|---|
 | `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives | later (verify first) |
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
-| `who` and `whos` print the same typed table | Both produce byte-identical output. In MATLAB `who` is a bare list of names and `whos` is a table with size, bytes and class, so both deviate rather than only `who`, and neither has a bytes column | 13 |
 | Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each. Cycle 10 replaced the complex refusals of `roots` with the values | by design |
 | Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where MATLAB is understood to say "close to singular or badly scaled" with an `RCOND`; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `eig([])` is 0x1. The Design notes of `docs/modules/08-linear-algebra.md` have each | later (verify first) |
 | Complex numbers, cycle 10: every builtin not on `builtins::TAKES_COMPLEX` refuses a complex argument (`sort`, `max`, `min`, `floor`, `mod`, `num2str`, `reshape`, `inv`, `det`, the solvers and every other), where MATLAB takes many of them; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` refuse a complex value; indexing, concatenation and assignment drop an all-zero imaginary part as arithmetic does, and a zero imaginary part of either sign is read as `+0`, on a branch cut and in the display; the complex display, its scale factor and the phase of complex eigenvectors are SplatCrab's; `eig` and `roots` of complex input are refused. The Design notes of `docs/modules/10-complex.md` have each | by design (verify first) |
@@ -837,7 +890,8 @@ cycle named:
 | Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
 | Function handles, cycle 06: `func2str` renders an anonymous function from its parse tree, so `@(x) (x)` reads back `@(x)x` where MATLAB keeps the text as written; the trace names an anonymous function `  in @(n)g(n)` with no line; an anonymous call counts against the recursion limit of 500; `str2func` of a text that is not a name makes a handle that fails only when called. The Design notes of `docs/modules/06-function-handles.md` have each | by design (verify first) |
 | Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
-| `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off`. `format long` is the unrecognized-name error | `format` 13, warning state later |
+| `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off` | later |
+| The environment, cycle 13: `format` has `short` and `long` only; `whos` has no heading row and its layout is SplatCrab's; `ls` and `dir` print one name per line with no `.` or `..`, and `dir` returns no `date` or `datenum`; a bare `pause` waits for Enter rather than any key; `evalc` drops the final line end of what it captured, as the spec records; `datestr` takes date numbers or one date vector and no format; `exit(n)` takes 0 to 255; `which` and `help` do not report local functions. The Design notes of `docs/modules/13-environment.md` have each | by design |
 | Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
@@ -906,6 +960,9 @@ flags (QA D16), `num2str` of a matrix (QA D13), `fprintf` to a file
 identifier and its byte count (QA D25), and the unexpected character
 echoed raw into the lexer's message; it also discharged the Known
 deviations row for a char range and `diag` of a char.
+Cycle 13 fixed the two rows scheduled to it, `clc` writing its escapes into
+captured output and `exit` and `quit` working only as bare REPL lines
+(QA D28), and discharged the Known deviations row for `who` and `whos`.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -920,8 +977,6 @@ spec also lists, it removes the row from that spec in the same commit.
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
 | A non-UTF-8 file is unread (was part of QA D29) | A UTF-16LE file is `Error: Line 2: unexpected character U+0000` on a NUL, the high byte of its first ASCII character (`err_utf16_file` pins the text up to the code point, and its exit code 1; since cycle 11 the character is named rather than written raw); MATLAB and Octave read it. Cycle 01e skipped the leading UTF-8 byte-order mark and swapped the strict read for a lossy one, which fixed the Windows-1252 half (a `% caf<E9>` comment now runs) and brought the failure inside the `Error:` format; a UTF-16 file still decodes to replacement characters rather than to its text, because that needs encoding detection and not a lossy decode | later |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
-| `clc` writes raw terminal escapes to stdout | `clc` emits `ESC[2J ESC[H` through the normal output sink, so a script that calls it and is piped or redirected has those bytes in its captured output. MATLAB's `clc` affects the command window, not the program's output stream. Found while writing the handbook | 13 |
-| `exit` and `quit` work only as bare REPL lines (QA D28) | A script ending in `exit` fails with "Unrecognized function or variable 'exit'." In the REPL, `exit;`, `quit;`, `exit(3)` and an `exit` inside a block are not recognised, and the final exit code is always 0. MATLAB's `exit` ends the session, and `exit(3)` exits with code 3. Cycle 13 claims `exit` | 13 |
 | Constructors take two sizes only | `zeros(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds a 2-by-3-by-4 array. The same holds for `ones`, `rand`, `NaN`, `Inf`, `true`, `false`, `reshape` and `repmat`, with separate sizes or a size vector. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `zeros(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Before 01c, `zeros`, `ones` and `rand` with three sizes were "Too many input arguments.", and before cycle 01 they built the 2-D array and dropped the third size. The row stays, because building N-D arrays needs a design that no roadmap module claims yet. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D arrays |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | An element-wise operation on an empty array with a huge dimension hangs | `x = zeros(0, 1e12); x + 1` does not return: the broadcast loop in `Matrix::try_zip` runs once per column even when there are no rows, so a 0x1e12 operand costs 1e12 iterations for an empty result. Cycle 10's complex paths copied the pattern (`x + 1i`, `x .* 1i`, `x == 1i`, `power(x, 0.5)`). It needs no allocation, so the size check does not catch it. Older than cycle 10; found by its review | later, a bug-fix pass |

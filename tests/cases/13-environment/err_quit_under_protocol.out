@@ -1,0 +1,2 @@
+{"id":1,"ok":false,"out":"","error":{"message":"quit is not available here: the client ends the session.","line":1}}
+{"id":2,"ok":true,"out":"     2\n"}

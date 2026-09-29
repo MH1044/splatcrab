@@ -1,0 +1,1 @@
+sum(A), sum(A,dim), sum(A,'all') - sum of the elements.

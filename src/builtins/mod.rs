@@ -19,6 +19,7 @@ pub mod args;
 pub mod cells;
 pub mod complex;
 pub mod core;
+pub mod environ;
 pub mod factor;
 pub mod io;
 pub mod linalg;
@@ -42,8 +43,8 @@ pub type BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>;
 /// What the registry stores for a name.
 pub struct Entry {
     pub f: BuiltinFn,
-    /// One line, in the style of MATLAB's `help`. Nothing consumes these yet;
-    /// `help` itself arrives in cycle 13.
+    /// One line, in the style of MATLAB's `help`: what `help name` prints
+    /// for a builtin (cycle 13).
     pub help: &'static str,
 }
 
@@ -63,6 +64,7 @@ pub fn registry() -> Registry {
     strings::register(&mut r);
     io::register(&mut r);
     crate::plot::register(&mut r);
+    environ::register(&mut r);
     r
 }
 
@@ -210,8 +212,11 @@ mod tests {
     /// the twenty-one string functions of `strings.rs` beside `num2str`,
     /// which moved there, and the sixteen file functions of `io.rs` beside
     /// `fprintf`, which moved there, and `input`. Cycle 12 added the
-    /// twenty plotting builtins of `plot/mod.rs`.
-    const EXPECTED: usize = 231;
+    /// twenty plotting builtins of `plot/mod.rs`. Cycle 13 added the
+    /// nineteen of `environ.rs`: `cd`, `pwd`, `ls`, `dir`, `help`, `which`,
+    /// `format`, `eval`, `evalc`, `run`, `datestr`, `now`, `clock`, `pause`,
+    /// `getenv`, `system`, `version`, `exit` and `quit`.
+    const EXPECTED: usize = 250;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {

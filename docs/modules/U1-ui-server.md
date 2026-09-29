@@ -133,6 +133,10 @@ Settled at planning:
   never appears in a request line, a server log or a `Referer`.
 - A custom header rather than a cookie, so that no browser sends the token on
   its own to a request some other page started.
+- Since cycle 13 the token guards a shell, not only an interpreter: `system`
+  runs any command with the user's rights, so anyone who holds the token, or
+  gets a request past the `Host`, `Origin` and token checks, can run programs
+  on the machine, and none of those checks may ever be relaxed.
 - `Connection: close` on everything keeps the parser free of keep-alive and
   pipelining, at the cost of one connection per request, which a single
   person typing at a prompt will not notice.

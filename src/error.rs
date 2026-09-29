@@ -47,6 +47,9 @@ struct Extra {
     /// The user functions (and path scripts) the error unwound out of,
     /// innermost first, each with the line it was on there (cycle 05).
     stack: Vec<StackEntry>,
+    /// `Some(n)` when this is not an error at all but `exit(n)` or `quit`
+    /// on its way out of every frame (cycle 13); see [`MError::exit`].
+    exit: Option<i32>,
 }
 
 /// One frame an error unwound out of: the function's name, the line of the
@@ -71,6 +74,21 @@ impl MError {
             line: None,
             extra: None,
         }
+    }
+
+    /// `exit(code)` or `quit` (cycle 13), travelling as an error so that it
+    /// leaves every frame, loop and builtin the way an error does. It is
+    /// not one: `try` does not catch it, `eval`'s second argument does not
+    /// run for it, and `main.rs` exits with `code` when it reaches the top.
+    pub fn exit(code: i32) -> MError {
+        let mut e = MError::new(format!("exit({})", code));
+        e.extra.get_or_insert_with(Box::default).exit = Some(code);
+        e
+    }
+
+    /// The code of an [`MError::exit`], and `None` for a real error.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.extra.as_ref().and_then(|x| x.exit)
     }
 
     /// The identifier `error('MyPkg:myid', ...)` attached; empty for every
@@ -1755,6 +1773,107 @@ pub fn unknown_operation(op: &str) -> MError {
     MError::new(format!("Unknown operation '{}'.", op))
 }
 
+// ---- the environment (cycle 13) ---------------------------------------
+
+/// `exit` or `quit` under `--protocol`, `--ui` or `--http-stdio`, where the
+/// session belongs to the client and must outlive the code it sends.
+pub fn exit_refused(name: &str) -> MError {
+    MError::new(format!(
+        "{} is not available here: the client ends the session.",
+        name
+    ))
+}
+
+/// `exit(n)` with an `n` that is not a whole number from 0 to 255, the
+/// codes every platform passes on unchanged.
+pub fn exit_code_invalid(name: &str) -> MError {
+    MError::new(format!(
+        "The code {} exits with must be a whole number from 0 to 255.",
+        name
+    ))
+}
+
+/// `cd` to a folder that is not there.
+pub fn cd_not_a_folder(dir: &str) -> MError {
+    MError::new(format!(
+        "Cannot CD to {} (Name is nonexistent or not a directory).",
+        dir
+    ))
+}
+
+/// `ls` or `dir` of a folder that cannot be listed.
+pub fn cannot_list(dir: &str) -> MError {
+    MError::new(format!("Cannot list '{}': no such folder.", dir))
+}
+
+/// `format` with anything but `short` or `long`.
+pub fn format_unknown(opt: &str) -> MError {
+    MError::new(format!(
+        "Unsupported format '{}'; SplatCrab has 'short' and 'long'.",
+        opt
+    ))
+}
+
+/// `pause` with no argument where nobody is at a terminal to press a key,
+/// so that a piped script never hangs.
+pub fn pause_no_terminal() -> MError {
+    MError::new(
+        "pause with no argument waits for a key, and there is no terminal to read one from.",
+    )
+}
+
+/// `pause(n)` with an `n` that is not a time it will wait.
+pub fn pause_time(limit: f64) -> MError {
+    MError::new(format!(
+        "The pause time must be a real number of seconds from 0 to {}.",
+        limit
+    ))
+}
+
+/// `system(cmd)` when no shell could be started.
+pub fn system_failed(e: &std::io::Error) -> MError {
+    MError::new(format!("Cannot run the command: {}", e))
+}
+
+/// `run(name)` of something that is not a script file.
+pub fn run_not_found(name: &str) -> MError {
+    MError::new(format!("Cannot run '{}': no such script file.", name))
+}
+
+/// `datestr` of something that is not date numbers or a date vector.
+/// A date number or date-vector component past `datestr`'s range.
+pub fn datestr_range(max: f64) -> MError {
+    MError::new(format!(
+        "Dates for 'datestr' must lie within {} days of year 0.",
+        crate::interp::fmt_g(max, 6)
+    ))
+}
+
+pub fn datestr_input() -> MError {
+    MError::new("datestr needs date numbers, or a date vector of 6 elements.")
+}
+
+/// What `help` and `which` print for a name that is nothing (not an error:
+/// both carry on, as MATLAB's do).
+pub fn not_found_text(name: &str) -> String {
+    format!("'{}' not found.\n", name)
+}
+
+/// What `help` prints for a file with no leading comment block.
+pub fn no_help_text(name: &str) -> String {
+    format!("No help found for {}.\n", name)
+}
+
+/// What `which` prints for a variable.
+pub fn which_variable_text(name: &str) -> String {
+    format!("{} is a variable.\n", name)
+}
+
+/// What `which` prints for a builtin.
+pub fn which_builtin_text(name: &str) -> String {
+    format!("built-in ({})", name)
+}
+
 // ---- UI server -------------------------------------------------------
 
 /// The status line text of every status `http.rs` can answer, which is also
@@ -1912,7 +2031,7 @@ mod tests {
     /// `format!`.
     #[test]
     fn no_source_file_builds_an_error_message_of_its_own() {
-        const FILES: [(&str, &str); 26] = [
+        const FILES: [(&str, &str); 29] = [
             ("lexer.rs", include_str!("lexer.rs")),
             ("parser.rs", include_str!("parser.rs")),
             ("interp.rs", include_str!("interp.rs")),
@@ -1920,6 +2039,9 @@ mod tests {
             ("json.rs", include_str!("json.rs")),
             ("syntax.rs", include_str!("syntax.rs")),
             ("env.rs", include_str!("env.rs")),
+            ("history.rs", include_str!("history.rs")),
+            ("editor.rs", include_str!("editor.rs")),
+            ("builtins/environ.rs", include_str!("builtins/environ.rs")),
             ("protocol.rs", include_str!("protocol.rs")),
             ("http.rs", include_str!("http.rs")),
             ("server.rs", include_str!("server.rs")),

@@ -14,7 +14,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 | A char element is a UTF-16 code unit | 02 | `char_utf16_units` | `length('😀')` is `2` and `double('😀')` is `55357 56832`, as in MATLAB; `disp` and `%s` decode the units back to UTF-8, so the pair prints as one character (QA D37) |
 | `%` comments | 00 | every case | |
 | Block comments `%{ ... %}` | 04 | `block_comment`, `block_comment_skips_code`, `block_comment_deep` | `%{` and `%}` each alone on its line, surrounding whitespace allowed; they nest, counted rather than recursed into. A marker with anything else on its line is an ordinary comment. An unterminated `%{` runs to the end of a script as a comment, and keeps the REPL reading. The lines between them used to execute (QA D7) |
-| Command syntax | 04 | `command_disp_word`, `command_clear_two_words`, `command_variable_expression`, `err_command_clear_one`, `err_command_clear_all`, `err_command_format_unrecognized`, `hold_on_close_all_commands`, `grid_on_as_command` | MATLAB's rule: a statement that starts with a name that is not a variable, then whitespace, then a word that is not an operator followed by whitespace, calls the name with each word as a char argument. Quotes group words; the command ends at a newline, `,`, `;` or `%` outside quotes. `clear x y`, `clear all` and `disp hello` work; `x -1` with `x` a variable stays `x - 1`. Whether a name is a variable is decided before the source runs, from the workspace and the names it has assigned so far. Since cycle 12 `hold on`, `grid on` and `close all` call the plotting builtins; `format long` is the unrecognized-name error until cycle 13. It used to be a parse error (QA D31) |
+| Command syntax | 04 | `command_disp_word`, `command_clear_two_words`, `command_variable_expression`, `err_command_clear_one`, `err_command_clear_all`, `hold_on_close_all_commands`, `format_long_then_short` (13), `grid_on_as_command` | MATLAB's rule: a statement that starts with a name that is not a variable, then whitespace, then a word that is not an operator followed by whitespace, calls the name with each word as a char argument. Quotes group words; the command ends at a newline, `,`, `;` or `%` outside quotes. `clear x y`, `clear all` and `disp hello` work; `x -1` with `x` a variable stays `x - 1`. Whether a name is a variable is decided before the source runs, from the workspace and the names it has assigned so far. Since cycle 12 `hold on`, `grid on` and `close all` call the plotting builtins, and since cycle 13 `format long`, `cd envdir`, `help sum` and `which sum` call theirs. It used to be a parse error (QA D31) |
 | `...` line continuation | 00 | `demo_smoke` | Works straight after a digit, as in `a = 1...` |
 | `...` separates elements inside brackets | 01b | `continuation_bracket_element` | `[1 ...` newline `-2]` is two elements, like `[1 -2]` |
 | `;` suppresses display, `,` and newline show | 00 | `indexing` | |
@@ -205,7 +205,8 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 | Files | `input fopen fclose fgetl fgets fread fwrite feof fileread readmatrix writematrix csvread csvwrite delete save load` | 11 | `io.rs`, over `mat.rs` for MAT-files |
 | Errors and warnings | `error rethrow lasterr warning assert` | 00, 04 | `core.rs` |
 | Comparison | `isequal` | 04 | `core.rs` |
-| Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04 |
+| Workspace | `clear clc who whos` | 00 | `core.rs`; `clear all` since 04; since 13 `who` is the names alone, `whos` a table with bytes, and `clc` writes only to a terminal |
+| The environment | `cd pwd ls dir help which format eval evalc run datestr now clock pause getenv system version exit quit` | 13 | `environ.rs` |
 | Timing | `tic toc` | 01 | `core.rs` |
 | Functions and the path | `nargin nargout exist feval addpath rmpath` | 05 | `core.rs` |
 | Function handles | `arrayfun func2str str2func` | 06 | `core.rs`; `feval` of a handle, `class` and `isa` of one since 06; `arrayfun` shares `cells.rs`'s map since 07 |
@@ -424,7 +425,8 @@ and `strfind` and delete every file they write.
 | A wide matrix wraps into column blocks | 01e | `wide_matrix_wraps` | 80 characters, whether the output is a terminal or a pipe, giving 8 fixed-point columns or 13 integer ones per block under a `Columns N through M` heading. `linspace(1, 2)` printed about 1300 characters on one line |
 | Empty display | 00 | `display_formats` | `x = []` still prints `     []`, as MATLAB does for a 0x0 double |
 | Typed empty headers | 02 | `typed_empty_display`, `empty_char_display` | `zeros(0,3)` shows `  0×3 empty double matrix`, `1:0` `  1×0 empty double row vector`, `zeros(0,1)` `  0×1 empty double column vector` and `''` `  0×0 empty char array`; a logical empty follows the pattern with `logical array` |
-| `who` and `whos` show the class | 02 | | A logical is `logical` and a char has its real shape, `2x2 char`; they used to be `double` and `1xN char` |
+| `who` and `whos` show the class | 02 | | A logical is `logical` and a char has its real shape, `2x2 char`; they used to be `double` and `1xN char`. Since cycle 13 the class is `whos`'s alone |
+| `format short` and `format long` | 13 | `tests/cases/13-environment/`; `interp.rs` `format_long_display` | Interpreter state; `format` alone is `short`. `long` keeps every layout rule of `short` and writes fifteen decimals, in columns three wider than the widest element: `format long; disp(pi)` is `   3.141592653589793`. Integers and logicals are unchanged. Any other format is a clean error |
 | `disp([])` prints nothing | 01e | `empty_result_shapes` | It used to print `     []`. `disp('')` is still a line with nothing on it |
 | Empty results have MATLAB's shapes | 01e | `empty_result_shapes` | `find([])` and `diag([])` are `0x0`, not `0x1`; `size('')` is `0 0`, not `1 0`, and `num2str([])` follows it. A shape with an orientation to keep still keeps it: `find([0 0])` is `1x0` |
 | `fprintf` and `sprintf` | 00 | `fprintf_vector` | `%d %i %u %f %F %e %E %g %G %x %X %o %c %s`, flags, width, precision |
@@ -451,6 +453,27 @@ and `strfind` and delete every file they write.
 | The REPL reports errors without a line, and survives them | 01b | `repl_error_has_no_line` | One line per entry, so a number would be noise |
 | REPL diagnostics go to stderr | 01e | `repl_error_to_stderr` | Script mode already did, so a piped session can now separate diagnostics from output too |
 | An unterminated block at end of input is reported | 01e | `err_repl_unterminated_block`, `err_repl_unterminated_switch` | Piping `for k = 1:3` and `disp(k)` with no `end` printed nothing and exited 0 (QA D36); it now exits 1 and says why |
+
+## Environment
+
+Cycle 13. Every golden case is in `tests/cases/13-environment/`; the unit
+tests are named beside each row.
+
+| Feature | Since | Tests | Notes |
+|---|---|---|---|
+| The current folder is the interpreter's | 13 | `interp.rs` `cd_moves_the_interpreter_not_the_process` | `cd`, `pwd`, `ls`, `dir`, `run`, `system`, every file builtin and every path lookup use `Interp::cwd`; `cd` never moves the process. `cd ..` and `.` are resolved by their components, so `pwd` never shows them. `cd nope` is `Cannot CD to nope (Name is nonexistent or not a directory).` |
+| `ls` and `dir` | 13 | `environ.rs` `wildcards_match_whole_names` | One name per line in byte order, `.` and `..` left out; a folder, a file or a `*`/`?` pattern. `s = ls` is a padded char matrix, `s = dir` an Nx1 struct of `name`, `folder`, `bytes` and `isdir` |
+| `help` and `which` | 13 | `environ.rs` `the_help_block_is_the_leading_comments` | `help sum` is the registry's help line; `help myf` a file's leading `%` block, before or just after its `function` line, each line less its `%`. `which sum` is `built-in (sum)`, a file its full path, a variable `x is a variable.`, anything else `'x' not found.` |
+| `who` and `whos` | 13 | `core.rs` `who_names_and_whos_bytes` | `who` is `Your variables are:` and the names, wrapped at 80 columns. `whos` is one row per variable, `  x            1x3   24  double`: 8 bytes a double element, 16 complex, 1 a logical, 2 a char, a cell or struct the sum of what it holds, a handle 0; no heading row |
+| `eval`, `evalc`, `run` | 13 | `interp.rs` `exit_passes_every_frame_and_eval_runs_text`, `eval_goes_through_the_nesting_budget` | `eval(code)` runs statements in the workspace, `v = eval(expr)` evaluates one expression, `eval(code, fallback)` runs the fallback on an error. Each counts one level of the nesting budget. `evalc` swaps both sinks for a buffer and returns what was printed less its final line end. `run(script)` runs a file by path or name in the workspace, moving to its folder for the run |
+| `now`, `clock`, `datestr`, `pause` | 13 | `environ.rs` `dates_round_trip_through_date_numbers` | Local time through `GetLocalTime` or `localtime_r`; `datestr` is `dd-mmm-yyyy HH:MM:SS`. `pause(n)` sleeps from 0 to 86400 seconds; a bare `pause` waits for Enter at a terminal and is a clean error anywhere else |
+| `getenv`, `system`, `version` | 13 | golden | `system(cmd)` runs `cmd /C` or `sh -c` in the current folder with no standard input; one output prints the command's output and returns the status, two return both. `version` is `Cargo.toml`'s version |
+| `exit`, `quit`, `exit(n)` (QA D28) | 13 | `interp.rs` `exit_passes_every_frame_and_eval_runs_text`, `tests/cli.rs` | Statements anywhere: a script, a block, a function, `eval`; no `try` catches them; `exit(n)` exits with `n`, a whole number from 0 to 255. Under `--protocol`, `--ui` and `--http-stdio` they are a clean error and the session goes on |
+| `clc` | 13 | golden | The terminal's clear only when standard output is a terminal; nothing in a pipe, `evalc`, `--protocol` or `--ui` |
+| Terminal line editor | 13 | `editor.rs`, `history.rs` | When standard input and output are both terminals: arrows, Home/End, Backspace/Delete, Up/Down history, Ctrl-C clears, Ctrl-D on an empty line ends, Tab completes through `env::completions`. A pure state machine inside `term.rs`'s raw-mode shell, which restores the terminal on every path. A pipe reads plain lines as before |
+| History file | 13 | `history.rs` | `SPLATCRAB_HISTORY`, else `~/.splatcrab_history`: UTF-8, one entry per line, `\\`, `\n` and `\r` escaped, newest 1000 kept |
+| `completions` lists path files | 13 | `env.rs` `path_files_are_listed_by_their_function_names` | The `.m` files of the current folder and the `addpath` folders, by function name, for the protocol and Tab alike |
+| `--help` and `--version` | 13 | `tests/cli.rs` | Both exit 0; the version comes from `Cargo.toml` through `env!` |
 
 ## Evaluation protocol
 
@@ -497,7 +520,7 @@ status, header and limit is also a unit test in `src/http.rs`.
 
 | Feature | Since | Notes |
 |---|---|---|
-| REPL with block and bracket continuation | 00 | `exit` and `quit` leave. Since U0 the continuation test is `syntax::is_complete`, shared with the protocol's `complete` |
+| REPL with block and bracket continuation | 00 | `exit` and `quit` leave. Since U0 the continuation test is `syntax::is_complete`, shared with the protocol's `complete`; since 13 `exit` is a statement and the line editor runs at a terminal |
 | `.proto` golden cases | U0 | `tests/golden.rs` spawns the binary with `--protocol` and types the case on stdin |
 | `.http` golden cases | U1 | `tests/golden.rs` spawns the binary with `--http-stdio --port 8123 --token test-token` and pipes the case on stdin; an `.http` case with no `.err` asserts an empty stderr |
 | The UI server over a real socket | U1 | `tests/ui_server.rs` spawns `--ui --port 0 --no-browser --token itest` and talks to it over `TcpStream`, killing it in a `Drop` guard; it also checks the refusals of bad `--ui` and `--http-stdio` options |

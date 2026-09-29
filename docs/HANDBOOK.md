@@ -60,8 +60,14 @@ the exit code is 1.
 
 **The REPL.** Run `splatcrab` with no arguments. It prints a banner and a
 `>>` prompt. A `for`, `if` or `while` block, or an unclosed bracket, keeps
-the prompt open until it is closed. `exit` or `quit` on a line by itself
-leaves.
+the prompt open until it is closed. `exit` or `quit` leaves, and `exit(n)`
+leaves with exit code `n`. At a terminal the prompt is a line editor: the
+arrows move and recall history, Home and End jump, Tab completes names
+(variables, files on the path, builtins), Ctrl-C clears the line and Ctrl-D
+on an empty line leaves. The history is kept in `~/.splatcrab_history`, or
+wherever `SPLATCRAB_HISTORY` points. Piped input is read as plain lines.
+`splatcrab --help` lists the options and `splatcrab --version` prints the
+version.
 
 ```
 SplatCrab 0.1.0  (type 'exit' to quit)
@@ -98,8 +104,8 @@ and, if it failed, an `error` holding the REPL's message and the one-based
 line within `code`. `complete` answers whether `code` is a finished entry or
 still inside an open block or bracket, the same test the REPL uses to decide
 whether to keep reading. `workspace` lists each variable's name, size and
-class, sorted by name. `completions` lists every variable and builtin whose
-name starts with `prefix`. Every response starts with the request's `id` (a
+class, sorted by name. `completions` lists every variable, function file on
+the path and builtin whose name starts with `prefix`. Every response starts with the request's `id` (a
 number or a string, or `null` when it sent none) and `ok`.
 
 This input, one request per line:
@@ -120,7 +126,7 @@ gets exactly these bytes on stdout, and the exit code is 0:
 {"id":2,"ok":false,"out":"     6\n","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":2}}
 {"id":3,"ok":true,"complete":false}
 {"id":4,"ok":true,"vars":[{"name":"x","size":[1,1],"class":"double"}]}
-{"id":5,"ok":true,"items":["diag","diff","disp"]}
+{"id":5,"ok":true,"items":["diag","diff","dir","disp"]}
 {"id":6,"ok":false,"error":{"message":"Unknown operation 'fly'.","line":null}}
 ```
 
@@ -571,7 +577,7 @@ hello
 two words
 Your variables are:
 
-  y            1x1 double
+y
 
 ans =
 
@@ -583,15 +589,19 @@ A command ends at a newline, a `,`, a `;` or a `%` outside quotes. Whether a
 name is a variable is decided before the script runs, from the names it has
 assigned by then, as MATLAB decides it in a file. `hold on`, `grid on`
 and `close all` are command syntax for the plotting builtins (see
-[Plotting](#plotting)). `format long` is command syntax too, but `format`
-arrives in cycle 13, so today it is the unrecognized-name error:
+[Plotting](#plotting)). So are `format long`, `cd folder`, `help sum` and
+`which sum` (see [The environment](#the-environment)):
 
 ```matlab
 format long
+disp(pi)
+format short
+disp(pi)
 ```
 
 ```
-Error: Line 1: Unrecognized function or variable 'format'.
+   3.141592653589793
+    3.1416
 ```
 
 ### Display and `;`
@@ -4559,7 +4569,8 @@ file. A script never opens one, and neither do `--protocol`, `--ui` and
 
 `clear clc who whos`. `clear()` with no arguments empties the workspace, and
 so does `clear all`; `clear('a')` removes one name, and so does the command
-form `clear a`. `clc` writes the ANSI clear-screen sequence.
+form `clear a`. `clc` clears the terminal, and writes nothing when the output
+is not a terminal: a pipe, a file, `evalc`, `--protocol` or `--ui`.
 
 ```matlab
 a = 1;
@@ -4577,27 +4588,100 @@ disp('done')
 ```
 Your variables are:
 
-  a            1x1 double
-  b            1x3 double
-  c            1x2 char
+a  b  c
+
+  a            1x1    8  double
+  b            1x3   24  double
+  c            1x2    4  char
 
 Your variables are:
 
-  a            1x1 double
-  b            1x3 double
-  c            1x2 char
-
-Your variables are:
-
-  b            1x3 double
-  c            1x2 char
+b  c
 
 done
 ```
 
-`who` prints the typed table that MATLAB's `whos` prints, and `whos` prints
-the same thing. `clear x`, without parentheses, is
+`who` prints the names, and `whos` a row per variable of its size, bytes and
+class: 8 bytes a double element, 16 a complex one, 1 a logical, 2 a char,
+and a cell or struct the sum of what it holds. The layout is SplatCrab's own
+and has no heading row. `clear x`, without parentheses, is
 [command syntax](#command-syntax).
+
+### The environment
+
+`cd pwd ls dir help which format eval evalc run datestr now clock pause
+getenv system version exit quit`. The current folder belongs to the
+interpreter: `cd` moves it, and every path it resolves (files on the path,
+the file functions, `ls`, `dir`, `run`, `system`) follows, while the
+process's own folder never changes. `help name` prints a builtin's help line,
+or a file's leading `%` comment block; `which name` says where a call of
+`name` goes. `eval(code)` runs text in the workspace, `v = eval(expr)`
+evaluates it, and `evalc(code)` returns what it printed, less the final line
+end. `pause(n)` waits `n` seconds, up to a day; a bare `pause` waits for
+Enter at a terminal and is an error in a pipe, so a piped script never
+hangs. `system(cmd)` runs a shell command in the current folder and returns
+its status, and with a second output its text. `exit` and `quit` are
+statements anywhere, and `exit(n)` exits with code `n`, from 0 to 255; under
+`--protocol` and `--ui` they are an error, since the session is the
+client's.
+
+```matlab
+eval('q = 6 * 7;')
+disp(q)
+s = evalc('disp(1)');
+disp(numel(s))
+which sum
+help numel
+disp(ischar(pwd))
+disp(ischar(datestr(now)))
+disp(ischar(version))
+disp(1)
+exit(3)
+disp(2)
+```
+
+```
+    42
+     6
+built-in (sum)
+numel(A) - the number of elements of A.
+   1
+   1
+   1
+     1
+```
+
+The script above exits with code 3, and `disp(2)` never runs. Under
+`--http-stdio` too `exit` and `quit` are refused, and `try` never catches
+an `exit`.
+
+`who` lists the names alone; `whos` adds each variable's size, bytes (8 per
+double element, 16 per complex one, 1 per logical, 2 per char) and class,
+in SplatCrab's own layout with no heading row. `format long` shows fifteen
+decimals, `format short` or a bare `format` goes back to four.
+
+```matlab
+x = 1:3;
+s = 'ab';
+who
+whos
+format long
+disp(x / 3)
+format
+disp(x / 3)
+```
+
+```
+Your variables are:
+
+s  x
+
+  s            1x2    4  char
+  x            1x3   24  double
+
+   0.333333333333333   0.666666666666667   1.000000000000000
+    0.3333    0.6667    1.0000
+```
 
 ### Functions and the path
 
@@ -5180,8 +5264,9 @@ largest magnitude is from 0.01 up to 1000, with an exact zero shown as a bare
 `0`. Outside that range a scalar switches to short exponential form and a
 matrix is printed under a common scale factor such as `1.0e+03 *`. An empty
 shows its typed header, except the 0x0 `[]`. Wide matrices wrap into MATLAB's
-`Columns N through M` blocks, at 80 columns. There is no `format long` or
-`format short` yet.
+`Columns N through M` blocks, at 80 columns. `format long` keeps every one
+of these rules and writes fifteen decimals instead of four; `format short`,
+or `format` alone, goes back.
 
 ```matlab
 a = 1000
@@ -5417,6 +5502,10 @@ a\b
 
 A script that fails prints `Error: Line N: <message>` to stderr and exits 1.
 stdout is flushed first, so everything that ran before the failure is visible.
+The exit code is what a caller can rely on: 0 when the script ran to its end
+or to a bare `exit`, 1 for an error, `n` for `exit(n)`, and the REPL the same
+at its end. Any other code, 101 for a panic or 134 for an abort, is a bug in
+SplatCrab.
 
 ```matlab
 disp('before')
@@ -5810,8 +5899,7 @@ refuse both.
 
 Command syntax decides whether a name is a variable before the script runs,
 from the names the script has assigned by then; a name cleared and then used
-in command form stays an expression. `hold on` and `format long` are
-command syntax whose builtins do not exist yet. Chained ranges parse as
+in command form stays an expression. Chained ranges parse as
 MATLAB reads them,
 `1:2:3:4` as `(1:2:3):4`, but a colon operand that is not a scalar is then an
 error. Hex literals (`0x1F`) are rejected. A UTF-8 byte-order mark at the
@@ -5974,16 +6062,15 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | N-D arrays `zeros(2, 3, 4)` | not scheduled |
 | Compressed MAT-files, `regexpi`, backreferences | not scheduled |
 | 3-D plots, surfaces, interaction with a figure | not scheduled |
-| `exit` in a script, `exit(code)`, `format`, `help`, `eval` | 13 |
 | Integer classes and `single` | not scheduled |
 
 Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-eval('1 + 1')
+zeros(2, 3, 4)
 ```
 
 ```
-Error: Line 1: Unrecognized function or variable 'eval'.
+Error: Line 1: N-D arrays are not supported.
 ```

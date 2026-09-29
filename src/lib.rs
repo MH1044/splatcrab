@@ -2,7 +2,8 @@
 //!
 //! The pipeline is `lexer` -> `parser` -> `interp`, with `value` holding the
 //! column-major matrix runtime. The binary in `main.rs` is the CLI and REPL;
-//! it is the only place in the project allowed to use `print!`.
+//! it, and the terminal line editor's `term.rs` that the binary owns, are the
+//! only places in the project allowed to use `print!`.
 //!
 //! `error` holds `MError` and every message text the other modules raise.
 //!
@@ -17,10 +18,16 @@
 //!
 //! Since cycle 12, `plot` holds the figures, the SVG writer, and the PNG
 //! rasterizer and encoder.
+//!
+//! Since cycle 13, `editor` is the terminal line editor's key-event state
+//! machine and `history` the history file; the raw-mode terminal around
+//! them is the binary's own `term.rs`, which alone writes to the terminal.
 
 pub mod builtins;
+pub mod editor;
 pub mod env;
 pub mod error;
+pub mod history;
 pub mod http;
 pub mod interp;
 pub mod json;

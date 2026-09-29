@@ -41,35 +41,38 @@ You need a Rust toolchain, version 1.85 or newer. If you do not have one,
 install it from <https://rustup.rs>. Nothing else is required: the crate has
 no dependencies, so a clean build takes a few seconds.
 
-**Option 1: install the binary with cargo**
+Install it straight from GitHub:
 
 ```
 cargo install --git https://github.com/MH1044/splatcrab
 ```
 
-This puts `splatcrab` in `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on
-Windows), which rustup already adds to your `PATH`.
-
-**Option 2: build from a clone**
+or from a clone of the repository:
 
 ```
 git clone https://github.com/MH1044/splatcrab
 cd splatcrab
-cargo build --release
+cargo install --path .
 ```
 
-The binary is `target/release/splatcrab` (`target\release\splatcrab.exe` on
-Windows). Run it from there, or run `cargo install --path .` to put it on your
-`PATH`.
-
-There are no prebuilt binaries yet.
+Either puts `splatcrab` in Cargo's bin folder, `~/.cargo/bin`
+(`%USERPROFILE%\.cargo\bin` on Windows), which rustup already adds to your
+`PATH`. From then on, typing `splatcrab` in any terminal starts the REPL, with
+line editing, history and Tab completion; `splatcrab script.m` runs a script,
+`splatcrab --help` lists the options and `splatcrab --version` prints the
+version. There are no prebuilt binaries yet.
 
 ## Use
 
 **REPL.** Run `splatcrab` with no arguments. Type MATLAB expressions at the
 `>>` prompt; a line ending in `;` assigns without printing. A `for`, `if`,
 `while`, `switch` or `try` block, an unclosed bracket, or an open `%{` block
-comment keeps the prompt open until it is closed. Type `exit` or `quit` to leave.
+comment keeps the prompt open until it is closed. Type `exit` or `quit` to leave,
+or `exit(n)` to leave with exit code `n`. At a terminal the prompt is a line
+editor: the arrow keys move and recall history, Home and End jump, Tab
+completes variable, function and file names, and Ctrl-C clears the line. The
+history is kept in `~/.splatcrab_history` (or wherever `SPLATCRAB_HISTORY`
+points), one entry per line.
 
 ```
 $ splatcrab
@@ -347,6 +350,13 @@ z
   go to stderr like a script's, a block left open at end of input is reported
   rather than discarded, and a script file may start with a UTF-8 byte-order
   mark or hold bytes that are not valid UTF-8
+- The environment (cycle 13): `cd`, `pwd`, `ls` and `dir` against the
+  interpreter's own current folder, never the process's; `help` (a builtin's
+  help line, or a file's leading comment block), `which`, `who` and `whos`
+  (with bytes), `format short` and `format long`, `eval`, `evalc` and `run`,
+  `datestr`, `now`, `clock`, `pause`, `getenv`, `system` and `version`;
+  `exit`, `quit` and `exit(n)` as statements anywhere in a script or at the
+  prompt; `clc`, which clears only a real terminal
 - `splatcrab --protocol`, a JSON Lines request loop over one session, with
   `eval`, `complete`, `workspace` and `completions`: the groundwork for the
   interface, with its JSON hand-written rather than taken from a crate

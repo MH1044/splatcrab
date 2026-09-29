@@ -1,0 +1,3 @@
+% covers: 13 - quit under --protocol is the same error answer as exit, and the session goes on
+{"id":1,"op":"eval","code":"quit"}
+{"id":2,"op":"eval","code":"disp(2)"}

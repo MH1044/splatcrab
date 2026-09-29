@@ -5,7 +5,7 @@
 //! `1`; a char element is one UTF-16 code unit, `0` to `65535`, as in MATLAB,
 //! so `length('😀')` is `2`.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -15,6 +15,53 @@ use crate::builtins::complex::C;
 use crate::error::{self, R};
 use crate::interp::Unit;
 use crate::parser::{AnonFn, Function};
+
+/// The numeric display format `format` chooses (cycle 13): interpreter
+/// state, held on `Interp` and handed to the display for the length of one
+/// display through [`with_format`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Format {
+    /// Four decimals: every display before cycle 13, and still the default.
+    #[default]
+    Short,
+    /// Fifteen decimals, with the same layout rules.
+    Long,
+}
+
+impl Format {
+    /// The decimals a non-integer element is written with.
+    fn decimals(self) -> usize {
+        match self {
+            Format::Short => 4,
+            Format::Long => 15,
+        }
+    }
+}
+
+thread_local! {
+    /// The format the display on this thread is writing in. Only
+    /// [`with_format`] sets it, and it puts the old one back, so between
+    /// two displays it is always `Short` and a unit test that builds a
+    /// display directly sees the short format.
+    static FORMAT: Cell<Format> = const { Cell::new(Format::Short) };
+}
+
+/// Runs `f` with the display writing in `format`, and puts the previous
+/// format back afterwards, even if `f` unwinds.
+pub fn with_format<T>(format: Format, f: impl FnOnce() -> T) -> T {
+    struct Restore(Format);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORMAT.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(FORMAT.with(|c| c.replace(format)));
+    f()
+}
+
+fn current_format() -> Format {
+    FORMAT.with(Cell::get)
+}
 
 /// The class of an array. Storage is the same for all three; the tag decides
 /// how the array displays, what `class` says, and how an operation classes
@@ -1409,16 +1456,36 @@ impl Matrix {
             return (texts, width, None);
         }
         let exp = max_abs.log10().floor() as i32;
+        let format = current_format();
+        // `format long` keeps every layout rule and writes fifteen
+        // decimals; its columns are three wider than the widest element,
+        // not counting a minus sign, which takes one of the three spaces.
+        let wide = |texts: &[String], short: usize| match format {
+            Format::Short => short,
+            Format::Long => {
+                3 + texts
+                    .iter()
+                    .map(|t| t.trim_start_matches('-').len())
+                    .max()
+                    .unwrap_or(0)
+            }
+        };
         if (-2..=2).contains(&exp) {
-            return (self.fixed_texts(1.0), 10, None);
+            let texts = self.fixed_texts(1.0);
+            let w = wide(&texts, 10);
+            return (texts, w, None);
         }
         if self.is_scalar() {
             let v = self.data[0];
-            return (vec![crate::interp::fmt_e(v, 4)], 13, None);
+            let texts = vec![crate::interp::fmt_e(v, format.decimals())];
+            let w = wide(&texts, 13);
+            return (texts, w, None);
         }
         let scale: f64 = format!("1e{exp}").parse().unwrap_or(1.0);
         let header = format!("   1.0e{:+03} *\n\n", exp);
-        (self.fixed_texts(scale), 10, Some(header))
+        let texts = self.fixed_texts(scale);
+        let w = wide(&texts, 10);
+        (texts, w, Some(header))
     }
 
     /// [`cells`](Matrix::cells) for complex storage (cycle 10): each element
@@ -1461,15 +1528,16 @@ impl Matrix {
             let scale: f64 = format!("1e{exp}").parse().unwrap_or(1.0);
             (scale, false, Some(format!("   1.0e{:+03} *\n\n", exp)))
         };
+        let decimals = current_format().decimals();
         let part = |v: f64| {
             // A zero of either sign is written without one.
             let v = if v == 0.0 { 0.0 } else { v };
             if !v.is_finite() {
                 nonfinite(v)
             } else if e_format {
-                crate::interp::fmt_e(v, 4)
+                crate::interp::fmt_e(v, decimals)
             } else {
-                format!("{:.4}", v / scale)
+                format!("{:.*}", decimals, v / scale)
             }
         };
         let re: Vec<String> = self.data.iter().map(|&v| part(v)).collect();
@@ -1492,6 +1560,7 @@ impl Matrix {
     /// Every element divided by `scale` in four decimals, with an exact zero
     /// as a bare `0` and a non-finite value as its name.
     fn fixed_texts(&self, scale: f64) -> Vec<String> {
+        let decimals = current_format().decimals();
         self.data
             .iter()
             .map(|v| {
@@ -1500,7 +1569,7 @@ impl Matrix {
                 } else if *v == 0.0 {
                     "0".to_string()
                 } else {
-                    format!("{:.4}", v / scale)
+                    format!("{:.*}", decimals, v / scale)
                 }
             })
             .collect()
