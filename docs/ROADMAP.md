@@ -45,6 +45,7 @@ and the table names the cycle that owns it.
 | 13b | [three-defects](modules/13b-three-defects.md) | The three Known bugs rows that were real defects: an empty result costs nothing however large a dimension, cells and structs are bounded by bytes as well as elements, and UTF-16 source files are read | Done (2026-09-29) |
 | 14 | [nd-arrays](modules/14-nd-arrays.md) | N-D numeric, logical and char arrays: constructors, size queries, `reshape`, indexing with any number of subscripts, element-wise operators with broadcasting and page-by-page display, every other builtin behind a gate | Done (2026-09-30) |
 | 14b | [nd-functions](modules/14b-nd-functions.md) | The builtins taught N-D: reductions along any dimension, the element-wise math, `squeeze`, `permute`, `cat`, N-D concatenation, `repmat`, N-D MAT-files | Done (2026-09-30) |
+| 14c | [more-nd-builtins](modules/14c-more-nd-builtins.md) | The rest of the everyday library taught N-D: `sort`, `find`, `diff`, `median`, `std`, `var`, `mode`, `fliplr`, `flipud` and `arrayfun`, and new `flip`, `circshift`, `ipermute`, `horzcat`, `vertcat`, `sub2ind` and `ind2sub` | Planned |
 | 15 | [verify-first](modules/15-verify-first.md) | The rows marked verify first, taken to their MathWorks pages: `isequal` of handles, cells and structs, transposed cells and structs, `sum` and `mean` along a dimension of size 1, `any` and `all` past `ndims`, text functions refusing a char matrix; the rest pinned or cited as unsettled | Done (2026-09-30) |
 
 ## The U series: the interface
