@@ -75,7 +75,7 @@ fn text_too_long(n: usize) -> error::MError {
     let units = n.div_ceil(3) as f64;
     check_shape(1.0, units)
         .err()
-        .unwrap_or_else(|| error::size_overflow("1", &units.to_string()))
+        .unwrap_or_else(|| error::size_overflow(&["1".to_string(), units.to_string()]))
 }
 
 /// One open file: the handle, what it was opened for, and the bytes read
@@ -1026,6 +1026,8 @@ fn save(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         for (n, v) in &vars {
             match v {
                 Value::Mat(m) if m.is_complex() => return Err(error::complex_argument("save")),
+                // A page past the first would be lost (cycle 14).
+                Value::Mat(m) if m.is_nd() => return Err(error::nd_argument("save")),
                 Value::Mat(m) => text.push_str(&ascii_text(m, double, tabs)),
                 other => return Err(error::save_ascii_unsupported(n, other.class_name())),
             }
@@ -1465,6 +1467,42 @@ mod tests {
         let e = call(&mut empty, save, &[s("none.mat")], 0).unwrap_err();
         assert_eq!(msg(e), "There are no variables to save.");
         assert!(!d.0.join("none.mat").exists());
+    }
+
+    /// Cycle 14: an N-D variable, or one held in a cell, is refused with
+    /// the gate's text before a byte is written, in both formats, and an
+    /// existing file is left as it was.
+    #[test]
+    fn save_refuses_an_nd_array_and_writes_nothing() {
+        let d = Dir::new("save-nd");
+        let mut it = interp_in(&d);
+        let nd = Value::Mat(Matrix::filled_dims(&[2, 2, 2], 1.0));
+        it.vars_mut().insert("A".into(), nd.clone());
+        it.vars_mut().insert(
+            "c".into(),
+            Value::cell(crate::value::CellArray::new(1, 1, vec![nd])),
+        );
+        let refusal = "N-D arrays are not supported by 'save'.";
+        for (file, var, ascii) in [
+            ("n.mat", "A", false),
+            ("m.mat", "c", false),
+            ("n.txt", "A", true),
+        ] {
+            let mut args = vec![s(file), s(var)];
+            if ascii {
+                args.push(s("-ascii"));
+            }
+            let e = call(&mut it, save, &args, 0).unwrap_err();
+            assert_eq!(msg(e), refusal);
+            assert!(!d.0.join(file).exists(), "{file}");
+        }
+        it.vars_mut()
+            .insert("x".into(), Value::Mat(Matrix::scalar(1.0)));
+        call(&mut it, save, &[s("k.mat"), s("x")], 0).unwrap();
+        let before = fs::read(d.0.join("k.mat")).unwrap();
+        let e = call(&mut it, save, &[s("k.mat"), s("A"), s("-append")], 0).unwrap_err();
+        assert_eq!(msg(e), refusal);
+        assert_eq!(fs::read(d.0.join("k.mat")).unwrap(), before);
     }
 
     #[test]

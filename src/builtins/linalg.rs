@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use super::args::{
-    at_most, check_shape, dim, fmt_dim, mat, need, option, shape, size_list, trailing_ones,
+    at_most, check_dims, check_shape, dim, fmt_dim, mat, need, option, shape, size_list,
 };
 use super::complex::C;
 use super::core::eps_at;
@@ -699,8 +699,10 @@ fn magic_square(n: usize) -> Matrix {
 // ---- rearrangement ---------------------------------------------------
 
 /// `reshape(A, r, c, ...)`, `reshape(A, sz)`, and one `[]` placeholder among
-/// the sizes for the one that makes the count come out. Trailing sizes of `1`
-/// are dropped; any other third size is the N-D error.
+/// the sizes, anywhere, for the one that makes the count come out. Since
+/// cycle 14 it takes any number of sizes and an N-D `A`: `reshape(1:24, 2,
+/// 3, 4)` is 2x3x4 and `reshape(A, 6, [])` of it 6x4. Trailing sizes of `1`
+/// are dropped, and the shape is judged by `check_dims` before the count.
 fn reshape(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     need(a, 2, "reshape")?;
     let m = mat(a, 0, "reshape")?;
@@ -728,14 +730,18 @@ fn reshape(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     } else {
         total as f64 / known
     };
-    let dims: Vec<f64> = list.into_iter().map(|d| d.unwrap_or(fill)).collect();
-    let (r, c) = trailing_ones(&dims)?;
-    let (r, c) = check_shape(r, c)?;
-    if r * c != total {
-        return Err(error::reshape_numel(total, r, c));
+    let mut dims: Vec<f64> = list.into_iter().map(|d| d.unwrap_or(fill)).collect();
+    while dims.len() > 2 && dims.last() == Some(&1.0) {
+        dims.pop();
+    }
+    let dims = check_dims(&dims)?;
+    // Saturating, since the sizes of an empty shape may multiply past
+    // `usize` before they reach the 0 (`reshape([], 2^40, 2^40, 0)`).
+    if crate::value::dims_product(&dims) != total {
+        return Err(error::reshape_numel(total, &dims));
     }
     // Rearrangement keeps the class, here and in the next three.
-    one_as(Matrix::new(r, c, m.data).with_class(m.class))
+    one_as(Matrix::from_dims(&dims, m.data).with_class(m.class))
 }
 
 /// `repmat(A, n)`, `repmat(A, r, c, ...)` and `repmat(A, sz)`, through the
@@ -1486,12 +1492,32 @@ mod tests {
                 .msg,
             "Size can only have one unknown dimension."
         );
+        // Cycle 14: to and from N-D, a placeholder anywhere, and the count
+        // message naming every size.
         assert_eq!(
             call(reshape, &[v.clone(), num(3.0), num(2.0), num(2.0)])
                 .unwrap_err()
                 .msg,
-            "N-D arrays are not supported."
+            "To reshape the number of elements must not change (6 vs 3x2x2)."
         );
+        let nd = call(reshape, &[v.clone(), num(1.0), num(2.0), num(3.0)]).unwrap();
+        assert_eq!(
+            (nd.dims(), nd.data.clone()),
+            (vec![1, 2, 3], v.mat().unwrap().data.clone())
+        );
+        let back = call(reshape, &[Value::Mat(nd.clone()), empty.clone(), num(2.0)]).unwrap();
+        assert_eq!(back.dims(), [3, 2]);
+        // An empty shape whose sizes multiply past `usize` before the 0 is
+        // counted as the 0 it is, never overflowing.
+        let huge = 2f64.powi(40);
+        let e = call(reshape, &[empty.clone(), num(huge), num(huge), num(0.0)]).unwrap();
+        assert_eq!(e.dims(), [1 << 40, 1 << 40, 0]);
+        let mid = call(
+            reshape,
+            &[Value::Mat(nd), num(1.0), empty.clone(), num(2.0)],
+        )
+        .unwrap();
+        assert_eq!(mid.dims(), [1, 3, 2]);
         // A single size must be a vector of at least two, not n by n.
         assert!(call(reshape, &[v.clone(), num(6.0)]).is_err());
         assert!(call(reshape, &[v.clone(), empty.clone()]).is_err());

@@ -375,9 +375,8 @@ pub fn fractional_matrix_power() -> MError {
 }
 
 /// `x()`, an index with no subscripts at all. Since cycle 03 accepted
-/// trailing singleton subscripts (QA D22), this is the one form that reaches
-/// it; a third subscript that would need an N-D array is
-/// [`nd_unsupported`] instead.
+/// trailing singleton subscripts (QA D22), and cycle 14 any number of
+/// subscripts, this is the one form that reaches it.
 pub fn indexing_rank() -> MError {
     MError::new("Only 1-D and 2-D indexing is supported.")
 }
@@ -652,10 +651,13 @@ pub fn output(e: std::io::Error) -> MError {
 
 // ---- matrix arithmetic -----------------------------------------------
 
-pub fn operator_dims(op: &str, ar: usize, ac: usize, br: usize, bc: usize) -> MError {
+/// Every dimension of each side since cycle 14: `(2x3x4 vs 2x3x5)`.
+pub fn operator_dims(op: &str, a: &[usize], b: &[usize]) -> MError {
     MError::new(format!(
-        "Arrays have incompatible sizes for operator '{}' ({}x{} vs {}x{}).",
-        op, ar, ac, br, bc
+        "Arrays have incompatible sizes for operator '{}' ({} vs {}).",
+        op,
+        crate::value::dims_text(a, "x"),
+        crate::value::dims_text(b, "x")
     ))
 }
 
@@ -792,16 +794,49 @@ pub fn bad_size_arg(name: &str) -> MError {
 /// The two dimensions arrive already rendered, because a requested size can
 /// be past `usize` (`zeros(1e300)`) and `args::fmt_dim` decides how such a
 /// size is printed.
-pub fn size_overflow(rows: &str, cols: &str) -> MError {
+///
+/// Since cycle 14 it names every size, `Requested 100000x100000x100000
+/// array exceeds the maximum array size.`
+pub fn size_overflow(dims: &[String]) -> MError {
     MError::new(format!(
-        "Requested {}x{} array exceeds the maximum array size.",
-        rows, cols
+        "Requested {} array exceeds the maximum array size.",
+        dims.join("x")
     ))
 }
 
-/// A third or later size other than `1`: `zeros(2, 3, 4)`.
+/// A third or later size other than `1` where no N-D array can be made:
+/// `cell(2, 3, 4)` and `repmat(1, [2 2 2])`, a cell or struct array read
+/// or grown into an N-D shape, and the builtins of `numerics.rs` that
+/// refuse a third dimension of their own (`meshgrid` of three inputs).
 pub fn nd_unsupported() -> MError {
     MError::new("N-D arrays are not supported.")
+}
+
+// ---- N-D arrays (cycle 14) --------------------------------------------
+//
+// SplatCrab's own wording throughout.
+
+/// An N-D argument to a builtin not on `builtins::ND_OK`, which the gate
+/// refuses before it runs: `sum(zeros(2, 2, 2))`. `save` refuses an N-D
+/// variable with the same text.
+pub fn nd_argument(name: &str) -> MError {
+    MError::new(format!("N-D arrays are not supported by '{}'.", name))
+}
+
+/// `*`, `/`, `\` and `^` of an N-D operand where they are not
+/// element-wise: `zeros(2, 2, 2) * ones(2, 2)`.
+pub fn nd_matrix_operation() -> MError {
+    MError::new("Matrix operations are not defined for N-D arrays.")
+}
+
+/// `'` and `.'` of an N-D array.
+pub fn nd_transpose() -> MError {
+    MError::new("Transpose is not defined for N-D arrays.")
+}
+
+/// A bracket concatenation holding an N-D array: `[zeros(2, 2, 2), 1]`.
+pub fn nd_concatenation() -> MError {
+    MError::new("Concatenation of N-D arrays is not supported.")
 }
 
 /// A single size argument that is a column or a matrix: `zeros([2; 3])`.
@@ -946,10 +981,12 @@ pub fn tolerance_arg(name: &str) -> MError {
     MError::new(format!("Tolerance for '{}' must be a real scalar.", name))
 }
 
-pub fn reshape_numel(have: usize, rows: usize, cols: usize) -> MError {
+/// Every size asked for since cycle 14: `(6 vs 2x2x2)`.
+pub fn reshape_numel(have: usize, dims: &[usize]) -> MError {
     MError::new(format!(
-        "To reshape the number of elements must not change ({} vs {}x{}).",
-        have, rows, cols
+        "To reshape the number of elements must not change ({} vs {}).",
+        have,
+        crate::value::dims_text(dims, "x")
     ))
 }
 

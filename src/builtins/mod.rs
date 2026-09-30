@@ -157,6 +157,72 @@ pub fn complex_gate(name: &str, args: &[Value]) -> R<()> {
     Ok(())
 }
 
+/// The builtins that take an N-D argument (cycle 14). Every other builtin
+/// was written for two dimensions and would read only the first page of
+/// an N-D array, so the registry refuses one to it before it runs, with
+/// `error::nd_argument`, as [`complex_gate`] refuses a complex argument:
+/// `sum(zeros(2, 2, 2))` is that refusal. On this list are the
+/// constructors, which make N-D arrays, the shape and class queries,
+/// `isequal`, `reshape`, `disp`, the class conversions, the printf family,
+/// which reads the elements in column-major order, and `feval` and
+/// `deal`, which pass their arguments on, so the callee's own gate judges
+/// them. Cycle 14b grows the list.
+///
+/// Only a matrix argument is judged, as the complex gate judges one: a
+/// cell or a struct is never N-D, though an element or a field may hold
+/// an N-D array, which a builtin that reads it judges itself.
+pub const ND_OK: &[&str] = &[
+    // The constructors.
+    "zeros",
+    "ones",
+    "rand",
+    "NaN",
+    "nan",
+    "Inf",
+    "inf",
+    "true",
+    "false",
+    // Shape and class queries.
+    "size",
+    "ndims",
+    "numel",
+    "length",
+    "isempty",
+    "isscalar",
+    "isvector",
+    "class",
+    "isa",
+    "islogical",
+    "ischar",
+    "isnumeric",
+    "iscell",
+    "isstruct",
+    "isreal",
+    // Comparison, rearrangement and output.
+    "isequal",
+    "reshape",
+    "disp",
+    // The class conversions and the printf family.
+    "double",
+    "logical",
+    "char",
+    "fprintf",
+    "sprintf",
+    // Values passed on whole.
+    "feval",
+    "deal",
+];
+
+/// The refusal of an N-D argument to a builtin not on [`ND_OK`]; see
+/// there.
+pub fn nd_gate(name: &str, args: &[Value]) -> R<()> {
+    let nd = args.iter().any(|v| matches!(v, Value::Mat(m) if m.is_nd()));
+    if nd && !ND_OK.contains(&name) {
+        return Err(crate::error::nd_argument(name));
+    }
+    Ok(())
+}
+
 pub(crate) fn add(r: &mut Registry, name: &'static str, f: BuiltinFn, help: &'static str) {
     let clash = r.insert(name, Entry { f, help });
     debug_assert!(clash.is_none(), "builtin '{name}' registered twice");
@@ -215,8 +281,9 @@ mod tests {
     /// twenty plotting builtins of `plot/mod.rs`. Cycle 13 added the
     /// nineteen of `environ.rs`: `cd`, `pwd`, `ls`, `dir`, `help`, `which`,
     /// `format`, `eval`, `evalc`, `run`, `datestr`, `now`, `clock`, `pause`,
-    /// `getenv`, `system`, `version`, `exit` and `quit`.
-    const EXPECTED: usize = 250;
+    /// `getenv`, `system`, `version`, `exit` and `quit`. Cycle 14 added
+    /// `ndims`.
+    const EXPECTED: usize = 251;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -239,6 +306,7 @@ mod tests {
             "rand",
             "linspace",
             "size",
+            "ndims",
             "numel",
             "length",
             "isempty",
@@ -451,6 +519,38 @@ mod tests {
         for name in TAKES_COMPLEX {
             assert!(r.contains_key(name), "'{name}' is on TAKES_COMPLEX only");
         }
+        // And so is every name the N-D gate lets through (cycle 14).
+        for name in ND_OK {
+            assert!(r.contains_key(name), "'{name}' is on ND_OK only");
+        }
+    }
+
+    /// Cycle 14: an N-D argument reaches only the builtins on `ND_OK`.
+    #[test]
+    fn the_gate_refuses_an_nd_argument_to_every_other_builtin() {
+        let nd = Value::Mat(Matrix::filled_dims(&[2, 2, 2], 0.0));
+        let e = nd_gate("sum", std::slice::from_ref(&nd)).unwrap_err().msg;
+        assert_eq!(e, "N-D arrays are not supported by 'sum'.");
+        for name in [
+            "abs", "max", "squeeze", "permute", "cat", "repmat", "find", "sort", "num2str",
+        ] {
+            assert!(nd_gate(name, std::slice::from_ref(&nd)).is_err(), "{name}");
+        }
+        for name in [
+            "size", "ndims", "numel", "reshape", "disp", "isequal", "feval", "deal",
+        ] {
+            assert!(nd_gate(name, std::slice::from_ref(&nd)).is_ok(), "{name}");
+        }
+        // A 2-D argument, and an N-D array inside a cell, pass everywhere.
+        assert!(nd_gate("sum", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
+        let boxed = Value::cell(crate::value::CellArray::new(1, 1, vec![nd.clone()]));
+        assert!(nd_gate("sum", &[boxed]).is_ok());
+        // Through the interpreter: the gate runs on every builtin call, a
+        // call through `feval` included, and names the callee.
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        let e = it.run("feval(@abs, zeros(2, 2, 2))").unwrap_err().msg;
+        assert_eq!(e, "N-D arrays are not supported by 'abs'.");
+        assert!(it.run("x = numel(zeros(2, 2, 2));").is_ok());
     }
 
     /// Cycle 10: a complex argument reaches only the builtins that take one.

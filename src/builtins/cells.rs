@@ -240,7 +240,10 @@ fn num2cell(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 1, "num2cell")?;
     at_most(args, 1, "num2cell")?;
     let v = &args[0];
-    let (r, c) = v.dims();
+    // Never N-D: the gate refuses an N-D array, and a cell or a struct
+    // array is never one (cycle 14).
+    let d = v.dims();
+    let (r, c) = (d[0], d[1]);
     check_cell(r, c)?;
     let data = (0..r * c).map(|k| v.element(k)).collect();
     one(Value::cell(CellArray::new(r, c, data)))
@@ -350,10 +353,13 @@ pub(crate) fn map_elements(
             bail!(error::arg_not_a_cell(k + 2, name));
         }
     }
-    let (rows, cols) = inputs[0].dims();
-    if inputs.iter().any(|v| v.dims() != (rows, cols)) {
+    let dims = inputs[0].dims();
+    if inputs.iter().any(|v| v.dims() != dims) {
         bail!(error::arrayfun_size());
     }
+    // Every input is a cell, a struct array, a handle or a matrix the N-D
+    // gate has let through, so two dimensions are all there are (cycle 14).
+    let (rows, cols) = (dims[0], dims[1]);
     let outs = nargout.max(1);
     if !uniform {
         // Each output is a cell of the inputs' size (cycle 13b).
@@ -474,10 +480,10 @@ mod tests {
         let c = one_of(cell, &[num(1.0), num(3.0)]);
         assert_eq!(
             (c.dims(), cell_of(&c).data.iter().all(Value::is_blank)),
-            ((1, 3), true)
+            (vec![1, 3], true)
         );
-        assert_eq!(one_of(cell, &[num(2.0)]).dims(), (2, 2));
-        assert_eq!(one_of(cell, &[]).dims(), (0, 0));
+        assert_eq!(one_of(cell, &[num(2.0)]).dims(), [2, 2]);
+        assert_eq!(one_of(cell, &[]).dims(), [0, 0]);
         assert!(call(cell, &[num(1e10)], 1).is_err());
     }
 
@@ -511,13 +517,16 @@ mod tests {
             strukt,
             &[Value::str("a"), Value::cell(CellArray::default())],
         );
-        assert_eq!((none.dims(), struct_of(&none).fields.len()), ((0, 0), 1));
+        assert_eq!(
+            (none.dims(), struct_of(&none).fields.len()),
+            (vec![0, 0], 1)
+        );
         let holds = one_of(
             strukt,
             &[Value::str("a"), row(&[row(&[num(1.0), num(2.0)])])],
         );
         assert!(matches!(&struct_of(&holds).elems[0][0], Value::Cell(c) if c.numel() == 2));
-        assert_eq!(one_of(strukt, &[]).dims(), (1, 1));
+        assert_eq!(one_of(strukt, &[]).dims(), [1, 1]);
         assert_eq!(
             call(strukt, &[Value::str("a")], 1).unwrap_err().msg,
             error::struct_pairs().msg
@@ -560,7 +569,7 @@ mod tests {
             &[Value::str("a"), num(1.0), Value::str("b"), num(2.0)],
         );
         let f = one_of(fieldnames, std::slice::from_ref(&s));
-        assert_eq!(f.dims(), (2, 1));
+        assert_eq!(f.dims(), [2, 1]);
         assert_eq!(cell_of(&f).data[1].text().as_deref(), Some("b"));
         let yes = |args: &[Value]| one_of(isfield, args);
         assert!(
@@ -605,7 +614,7 @@ mod tests {
     fn the_conversions_and_deal() {
         let m = Value::Mat(Matrix::new(2, 2, vec![1.0, 3.0, 2.0, 4.0]));
         let c = one_of(num2cell, std::slice::from_ref(&m));
-        assert_eq!(c.dims(), (2, 2));
+        assert_eq!(c.dims(), [2, 2]);
         assert!(matches!(&cell_of(&c).data[1], Value::Mat(x) if x.data == [3.0]));
         let back = one_of(cell2mat, &[c]);
         assert!(matches!(back, Value::Mat(x) if x.rows == 2 && x.data == [1.0, 3.0, 2.0, 4.0]));
@@ -648,7 +657,7 @@ mod tests {
         let mut args = vec![numel_of.clone(), c.clone()];
         args.extend(off.iter().cloned());
         let r = one_of(cellfun, &args);
-        assert_eq!((r.class_name(), r.dims()), ("cell", (1, 3)));
+        assert_eq!((r.class_name(), r.dims()), ("cell", vec![1, 3]));
         // The option's name in any case.
         args[2] = Value::str("uniformoutput");
         assert_eq!(one_of(cellfun, &args).class_name(), "cell");

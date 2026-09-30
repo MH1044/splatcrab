@@ -6,7 +6,7 @@ SplatCrab is a MATLAB-compatible numerical language written in Rust. It runs
 `.m` scripts and gives you a REPL. Every value is a matrix stored
 column-major, exactly as MATLAB stores it, so linear indexing, `reshape` and
 `(:)` agree with MATLAB element for element. A matrix is of class `double`,
-`logical` or `char`, as in MATLAB.
+`logical` or `char`, as in MATLAB, and may have any number of dimensions.
 
 This handbook is a reference to scan. Every example below was run against the
 binary and the output blocks are the bytes it produced. Where SplatCrab
@@ -23,6 +23,7 @@ each entry. `docs/ROADMAP.md` is the order the rest arrives in.
 - [Matrices](#matrices)
 - [Operators](#operators)
 - [Indexing](#indexing)
+- [N-D arrays](#n-d-arrays)
 - [Cells and structs](#cells-and-structs)
 - [Control flow](#control-flow)
 - [Functions](#functions)
@@ -1890,7 +1891,7 @@ c =
 
 ```
 
-Anything past 1 there is out of bounds:
+Anything past 1 there is out of bounds when you read it:
 
 ```matlab
 A = [1 2; 3 4];
@@ -1900,6 +1901,9 @@ A(1, 1, 2)
 ```
 Error: Line 2: Index in position 3 exceeds array bounds. Index must not exceed 1.
 ```
+
+Assigning there grows the matrix into a second page, as the next section
+shows.
 
 ### Brace and dot on a matrix
 
@@ -1924,10 +1928,176 @@ x.a
 Error: Line 2: Dot indexing is not supported for variables of this type.
 ```
 
-Cell arrays and structs, which do support them, are the next section.
+Cell arrays and structs, which do support them, come after N-D arrays.
 Assigning through a brace or a field into a matrix is MATLAB's assignment
 form of the same error, `Unable to perform assignment because dot indexing
 is not supported for variables of this type.`
+
+## N-D arrays
+
+A numeric, logical or char array can have any number of dimensions. The
+constructors `zeros`, `ones`, `rand`, `NaN`, `Inf`, `true` and `false` take
+three or more sizes or a size vector of any length, `zeros(2, 3, 4)` and
+`ones([2 2 2])`, with trailing sizes of 1 dropped as MATLAB drops them;
+`reshape` takes any number of sizes and one `[]`; and an assignment past
+the end grows an array into a new page. A named display
+shows an N-D array page by page, each page headed by its index and laid
+out as that page alone would be:
+
+```matlab
+A = reshape(1:8, 2, 2, 2)
+p = A(:, :, 2)
+B = zeros(2, 2);
+B(:, :, 2) = [1 2; 3 4];
+disp(size(B))
+```
+
+```
+A(:,:,1) =
+
+     1     3
+     2     4
+
+
+A(:,:,2) =
+
+     5     7
+     6     8
+
+p =
+
+     5     7
+     6     8
+
+     2     2     2
+```
+
+The shape queries see every dimension. `size` with fewer outputs than
+dimensions folds the rest into its last output and gives `1` for any
+output past them, as does `size(A, k)` past `ndims(A)`. `ndims` is 2 for
+every 2-D value, a cell or a struct included, and `isvector` and
+`isscalar` are false for any N-D array:
+
+```matlab
+A = zeros(2, 3, 4);
+disp(size(A))
+[r, c] = size(A);
+disp([r c])
+disp([ndims(A) numel(A) size(A, 5)])
+disp([ndims(5) ndims({}) isvector(zeros(1, 1, 3))])
+```
+
+```
+     2     3     4
+     2    12
+     3    24     1
+     2     2     0
+```
+
+An index takes any number of subscripts. With fewer than the array has
+dimensions, the last one indexes every remaining dimension folded into
+one, so `A(2, 7)` of a 2x3x4 is element (2, 7) of it as a 2x12, and `end`
+in the last position is the product of the dimensions it spans. A single
+subscript is linear over every element, and a read keeps one dimension
+per subscript. Deleting with one subscript that is not `:` removes those
+positions along its dimension:
+
+```matlab
+A = reshape(1:24, 2, 3, 4);
+disp(A(2, 7))
+disp(A(1, end))
+v = A(1, 2, :);
+disp(v(:)')
+disp(size(A(1, :, :)))
+A(:, :, 2) = [];
+disp(size(A))
+```
+
+```
+    14
+    23
+     3     9    15    21
+     1     3     4
+     2     3     3
+```
+
+The element-wise operators broadcast across every dimension: two
+dimensions agree when they are equal or one of them is 1, and a dimension
+past an operand's last is 1. `disp` writes the pages under headers of
+`(:,:,k) =`, and an empty N-D array says what it is:
+
+```matlab
+A = reshape(1:8, 2, 2, 2);
+D = A - [10; 20];
+disp(D(:)')
+L = A > 4;
+disp(class(L))
+disp(A)
+E = zeros(2, 0, 3)
+```
+
+```
+    -9   -18    -7   -16    -5   -14    -3   -12
+logical
+(:,:,1) =
+
+     1     3
+     2     4
+
+
+(:,:,2) =
+
+     5     7
+     6     8
+
+E =
+
+  2×0×3 empty double array
+
+```
+
+`for` over an N-D array iterates the columns of its 2-D fold, each a column
+of the array's rows:
+
+```matlab
+for col = reshape(1:6, 2, 1, 3)
+    disp(col')
+end
+```
+
+```
+     1     2
+     3     4
+     5     6
+```
+
+The builtins that take an N-D array so far, until the rest arrive with
+cycle 14b ([Not yet](#not-yet)), are those constructors, the shape and class
+queries, `ndims`, `reshape`, `isequal`, `disp`, `double`, `logical`,
+`char`, `fprintf`, `sprintf`, `feval` and `deal`. Every other builtin
+refuses one by name rather than read its first page alone, the matrix
+operators refuse one where they are not element-wise, and so do `'`, `.'`,
+a bracket that joins one to anything, and `save`:
+
+```matlab
+A = zeros(2, 2, 2);
+s = sum(A)
+```
+
+```
+Error: Line 2: N-D arrays are not supported by 'sum'.
+```
+
+`A * 2`, `A / 2` and `2 \ A` are element-wise, as they are for a matrix;
+`A * B` of two arrays is `Matrix operations are not defined for N-D
+arrays.`, `A'` is `Transpose is not defined for N-D arrays.` and `[A, 1]`
+is `Concatenation of N-D arrays is not supported.` Cells and structs stay
+2-D, though an element or a field may hold an N-D array, which a cell's
+display summarises as `{2×3×4 double}` and a struct's as `[2×3×4 double]`.
+A builtin that reads a cell's elements judges an N-D one itself: `unique`
+and the other set functions refuse it, `str2double` reads it as `NaN`, and
+`strcmp` and `strcmpi` compare it by every dimension, so the same
+characters in another shape are not the same text.
 
 ## Cells and structs
 
@@ -2846,6 +3016,8 @@ an ordinary name you are free to use as a variable.
 
 `zeros ones eye rand linspace`. A negative size gives an empty, not an error;
 a size that would overflow is a clean error naming the size you asked for.
+Every constructor but `eye` and `linspace` takes three or more sizes too,
+for an [N-D array](#n-d-arrays).
 
 ```matlab
 Z = zeros(2,3)
@@ -2887,9 +3059,10 @@ there is no `rng` to reseed it yet.
 
 ### Shape queries
 
-`size numel length isempty isscalar isvector`. `size(A)` returns the row
-vector `[rows cols]`, `size(A, d)` one dimension. `length` is the largest
-dimension.
+`size ndims numel length isempty isscalar isvector`. `size(A)` returns the
+row vector `[rows cols]`, and one more size per dimension of an [N-D
+array](#n-d-arrays); `size(A, d)` returns one dimension. `length` is the
+largest dimension.
 
 ```matlab
 A = [1 2 3; 4 5 6];
@@ -4967,9 +5140,11 @@ E =
 ```
 
 `pi(2)` stays an error, as in MATLAB. A trailing size of `1` is dropped, so
-`zeros(2, 3, 1)` is 2x3; any other third size, including `0`, is the clean
-error `N-D arrays are not supported.` A size past what `usize` holds is named
-as you asked for it, not as the clamp:
+`zeros(2, 3, 1)` is 2x3, while any other third size makes an [N-D
+array](#n-d-arrays), `zeros(2, 3, 0)` an empty 2x3x0. `eye` keeps two
+sizes, and `cell` and `repmat` keep the clean error `N-D arrays are not
+supported.` for a third size other than `1`. A size past what `usize`
+holds is named as you asked for it, not as the clamp:
 
 ```matlab
 x = zeros(1e300);
@@ -6001,9 +6176,16 @@ Error: Line 1: NaN's cannot be converted to logicals.
   work, as in Octave; MATLAB refuses to chain parentheses. `x()` with no
   subscripts is `Only 1-D and 2-D indexing is supported.`, where MATLAB
   returns `x`.
-- There are no N-D arrays, so `A(:, :, [1 1])`, `A(:, :, [])` and growth into
-  a second page (`A(1, 1, 2) = 5`) are `N-D arrays are not supported.`, where
-  MATLAB builds the N-D array.
+- An N-D array grows only through as many subscripts as it has dimensions,
+  or more: a linear subscript past its end, and a subscript past the end of
+  the fold that fewer subscripts index, are `Attempt to grow array along
+  ambiguous dimension.`
+- The builtins not yet taught N-D arrays refuse one by name, `N-D arrays are
+  not supported by 'sum'.`, where MATLAB takes most of them; so does `save`,
+  and a bracket joining one to anything. The per-page class line of a
+  logical or char N-D array, the `(:,:,k) =` headers of `disp` and the
+  `2×0×3 empty double array` wording are SplatCrab's stated rules, not
+  checked against MATLAB.
 - A cs-list is not spread into index subscripts, so `x(c{:})` of a
   two-element `c` is the cs-list error, and `[c{:}] = deal(0)` is not a
   target list; MATLAB accepts both. A cell cannot be transposed, `c'`.
@@ -6257,7 +6439,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| N-D arrays `zeros(2, 3, 4)` | not scheduled |
+| N-D reductions, element-wise math, `squeeze`, `permute`, `cat`, N-D concatenation, `repmat` and MAT-files | 14b |
 | Compressed MAT-files, `regexpi`, backreferences | not scheduled |
 | 3-D plots, surfaces, interaction with a figure | not scheduled |
 | Integer classes and `single` | not scheduled |
@@ -6266,9 +6448,9 @@ Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-zeros(2, 3, 4)
+sum(zeros(2, 3, 4))
 ```
 
 ```
-Error: Line 1: N-D arrays are not supported.
+Error: Line 1: N-D arrays are not supported by 'sum'.
 ```

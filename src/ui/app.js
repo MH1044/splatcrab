@@ -599,7 +599,7 @@
       const tr = element('tr');
       tr.appendChild(cell(v.name, 'name'));
       tr.appendChild(cell(v.value, 'value'));
-      tr.appendChild(cell(v.size[0] + '×' + v.size[1], 'size'));
+      tr.appendChild(cell(v.size.join('×'), 'size'));
       tr.appendChild(cell(v['class'], 'class'));
       varsBody.appendChild(tr);
     });

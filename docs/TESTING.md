@@ -234,21 +234,45 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   all derive `PartialEq`, so trees can be compared directly.
 - `value.rs`: numerics with tolerances. Broadcasting, matmul shapes, `solve`
   including pivoting and singular systems, `inv`, `det`, and the display
-  format branches.
+  format branches. Since cycle 14 the N-D representation: no stored
+  trailing 1 and a 2-D value unchanged, broadcasting's result shape across
+  every dimension and its refusal naming every dimension, a broadcast past
+  a hundred thousand singleton dimensions within a bound, and the page
+  display, a logical, char and complex page, headers past the fourth
+  dimension, a page's own scale factor and the empty N-D wording, the
+  display handed out a page at a time, two thousand pages under headers
+  naming three thousand dimensions of 1 within a bound, and a field name
+  past any format width aligned by hand.
 - `interp.rs`: behaviour, through a capture helper that swaps `Interp.out` for
   an in-memory buffer, plus the pure helpers `fmt_e`, `fmt_g`, `range` and
   `matrix_power`. The builtin tests here cover the wiring only: name
-  resolution, `nargout`, and the empty return.
+  resolution, `nargout`, and the empty return. Since cycle 14 the index
+  pipeline on N-D arrays: the column-major offset of an N-D subscript, the
+  fold of trailing dimensions and `end` in each position, growth into new
+  pages and dimensions and `regrid`'s layouts, a read through a hundred
+  thousand singleton subscripts and a growth past as many singleton
+  dimensions within a bound, deletion along one dimension, the operators
+  and `for`, the refusals, and a colon over an empty target taking the
+  right-hand side's extent.
 - `builtins/`: the builtins themselves, called directly as functions.
   `mod.rs` checks the registry holds every name exactly once and that every
   entry is callable; `args.rs` the message text of each helper and the size
-  overflow guard; `core.rs` the constructors;
+  overflow guard, and since cycle 14 `check_dims` at and past `MAX_ELEMS`
+  and a size of 0 anywhere among huge ones;
+  `core.rs` the constructors, and since cycle 14 their N-D sizes, the shape
+  queries by the `size` page's rules and `values_equal` of arrays of
+  different shapes and `whos` padding a column past any format width;
+  since cycle 14 `sets.rs` and `strings.rs` a cell
+  holding an N-D char, which is no character vector, and `strings.rs`
+  `strcmp` and `strcmpi` comparing one by every dimension;
   `math.rs` the reduction and scan dimension rules; `linalg.rs` sorting and
   rearrangement. Since cycle 10 `complex.rs` checks the complex arithmetic,
   the powers and the branch cuts with tolerances, and `fft` against the
   direct DFT for every length from 1 to 40 and at a prime length of
   100,003; `factor.rs` checks complex eigenvalues by the residual
-  `A*v - lambda*v`; `mod.rs` checks the complex gate. Since cycle 11
+  `A*v - lambda*v`; `mod.rs` checks the complex gate, and since cycle 14
+  the N-D gate, refusing an N-D argument to a builtin not on `ND_OK` and
+  passing one on it, through `feval` too. Since cycle 11
   `printf.rs` checks every conversion, flag and escape and the width and
   precision bound, `*` fields included; `strings.rs` the `num2str` layouts,
   the string functions, `regexp`'s outputs and the refusal of a result too
@@ -259,7 +283,8 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   past its bound, each a clean error; `io.rs` the file-identifier table,
   lines, bytes and the end-of-file flag, `save` and `load` in both formats,
   and `input` from a reader and refused, each in a temporary folder of its
-  own.
+  own. Since cycle 14 `mat.rs` and `io.rs` check that `save` refuses an
+  N-D array as a variable, a cell element or a field, and leaves no file.
 - `json.rs`: a round trip of every value kind, each escape the writer makes
   and the parser reads, surrogate pairs, rejection of trailing garbage and of
   malformed numbers and strings, and the depth limit at and past its bound.
@@ -269,7 +294,8 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 - `env.rs`: `completions` ordering, the merge of variables and builtins, and
   a shadowed builtin listed once; since cycle U2 each rule of `preview`, the
   display format, the cut at 80 scalar values, and a 2^20-element char row
-  previewed after decoding no more than 82 of its code units.
+  previewed after decoding no more than 82 of its code units; since cycle 14
+  rule 4 for every N-D array.
 - `files.rs` (cycle U2): the confinement rule at every step, the listing's
   order and sizes, a name that is not Unicode left out, the entry bound
   reached with a bound of 3, an uncanonical root refusing everything, a
@@ -312,7 +338,8 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   bound reached with a bound of the figure's own length; `cwd`'s moves,
   its refusals leaving the folder where it was, `cd` stopping at the root,
   no root and a folder gone answering `null`; and `pwd` after `cwd` in the
-  plain form `cd` gives, never `\\?\`.
+  plain form `cd` gives, never `\\?\`. Since cycle 14 `workspace` answers
+  every dimension of an N-D array in `size` and its preview.
 - `http.rs`: `handle` driven with byte strings, through every status, the
   header order, `Content-Length` against the body on every response, the
   static routes against the embedded files, the `Host`, `Origin` and token

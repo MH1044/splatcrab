@@ -85,13 +85,26 @@ impl Class {
     }
 }
 
+/// An array of doubles, logicals or chars with any number of dimensions.
+///
+/// Since cycle 14 a matrix keeps its `rows` and `cols` and, beside them,
+/// the dimensions past the second in `higher`, stored normalised: a
+/// trailing dimension of 1 is never stored, so a 2-D matrix has an empty
+/// `higher` and is exactly what it was before N-D arrays existed, and
+/// `ndims` is 2 plus the stored count. The field is private so that only
+/// the constructors here, which normalise, ever set it; [`Matrix::dims`]
+/// reads every dimension and [`Matrix::set_dims`] changes them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    /// Column-major: element (r, c) lives at data[c * rows + r]. For a
-    /// complex array these are the real parts.
+    /// Column-major: element (r, c) lives at data[c * rows + r], and
+    /// element `(i1, i2, ..., ik)` of an N-D array, zero-based, at
+    /// `i1 + d1*(i2 + d2*(i3 + ...))`. For a complex array these are the
+    /// real parts.
     pub data: Vec<f64>,
+    /// The dimensions past the second (cycle 14), never ending in a 1.
+    higher: Vec<usize>,
     /// The imaginary parts (cycle 10), column-major like `data`, or `None`
     /// for real storage. Only a double is ever complex. Every operation
     /// drops an imaginary part that is zero throughout, through
@@ -481,28 +494,34 @@ impl Value {
         }
     }
 
-    /// Rows and columns; an `MException` and a function handle are each
-    /// one object, 1x1.
-    pub fn dims(&self) -> (usize, usize) {
+    /// Every dimension, at least two: a matrix's own, all of them since
+    /// cycle 14, a cell's and a struct array's rows and columns (they are
+    /// never N-D), and 1x1 for an `MException` and a function handle, each
+    /// one object.
+    pub fn dims(&self) -> Vec<usize> {
         match self {
-            Value::Mat(m) => (m.rows, m.cols),
-            Value::Exception(_) | Value::Func(_) => (1, 1),
-            Value::Cell(c) => (c.rows, c.cols),
-            Value::Struct(s) => (s.rows, s.cols),
+            Value::Mat(m) => m.dims(),
+            Value::Exception(_) | Value::Func(_) => vec![1, 1],
+            Value::Cell(c) => vec![c.rows, c.cols],
+            Value::Struct(s) => vec![s.rows, s.cols],
         }
     }
 
-    /// How many elements: `rows * cols` of [`dims`](Value::dims).
+    /// How many elements: the product of every dimension.
     pub fn numel(&self) -> usize {
-        let (r, c) = self.dims();
-        r * c
+        match self {
+            Value::Mat(m) => m.numel(),
+            Value::Exception(_) | Value::Func(_) => 1,
+            Value::Cell(c) => c.rows * c.cols,
+            Value::Struct(s) => s.rows * s.cols,
+        }
     }
 
     /// True for the 0x0 double `[]`, which an assignment or a
     /// concatenation treats as "nothing here yet": `x = []; x.a = 1` makes
-    /// a struct and `[[] {1}]` is a cell.
+    /// a struct and `[[] {1}]` is a cell. A 0x0x3 is not it.
     pub fn is_blank(&self) -> bool {
-        matches!(self, Value::Mat(m) if m.class == Class::Double && m.rows == 0 && m.cols == 0)
+        matches!(self, Value::Mat(m) if m.is_blank())
     }
 
     /// Element `k`, linear and zero-based, as a value of its own: a scalar
@@ -531,13 +550,44 @@ impl Value {
     /// `name =`, a blank line, the display body and a closing blank line.
     /// A struct's first line is `name = `, with the space after the `=`
     /// that the spec records for MATLAB's struct display (cycle 07).
+    ///
+    /// A non-empty N-D array is its pages instead (cycle 14); see
+    /// [`Matrix::page_display`].
     pub fn display(&self, name: &str) -> String {
+        if let Value::Mat(m) = self {
+            if m.is_nd() && !m.is_empty() {
+                return m.page_display(name);
+            }
+        }
         let eq = if matches!(self, Value::Struct(_)) {
             "= "
         } else {
             "="
         };
         format!("{} {}\n\n{}\n", name, eq, self.display_body())
+    }
+
+    /// [`Value::display`] handed to `emit`: a non-empty N-D array a page at
+    /// a time (cycle 14), so its display holds one page's text whatever the
+    /// page count, and any other value whole.
+    pub fn write_display<E>(
+        &self,
+        name: &str,
+        mut emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Value::Mat(m) if m.is_nd() && !m.is_empty() => m.write_pages(name, emit),
+            v => emit(&v.display(name)),
+        }
+    }
+
+    /// [`Value::disp_text`] handed to `emit`, a non-empty N-D array a page
+    /// at a time; see [`Value::write_display`].
+    pub fn write_disp<E>(&self, mut emit: impl FnMut(&str) -> Result<(), E>) -> Result<(), E> {
+        match self {
+            Value::Mat(m) if m.is_nd() && !m.is_empty() => m.write_pages("", emit),
+            v => emit(&v.disp_text()),
+        }
     }
 
     /// What follows `x =` and its blank line.
@@ -576,20 +626,21 @@ impl Value {
     }
 }
 
-/// `r×c`, the size as every container display writes it.
-fn size_text(r: usize, c: usize) -> String {
-    format!("{r}×{c}")
+/// `r×c`, and `2×3×4` for an N-D array (cycle 14): the size as every
+/// container display writes it.
+fn size_text(dims: &[usize]) -> String {
+    dims_text(dims, "×")
 }
 
 /// A named display's body for a cell (cycle 07): `  1×2 cell array`, a
 /// blank line and the rows, or `  0×0 empty cell array` for an empty.
 fn cell_body(c: &CellArray) -> String {
     if c.data.is_empty() {
-        return format!("  {} empty cell array\n", size_text(c.rows, c.cols));
+        return format!("  {} empty cell array\n", size_text(&[c.rows, c.cols]));
     }
     format!(
         "  {} cell array\n\n{}",
-        size_text(c.rows, c.cols),
+        size_text(&[c.rows, c.cols]),
         cell_rows(c)
     )
 }
@@ -610,17 +661,37 @@ fn cell_element(v: &Value) -> (String, usize) {
             let t = format!("{{[{}]}}", m.format().trim());
             return (t, 2);
         }
-        Value::Mat(m) if m.class == Class::Char && m.rows == 1 => {
+        Value::Mat(m) if m.class == Class::Char && m.rows == 1 && !m.is_nd() => {
             format!("{{'{}'}}", m.row_text(0))
         }
         Value::Func(f) => format!("{{{}}}", f.shown()),
-        v => {
-            let (r, c) = v.dims();
-            format!("{{{} {}}}", size_text(r, c), v.class_name())
-        }
+        v => format!("{{{} {}}}", size_text(&v.dims()), v.class_name()),
     };
     let at = text.chars().count() - 1;
     (text, at)
+}
+
+/// Pushes `text` onto `out` right-aligned in `width` characters, as
+/// `{:>w$}` writes it. Rust's formatter panics with "Formatting argument
+/// out of range" on a runtime width past 65,535, and a width a program
+/// controls, a field name's or a size text's, can pass it, so every such
+/// column is padded here instead (cycle 14).
+pub fn push_right(out: &mut String, text: &str, width: usize) {
+    out.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(text.chars().count()),
+    ));
+    out.push_str(text);
+}
+
+/// Pushes `text` onto `out` left-aligned in `width` characters, as
+/// `{:<w$}` writes it; see [`push_right`].
+pub fn push_left(out: &mut String, text: &str, width: usize) {
+    out.push_str(text);
+    out.extend(std::iter::repeat_n(
+        ' ',
+        width.saturating_sub(text.chars().count()),
+    ));
 }
 
 /// `text` widened to `width` characters by spaces inserted at `at`.
@@ -703,9 +774,9 @@ fn struct_body(s: &StructArray) -> String {
         return format!("  struct with fields:\n\n{}", field_lines(s));
     }
     let what = if n == 0 {
-        format!("{} empty struct array", size_text(s.rows, s.cols))
+        format!("{} empty struct array", size_text(&[s.rows, s.cols]))
     } else {
-        format!("{} struct array", size_text(s.rows, s.cols))
+        format!("{} struct array", size_text(&[s.rows, s.cols]))
     };
     if s.fields.is_empty() {
         return format!("  {what} with no fields.\n");
@@ -726,7 +797,11 @@ fn field_lines(s: &StructArray) -> String {
         .unwrap_or(0);
     let mut out = String::new();
     for (f, v) in s.fields.iter().zip(&s.elems[0]) {
-        let head = format!("    {:>w$}: ", f, w = w);
+        // Padded by hand: a field name has no length limit, and a runtime
+        // width past 65,535 panics in Rust's formatter (cycle 14).
+        let mut head = String::from("    ");
+        push_right(&mut head, f, w);
+        head.push_str(": ");
         let room = TERM_WIDTH.saturating_sub(head.chars().count());
         let _ = writeln!(out, "{}{}", head, field_summary(v, room));
     }
@@ -740,11 +815,10 @@ fn field_lines(s: &StructArray) -> String {
 /// double, a handle its text; anything else is its size and class, `[2×2
 /// double]`, `{1×2 cell}` for a cell and `[1×1 struct]` for a struct.
 fn field_summary(v: &Value, room: usize) -> String {
-    let sized = |v: &Value| {
-        let (r, c) = v.dims();
-        format!("[{} {}]", size_text(r, c), v.class_name())
-    };
+    let sized = |v: &Value| format!("[{} {}]", size_text(&v.dims()), v.class_name());
     match v {
+        // An N-D array is always its size and class (cycle 14).
+        Value::Mat(m) if m.is_nd() => sized(v),
         Value::Mat(m) if m.class == Class::Char => {
             if m.rows == 0 && m.cols == 0 {
                 "''".to_string()
@@ -766,7 +840,7 @@ fn field_summary(v: &Value, room: usize) -> String {
             }
         }
         Value::Func(f) => f.shown(),
-        Value::Cell(c) => format!("{{{} cell}}", size_text(c.rows, c.cols)),
+        Value::Cell(c) => format!("{{{} cell}}", size_text(&[c.rows, c.cols])),
         v => sized(v),
     }
 }
@@ -809,6 +883,105 @@ fn broadcast_dim(a: usize, b: usize) -> Option<usize> {
     }
 }
 
+/// The product of `dims`, saturating: the element count of an array, and
+/// of an empty one whose other dimensions multiply past `usize`, where no
+/// element could ever be addressed anyway (cycle 14).
+pub fn dims_product(dims: &[usize]) -> usize {
+    dims.iter().fold(1usize, |n, &d| n.saturating_mul(d))
+}
+
+/// `dims` as a matrix stores them: at least two, every trailing 1 past the
+/// second dropped. No dimensions is 1x1 and one is a column.
+pub fn normalize_dims(dims: &[usize]) -> Vec<usize> {
+    let mut d: Vec<usize> = dims.to_vec();
+    while d.len() < 2 {
+        d.push(1);
+    }
+    while d.len() > 2 && d.last() == Some(&1) {
+        d.pop();
+    }
+    d
+}
+
+/// `dims` joined with `sep`: `2x3x4` for a message, `2×3×4` for a display.
+pub fn dims_text(dims: &[usize], sep: &str) -> String {
+    dims.iter()
+        .map(|d| d.to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The shape two operands broadcast to (cycle 14): two dimensions agree
+/// when they are equal or one of them is 1, and a dimension past an
+/// operand's `ndims` is 1.
+pub fn broadcast_dims(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+    let n = a.len().max(b.len());
+    (0..n)
+        .map(|k| {
+            broadcast_dim(
+                a.get(k).copied().unwrap_or(1),
+                b.get(k).copied().unwrap_or(1),
+            )
+        })
+        .collect()
+}
+
+/// Calls `f` with the offsets in `a` and in `b` of every element of the
+/// broadcast shape `dims`, in column-major order: a dimension of 1 in an
+/// operand is read at its one position. The offsets are carried as a
+/// counter, one step per element, so the walk is linear in the elements it
+/// produces and costs nothing for an empty result.
+fn broadcast_walk(
+    dims: &[usize],
+    a: &[usize],
+    b: &[usize],
+    mut f: impl FnMut(usize, usize) -> R<()>,
+) -> R<()> {
+    let n = dims_product(dims);
+    if n == 0 {
+        return Ok(());
+    }
+    let strides = |d: &[usize]| -> Vec<usize> {
+        let mut s = Vec::with_capacity(dims.len());
+        let mut acc = 1usize;
+        for k in 0..dims.len() {
+            let dk = d.get(k).copied().unwrap_or(1);
+            s.push(if dk == 1 { 0 } else { acc });
+            acc = acc.saturating_mul(dk);
+        }
+        s
+    };
+    let (sa, sb) = (strides(a), strides(b));
+    // A dimension of 1 in the result is 1 in both operands and moves
+    // neither offset, so the counter leaves it out: it then carries only
+    // through dimensions of 2 or more, of which an array of `n` elements
+    // has at most log2(n), and a step costs no more however many
+    // singletons stand between them (`zeros([ones(1, 1e4) 2000])`).
+    let live: Vec<(usize, usize, usize)> = (0..dims.len())
+        .filter(|&k| dims[k] > 1)
+        .map(|k| (dims[k], sa[k], sb[k]))
+        .collect();
+    let mut coord = vec![0usize; live.len()];
+    let (mut oa, mut ob) = (0usize, 0usize);
+    for _ in 0..n {
+        f(oa, ob)?;
+        // The next element: the first coordinate moves, and a coordinate
+        // that reaches its dimension carries into the next.
+        for (c, &(d, step_a, step_b)) in coord.iter_mut().zip(&live) {
+            *c += 1;
+            oa += step_a;
+            ob += step_b;
+            if *c < d {
+                break;
+            }
+            oa -= step_a * d;
+            ob -= step_b * d;
+            *c = 0;
+        }
+    }
+    Ok(())
+}
+
 impl Matrix {
     pub fn new(rows: usize, cols: usize, data: Vec<f64>) -> Matrix {
         debug_assert_eq!(rows * cols, data.len());
@@ -816,6 +989,99 @@ impl Matrix {
             rows,
             cols,
             data,
+            higher: Vec::new(),
+            im: None,
+            class: Class::Double,
+        }
+    }
+
+    /// A double of any number of dimensions (cycle 14), normalised as
+    /// [`normalize_dims`] says, so `from_dims(&[2, 3, 1], ..)` is 2x3.
+    pub fn from_dims(dims: &[usize], data: Vec<f64>) -> Matrix {
+        let d = normalize_dims(dims);
+        debug_assert_eq!(dims_product(&d), data.len());
+        Matrix {
+            rows: d[0],
+            cols: d[1],
+            data,
+            higher: d[2..].to_vec(),
+            im: None,
+            class: Class::Double,
+        }
+    }
+
+    /// `dims` filled with `v`; the caller has judged the shape.
+    pub fn filled_dims(dims: &[usize], v: f64) -> Matrix {
+        Matrix::from_dims(dims, vec![v; dims_product(dims)])
+    }
+
+    /// Every dimension: the rows, the columns and the stored ones past
+    /// them, so a 2-D matrix answers two and a 2x3x4 three.
+    pub fn dims(&self) -> Vec<usize> {
+        let mut d = Vec::with_capacity(2 + self.higher.len());
+        d.push(self.rows);
+        d.push(self.cols);
+        d.extend_from_slice(&self.higher);
+        d
+    }
+
+    /// The dimensions past the second, never ending in a 1.
+    pub fn higher(&self) -> &[usize] {
+        &self.higher
+    }
+
+    /// `ndims`: 2 for a 2-D matrix, and one more per stored dimension.
+    pub fn ndims(&self) -> usize {
+        2 + self.higher.len()
+    }
+
+    /// True for an array of three dimensions or more (cycle 14).
+    pub fn is_nd(&self) -> bool {
+        !self.higher.is_empty()
+    }
+
+    /// Gives this matrix the shape `dims`, normalised, which must hold as
+    /// many elements as it does: a reshape, a deletion or a growth after
+    /// its storage has been laid out.
+    pub fn set_dims(&mut self, dims: &[usize]) {
+        let d = normalize_dims(dims);
+        debug_assert_eq!(dims_product(&d), self.data.len());
+        self.rows = d[0];
+        self.cols = d[1];
+        self.higher = d[2..].to_vec();
+    }
+
+    /// The columns of the 2-D fold, `rows x (the product of the rest)`,
+    /// which is what `for` iterates (cycle 14).
+    pub fn fold_cols(&self) -> usize {
+        self.cols.saturating_mul(dims_product(&self.higher))
+    }
+
+    /// How many `rows x cols` pages the array holds.
+    pub fn pages(&self) -> usize {
+        dims_product(&self.higher)
+    }
+
+    /// Page `p`, zero-based in column-major page order, as a 2-D matrix of
+    /// this array's class and storage: a page of a complex array is complex
+    /// whatever its own imaginary parts, which is how the display shows it.
+    pub fn page(&self, p: usize) -> Matrix {
+        let n = self.rows * self.cols;
+        let span = p * n..(p + 1) * n;
+        let mut m = Matrix::new(self.rows, self.cols, self.data[span.clone()].to_vec())
+            .with_class(self.class);
+        m.im = self.im.as_ref().map(|v| v[span].to_vec());
+        m
+    }
+
+    /// A double of this matrix's shape holding `data`.
+    fn shaped(&self, data: Vec<f64>) -> Matrix {
+        debug_assert_eq!(data.len(), self.data.len());
+        Matrix {
+            rows: self.rows,
+            cols: self.cols,
+            data,
+            higher: self.higher.clone(),
             im: None,
             class: Class::Double,
         }
@@ -888,33 +1154,42 @@ impl Matrix {
     /// Every element through `f` as a complex scalar, stored by the flag
     /// rule.
     pub fn map_c(&self, f: impl Fn(C) -> C) -> Matrix {
-        let z = (0..self.numel()).map(|k| f(self.c(k))).collect();
-        Matrix::from_c(self.rows, self.cols, z)
+        let (re, im): (Vec<f64>, Vec<f64>) = (0..self.numel())
+            .map(|k| {
+                let z = f(self.c(k));
+                (z.re, z.im)
+            })
+            .unzip();
+        self.shaped(re).with_im(Some(im))
+    }
+
+    /// The shape `self` and `o` broadcast to, judged by `check_dims`
+    /// before anything is allocated, or the operand-size refusal naming
+    /// every dimension of each side (cycle 14).
+    fn broadcast_shape(&self, o: &Matrix, op: &str) -> R<Vec<usize>> {
+        let (a, b) = (self.dims(), o.dims());
+        let dims = broadcast_dims(&a, &b).ok_or_else(|| error::operator_dims(op, &a, &b))?;
+        let asked: Vec<f64> = dims.iter().map(|&d| d as f64).collect();
+        crate::builtins::args::check_dims(&asked)?;
+        Ok(dims)
     }
 
     /// [`zip`](Matrix::zip) over complex scalars, with the same broadcasting
     /// and the same size check, stored by the flag rule.
     pub fn zip_c(&self, o: &Matrix, op: &str, f: impl Fn(C, C) -> C) -> R<Matrix> {
-        let dims_err = || error::operator_dims(op, self.rows, self.cols, o.rows, o.cols);
-        let rows = broadcast_dim(self.rows, o.rows).ok_or_else(dims_err)?;
-        let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
-        crate::builtins::args::check_shape(rows as f64, cols as f64)?;
-        let at = |m: &Matrix, r: usize, c: usize| {
-            let r = if m.rows == 1 { 0 } else { r };
-            let c = if m.cols == 1 { 0 } else { c };
-            m.c(c * m.rows + r)
-        };
-        let mut re = Vec::with_capacity(rows * cols);
-        let mut im = Vec::with_capacity(rows * cols);
+        let dims = self.broadcast_shape(o, op)?;
+        let n = dims_product(&dims);
+        let mut re = Vec::with_capacity(n);
+        let mut im = Vec::with_capacity(n);
         // One pass per element produced, never per column: a 0x1e12
         // operand has no elements and must cost nothing (cycle 13b).
-        for k in 0..rows * cols {
-            let (r, c) = (k % rows, k / rows);
-            let z = f(at(self, r, c), at(o, r, c));
+        broadcast_walk(&dims, &self.dims(), &o.dims(), |i, j| {
+            let z = f(self.c(i), o.c(j));
             re.push(z.re);
             im.push(z.im);
-        }
-        Ok(Matrix::new(rows, cols, re).with_im(Some(im)))
+            Ok(())
+        })?;
+        Ok(Matrix::from_dims(&dims, re).with_im(Some(im)))
     }
 
     /// This matrix with its class tag set, leaving the elements alone. The
@@ -974,6 +1249,7 @@ impl Matrix {
             rows: self.rows,
             cols: self.cols,
             data,
+            higher: self.higher,
             im: None,
             class,
         })
@@ -981,6 +1257,17 @@ impl Matrix {
 
     pub fn is_char(&self) -> bool {
         self.class == Class::Char
+    }
+
+    /// True for the 0x0 double `[]`; see [`Value::is_blank`].
+    pub fn is_blank(&self) -> bool {
+        self.class == Class::Double && self.rows == 0 && self.cols == 0 && !self.is_nd()
+    }
+
+    /// True for a char of at most one row that is not N-D: a character
+    /// vector, `''` included, which is what a text display quotes.
+    pub fn is_char_row(&self) -> bool {
+        self.class == Class::Char && self.rows <= 1 && !self.is_nd()
     }
 
     /// Every element, in column-major order, decoded as UTF-16. This is how
@@ -1038,8 +1325,9 @@ impl Matrix {
 
     /// MATLAB's `isvector`: 1-by-N or N-by-1, where N may be `0`. A 1x0 and a
     /// 0x1 are vectors; a 0x0 is not.
+    /// An N-D array is never one (cycle 14).
     pub fn is_vector(&self) -> bool {
-        self.rows == 1 || self.cols == 1
+        !self.is_nd() && (self.rows == 1 || self.cols == 1)
     }
 
     pub fn get(&self, r: usize, c: usize) -> f64 {
@@ -1110,12 +1398,10 @@ impl Matrix {
         Ok(v != 0.0)
     }
 
+    /// Every element through `f`, as a double of this matrix's shape, every
+    /// dimension included.
     pub fn map(&self, f: impl Fn(f64) -> f64) -> Matrix {
-        Matrix::new(
-            self.rows,
-            self.cols,
-            self.data.iter().map(|v| f(*v)).collect(),
-        )
+        self.shaped(self.data.iter().map(|v| f(*v)).collect())
     }
 
     /// [`map`](Matrix::map) for an operation that may refuse an element, which
@@ -1126,7 +1412,7 @@ impl Matrix {
         for v in &self.data {
             data.push(f(*v)?);
         }
-        Ok(Matrix::new(self.rows, self.cols, data))
+        Ok(self.shaped(data))
     }
 
     /// Element-wise combination with scalar / row / column broadcasting.
@@ -1144,11 +1430,21 @@ impl Matrix {
     /// element is allocated. `ones(1e5, 1) + ones(1, 1e5)` asks for 1e10
     /// elements from two 1e5-element operands, and used to abort in the
     /// allocator with exit 134, taking the REPL with it.
+    ///
+    /// Since cycle 14 the broadcasting runs across every dimension, and the
+    /// size refusal names every dimension of each side. Two 2-D operands
+    /// take the loop they always took.
     pub fn try_zip(&self, o: &Matrix, op: &str, f: impl Fn(f64, f64) -> R<f64>) -> R<Matrix> {
-        let dims_err = || error::operator_dims(op, self.rows, self.cols, o.rows, o.cols);
-        let rows = broadcast_dim(self.rows, o.rows).ok_or_else(dims_err)?;
-        let cols = broadcast_dim(self.cols, o.cols).ok_or_else(dims_err)?;
-        crate::builtins::args::check_shape(rows as f64, cols as f64)?;
+        let dims = self.broadcast_shape(o, op)?;
+        if self.is_nd() || o.is_nd() {
+            let mut data = Vec::with_capacity(dims_product(&dims));
+            broadcast_walk(&dims, &self.dims(), &o.dims(), |i, j| {
+                data.push(f(self.data[i], o.data[j])?);
+                Ok(())
+            })?;
+            return Ok(Matrix::from_dims(&dims, data));
+        }
+        let (rows, cols) = (dims[0], dims[1]);
         let mut data = Vec::with_capacity(rows * cols);
         // One pass per element produced, never per column: `zeros(0, 1e12)
         // + 1` used to spin 1e12 times for an empty result (cycle 13b).
@@ -1169,7 +1465,11 @@ impl Matrix {
 
     /// `A.'`, the plain transpose: the imaginary parts move with the real
     /// ones and keep their signs.
+    ///
+    /// An N-D array has no transpose; `'` and `.'` refuse one before they
+    /// get here, and every builtin that transposes is behind the N-D gate.
     pub fn transpose(&self) -> Matrix {
+        debug_assert!(!self.is_nd(), "transpose of an N-D array");
         let flip = |v: &[f64]| -> Vec<f64> {
             // Output element `k` is row `k % cols`, column `k / cols` of the
             // result, which is element (`k / cols`, `k % cols`) of this one.
@@ -1187,13 +1487,13 @@ impl Matrix {
 
     /// The real parts, as a real matrix of the same class.
     pub fn real_part(&self) -> Matrix {
-        Matrix::new(self.rows, self.cols, self.data.clone()).with_class(self.class)
+        self.shaped(self.data.clone()).with_class(self.class)
     }
 
     /// The imaginary parts, as a real matrix; zeros for real storage.
     pub fn imag_part(&self) -> Matrix {
         let im = self.im.clone().unwrap_or_else(|| vec![0.0; self.numel()]);
-        Matrix::new(self.rows, self.cols, im)
+        self.shaped(im)
     }
 
     /// Matrix product. The result shape comes from the operands, so it goes
@@ -1635,7 +1935,16 @@ impl Matrix {
 
     /// What `disp` prints. A char is bare text, one line per row, and `''`
     /// is still one empty line; any other empty prints nothing at all.
+    ///
+    /// An N-D array (cycle 14) writes the pages its named display writes,
+    /// under the headers `(:,:,k) =`, and an empty one nothing.
     pub fn disp_text(&self) -> String {
+        if self.is_nd() {
+            if self.is_empty() {
+                return String::new();
+            }
+            return self.page_display("");
+        }
         if self.class == Class::Char {
             if self.rows == 0 {
                 return "\n".to_string();
@@ -1657,7 +1966,21 @@ impl Matrix {
     /// a blank line. A 1-row char is its text quoted, as MATLAB has shown it
     /// since R2018a. An empty says what it is, `  0×3 empty double matrix`,
     /// except the 0x0 double, which is still `     []`.
+    ///
+    /// An empty N-D array is `  2×0×3 empty double array` (and `logical`,
+    /// `char`), where a 2-D empty keeps `matrix` (cycle 14); a non-empty
+    /// one is its pages, as [`Matrix::page_display`] writes them.
     pub fn display_body(&self) -> String {
+        if self.is_nd() {
+            if self.is_empty() {
+                return format!(
+                    "  {} empty {} array\n",
+                    size_text(&self.dims()),
+                    self.class.name()
+                );
+            }
+            return self.page_display("");
+        }
         let (r, c) = (self.rows, self.cols);
         if self.is_empty() {
             return match self.class {
@@ -1685,6 +2008,102 @@ impl Matrix {
             Class::Logical => format!("  {r}×{c} logical array\n\n{}", self.format()),
             Class::Double => self.format(),
         }
+    }
+
+    /// The named display of a non-empty N-D array (cycle 14), by the page
+    /// layout of the MathWorks page "Multidimensional Arrays": for each
+    /// page in column-major page order, `name(:,:,k) =` with every index
+    /// past the second (`name(:,:,1,2) =`), a blank line, the page's body
+    /// exactly as the named display of that page alone writes it after its
+    /// `name =` line (its own scale factor, column wrapping, class line and
+    /// quoted char rows, since each page is a 2-D value of this array's
+    /// class and storage), its closing blank line, and one more blank line
+    /// between pages. `disp` writes the same pages with `name` empty, so
+    /// the headers are `(:,:,k) =`.
+    ///
+    /// This is [`Matrix::write_pages`] gathered into one text; the
+    /// interpreter writes the pages to its output one at a time instead.
+    pub fn page_display(&self, name: &str) -> String {
+        let mut out = String::new();
+        let Ok(()) = self.write_pages(name, |s| {
+            out.push_str(s);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        out
+    }
+
+    /// The pages of [`Matrix::page_display`] handed to `emit` one at a
+    /// time, each with its header and its blank lines (cycle 14), so what
+    /// is held at once is one page's text however many pages there are:
+    /// gathered whole, `zeros([1 1 ones(1, 10000) 10000])` built a text of
+    /// 200 MB before writing a byte of it.
+    ///
+    /// Each header costs time linear in its length. A dimension of 1 always
+    /// has the index 1, so a run of them is written as one piece, and only
+    /// the dimensions past 1 are stepped from page to page.
+    pub fn write_pages<E>(
+        &self,
+        name: &str,
+        mut emit: impl FnMut(&str) -> Result<(), E>,
+    ) -> Result<(), E> {
+        // The header's pieces after `(:,:`: a run of dimensions of 1, as
+        // its length, or one dimension past 1, as its position.
+        enum Piece {
+            Ones(usize),
+            Moving(usize),
+        }
+        let mut pieces: Vec<Piece> = Vec::new();
+        for (k, &d) in self.higher.iter().enumerate() {
+            if d != 1 {
+                pieces.push(Piece::Moving(k));
+            } else if let Some(Piece::Ones(n)) = pieces.last_mut() {
+                *n += 1;
+            } else {
+                pieces.push(Piece::Ones(1));
+            }
+        }
+        let longest = pieces
+            .iter()
+            .map(|p| match p {
+                Piece::Ones(n) => *n,
+                Piece::Moving(_) => 0,
+            })
+            .max()
+            .unwrap_or(0);
+        let ones = ",1".repeat(longest);
+        let mut index = vec![0usize; self.higher.len()];
+        let mut text = String::new();
+        for p in 0..self.pages() {
+            text.clear();
+            if p > 0 {
+                text.push('\n');
+            }
+            text.push_str(name);
+            text.push_str("(:,:");
+            for piece in &pieces {
+                match *piece {
+                    Piece::Ones(n) => text.push_str(&ones[..2 * n]),
+                    Piece::Moving(k) => {
+                        let _ = write!(text, ",{}", index[k] + 1);
+                    }
+                }
+            }
+            text.push_str(") =\n\n");
+            text.push_str(&self.page(p).display_body());
+            text.push('\n');
+            emit(&text)?;
+            // The next page's indices, the first moving fastest.
+            for piece in &pieces {
+                if let Piece::Moving(k) = *piece {
+                    index[k] += 1;
+                    if index[k] < self.higher[k] {
+                        break;
+                    }
+                    index[k] = 0;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2724,11 +3143,14 @@ mod tests {
     #[test]
     fn every_value_answers_class_dims_and_element() {
         let c = Value::cell(CellArray::blanks(2, 3));
-        assert_eq!((c.class_name(), c.dims(), c.numel()), ("cell", (2, 3), 6));
+        assert_eq!(
+            (c.class_name(), c.dims(), c.numel()),
+            ("cell", vec![2, 3], 6)
+        );
         let e = c.element(4);
         assert!(matches!(&e, Value::Cell(x) if x.numel() == 1));
         let s = Value::strukt(StructArray::scalar(vec!["a".into()], vec![num(1.0)]));
-        assert_eq!((s.class_name(), s.dims()), ("struct", (1, 1)));
+        assert_eq!((s.class_name(), s.dims()), ("struct", vec![1, 1]));
         assert!(blank().is_blank());
         assert!(!Value::str("").is_blank());
     }
@@ -2836,5 +3258,289 @@ mod tests {
         let t = a.transpose();
         assert_eq!((t.rows, t.cols), (3, 2));
         assert_eq!(t.data, [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
+    }
+
+    // ---- N-D arrays (cycle 14) -----------------------------------------
+
+    /// The dimensions past the second are stored normalised: never a
+    /// trailing 1, so a 2-D matrix is exactly what it was before.
+    #[test]
+    fn nd_dimensions_are_stored_without_a_trailing_one() {
+        let two = Matrix::from_dims(&[2, 3, 1, 1], vec![0.0; 6]);
+        assert_eq!(two, Matrix::new(2, 3, vec![0.0; 6]));
+        assert_eq!(
+            (two.dims(), two.ndims(), two.is_nd()),
+            (vec![2, 3], 2, false)
+        );
+        assert!(two.higher().is_empty());
+        let nd = Matrix::from_dims(&[2, 3, 1, 4], vec![0.0; 24]);
+        assert_eq!(
+            (nd.dims(), nd.ndims(), nd.higher()),
+            (vec![2, 3, 1, 4], 4, &[1, 4][..])
+        );
+        let empty = Matrix::from_dims(&[2, 0, 3], Vec::new());
+        assert_eq!((empty.dims(), empty.is_empty()), (vec![2, 0, 3], true));
+        // No dimensions is 1x1, one a column.
+        assert_eq!(Matrix::from_dims(&[], vec![5.0]).dims(), [1, 1]);
+        assert_eq!(Matrix::from_dims(&[3], vec![0.0; 3]).dims(), [3, 1]);
+        // A reshape back to two dimensions drops what it no longer has.
+        let mut m = nd.clone();
+        m.set_dims(&[6, 4, 1]);
+        assert_eq!((m.dims(), m.higher().len()), (vec![6, 4], 0));
+        // An N-D array is never a vector, a scalar or a blank.
+        let tall = Matrix::from_dims(&[1, 3, 4], vec![0.0; 12]);
+        assert!(!tall.is_vector() && !tall.is_scalar());
+        assert!(!Matrix::from_dims(&[0, 0, 3], Vec::new()).is_blank());
+        assert!(Matrix::empty().is_blank());
+        assert_eq!((tall.fold_cols(), tall.pages()), (12, 4));
+        // Element-wise results, class conversions and parts keep every
+        // dimension.
+        assert_eq!(nd.map(|x| x + 1.0).dims(), nd.dims());
+        assert_eq!(nd.clone().to_class(Class::Char).unwrap().dims(), nd.dims());
+        assert_eq!(nd.real_part().dims(), nd.dims());
+        assert_eq!(nd.imag_part().dims(), nd.dims());
+        assert_eq!(nd.map_c(|z| z).dims(), nd.dims());
+        assert_eq!(normalize_dims(&[4, 1, 1]), [4, 1]);
+        assert_eq!(dims_text(&[2, 3, 4], "x"), "2x3x4");
+        assert_eq!(dims_product(&[0, usize::MAX, usize::MAX]), 0);
+    }
+
+    /// Broadcasting across every dimension: two dimensions agree when they
+    /// are equal or one is 1, and a dimension past an operand's `ndims` is
+    /// 1. The refusal names every dimension of each side.
+    #[test]
+    fn broadcasting_runs_across_every_dimension() {
+        assert_eq!(broadcast_dims(&[2, 3, 4], &[1, 1, 4]), Some(vec![2, 3, 4]));
+        assert_eq!(broadcast_dims(&[2, 1], &[2, 2, 2]), Some(vec![2, 2, 2]));
+        assert_eq!(broadcast_dims(&[1, 3], &[2, 1, 5]), Some(vec![2, 3, 5]));
+        assert_eq!(broadcast_dims(&[2, 3, 4], &[2, 3, 5]), None);
+        let a = Matrix::from_dims(&[2, 2, 2], (1..=8).map(f64::from).collect());
+        let col = Matrix::col(vec![10.0, 20.0]);
+        let d = a.zip(&col, "-", |x, y| x - y).unwrap();
+        assert_eq!(d.dims(), [2, 2, 2]);
+        assert_eq!(d.data, [-9.0, -18.0, -7.0, -16.0, -5.0, -14.0, -3.0, -12.0]);
+        // A page vector against a matrix fills every page with its own.
+        let pages = Matrix::from_dims(&[1, 1, 2], vec![100.0, 200.0]);
+        let m = Matrix::new(2, 1, vec![1.0, 2.0]);
+        let s = m.zip(&pages, "+", |x, y| x + y).unwrap();
+        assert_eq!(
+            (s.dims(), s.data),
+            (vec![2, 1, 2], vec![101.0, 102.0, 201.0, 202.0])
+        );
+        let big = Matrix::filled_dims(&[2, 3, 4], 0.0);
+        let e = big
+            .zip(&Matrix::filled_dims(&[2, 3, 5], 0.0), "+", |x, y| x + y)
+            .unwrap_err()
+            .msg;
+        assert_eq!(
+            e,
+            "Arrays have incompatible sizes for operator '+' (2x3x4 vs 2x3x5)."
+        );
+        let z = a
+            .zip_c(&Matrix::scalar(0.0), "*", |x, _| x * C::new(0.0, 1.0))
+            .unwrap();
+        assert_eq!((z.dims(), z.is_complex()), (vec![2, 2, 2], true));
+        // The broadcast shape is judged before it is allocated.
+        let wide = Matrix::from_dims(&[1, 1, 20_000], vec![0.0; 20_000]);
+        let long = Matrix::col(vec![0.0; 20_000]);
+        assert_eq!(
+            wide.zip(&long, "+", |x, y| x + y).unwrap_err().msg,
+            "Requested 20000x1x20000 array exceeds the maximum array size."
+        );
+    }
+
+    /// A dimension of 1 moves neither operand, so the walk passes over it:
+    /// interior singletons leave every value where it belongs, and a
+    /// hundred thousand of them cost a broadcast no more than none, where
+    /// a counter carried through each would take time in proportion to the
+    /// elements times the dimensions.
+    #[test]
+    fn broadcasting_passes_over_singleton_dimensions() {
+        let a = Matrix::from_dims(&[2, 1, 3], (1..=6).map(f64::from).collect());
+        let b = Matrix::from_dims(&[1, 1, 3, 1, 2], vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        let s = a.zip(&b, "+", |x, y| x + y).unwrap();
+        assert_eq!(s.dims(), [2, 1, 3, 1, 2]);
+        assert_eq!(
+            s.data,
+            [
+                11.0, 12.0, 23.0, 24.0, 35.0, 36.0, 41.0, 42.0, 53.0, 54.0, 65.0, 66.0
+            ]
+        );
+        let mut dims = vec![1usize; 100_000];
+        dims.push(2000);
+        let x = Matrix::filled_dims(&dims, 1.0);
+        let start = std::time::Instant::now();
+        let y = x
+            .zip(&Matrix::col(vec![1.0, 2.0]), "+", |p, q| p + q)
+            .unwrap();
+        let z = x.zip(&x, "+", |p, q| p + q).unwrap();
+        let took = start.elapsed();
+        assert_eq!((y.numel(), y.ndims()), (4000, 100_001));
+        assert_eq!(y.data[..4], [2.0, 3.0, 2.0, 3.0]);
+        assert!(z.data.iter().all(|&v| v == 2.0));
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    }
+
+    /// The named display of an N-D array is its pages, each the named
+    /// display of that page alone; `disp` writes the same pages under
+    /// `(:,:,k) =`; an empty one is one line.
+    #[test]
+    fn an_nd_array_displays_page_by_page() {
+        let a = Value::Mat(Matrix::from_dims(
+            &[2, 2, 2],
+            (1..=8).map(f64::from).collect(),
+        ));
+        let pages = "(:,:,1) =\n\n     1     3\n     2     4\n\n\n\
+                     (:,:,2) =\n\n     5     7\n     6     8\n\n";
+        assert_eq!(
+            a.display("A"),
+            format!("A{}", pages.replace("\n\n\n(", "\n\n\nA("))
+        );
+        assert_eq!(a.disp_text(), pages);
+        let l = Matrix::from_dims(&[1, 2, 2], vec![1.0, 0.0, 0.0, 1.0]).with_class(Class::Logical);
+        assert_eq!(
+            Value::Mat(l).display("L"),
+            "L(:,:,1) =\n\n  1×2 logical array\n\n   1   0\n\n\n\
+             L(:,:,2) =\n\n  1×2 logical array\n\n   0   1\n\n"
+        );
+        let c = Matrix::from_dims(&[1, 2, 2], "abcd".encode_utf16().map(f64::from).collect())
+            .with_class(Class::Char);
+        assert_eq!(
+            Value::Mat(c).display("c"),
+            "c(:,:,1) =\n\n    'ab'\n\n\nc(:,:,2) =\n\n    'cd'\n\n"
+        );
+        // A page of a complex array is complex, whatever its own parts.
+        let mut z = Matrix::from_dims(&[1, 1, 2], vec![0.0, 0.0]);
+        z.im = Some(vec![0.0, 1.0]);
+        assert_eq!(
+            Value::Mat(z).display("Z"),
+            "Z(:,:,1) =\n\n   0.0000 + 0.0000i\n\n\nZ(:,:,2) =\n\n   0.0000 + 1.0000i\n\n"
+        );
+        // Every index past the second is written.
+        let x = Value::Mat(Matrix::filled_dims(&[1, 1, 1, 2], 0.0));
+        assert_eq!(
+            x.display("x"),
+            "x(:,:,1,1) =\n\n     0\n\n\nx(:,:,1,2) =\n\n     0\n\n"
+        );
+        // Each page takes its own scale factor.
+        let w = Value::Mat(Matrix::from_dims(&[1, 2, 2], vec![1.0, 2.0, 1000.5, 3.0]));
+        assert!(
+            w.display("W")
+                .contains("W(:,:,2) =\n\n   1.0e+03 *\n\n    1.0005    0.0030\n")
+        );
+        // An empty N-D array says so, and `disp` of one prints nothing.
+        let e = Matrix::from_dims(&[2, 0, 3], Vec::new());
+        assert_eq!(
+            Value::Mat(e.clone()).display("E"),
+            "E =\n\n  2×0×3 empty double array\n\n"
+        );
+        let el = e.clone().with_class(Class::Logical);
+        assert_eq!(el.display_body(), "  2×0×3 empty logical array\n");
+        let ec = e.clone().with_class(Class::Char);
+        assert_eq!(ec.display_body(), "  2×0×3 empty char array\n");
+        assert_eq!(e.disp_text(), "");
+        // A cell element and a struct field are summarised by size.
+        let nd = Value::Mat(Matrix::filled_dims(&[2, 3, 4], 0.0));
+        let cell = Value::cell(CellArray::new(1, 1, vec![nd.clone()]));
+        assert_eq!(
+            cell.display("c"),
+            "c =\n\n  1×1 cell array\n\n    {2×3×4 double}\n\n"
+        );
+        let s = Value::strukt(StructArray::scalar(vec!["f".into()], vec![nd]));
+        assert_eq!(
+            s.display("s"),
+            "s = \n\n  struct with fields:\n\n    f: [2×3×4 double]\n\n"
+        );
+    }
+
+    /// Cycle 14: the display is handed out a page at a time, each piece
+    /// one page's header and body, and an array of many pages and many
+    /// dimensions of 1 writes its long headers in time linear in their
+    /// length, the text gathered whole being the pieces joined.
+    #[test]
+    fn an_nd_display_is_written_a_page_at_a_time() {
+        let ones = 3000;
+        let pages = 2000;
+        let mut dims = vec![1usize, 1];
+        dims.extend(std::iter::repeat_n(1, ones));
+        dims.push(pages);
+        let m = Matrix::filled_dims(&dims, 0.0);
+        assert_eq!(m.pages(), pages);
+        let header = |name: &str, k: usize| format!("{name}(:,:,{}{k}) =", "1,".repeat(ones));
+        let start = std::time::Instant::now();
+        let (mut count, mut longest) = (0, 0);
+        let (mut first, mut last) = (String::new(), String::new());
+        let r = Value::Mat(m.clone()).write_display("x", |s| {
+            if count == 0 {
+                first.push_str(s);
+            }
+            count += 1;
+            longest = longest.max(s.len());
+            last.clear();
+            last.push_str(s);
+            Ok::<(), ()>(())
+        });
+        let took = start.elapsed();
+        assert_eq!(r, Ok(()));
+        assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+        // One piece per page, none longer than a page's text.
+        assert_eq!(count, pages);
+        assert_eq!(first, format!("{}\n\n     0\n\n", header("x", 1)));
+        assert_eq!(last, format!("\n{}\n\n     0\n\n", header("x", pages)));
+        assert_eq!(longest, last.len());
+        // `disp` writes the same pages under headers with no name.
+        let mut heads: Vec<String> = Vec::new();
+        let r = Value::Mat(m).write_disp(|s| {
+            heads.push(s.lines().find(|l| !l.is_empty()).unwrap_or("").to_string());
+            Ok::<(), ()>(())
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(heads.len(), pages);
+        assert_eq!(heads[0], header("", 1));
+        assert_eq!(heads[pages - 1], header("", pages));
+        // A dimension past 1 among the ones moves in column-major order,
+        // and the pieces joined are the text gathered whole.
+        let mut dims = vec![1usize, 1, 2];
+        dims.extend(std::iter::repeat_n(1, 3));
+        dims.push(3);
+        let m = Matrix::filled_dims(&dims, 0.0);
+        let mut heads: Vec<String> = Vec::new();
+        let mut joined = String::new();
+        let Ok(()) = m.write_pages("y", |s| {
+            heads.push(s.lines().find(|l| !l.is_empty()).unwrap_or("").to_string());
+            joined.push_str(s);
+            Ok::<(), std::convert::Infallible>(())
+        });
+        assert_eq!(
+            heads,
+            [
+                "y(:,:,1,1,1,1,1) =",
+                "y(:,:,2,1,1,1,1) =",
+                "y(:,:,1,1,1,1,2) =",
+                "y(:,:,2,1,1,1,2) =",
+                "y(:,:,1,1,1,1,3) =",
+                "y(:,:,2,1,1,1,3) =",
+            ]
+        );
+        assert_eq!(joined, m.page_display("y"));
+    }
+
+    /// Cycle 14: a field name longer than the 65,535 characters Rust's
+    /// formatter takes as a width is aligned by hand, where a formatted
+    /// width panicked.
+    #[test]
+    fn a_field_name_past_any_format_width_is_aligned_by_hand() {
+        let long = "a".repeat(70_000);
+        let s = StructArray::scalar(
+            vec![long.clone(), "b".into()],
+            vec![
+                Value::Mat(Matrix::scalar(1.0)),
+                Value::Mat(Matrix::scalar(2.0)),
+            ],
+        );
+        let text = field_lines(&s);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], format!("    {long}: 1"));
+        assert_eq!(lines[1], format!("    {}b: 2", " ".repeat(69_999)));
     }
 }

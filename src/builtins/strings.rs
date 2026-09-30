@@ -540,6 +540,12 @@ fn lower(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 /// chars of one size and the same units, case-folded when `icase`, and
 /// with `n`, only their first `n` units, which must be there in both or
 /// be missing from both.
+///
+/// One size is every dimension (cycle 14): the gate refuses an N-D char
+/// argument, but one held in a cell reaches this, and `reshape('abcd', 1,
+/// 1, 4)` and `reshape('abcd', 1, 1, 2, 2)` share their rows, their
+/// columns and their units and are still not the same text. Two empties
+/// are the same text whatever their shapes, as before.
 fn same_text(a: &Value, b: &Value, n: Option<usize>, icase: bool) -> bool {
     let (Value::Mat(x), Value::Mat(y)) = (a, b) else {
         return false;
@@ -558,10 +564,7 @@ fn same_text(a: &Value, b: &Value, n: Option<usize>, icase: bool) -> bool {
             })
     };
     match n {
-        None => {
-            ((x.rows, x.cols) == (y.rows, y.cols) || (x.is_empty() && y.is_empty()))
-                && eq(&x.data, &y.data)
-        }
+        None => (x.dims() == y.dims() || (x.is_empty() && y.is_empty())) && eq(&x.data, &y.data),
         Some(n) => eq(
             &x.data[..n.min(x.data.len())],
             &y.data[..n.min(y.data.len())],
@@ -974,9 +977,7 @@ fn str2double(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 1, "str2double")?;
     at_most(args, 1, "str2double")?;
     let of = |v: &Value| match v {
-        Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => {
-            parse_double(&m.text()).unwrap_or(f64::NAN)
-        }
+        Value::Mat(m) if m.is_char_row() => parse_double(&m.text()).unwrap_or(f64::NAN),
         _ => f64::NAN,
     };
     match &args[0] {
@@ -1572,7 +1573,7 @@ mod tests {
                 args.push(Value::Mat(Matrix::scalar(0.0)));
             }
             let out = strsplit(&mut it, &args, 1).unwrap();
-            assert_eq!(out[0].dims(), (1, pieces), "{text} {collapse}");
+            assert_eq!(out[0].dims(), [1, pieces], "{text} {collapse}");
         }
     }
 
@@ -1716,6 +1717,17 @@ mod tests {
         }
         let v = call(str2double, &[num(5.0)], 1).unwrap();
         assert!(v[0].mat().unwrap().data[0].is_nan());
+        // Cycle 14: a cell's N-D char is no text, as a char matrix is none,
+        // however few its rows.
+        let nd = Value::Mat(
+            Matrix::from_dims(&[1, 2, 2], "1234".bytes().map(f64::from).collect())
+                .with_class(Class::Char),
+        );
+        let c = Value::cell(CellArray::row(vec![nd, Value::str("1234")]));
+        let v = call(str2double, &[c], 1).unwrap();
+        let d = &v[0].mat().unwrap().data;
+        assert!(d[0].is_nan());
+        assert_eq!(d[1], 1234.0);
     }
 
     #[test]
@@ -1820,6 +1832,24 @@ mod tests {
             Class::Logical
         );
         assert!(call(strncmp, &[s("a"), s("a"), num(-1.0)], 1).is_err());
+        // Cycle 14: an N-D char in a cell is compared by every dimension,
+        // so the same units in two shapes with the same rows and columns
+        // are not the same text; two empties still are, whatever their
+        // shapes.
+        let nd = |dims: &[usize], text: &str| {
+            Value::cell(CellArray::row(vec![Value::Mat(
+                Matrix::from_dims(dims, text.bytes().map(f64::from).collect())
+                    .with_class(Class::Char),
+            )]))
+        };
+        let a = nd(&[1, 1, 4], "abcd");
+        assert_eq!(t(strcmp, &[a.clone(), nd(&[1, 1, 2, 2], "abcd")]), [0.0]);
+        assert_eq!(t(strcmp, &[a.clone(), nd(&[1, 1, 4], "abcd")]), [1.0]);
+        assert_eq!(t(strcmp, &[a.clone(), s("abcd")]), [0.0]);
+        assert_eq!(t(strcmpi, &[a.clone(), nd(&[1, 1, 2, 2], "ABCD")]), [0.0]);
+        assert_eq!(t(strcmpi, &[a, nd(&[1, 1, 4], "ABCD")]), [1.0]);
+        let empty = nd(&[1, 0, 3], "");
+        assert_eq!(t(strcmp, &[empty, s("")]), [1.0]);
     }
 
     #[test]

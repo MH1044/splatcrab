@@ -1,0 +1,4 @@
+% covers: 11 - the protocol's workspace answers an N-D array's size with every dimension, and with preview its value is the size and class with × between every dimension, never the elements of an N-D array however few
+{"id":1,"op":"eval","code":"A = zeros(2, 3, 4); B = zeros(1, 1, 2);"}
+{"id":2,"op":"workspace"}
+{"id":3,"op":"workspace","preview":true}

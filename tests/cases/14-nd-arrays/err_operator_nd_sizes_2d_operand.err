@@ -1,0 +1,1 @@
+Error: Line 2: Arrays have incompatible sizes for operator '.*' (2x3 vs 3x2x2).

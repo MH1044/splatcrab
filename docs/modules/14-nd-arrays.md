@@ -203,6 +203,186 @@ Settled at planning:
   headers, and the empty N-D wording are this spec's stated rules; the page
   layout itself is the documentation's.
 
+Settled in testing, before the code that follows it:
+
+- **A colon over an empty target takes the right-hand side's extent in
+  every position where the target has none of its own,** a dimension of 0
+  or one past the target's dimensions, the general case of cycle 03's rule
+  for a matrix, so `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` builds the
+  2x2x2 array; the first build took the extent only where the fold's
+  dimension was 0 and refused it. A dimension the empty target has keeps
+  its size, as in cycle 03, so `x = zeros(0, 3); x(:, :) = 5` is still
+  `[5 5 5]`.
+- **The display is written a page at a time,** so its memory is one page's
+  whatever the page count, and its time is linear in what it writes; an
+  array with very many dimensions writes a long header per page, which the
+  layout above requires.
+- **Nothing a program controls reaches a formatting width,** since Rust's
+  formatter refuses any width past 65,535: `whos` pads its size column by
+  hand, as the display already pads its columns.
+- **A cell holding an N-D char is compared by every dimension** in `strcmp`
+  and `strcmpi`, as the set functions and `str2double` judge one.
+
+Recorded during implementation:
+
+- **Files and types changed.** `src/value.rs`: `Matrix` gains the private
+  `higher: Vec<usize>`, the dimensions past the second, which only
+  `from_dims`, `filled_dims` and `set_dims` set, each normalising through
+  `normalize_dims`; `dims`, `ndims`, `is_nd`, `is_char_row`, `fold_cols`,
+  `pages`, `page`, `page_display` and `write_pages` are new, as are
+  `Value::write_display` and `Value::write_disp` and the free functions
+  `dims_product`, `normalize_dims`, `dims_text`, `broadcast_dims`,
+  `broadcast_walk`, `push_left` and `push_right`.
+  `map`, `try_map`, `map_c`, `real_part`, `imag_part` and `to_class` carry
+  every dimension, and `try_zip` (so `zip`) and `zip_c` broadcast across
+  every dimension through `broadcast_walk`, a counter carried one step per
+  element, the 2-D loop kept for two 2-D operands. `Value::dims` returns a
+  `Vec<usize>` of every dimension, so the compiler listed each caller;
+  `Value::numel` is the product and `Value::is_blank` is false for an N-D
+  empty. `src/builtins/args.rs`: `check_dims` and `shape_dims`;
+  `check_shape` is `check_dims` of two sizes. `src/builtins/mod.rs`:
+  `ND_OK`, `nd_gate`. `src/builtins/core.rs`: the N-D constructors, `size`,
+  `ndims` (new), `numel`, `length`, the shape predicates, `values_equal`
+  and `whos`. `src/builtins/linalg.rs`: `reshape`. `src/builtins/io.rs`
+  and `mat.rs`: `save` refusing an N-D array. `src/builtins/sets.rs`,
+  `strings.rs` (`str2double`, `strcmp`, `strcmpi`) and `cells.rs`
+  (`cell2mat`, `num2cell`, `map_elements`): their judgments of an N-D
+  element, below. `src/interp.rs`: `Sel::List`
+  holds its index's `shape`, the plans `Gather`, `Scatter` and `Keep` hold
+  `dims`, and `end_value`, `fold_dims`, `sel_positions`, `sel_counts`,
+  `keeps_layout`, `flat`, `flat_operand`, `emit_display`, `emit_disp` and
+  `emit_to` are new; `resolve_read`, `resolve_write`, `resolve_delete`,
+  `regrid`, `scatter`, `gather`, the operators, `for`, `switch`, `hcat`,
+  `vcat` and `show_var` changed. `src/error.rs`:
+  `nd_argument`, `nd_matrix_operation`, `nd_transpose` and
+  `nd_concatenation` are new, and `size_overflow`, `operator_dims` and
+  `reshape_numel` name every dimension. `src/env.rs`, `src/protocol.rs`
+  and `src/ui/app.js`: the preview, the workspace's `size` and the pane's
+  size text.
+- **Invariants preserved.** Column-major storage: every resolver and
+  `regrid` compute offsets as `i1 + d1*(i2 + ...)`, and the fold of
+  trailing dimensions costs nothing because a position's offset is the
+  same in the array and in its fold. One-based to zero-based: still only
+  in `eval_index_args` through `index_positions` and `mask_positions`;
+  `end_value` computes one-based sizes, never positions. The `end` stack:
+  pushed per subscript in `eval_index_args` only, now with `end_value`. Name
+  resolution and the output sink: unchanged; the display still goes
+  through `Value::display` and `Interp::emit`. Invariant 6: every shape
+  computed here, a constructor's, a reshape's, a broadcast's, a read's and
+  a growth's and its count of positions, goes through `check_dims` before
+  anything is allocated; no `unwrap` or `expect` was added on anything a
+  program controls, and a product of the dimensions of an empty array,
+  which can pass `usize`, saturates rather than overflowing.
+- **Growth through fewer subscripts than dimensions.** The spec gives the
+  linear case, the ambiguous-growth error. With two or more subscripts but
+  fewer than the array's dimensions, the last indexes a fold that is not a
+  dimension of the array, so a subscript past the end of any of them is the
+  same ambiguous-growth error (`A(3, 1) = 1` and `A(1, 13) = 1` of a
+  2x3x4). A linear subscript past the end of an N-D empty is that error too:
+  the N-D test comes before the empty one. Not verified against MATLAB.
+- **Deletion through fewer subscripts** works on the fold, and leaves the
+  folded shape: `A(:, 2) = []` of a 2x3x4 is 2x11. When every subscript
+  selects its whole dimension, the last one written as a list deletes, and
+  the first dimension when all are `:`, which is cycle 03's two-subscript
+  rule generalised; a subscript past `ndims` must select position 1 and
+  never deletes, as before. Not verified against MATLAB.
+- **Reads.** An N-D index gives its own shape, as cycle 03's rule has it
+  (`A(ones(2, 2, 2))` is 2x2x2), and an N-D mask selects as a column, as
+  `find` of a mask that is not a row gives. `A(:, :, [1 1])` of a matrix is
+  now the 2-D matrix doubled into two pages, the general case of the
+  trailing-singleton rule.
+- **The count of positions an assignment selects** is judged by
+  `check_dims` as a shape, since repeated subscripts can make it far larger
+  than the array; before, `A(ones(1, 1e5), ones(1, 1e5)) = 5` asked the
+  allocator for 1e10 positions.
+- **`[A]` of one N-D array** is `A`, stored by the flag rule as a
+  bracket's result is: a bracket of one joins it to nothing, so it is no
+  concatenation, and `cell2mat({A})` is `A` by the same path. With anything
+  beside it, `[]` included, it is the concatenation refusal.
+- **`disp` of an N-D array** writes exactly the pages the named display
+  writes, the trailing blank line of the last page included, under
+  `(:,:,k) =`; `disp` of an empty N-D array writes nothing, as `disp` of any
+  other empty but a char does, whatever its class.
+- **Cells and structs.** The index pipeline takes their two dimensions, and
+  `flat` refuses, with today's `N-D arrays are not supported.`, a read or a
+  growth whose shape would be N-D (`c(:, :, [1 1])`, `c{1, 1, 2} = 5`), so
+  their paths refuse exactly what they refused before. The gate judges only
+  a matrix argument, as the complex gate does; a builtin that reads a cell
+  or struct holding an N-D array judges it itself: `cell2mat` through the
+  bracket rule, `save` in its MAT-file writer, which refuses an N-D array
+  wherever it sits, a variable, a cell element or a field, before a byte is
+  written, and in `-ascii`; `-append` leaves the old file as it was. The
+  set functions (`sets.rs`) refuse a cell holding an N-D char and
+  `str2double` (`strings.rs`) reads one as `NaN`, each through
+  `Matrix::is_char_row`, since an N-D char is no character vector however
+  few its rows; `strcmp` and `strcmpi` compare one by every dimension; and
+  `cellfun`, `arrayfun` and `num2cell` (`cells.rs`) take the two
+  dimensions of a cell, which is never N-D, or of an array the gate has
+  let through, and `cellfun` hands each element on to a callee whose own
+  gate judges it.
+- **The gates' order.** `complex_gate` runs first, so a complex N-D
+  argument to a builtin on neither list is the complex refusal. The
+  operators judge an N-D operand before the complex dispatch, so a complex
+  and a real one are refused alike; `^` is refused whenever an operand is
+  N-D, a scalar base or exponent included, as the spec says.
+- **Smaller choices.** A size vector with one row that is N-D (`1x1x3`) is
+  not a row vector, the existing refusal, since `size_list` read it as one.
+  `size` computes its outputs in `f64`, so the fold of an empty's huge
+  dimensions is named as it is. Trailing ones are dropped before
+  `check_dims`, so a refusal names the sizes the array would have. `for`
+  over an N-D array with no rows follows the 2-D rule on the fold. A char
+  that is N-D is no character vector for `switch`, a cell display, a
+  struct field or the preview. `eye` and `cell` keep `args::shape`, so
+  `cell(2, 3, 1)` is still the N-D refusal, as it was.
+- **The builtin count in `docs/FEATURES.md`** read 231, which left out
+  cycle 13's nineteen; it is 251 with `ndims`.
+- **`whos` pads by hand**, as settled in testing. `whos_text` padded its
+  size column with a formatted width, and Rust's formatter panics on a
+  runtime width past 65,535: `A = zeros([2 ones(1, 40000) 2]); whos`
+  exited 101, and under `--protocol` or `--ui` took the process down. Every
+  column is padded through `value::push_left` and `push_right` now, and
+  so are a struct's field lines, whose width is a field name's, which has
+  no length limit either: `s.(repmat('a', 1, 70000)) = 1` panicked the
+  same way. A search of the crate for every other runtime width or
+  precision found none a program controls: `printf`'s are bounded by
+  `printf::MAX_FIELD`, `num2str`'s and `mat2str`'s precision by its clamp
+  at 800, `save -ascii`'s width is fixed, and the display's widths and
+  decimals follow from the numbers' own texts.
+- **`strcmp` and `strcmpi` compare every dimension**, as settled in
+  testing. `same_text` judged two chars one size by their rows and
+  columns, so `strcmp({reshape('abcd', 1, 1, 4)}, {reshape('abcd', 1, 1,
+  2, 2)})` was 1; it compares `dims` now, and two empties are still the
+  same text whatever their shapes. The other readers of a cell's elements
+  were searched for the same judgment and none makes it: `strncmp` and
+  `strncmpi` compare the first `n` units whatever the shape, as they do
+  for a char matrix, and `upper`, `lower`, `strtrim`, `strrep`, `strcat`,
+  `strjoin`, `strfind`, `regexp`, `regexprep`, `isfield`, `rmfield` and
+  `legend` read an N-D char's units in column-major order, as they read a
+  char matrix's, with no test of its rows or columns.
+- **A colon over an empty target**, as settled in testing, takes the
+  right-hand side's extent in every position where the target has no
+  extent of its own: a dimension of 0, as in cycle 03, and every position
+  past its dimensions, which `resolve_write` had given the extent 1, so
+  that `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` was refused with `left
+  side has 4 elements and the right side has 8`. A dimension an empty
+  target has keeps its extent, as cycle 03 has it, so `x = zeros(0, 3);
+  x(:, :) = 5` still fills three columns, and past the dimensions of an
+  array with elements a colon still selects its one position. Not
+  verified against MATLAB.
+- **The display is written a page at a time**, as settled in testing.
+  `page_display` built the whole display in one text, each header joined
+  from a list of index texts, so `A = zeros([1 1 ones(1, 10000) 10000])`
+  built 200 MB before writing a byte of it: 46 s and a peak of 320 MB in
+  a debug build, and `disp(A)` 57 s. `Matrix::write_pages` hands each
+  page, its header and its body, to `Interp::emit_display` or `emit_disp`,
+  which the statement displays and `disp` call, and `show_var` writes a
+  variable where it is stored through `emit_to`, the body of
+  `Interp::emit`, rather than copy an array as large. A header writes a
+  run of dimensions of 1 as one piece and steps only the dimensions past
+  1, so its cost is linear in its length. The same display takes 4 s with
+  a peak of 7 MB, and `disp(A)` 3 s, each byte for byte as before;
+  `page_display` gathers the pages for a caller that wants the text.
+
 ## Acceptance tests
 
 Each numbered item becomes at least one golden case in
@@ -210,24 +390,24 @@ Each numbered item becomes at least one golden case in
 Expected output follows from this spec's rules and the existing display,
 which each page reuses.
 
-1. Constructors: `size` of `zeros(2, 3, 4)`, `ones([2 2 2])`, `NaN(2, 1, 3)`, `true(1, 1, 3)` (class `logical`), `rand(2, 2, 2)` (every element in (0, 1), self-checked), `zeros(2, 3, 1, 4)` (`2 3 1 4`), `zeros(2, 3, 1)` (`2 3`) and `ones(2, 3, 0)` (`2 3 0`), each printed with `disp`.
-2. `err_*` cases: `zeros(1e5, 1e5, 1e5)` → the size message with every size; `cell(2, 3, 4)` → `N-D arrays are not supported.`
-3. Shape queries: `[r, c] = size(zeros(2, 3, 4))` → `c` 12; `[a, b, c, d] = size(zeros(2, 3, 4))` → `d` 1; `size(zeros(2, 3, 4), 3)` → 4 and `size(zeros(2, 3, 4), 5)` → 1; `ndims` of `zeros(2, 3, 4)`, `5`, `{}` and `'ab'` → 3, 2, 2, 2; `numel(zeros(2, 3, 4))` → 24; `length(zeros(2, 5, 3))` → 5 and `length(zeros(2, 0, 3))` → 0; `isempty(zeros(2, 0, 3))` → 1; `isvector(zeros(1, 1, 3))` and `isscalar(zeros(1, 1, 3))` → 0.
-4. `reshape`: `A = reshape(1:24, 2, 3, 4)` then `size`; `reshape(A, 6, [])` → 6x4; `reshape(A, [4 6])` → 4x6; `reshape(1:6, 1, 2, 3)` → 1x2x3; `reshape(1:6, 4, [])` → today's count message.
-5. Indexing reads on `A = reshape(1:24, 2, 3, 4)`: `A(2, 3, 4)` → 24; `A(:, :, 2)` → the 2x3 page `[7 9 11; 8 10 12]`; `size(A(1, :, :))` → `1 3 4`; `v = A(1, 2, :); disp(v(:)')` → `3 9 15 21`; `A(2, 7)` → 14 (folded); `A(end)` → 24; `A(1, end)` → 23; `A(end, end, end)` → 24; `A(A > 20)'` → `21 22 23 24`; `A(1, 1, 1, 1)` → 1; `A(1, 1, 5)` → today's index-exceeds message naming position 3.
-6. Indexed growth: `B = zeros(2, 2); B(:, :, 2) = [1 2; 3 4];` → `size` `2 2 2` and `B(:, :, 2)` back; `B(1, 1, 3) = 9;` → `2 2 3` with `B(2, 2, 3)` 0; `B(1, 1, 1, 2) = 5;` → `2 2 3 2`; a char and a logical grown into a second page keep their class.
-7. Deletion: on `A = reshape(1:24, 2, 3, 4)`, `A(:, :, 2) = []` → `2 3 3` and `A(:, :, 2)` now the old third page; `A(1, :, :) = []` → `1 3 3`; `A(3) = []` on a fresh 2x2x2 → a 1x7 row; `A(1, 2, :) = []` → `A null assignment can have only one non-colon index.`
-8. Element-wise operators: `A + 1`, `A .* A`, `-A`, `A > 12` (class logical, `size` `2 3 4`), `~(A > 12)`, `2 * A` and `A / 2` on `A = reshape(1:8, 2, 2, 2)`, each checked through its `A(:)'` row; broadcasting `A - [10; 20]` (2x1 against 2x2x2) and `zeros(2, 3, 4) + ones(1, 1, 4)` (`size` `2 3 4`); a complex N-D array, `A * 1i`, keeping its shape and its imaginary parts.
-9. `err_*`: `zeros(2, 3, 4) + zeros(2, 3, 5)` → `Arrays have incompatible sizes for operator '+' (2x3x4 vs 2x3x5).`
-10. The display: `A = reshape(1:8, 2, 2, 2)` named, with both pages; `disp(A)`; `L = reshape(logical([1 0 1 0 1 0 1 0]), 2, 2, 2)` named; `c = 'ab'; c(:, :, 2) = 'cd'` named; `E = zeros(2, 0, 3)` named; `Z = zeros(1, 1, 2); Z(:, :, 2) = 1i` named, both pages complex; `x = zeros(1, 1, 1, 2)` named, with the headers `x(:,:,1,1) =` and `x(:,:,1,2) =`.
-11. Elsewhere: `c = {zeros(2, 3, 4)}` and `s.f = zeros(2, 3, 4)` displayed; `whos` after `A = zeros(2, 3, 4);`; a `.proto` case: `workspace` with `"preview":true` after `A = zeros(2, 3, 4);` → `"size":[2,3,4]` and `"value":"2×3×4 double"`.
-12. The gate and the refusals, each an `err_*` case: `sum(zeros(2, 2, 2))` → `N-D arrays are not supported by 'sum'.`; `feval(@abs, zeros(2, 2, 2))` → the same for `'abs'`; `zeros(2, 2, 2) * ones(2, 2)` and `zeros(2, 2, 2) ^ 2` → `Matrix operations are not defined for N-D arrays.`; `zeros(2, 2, 2)'` → `Transpose is not defined for N-D arrays.`; `[zeros(2, 2, 2), 1]` → `Concatenation of N-D arrays is not supported.`; `A = zeros(2, 2, 2); save('scratch_nd.mat', 'A')` → `N-D arrays are not supported by 'save'.`, with no file left behind.
-13. `for`: `for col = reshape(1:8, 2, 2, 2), disp(col'), end` → four lines `1 2`, `3 4`, `5 6`, `7 8`.
-14. `isequal`: `isequal(zeros(2, 2, 2), zeros(2, 2, 2))` → 1; `isequal(zeros(2, 2, 2), zeros(2, 4))` → 0; `isequal(zeros(2, 2, 2), zeros(2, 2))` → 0; `isequal(zeros(2, 2), zeros(2, 2, 2))` → 0.
-15. The pass-through builtins: `double(true(1, 1, 2))`, `logical(zeros(1, 1, 2))`, `char(zeros(1, 1, 2) + 65)` keep their shape; `fprintf('%d ', reshape(1:8, 2, 2, 2)); fprintf('\n')` → `1 2 3 4 5 6 7 8`; `class(zeros(2, 2, 2))` → `double`.
-16. Unit tests: the normalisation (no stored trailing 1, a 2-D value unchanged); `check_dims` at and past `MAX_ELEMS`; the column-major offset of an N-D subscript; the fold of trailing dimensions and `end`; broadcasting's result shape; the gate refusing an N-D argument to a builtin not listed and passing one listed; `values_equal` on arrays of different shapes.
-17. Every existing case passes unchanged, apart from the four 01c cases this spec removes.
+1. Constructors: `size` of `zeros(2, 3, 4)`, `ones([2 2 2])`, `NaN(2, 1, 3)`, `true(1, 1, 3)` (class `logical`), `rand(2, 2, 2)` (every element in (0, 1), self-checked), `zeros(2, 3, 1, 4)` (`2 3 1 4`), `zeros(2, 3, 1)` (`2 3`) and `ones(2, 3, 0)` (`2 3 0`), each printed with `disp`. Cases: `constructors_nd_sizes.m`, `constructors_nd_empty_huge.m`.
+2. `err_*` cases: `zeros(1e5, 1e5, 1e5)` → the size message with every size; `cell(2, 3, 4)` → `N-D arrays are not supported.` Cases: `err_constructor_size_every_dim.m`, `err_cell_third_size.m`.
+3. Shape queries: `[r, c] = size(zeros(2, 3, 4))` → `c` 12; `[a, b, c, d] = size(zeros(2, 3, 4))` → `d` 1; `size(zeros(2, 3, 4), 3)` → 4 and `size(zeros(2, 3, 4), 5)` → 1; `ndims` of `zeros(2, 3, 4)`, `5`, `{}` and `'ab'` → 3, 2, 2, 2; `numel(zeros(2, 3, 4))` → 24; `length(zeros(2, 5, 3))` → 5 and `length(zeros(2, 0, 3))` → 0; `isempty(zeros(2, 0, 3))` → 1; `isvector(zeros(1, 1, 3))` and `isscalar(zeros(1, 1, 3))` → 0. Cases: `shape_queries_nd.m`.
+4. `reshape`: `A = reshape(1:24, 2, 3, 4)` then `size`; `reshape(A, 6, [])` → 6x4; `reshape(A, [4 6])` → 4x6; `reshape(1:6, 1, 2, 3)` → 1x2x3; `reshape(1:6, 4, [])` → today's count message. Cases: `reshape_nd.m`, `reshape_nd_empty_huge.m`, `err_reshape_nd_count.m`, `err_reshape_nd_placeholder_count.m`, `err_reshape_two_placeholders.m`, `err_reshape_nd_numel.m`.
+5. Indexing reads on `A = reshape(1:24, 2, 3, 4)`: `A(2, 3, 4)` → 24; `A(:, :, 2)` → the 2x3 page `[7 9 11; 8 10 12]`; `size(A(1, :, :))` → `1 3 4`; `v = A(1, 2, :); disp(v(:)')` → `3 9 15 21`; `A(2, 7)` → 14 (folded); `A(end)` → 24; `A(1, end)` → 23; `A(end, end, end)` → 24; `A(A > 20)'` → `21 22 23 24`; `A(1, 1, 1, 1)` → 1; `A(1, 1, 5)` → today's index-exceeds message naming position 3. Cases: `index_read_nd.m`, `err_index_page_past_end.m`, `err_index_folded_past_end.m`, `err_index_linear_past_end.m`, `err_index_trailing_past_one.m`.
+6. Indexed growth: `B = zeros(2, 2); B(:, :, 2) = [1 2; 3 4];` → `size` `2 2 2` and `B(:, :, 2)` back; `B(1, 1, 3) = 9;` → `2 2 3` with `B(2, 2, 3)` 0; `B(1, 1, 1, 2) = 5;` → `2 2 3 2`; a char and a logical grown into a second page keep their class. Cases: `grow_nd_pages.m`, `grow_nd_keeps_class.m`, `err_grow_nd_linear_ambiguous.m`, `err_grow_nd_size_every_dim.m`, `grow_nd_colon_empty.m`.
+7. Deletion: on `A = reshape(1:24, 2, 3, 4)`, `A(:, :, 2) = []` → `2 3 3` and `A(:, :, 2)` now the old third page; `A(1, :, :) = []` → `1 3 3`; `A(3) = []` on a fresh 2x2x2 → a 1x7 row; `A(1, 2, :) = []` → `A null assignment can have only one non-colon index.` Cases: `delete_nd.m`, `err_delete_nd_two_indices.m`.
+8. Element-wise operators: `A + 1`, `A .* A`, `-A`, `A > 12` (class logical, `size` `2 3 4`), `~(A > 12)`, `2 * A` and `A / 2` on `A = reshape(1:8, 2, 2, 2)`, each checked through its `A(:)'` row; broadcasting `A - [10; 20]` (2x1 against 2x2x2) and `zeros(2, 3, 4) + ones(1, 1, 4)` (`size` `2 3 4`); a complex N-D array, `A * 1i`, keeping its shape and its imaginary parts. Cases: `elementwise_nd_arithmetic.m`, `elementwise_nd_logical.m`, `broadcast_nd.m`, `complex_nd_elementwise.m`.
+9. `err_*`: `zeros(2, 3, 4) + zeros(2, 3, 5)` → `Arrays have incompatible sizes for operator '+' (2x3x4 vs 2x3x5).` Cases: `err_operator_nd_sizes.m`, `err_operator_nd_sizes_2d_operand.m`.
+10. The display: `A = reshape(1:8, 2, 2, 2)` named, with both pages; `disp(A)`; `L = reshape(logical([1 0 1 0 1 0 1 0]), 2, 2, 2)` named; `c = 'ab'; c(:, :, 2) = 'cd'` named; `E = zeros(2, 0, 3)` named; `Z = zeros(1, 1, 2); Z(:, :, 2) = 1i` named, both pages complex; `x = zeros(1, 1, 1, 2)` named, with the headers `x(:,:,1,1) =` and `x(:,:,1,2) =`. Cases: `display_nd_double.m`, `disp_nd_pages.m`, `display_nd_logical.m`, `display_nd_char.m`, `display_nd_empty.m`, `display_nd_complex.m`, `display_nd_fourth_dim.m`, `display_nd_page_scale.m`, `display_nd_page_columns.m`.
+11. Elsewhere: `c = {zeros(2, 3, 4)}` and `s.f = zeros(2, 3, 4)` displayed; `whos` after `A = zeros(2, 3, 4);`; a `.proto` case: `workspace` with `"preview":true` after `A = zeros(2, 3, 4);` → `"size":[2,3,4]` and `"value":"2×3×4 double"`. Cases: `cell_struct_nd_summary.m`, `whos_nd_size.m`, `workspace_nd_size.proto`, `whos_nd_long_size.m`, `struct_field_name_past_width.m`.
+12. The gate and the refusals, each an `err_*` case: `sum(zeros(2, 2, 2))` → `N-D arrays are not supported by 'sum'.`; `feval(@abs, zeros(2, 2, 2))` → the same for `'abs'`; `zeros(2, 2, 2) * ones(2, 2)` and `zeros(2, 2, 2) ^ 2` → `Matrix operations are not defined for N-D arrays.`; `zeros(2, 2, 2)'` → `Transpose is not defined for N-D arrays.`; `[zeros(2, 2, 2), 1]` → `Concatenation of N-D arrays is not supported.`; `A = zeros(2, 2, 2); save('scratch_nd.mat', 'A')` → `N-D arrays are not supported by 'save'.`, with no file left behind. Cases: `err_gate_sum.m`, `err_gate_feval_abs.m`, `err_gate_second_argument.m`, `err_mtimes_nd.m`, `err_mpower_nd.m`, `err_mpower_nd_exponent.m`, `err_mrdivide_nd.m`, `err_mldivide_nd.m`, `err_ctranspose_nd.m`, `err_transpose_nd.m`, `err_hcat_nd.m`, `err_vcat_nd.m`, `err_save_nd.m`, `err_save_nd_workspace.m`, `err_set_cell_nd_char.m`, `str2double_cell_nd_char.m`, `strcmp_cell_nd_char.m`.
+13. `for`: `for col = reshape(1:8, 2, 2, 2), disp(col'), end` → four lines `1 2`, `3 4`, `5 6`, `7 8`. Cases: `for_nd_columns.m`.
+14. `isequal`: `isequal(zeros(2, 2, 2), zeros(2, 2, 2))` → 1; `isequal(zeros(2, 2, 2), zeros(2, 4))` → 0; `isequal(zeros(2, 2, 2), zeros(2, 2))` → 0; `isequal(zeros(2, 2), zeros(2, 2, 2))` → 0. Cases: `isequal_nd_shapes.m`.
+15. The pass-through builtins: `double(true(1, 1, 2))`, `logical(zeros(1, 1, 2))`, `char(zeros(1, 1, 2) + 65)` keep their shape; `fprintf('%d ', reshape(1:8, 2, 2, 2)); fprintf('\n')` → `1 2 3 4 5 6 7 8`; `class(zeros(2, 2, 2))` → `double`. Cases: `passthrough_nd.m`.
+16. Unit tests: the normalisation (no stored trailing 1, a 2-D value unchanged); `check_dims` at and past `MAX_ELEMS`; the column-major offset of an N-D subscript; the fold of trailing dimensions and `end`; broadcasting's result shape; the gate refusing an N-D argument to a builtin not listed and passing one listed; `values_equal` on arrays of different shapes. Tests: `nd_dimensions_are_stored_without_a_trailing_one`, `check_dims_judges_every_size_before_allocating`, `an_nd_subscript_lands_at_its_column_major_offset`, `fewer_subscripts_fold_the_trailing_dimensions_and_end`, `broadcasting_runs_across_every_dimension`, `broadcasting_passes_over_singleton_dimensions`, `singleton_subscripts_and_dimensions_cost_nothing_extra`, `the_gate_refuses_an_nd_argument_to_every_other_builtin`, `values_equal_compares_every_dimension_first`.
+17. Every existing case passes unchanged, apart from the four 01c cases this spec removes. Cases: the whole golden suite.
 
 ## Status
 
-Planned
+Done (2026-09-30)

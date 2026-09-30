@@ -24,14 +24,14 @@ x =
 ```
 
 SplatCrab is early software (version 0.1.0). The core language works:
-matrices, the double, logical and char classes, indexing, control flow with
-`switch` and `try`/`catch`, command syntax, user functions in scripts and in
-function files on a path, function handles and anonymous functions, cell
-arrays and structs, linear algebra, numerics (polynomials, interpolation,
-statistics, sets, root finding, minimisation, quadrature and ODEs), formatted
-output, complex numbers with `fft`, string functions, regular expressions,
-file input and output with `save` and `load`, plotting to SVG and PNG, and
-231 builtins. See
+matrices and N-D arrays, the double, logical and char classes, indexing,
+control flow with `switch` and `try`/`catch`, command syntax, user functions
+in scripts and in function files on a path, function handles and anonymous
+functions, cell arrays and structs, linear algebra, numerics (polynomials,
+interpolation, statistics, sets, root finding, minimisation, quadrature and
+ODEs), formatted output, complex numbers with `fft`, string functions,
+regular expressions, file input and output with `save` and `load`, plotting
+to SVG and PNG, and 251 builtins. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -215,6 +215,16 @@ z
   and `x(isnan(x)) = 0`, selecting what `find(mask)` would. Deletion
   `x(i) = []`, `A(:, j) = []` and `A(i, :) = []` follows MATLAB's shape
   rules. A failed indexed assignment leaves its variable untouched
+- N-D arrays (cycle 14): numeric, logical and char arrays of any number of
+  dimensions from `zeros(2, 3, 4)`, `ones([2 2 2])`, the other constructors
+  and `reshape`; `size`, the new `ndims` and the other shape queries by the
+  MathWorks rules; indexing with any number of subscripts, the rest folded
+  into the last, growth into new pages and deletion along any one
+  dimension; the element-wise operators with broadcasting across every
+  dimension; `for` over the columns of the 2-D fold; and a page-by-page
+  display, `A(:,:,1) =`, `A(:,:,2) =`. Every builtin not yet taught N-D
+  arrays refuses one by name, `N-D arrays are not supported by 'sum'.`,
+  rather than read its first page alone
 - Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
   `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(A)`,
   `[r, c] = size(A)` and `[r, c, v] = find(X)`. On a matrix, `c{1}`, `s.a`
@@ -289,7 +299,7 @@ z
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 231 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 251 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -299,8 +309,9 @@ z
   `sort(v, 'descend')`, `find(x, n, 'last')`, `norm(v, p)`, `diag(v, k)`,
   `num2str(x, n)`, `round(x, n)` and `round(x, n, 'significant')`,
   `sum(A, 'all')` and `max(A, [], 'all')`, and `dot` of two matrices. A char
-  option is never read as a dimension, and a third size other than `1` is the
-  clear error "N-D arrays are not supported."
+  option is never read as a dimension, and a third size other than `1` makes
+  an N-D array, except for `cell` and `repmat`, where it is the clear error
+  "N-D arrays are not supported.", and `eye`, which takes two sizes
 - `fprintf` and `sprintf` with a bounded width and precision, so no format
   specifier can panic or build a pad it cannot afford; `%d` prints an integer
   past `2^63` in full, and `%.Ns` truncates a string before padding it.
@@ -409,9 +420,11 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-N-D arrays, integer classes, compressed MAT-files, 3-D plots and interaction
-with a figure. `docs/ROADMAP.md` has the order they arrive in, one module at
-a time.
+The builtins on N-D arrays (reductions along any dimension, the
+element-wise math, `squeeze`, `permute`, `cat`, N-D concatenation, `repmat`
+and N-D MAT-files), integer classes, compressed MAT-files, 3-D plots and
+interaction with a figure. `docs/ROADMAP.md` has the order they arrive in,
+one module at a time.
 
 ## How it is built
 
@@ -421,7 +434,7 @@ a time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 231 builtins,
+                                         builtins/    the 251 builtins,
                                                       behind a registry
                                          plot/        figures, SVG, PNG
 

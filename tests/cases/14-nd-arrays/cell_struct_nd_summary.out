@@ -1,0 +1,11 @@
+c =
+
+  1×1 cell array
+
+    {2×3×4 double}
+
+s =
+
+  struct with fields:
+
+    f: [2×3×4 double]

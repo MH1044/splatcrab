@@ -150,7 +150,8 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
         if m.is_empty() {
             return Ok(vec![Some(0.0), Some(0.0)]);
         }
-        if m.rows != 1 {
+        // A 1x1x3 has one row, and is still no row vector (cycle 14).
+        if m.rows != 1 || m.is_nd() {
             return Err(error::size_vector_not_row(name));
         }
         return m
@@ -172,7 +173,9 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
 
 /// Two dimensions out of a list of sizes. Trailing sizes of `1` are dropped,
 /// as MATLAB drops them; any other third or later size, `0` included, would
-/// need an N-D array. `dims` has at least two entries.
+/// need an N-D array, which the callers that come here (`eye`, `cell` and
+/// `repmat`, through [`shape`]) cannot make yet. `dims` has at least two
+/// entries.
 pub fn trailing_ones(dims: &[f64]) -> R<(f64, f64)> {
     if dims[2..].iter().any(|&d| d != 1.0) {
         return Err(error::nd_unsupported());
@@ -180,10 +183,12 @@ pub fn trailing_ones(dims: &[f64]) -> R<(f64, f64)> {
     Ok((dims[0], dims[1]))
 }
 
-/// The requested `(rows, cols)` of a constructor: no size is 1x1, and
-/// otherwise [`size_list`] then [`trailing_ones`]. More than `max_dims` sizes
-/// is the N-D error even when they are ones, which is how `eye` keeps its
-/// two-size limit for a size vector.
+/// The requested `(rows, cols)` of a builtin that makes a 2-D array only,
+/// `eye`, `cell` and `repmat` since cycle 14 gave the other constructors
+/// [`shape_dims`]: no size is 1x1, and otherwise [`size_list`] then
+/// [`trailing_ones`]. More than `max_dims` sizes is the N-D error even when
+/// they are ones, which is how `eye` keeps its two-size limit for a size
+/// vector.
 pub fn shape(args: &[Value], from: usize, name: &str, max_dims: usize) -> R<(f64, f64)> {
     let list = size_list(args, from, name, false)?;
     if list.is_empty() {
@@ -196,23 +201,68 @@ pub fn shape(args: &[Value], from: usize, name: &str, max_dims: usize) -> R<(f64
     trailing_ones(&dims)
 }
 
+/// The sizes of a constructor that takes any number of dimensions (cycle
+/// 14): no size is 1x1, and otherwise [`size_list`], with every trailing
+/// size of `1` past the second dropped, as MATLAB drops it, so
+/// `zeros(2, 3, 1)` asks for 2x3 and `zeros(2, 3, 1, 4)` for 2x3x1x4. The
+/// sizes stay `f64` for [`check_dims`] to judge and name.
+pub fn shape_dims(args: &[Value], from: usize, name: &str) -> R<Vec<f64>> {
+    let list = size_list(args, from, name, false)?;
+    if list.is_empty() {
+        return Ok(vec![1.0, 1.0]);
+    }
+    let mut dims: Vec<f64> = list.into_iter().map(|d| d.unwrap_or(0.0)).collect();
+    while dims.len() > 2 && dims.last() == Some(&1.0) {
+        dims.pop();
+    }
+    Ok(dims)
+}
+
+/// A shape of any number of dimensions (cycle 14), judged before anything
+/// is allocated: every size a non-negative integer or `+Inf`, still as
+/// `f64`, below `usize`, and their product at most [`MAX_ELEMS`]. The
+/// refusal is [`check_shape`]'s, naming every size as it was asked for:
+/// `Requested 100000x100000x100000 array exceeds the maximum array size.`
+/// Every N-D shape the interpreter computes, a constructor's, a reshape's,
+/// a broadcast's, a read's and a growth's, comes here.
+pub fn check_dims(dims: &[f64]) -> R<Vec<usize>> {
+    // `usize::MAX as f64` rounds up to 2^64, so anything below it fits.
+    let limit = usize::MAX as f64;
+    if dims.iter().all(|&d| d < limit) {
+        let out: Vec<usize> = dims.iter().map(|&d| d as usize).collect();
+        // A size of 0 makes the product 0 wherever it stands, so an empty
+        // shape is judged alike in any order: `zeros(2^60, 2^60, 0)` as
+        // `zeros(0, 2^60, 2^60)`, where a running product would overflow
+        // before it reached the 0.
+        let total = if out.contains(&0) {
+            Some(0)
+        } else {
+            out.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+        };
+        if total.is_some_and(|n| n <= MAX_ELEMS) {
+            return Ok(out);
+        }
+    }
+    Err(overflow(dims))
+}
+
+/// The refusal of a shape too large to hold, every size named.
+fn overflow(dims: &[f64]) -> error::MError {
+    let named: Vec<String> = dims.iter().map(|&d| fmt_dim(d)).collect();
+    error::size_overflow(&named)
+}
+
 /// A shape the user asked for, judged before anything is allocated. Both
 /// sizes are non-negative integers or `+Inf`, still as `f64`, so a size past
 /// `usize` is refused under its own name: `zeros(1e300)` reports
 /// `1e+300x1e+300`, not the `usize::MAX` it used to saturate to. Constructors,
 /// `reshape`, `repmat`, `diag`, `linspace`, the `:` operator and, since cycle
 /// 03, indexed growth all come here; `check_size`, which took sizes already
-/// saturated to `usize`, went with the growth path that used it.
+/// saturated to `usize`, went with the growth path that used it. It is
+/// [`check_dims`] of two sizes.
 pub fn check_shape(rows: f64, cols: f64) -> R<(usize, usize)> {
-    // `usize::MAX as f64` rounds up to 2^64, so anything below it fits.
-    let limit = usize::MAX as f64;
-    if rows < limit && cols < limit {
-        let (r, c) = (rows as usize, cols as usize);
-        if r.checked_mul(c).is_some_and(|n| n <= MAX_ELEMS) {
-            return Ok((r, c));
-        }
-    }
-    Err(error::size_overflow(&fmt_dim(rows), &fmt_dim(cols)))
+    let d = check_dims(&[rows, cols])?;
+    Ok((d[0], d[1]))
 }
 
 /// The memory budget of any one array: what a double array at
@@ -238,7 +288,7 @@ pub fn check_bytes(rows: f64, cols: f64, unit: usize) -> R<(usize, usize)> {
     if (r * c).checked_mul(unit).is_some_and(|b| b <= MAX_BYTES) {
         return Ok((r, c));
     }
-    Err(error::size_overflow(&fmt_dim(rows), &fmt_dim(cols)))
+    Err(overflow(&[rows, cols]))
 }
 
 /// [`check_bytes`] for a cell array of `rows x cols`.
@@ -419,6 +469,9 @@ mod tests {
 
     #[test]
     fn the_size_parser_drops_trailing_ones_and_nothing_else() {
+        // `shape` is the two-size parser `eye`, `cell` and `repmat` keep
+        // (cycle 14): a third size other than 1 is still its refusal. The
+        // constructors that make N-D arrays read `shape_dims` instead.
         let nd = "N-D arrays are not supported.";
         assert_eq!(sizes(&[num(2.0), num(3.0), num(1.0)]).unwrap(), (2.0, 3.0));
         assert_eq!(
@@ -529,5 +582,77 @@ mod tests {
         );
         // A double array is judged the same by both.
         assert!(check_bytes(MAX_ELEMS as f64, 1.0, 8).is_ok());
+    }
+
+    /// Cycle 14: any number of sizes, judged together, at and past the
+    /// element cap, and refused naming every size as it was asked for.
+    #[test]
+    fn check_dims_judges_every_size_before_allocating() {
+        assert_eq!(check_dims(&[2.0, 3.0, 4.0]).unwrap(), [2, 3, 4]);
+        assert_eq!(
+            check_dims(&[MAX_ELEMS as f64 / 4.0, 2.0, 2.0]).unwrap()[0],
+            MAX_ELEMS / 4
+        );
+        let at = [1024.0, 1024.0, (MAX_ELEMS / (1 << 20)) as f64];
+        assert!(check_dims(&at).is_ok());
+        let past = [1024.0, 1024.0, (MAX_ELEMS / (1 << 20)) as f64 + 1.0];
+        assert_eq!(
+            check_dims(&past).unwrap_err().msg,
+            "Requested 1024x1024x257 array exceeds the maximum array size."
+        );
+        assert_eq!(
+            check_dims(&[1e5, 1e5, 1e5]).unwrap_err().msg,
+            "Requested 100000x100000x100000 array exceeds the maximum array size."
+        );
+        // A product that would wrap `usize` is refused, not wrapped.
+        let wrap = [4294967296.0, 4294967296.0, 2.0];
+        assert!(check_dims(&wrap).is_err());
+        // An empty shape is free, but a size past `usize` is still named.
+        assert_eq!(
+            check_dims(&[0.0, 1e15, 3.0]).unwrap(),
+            [0, 1_000_000_000_000_000, 3]
+        );
+        assert!(
+            check_dims(&[0.0, 1e300, 3.0])
+                .unwrap_err()
+                .msg
+                .contains("0x1e+300x3")
+        );
+        // A 0 anywhere makes the product 0, so the order of the sizes
+        // never decides: sizes whose running product would pass `usize`
+        // before the 0 are empty too.
+        let huge = 2f64.powi(60);
+        assert_eq!(
+            check_dims(&[huge, huge, 0.0]).unwrap(),
+            [1 << 60, 1 << 60, 0]
+        );
+        assert_eq!(
+            check_dims(&[huge, 0.0, huge]).unwrap(),
+            [1 << 60, 0, 1 << 60]
+        );
+        assert!(check_dims(&[huge, huge, 1.0]).is_err());
+        // check_shape is check_dims of two sizes.
+        assert_eq!(check_shape(2.0, 3.0).unwrap(), (2, 3));
+    }
+
+    #[test]
+    fn shape_dims_drops_trailing_ones_and_keeps_every_other_size() {
+        let dims = |a: &[Value]| shape_dims(a, 0, "zeros").unwrap();
+        assert_eq!(dims(&[]), [1.0, 1.0]);
+        assert_eq!(dims(&[num(3.0)]), [3.0, 3.0]);
+        assert_eq!(dims(&[num(2.0), num(3.0), num(4.0)]), [2.0, 3.0, 4.0]);
+        assert_eq!(dims(&[num(2.0), num(3.0), num(1.0)]), [2.0, 3.0]);
+        assert_eq!(
+            dims(&[num(2.0), num(3.0), num(1.0), num(4.0)]),
+            [2.0, 3.0, 1.0, 4.0]
+        );
+        assert_eq!(dims(&[row(&[2.0, 2.0, 2.0, 1.0])]), [2.0, 2.0, 2.0]);
+        assert_eq!(dims(&[num(2.0), num(3.0), num(0.0)]), [2.0, 3.0, 0.0]);
+        // A size vector is a row, and a 1x1x3 is none.
+        let nd = Value::Mat(Matrix::from_dims(&[1, 1, 3], vec![1.0; 3]));
+        assert_eq!(
+            shape_dims(&[nd], 0, "zeros").unwrap_err().msg,
+            "Size vector for 'zeros' must be a row vector."
+        );
     }
 }

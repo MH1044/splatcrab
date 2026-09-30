@@ -18,7 +18,8 @@ use crate::parser::{
     Stmt,
 };
 use crate::value::{
-    CellArray, Class, Format, Func, Matrix, StructArray, Value, blank, nonfinite, with_format,
+    CellArray, Class, Format, Func, Matrix, StructArray, Value, blank, dims_product, nonfinite,
+    normalize_dims, with_format,
 };
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -304,14 +305,14 @@ enum Sel {
     /// `:`, every position along the dimension it indexes.
     All,
     /// Positions, zero-based, with the shape the index had: the index
-    /// array's own, or for a logical mask the shape `find(mask)` would have.
-    /// `max` is the largest one-based position asked for, kept as an `f64`:
-    /// a position past `usize` saturates in `idx`, and growth must still be
-    /// able to name the size that was asked for (`x(1e300) = 1`).
+    /// array's own, every dimension of it (cycle 14), or for a logical mask
+    /// the shape `find(mask)` would have. `max` is the largest one-based
+    /// position asked for, kept as an `f64`: a position past `usize`
+    /// saturates in `idx`, and growth must still be able to name the size
+    /// that was asked for (`x(1e300) = 1`).
     List {
         idx: Vec<usize>,
-        rows: usize,
-        cols: usize,
+        shape: Vec<usize>,
         max: f64,
     },
 }
@@ -322,13 +323,8 @@ impl Sel {
     #[cfg(test)]
     fn row(idx: Vec<usize>) -> Sel {
         let max = idx.iter().map(|&k| k as f64 + 1.0).fold(0.0, f64::max);
-        let cols = idx.len();
-        Sel::List {
-            idx,
-            rows: 1,
-            cols,
-            max,
-        }
+        let shape = vec![1, idx.len()];
+        Sel::List { idx, shape, max }
     }
 
     /// The zero-based positions this selects along a dimension of `n`.
@@ -384,8 +380,9 @@ struct Gather {
     /// Linear, zero-based, column-major positions in the source, in the
     /// order the result holds them.
     pos: Vec<usize>,
-    rows: usize,
-    cols: usize,
+    /// Every dimension of the result (cycle 14), trailing ones not yet
+    /// dropped; the matrix built from it normalises them.
+    dims: Vec<usize>,
 }
 
 /// Where an assignment stores, and the shape the target has afterwards:
@@ -393,9 +390,9 @@ struct Gather {
 /// done before the target is touched.
 #[derive(Debug, PartialEq)]
 struct Scatter {
-    /// The target's shape after growth; its own shape when it does not grow.
-    rows: usize,
-    cols: usize,
+    /// The target's shape after growth, every dimension of it; its own
+    /// shape when it does not grow.
+    dims: Vec<usize>,
     /// Linear, zero-based positions in the grown target, in the order the
     /// right-hand side's elements are taken.
     pos: Vec<usize>,
@@ -405,8 +402,7 @@ struct Scatter {
 #[derive(Debug, PartialEq)]
 struct Keep {
     pos: Vec<usize>,
-    rows: usize,
-    cols: usize,
+    dims: Vec<usize>,
 }
 
 impl Default for Interp {
@@ -515,9 +511,10 @@ impl Interp {
         Ok(())
     }
 
-    /// The single place interpreter output leaves the evaluator.
+    /// The single place interpreter output leaves the evaluator, through
+    /// [`emit_to`].
     pub(crate) fn emit(&mut self, s: &str) -> R<()> {
-        self.out.write_all(s.as_bytes()).map_err(error::output)
+        emit_to(&mut *self.out, s)
     }
 
     /// Writes a warning a computation returned, if it returned one: the
@@ -577,7 +574,9 @@ impl Interp {
         if n as u64 >= limit && !line.ends_with('\n') {
             let units = line.encode_utf16().count() as f64;
             let e = crate::builtins::args::check_shape(1.0, units).err();
-            return Err(e.unwrap_or_else(|| error::size_overflow("1", &units.to_string())));
+            return Err(
+                e.unwrap_or_else(|| error::size_overflow(&["1".to_string(), units.to_string()]))
+            );
         }
         if line.ends_with('\n') {
             line.pop();
@@ -759,14 +758,19 @@ impl Interp {
 
     // ---- the environment (cycle 13) ------------------------------------
 
-    /// `v` displayed under `name` in the current `format`.
-    pub(crate) fn display(&self, v: &Value, name: &str) -> String {
-        with_format(self.format, || v.display(name))
+    /// Writes `v` displayed under `name`, in the current `format`, through
+    /// [`Interp::emit`]: a non-empty N-D array a page at a time (cycle 14),
+    /// so the display's memory is one page's whatever the page count.
+    pub(crate) fn emit_display(&mut self, v: &Value, name: &str) -> R<()> {
+        let format = self.format;
+        with_format(format, || v.write_display(name, |s| self.emit(s)))
     }
 
-    /// What `disp(v)` prints, in the current `format`.
-    pub(crate) fn disp_text(&self, v: &Value) -> String {
-        with_format(self.format, || v.disp_text())
+    /// Writes what `disp(v)` prints, in the current `format`, as
+    /// [`Interp::emit_display`] writes a display.
+    pub(crate) fn emit_disp(&mut self, v: &Value) -> R<()> {
+        let format = self.format;
+        with_format(format, || v.write_disp(|s| self.emit(s)))
     }
 
     /// Moves the interpreter to `dir`, which must be a folder: what `cd`
@@ -921,8 +925,7 @@ impl Interp {
                     for v in result {
                         self.vars_mut().insert("ans".to_string(), v.clone());
                         if *show {
-                            let shown = self.display(&v, "ans");
-                            self.emit(&shown)?;
+                            self.emit_display(&v, "ans")?;
                         }
                     }
                     return Ok(Flow::Normal);
@@ -936,8 +939,7 @@ impl Interp {
                         self.vars_mut().insert(name.clone(), v.clone());
                     }
                     if *show {
-                        let shown = self.display(&v, &name);
-                        self.emit(&shown)?;
+                        self.emit_display(&v, &name)?;
                     }
                 }
                 Ok(Flow::Normal)
@@ -1016,8 +1018,9 @@ impl Interp {
                 // existence. The value is the empty that the next column
                 // would have been, which gives `[]` a 0x0 and `1:0` a 1x0,
                 // the shapes Octave assigns. MATLAB's exact shape is
-                // unsettled, so no golden case asserts it.
-                if m.cols == 0 {
+                // unsettled, so no golden case asserts it. An N-D array
+                // iterates the columns of its 2-D fold (cycle 14).
+                if m.fold_cols() == 0 {
                     let empty = Matrix::new(m.rows, 0, Vec::new()).with_class(m.class);
                     self.vars_mut().insert(name.clone(), Value::Mat(empty));
                 }
@@ -1083,7 +1086,7 @@ impl Interp {
         otherwise: &Option<Vec<Located>>,
     ) -> R<Flow> {
         let subject = match self.eval(subject)? {
-            Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => Subject::Text(m.text()),
+            Value::Mat(m) if m.is_char_row() => Subject::Text(m.text()),
             Value::Mat(m) if m.is_scalar() && m.class != Class::Char => Subject::Num(m.c(0)),
             _ => bail!(error::switch_expression()),
         };
@@ -1091,9 +1094,7 @@ impl Interp {
             for e in &arm.values {
                 let v = self.eval(e).map_err(|err| err.at(arm.line))?;
                 let hit = match (&subject, &v) {
-                    (Subject::Text(s), Value::Mat(m)) => {
-                        m.class == Class::Char && m.rows <= 1 && m.text() == *s
-                    }
+                    (Subject::Text(s), Value::Mat(m)) => m.is_char_row() && m.text() == *s,
                     // A number matches by `==`, both parts (cycle 10).
                     (Subject::Num(x), Value::Mat(m)) => {
                         m.class != Class::Char && m.is_scalar() && m.c(0) == *x
@@ -1116,8 +1117,15 @@ impl Interp {
     /// an error unwinding through it. A `loop_depth` left raised would make a
     /// later top-level `break` legal. A `return` in the body ends the loop
     /// and is passed on, to end the function or script around it.
+    ///
+    /// An N-D array iterates the columns of its 2-D fold (cycle 14), as the
+    /// MathWorks `for` page says: "The loop executes a maximum of n times,
+    /// where n is the number of columns of valArray, given by
+    /// numel(valArray(1,:))". Each value is a column of `rows` elements, and
+    /// the storage is column-major, so column `c` is the same run of
+    /// elements in the fold as in the array.
     fn run_for(&mut self, name: &str, m: &Matrix, body: &[Located]) -> R<Flow> {
-        for c in 0..m.cols {
+        for c in 0..m.fold_cols() {
             let span = c * m.rows..(c + 1) * m.rows;
             let column: Vec<f64> = m.data[span.clone()].to_vec();
             // A complex column carries its imaginary parts, stored by the
@@ -1146,7 +1154,9 @@ impl Interp {
     /// own, so over a row each is 1x1. As for a matrix, a loop over no
     /// columns still assigns its variable, the empty of the same kind.
     fn run_for_items(&mut self, name: &str, v: &Value, body: &[Located]) -> R<Flow> {
-        let (rows, cols) = v.dims();
+        // A cell or a struct array is never N-D (cycle 14).
+        let dims = v.dims();
+        let (rows, cols) = (dims[0], dims[1]);
         let column = |j: usize| match v {
             Value::Cell(c) => Value::cell(CellArray::new(
                 rows,
@@ -1259,8 +1269,9 @@ impl Interp {
                 ))
             }
             // `'` conjugates as it transposes and `.'` does not (cycle 10).
-            Expr::Transpose(a) => Ok(Value::Mat(self.eval_mat(a)?.ctranspose())),
-            Expr::DotTranspose(a) => Ok(Value::Mat(self.eval_mat(a)?.transpose())),
+            // Neither is defined for an N-D array (cycle 14).
+            Expr::Transpose(a) => Ok(Value::Mat(flat_operand(self.eval_mat(a)?)?.ctranspose())),
+            Expr::DotTranspose(a) => Ok(Value::Mat(flat_operand(self.eval_mat(a)?)?.transpose())),
             // A range between two chars is a char (cycle 11): `'a':'e'` is
             // `'abcde'`, as in MATLAB. Any other range is a double.
             Expr::Range(a, step, b) => {
@@ -1396,6 +1407,21 @@ impl Interp {
                 bail!(error::operator_unsupported(binop_text(op), v.class_name()))
             }
         };
+        // An N-D operand is element-wise or nothing (cycle 14): `*` with a
+        // scalar on either side, `/` by a scalar and `\` with a scalar on
+        // the left are element-wise, as they are for a matrix; any other
+        // `*`, `/` or `\`, and every `^`, would be a matrix operation.
+        if (a.is_nd() || b.is_nd())
+            && match op {
+                BinOp::Mul => !(a.is_scalar() || b.is_scalar()),
+                BinOp::Div => !b.is_scalar(),
+                BinOp::LDiv => !a.is_scalar(),
+                BinOp::Pow => true,
+                _ => false,
+            }
+        {
+            bail!(error::nd_matrix_operation());
+        }
         let bool_op =
             |f: fn(f64, f64) -> bool| move |x: f64, y: f64| if f(x, y) { 1.0 } else { 0.0 };
         let r = if a.is_complex() || b.is_complex() {
@@ -1666,13 +1692,19 @@ impl Interp {
     }
 
     /// Shows a variable under its own name, after an assignment to it.
+    ///
+    /// The variable is displayed where it is stored, a page at a time as
+    /// [`Interp::emit_display`] writes one (cycle 14): copying it out first
+    /// would hold a second array as large as the first, so the output sink
+    /// is borrowed beside the frames and written through [`emit_to`].
     fn show_var(&mut self, name: &str) -> R<()> {
         let format = self.format;
-        let shown = match self.vars().get(name) {
-            Some(v) => with_format(format, || v.display(name)),
-            None => return Ok(()),
+        let Interp { frames, out, .. } = self;
+        let frame = frames.last().expect("frames[0] is never popped");
+        let Some(v) = frame.vars.get(name) else {
+            return Ok(());
         };
-        self.emit(&shown)
+        with_format(format, || v.write_display(name, |s| emit_to(&mut **out, s)))
     }
 
     /// `name` followed by its access chain, as the values it gives: one for
@@ -1724,17 +1756,17 @@ impl Interp {
         if let Some(Access::Paren(args)) = chain.get(nf) {
             let fields = &chain[..nf];
             let shape = match self.at_fields(name, fields) {
-                Some(Value::Mat(m)) => Some((m.rows, m.cols)),
+                Some(Value::Mat(m)) => Some(m.dims()),
                 _ => None,
             };
-            if let Some((rows, cols)) = shape {
-                let sel = self.eval_index_args(rows, cols, args)?;
+            if let Some(dims) = shape {
+                let sel = self.eval_index_args(&dims, args)?;
                 let Some(Value::Mat(m)) = self.at_fields(name, fields) else {
                     return Err(error::undefined(name));
                 };
                 // Indexing keeps the class, so `s(2)` of a char is a char and
                 // `s(:)` is a char column (QA D17).
-                let g = resolve_read(m.rows, m.cols, &sel)?;
+                let g = resolve_read(&m.dims(), &sel)?;
                 return Ok((vec![Value::Mat(gather(m, &g))], nf + 1));
             }
             // A handle's `(...)` is a call of the handle.
@@ -1806,30 +1838,39 @@ impl Interp {
                 Ok(vec![self.call_handle_for_value(&f, a)?])
             }
             (Value::Mat(m), Access::Paren(args)) => {
-                let sel = self.eval_index_args(m.rows, m.cols, args)?;
-                let g = resolve_read(m.rows, m.cols, &sel)?;
+                let dims = m.dims();
+                let sel = self.eval_index_args(&dims, args)?;
+                let g = resolve_read(&dims, &sel)?;
                 Ok(vec![Value::Mat(gather(&m, &g))])
             }
+            // A cell or a struct array stays 2-D (cycle 14): a read that
+            // would make an N-D one is refused as it always was.
             (Value::Cell(c), Access::Brace(args)) => {
-                let sel = self.eval_index_args(c.rows, c.cols, args)?;
-                let g = resolve_read(c.rows, c.cols, &sel)?;
+                let dims = [c.rows, c.cols];
+                let sel = self.eval_index_args(&dims, args)?;
+                let g = resolve_read(&dims, &sel)?;
+                flat(&g.dims)?;
                 Ok(pick(&c.data, &g.pos))
             }
             (Value::Cell(c), Access::Paren(args)) => {
-                let sel = self.eval_index_args(c.rows, c.cols, args)?;
-                let g = resolve_read(c.rows, c.cols, &sel)?;
+                let dims = [c.rows, c.cols];
+                let sel = self.eval_index_args(&dims, args)?;
+                let g = resolve_read(&dims, &sel)?;
+                let (gr, gc) = flat(&g.dims)?;
                 // `c(ones(1, 2^27))` makes a cell of its own (cycle 13b).
-                crate::builtins::args::check_cell(g.rows, g.cols)?;
+                crate::builtins::args::check_cell(gr, gc)?;
                 let data = pick(&c.data, &g.pos);
-                Ok(vec![Value::cell(CellArray::new(g.rows, g.cols, data))])
+                Ok(vec![Value::cell(CellArray::new(gr, gc, data))])
             }
             (Value::Struct(s), Access::Paren(args)) => {
-                let sel = self.eval_index_args(s.rows, s.cols, args)?;
-                let g = resolve_read(s.rows, s.cols, &sel)?;
-                crate::builtins::args::check_struct(g.rows, g.cols, s.fields.len())?;
+                let dims = [s.rows, s.cols];
+                let sel = self.eval_index_args(&dims, args)?;
+                let g = resolve_read(&dims, &sel)?;
+                let (gr, gc) = flat(&g.dims)?;
+                crate::builtins::args::check_struct(gr, gc, s.fields.len())?;
                 Ok(vec![Value::strukt(StructArray::new(
-                    g.rows,
-                    g.cols,
+                    gr,
+                    gc,
                     s.fields.clone(),
                     pick(&s.elems, &g.pos),
                 ))])
@@ -1852,16 +1893,18 @@ impl Interp {
             .ok_or_else(error::dynamic_field_not_text)
     }
 
-    /// Evaluates the subscripts of an index into an array of `rows x cols`.
+    /// Evaluates the subscripts of an index into an array of `dims`.
     ///
     /// **Invariant 2: this is the one place a one-based subscript becomes
     /// zero-based.** Everything downstream of it, reading, assignment and
     /// deletion alike, works on the [`Sel`]s it returns.
     ///
-    /// `end` is the number of elements for a single subscript, the rows and
-    /// the columns in the first two positions of several, and `1` in any
-    /// position after those: a matrix has a trailing singleton dimension in
-    /// every position past the second (QA D22).
+    /// `end` is the number of elements for a single subscript; with several
+    /// it is the size of the dimension in its position, `1` in a position
+    /// past `ndims` (the trailing singleton of QA D22), and in the last
+    /// position the product of every dimension from it on, the dimensions
+    /// past the subscripts being folded into the last (cycle 14); see
+    /// [`end_value`].
     ///
     /// A logical subscript is a mask, never a list of positions (QA D6): it
     /// selects the positions `find(mask)` would return, in the shape `find`
@@ -1869,7 +1912,7 @@ impl Interp {
     /// than the array selects among the elements it covers, and a `true`
     /// past the end is a position past the end, for the reader or the writer
     /// to judge.
-    fn eval_index_args(&mut self, rows: usize, cols: usize, args: &[Expr]) -> R<Vec<Sel>> {
+    fn eval_index_args(&mut self, dims: &[usize], args: &[Expr]) -> R<Vec<Sel>> {
         if args.is_empty() {
             bail!(error::indexing_rank());
         }
@@ -1879,12 +1922,7 @@ impl Interp {
                 out.push(Sel::All);
                 continue;
             }
-            let end_val = match (args.len(), k) {
-                (1, _) => rows * cols,
-                (_, 0) => rows,
-                (_, 1) => cols,
-                _ => 1,
-            };
+            let end_val = end_value(dims, args.len(), k);
             self.frame_mut().end_stack.push(end_val);
             let v = self.eval_mat(a);
             self.frame_mut().end_stack.pop();
@@ -1952,12 +1990,12 @@ impl Interp {
                     Link::Field(f)
                 }
                 Access::Paren(args) => {
-                    let (rows, cols) = self.shape_at(name, &links);
-                    Link::Paren(self.eval_index_args(rows, cols, args)?)
+                    let dims = self.shape_at(name, &links);
+                    Link::Paren(self.eval_index_args(&dims, args)?)
                 }
                 Access::Brace(args) => {
-                    let (rows, cols) = self.shape_at(name, &links);
-                    Link::Brace(self.eval_index_args(rows, cols, args)?)
+                    let dims = self.shape_at(name, &links);
+                    Link::Brace(self.eval_index_args(&dims, args)?)
                 }
             };
             links.push(link);
@@ -1966,9 +2004,10 @@ impl Interp {
     }
 
     /// The shape of what the variable `name` holds at the end of `links`,
-    /// walked by reference, or `0x0` where the path does not reach: an
-    /// undefined variable, a missing field, a position past the end.
-    fn shape_at(&self, name: &str, links: &[Link]) -> (usize, usize) {
+    /// every dimension of it, walked by reference, or `0x0` where the path
+    /// does not reach: an undefined variable, a missing field, a position
+    /// past the end.
+    fn shape_at(&self, name: &str, links: &[Link]) -> Vec<usize> {
         /// A value, or element `k` of a struct array, which is not a value
         /// of its own until a field of it is taken.
         #[derive(Clone, Copy)]
@@ -1977,7 +2016,7 @@ impl Interp {
             E(&'a StructArray, usize),
         }
         let Some(v) = self.vars().get(name) else {
-            return (0, 0);
+            return vec![0, 0];
         };
         let mut at = At::V(v);
         for l in links {
@@ -1987,21 +2026,21 @@ impl Interp {
                 }
                 (At::E(s, k), Link::Field(f)) => s.field_index(f).map(|i| At::V(&s.elems[k][i])),
                 (At::V(Value::Cell(c)), Link::Brace(sel)) => {
-                    one_position(c.rows, c.cols, sel).map(|p| At::V(&c.data[p]))
+                    one_position(&[c.rows, c.cols], sel).map(|p| At::V(&c.data[p]))
                 }
                 (At::V(Value::Struct(s)), Link::Paren(sel)) => {
-                    one_position(s.rows, s.cols, sel).map(|p| At::E(s, p))
+                    one_position(&[s.rows, s.cols], sel).map(|p| At::E(s, p))
                 }
                 _ => None,
             };
             match next {
                 Some(n) => at = n,
-                None => return (0, 0),
+                None => return vec![0, 0],
             }
         }
         match at {
             At::V(v) => v.dims(),
-            At::E(..) => (1, 1),
+            At::E(..) => vec![1, 1],
         }
     }
 
@@ -2009,8 +2048,8 @@ impl Interp {
     /// cell or a struct array, keeping its kind and class. Checked in full
     /// before the variable changes.
     fn delete_index(&mut self, name: &str, args: &[Expr]) -> R<()> {
-        let (rows, cols) = self.vars().get(name).map_or((0, 0), Value::dims);
-        let sel = self.eval_index_args(rows, cols, args)?;
+        let dims = self.vars().get(name).map_or(vec![0, 0], Value::dims);
+        let sel = self.eval_index_args(&dims, args)?;
         match self.vars_mut().get_mut(name) {
             Some(v) => delete_in(v, &sel),
             None => {
@@ -2064,11 +2103,14 @@ impl Interp {
     ///
     /// A complex argument reaches only the builtins that take one; every
     /// other builtin refuses it here, before it runs (cycle 10, see
-    /// `builtins::TAKES_COMPLEX`).
+    /// `builtins::TAKES_COMPLEX`). An N-D argument is judged the same way,
+    /// against `builtins::ND_OK` (cycle 14): this is the only path into a
+    /// builtin, so no 2-D kernel ever reads the first page of an N-D array.
     fn call_builtin(&mut self, name: &str, args: Vec<Value>, nargout: usize) -> R<Vec<Value>> {
         match self.builtins.get(name).map(|e| e.f) {
             Some(f) => {
                 builtins::complex_gate(name, &args)?;
+                builtins::nd_gate(name, &args)?;
                 f(self, &args, nargout)
             }
             None => Err(error::undefined(name)),
@@ -3147,42 +3189,102 @@ fn pick<T: Clone>(items: &[T], pos: &[usize]) -> Vec<T> {
     pos.iter().map(|&p| items[p].clone()).collect()
 }
 
-/// The one linear position `sel` selects in bounds of a `rows x cols`
-/// array, if it selects exactly one.
-fn one_position(rows: usize, cols: usize, sel: &[Sel]) -> Option<usize> {
-    match resolve_read(rows, cols, sel).ok()?.pos[..] {
+/// The one linear position `sel` selects in bounds of an array of `dims`,
+/// if it selects exactly one.
+fn one_position(dims: &[usize], sel: &[Sel]) -> Option<usize> {
+    match resolve_read(dims, sel).ok()?.pos[..] {
         [p] => Some(p),
         _ => None,
     }
 }
 
-/// Grows column-major `items` from `rows x cols` to `nr x nc`, keeping
-/// every item at its row and column and filling the new ones with `fill`:
-/// `scatter`'s growth, for a cell's elements or a struct array's (cycle
-/// 07). When the linear positions do not move, the storage is resized in
-/// place, which `Vec` amortises.
-fn regrid<T>(
-    items: &mut Vec<T>,
-    (rows, cols): (usize, usize),
-    (nr, nc): (usize, usize),
-    fill: impl Fn() -> T,
-) {
-    if (rows, cols) == (nr, nc) {
+/// A cell's or a struct array's shape after a read or a growth: two
+/// dimensions, or today's refusal. Cells and structs stay 2-D in cycle
+/// 14, so `c(:, :, [1 1])` and `c{1, 1, 2} = 5` are refused as they were.
+fn flat(dims: &[usize]) -> R<(usize, usize)> {
+    let d = normalize_dims(dims);
+    if d.len() > 2 {
+        bail!(error::nd_unsupported());
+    }
+    Ok((d[0], d[1]))
+}
+
+/// The operand of `'` or `.'`, which is not defined for an N-D array
+/// (cycle 14).
+fn flat_operand(m: Matrix) -> R<Matrix> {
+    if m.is_nd() {
+        bail!(error::nd_transpose());
+    }
+    Ok(m)
+}
+
+/// True when column-major storage laid out as `old` is already the start
+/// of the same storage laid out as `new`, which is at least as large in
+/// every dimension: the dimensions agree up to the first that differs,
+/// and every one after it is 1 in `old`. A row gaining columns, a column
+/// gaining rows, a matrix gaining columns and an array gaining pages all
+/// keep their layout.
+fn keeps_layout(old: &[usize], new: &[usize]) -> bool {
+    let n = old.len().max(new.len());
+    let at = |d: &[usize], k: usize| d.get(k).copied().unwrap_or(1);
+    match (0..n).find(|&k| at(old, k) != at(new, k)) {
+        None => true,
+        Some(j) => (j + 1..n).all(|k| at(old, k) == 1),
+    }
+}
+
+/// Grows column-major `items` from the shape `old` to the shape `new`,
+/// which is at least as large in every dimension, keeping every item at
+/// its subscripts and filling the new ones with `fill`: `scatter`'s
+/// growth, for a matrix's elements and, since cycle 07, a cell's or a
+/// struct array's. When the linear positions do not move
+/// ([`keeps_layout`]), the storage is resized in place, which `Vec`
+/// amortises; otherwise each run of the first dimension is moved to where
+/// its subscripts put it in `new` (cycle 14 generalised it from two
+/// dimensions to any number).
+fn regrid<T>(items: &mut Vec<T>, old: &[usize], new: &[usize], fill: impl Fn() -> T) {
+    let total = dims_product(new);
+    if normalize_dims(old) == normalize_dims(new) {
         return;
     }
-    if rows == nr || items.is_empty() || (cols == 1 && nc == 1) {
-        items.resize_with(nr * nc, fill);
+    if items.is_empty() || keeps_layout(old, new) {
+        items.resize_with(total, fill);
         return;
     }
-    let mut old = std::mem::take(items).into_iter();
-    let mut out = Vec::with_capacity(nr * nc);
-    for c in 0..nc {
-        for r in 0..nr {
-            if c < cols && r < rows {
-                out.extend(old.next());
-            } else {
-                out.push(fill());
+    let n = old.len().max(new.len());
+    let at = |d: &[usize], k: usize| d.get(k).copied().unwrap_or(1);
+    // The stride of each dimension in the new layout.
+    let mut stride = vec![1usize; n];
+    for k in 1..n {
+        stride[k] = stride[k - 1] * at(new, k - 1);
+    }
+    let run = at(old, 0);
+    let mut out: Vec<T> = Vec::with_capacity(total);
+    out.resize_with(total, &fill);
+    // The dimensions past the first that the old layout has more than one
+    // of, each with its stride in the new: a dimension of 1 always carries
+    // and adds nothing to a run's place, so the counter leaves it out, and
+    // a run costs no more however many singletons the shape holds.
+    let live: Vec<(usize, usize)> = (1..n)
+        .filter(|&k| at(old, k) > 1)
+        .map(|k| (at(old, k), stride[k]))
+        .collect();
+    // The subscripts, along those dimensions, of the run being moved.
+    let mut coord = vec![0usize; live.len()];
+    let mut old_items = std::mem::take(items).into_iter();
+    for _ in 0..old_items.len() / run.max(1) {
+        let base: usize = coord.iter().zip(&live).map(|(&c, &(_, s))| c * s).sum();
+        for r in 0..run {
+            if let Some(v) = old_items.next() {
+                out[base + r] = v;
             }
+        }
+        for (c, &(d, _)) in coord.iter_mut().zip(&live) {
+            *c += 1;
+            if *c < d {
+                break;
+            }
+            *c = 0;
         }
     }
     *items = out;
@@ -3262,20 +3364,21 @@ fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
             let Value::Cell(rc) = cur else {
                 bail!(error::brace_assign_unsupported());
             };
-            let plan = resolve_write(rc.rows, rc.cols, sel, (1, 1))?;
+            let plan = resolve_write(&[rc.rows, rc.cols], sel, &[1, 1])?;
             let [p] = plan.pos[..] else {
                 bail!(error::cs_list_count(plan.pos.len()));
             };
-            if (plan.rows, plan.cols) == (rc.rows, rc.cols) {
+            let (pr, pc) = flat(&plan.dims)?;
+            if (pr, pc) == (rc.rows, rc.cols) {
                 return assign_chain(&mut Rc::make_mut(rc).data[p], rest, rhs);
             }
             // Growth is judged in bytes before it allocates (cycle 13b).
-            crate::builtins::args::check_cell(plan.rows, plan.cols)?;
+            crate::builtins::args::check_cell(pr, pc)?;
             let mut child = blank();
             assign_chain(&mut child, rest, rhs)?;
             let c = Rc::make_mut(rc);
-            regrid(&mut c.data, (c.rows, c.cols), (plan.rows, plan.cols), blank);
-            (c.rows, c.cols) = (plan.rows, plan.cols);
+            regrid(&mut c.data, &[c.rows, c.cols], &[pr, pc], blank);
+            (c.rows, c.cols) = (pr, pc);
             c.data[p] = child;
             Ok(())
         }
@@ -3288,17 +3391,18 @@ fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
             let Value::Struct(rc) = cur else {
                 bail!(error::dot_assign_unsupported());
             };
-            let plan = resolve_write(rc.rows, rc.cols, sel, (1, 1))?;
+            let plan = resolve_write(&[rc.rows, rc.cols], sel, &[1, 1])?;
             let [p] = plan.pos[..] else {
                 bail!(error::cs_list_count(plan.pos.len()));
             };
-            let grows = (plan.rows, plan.cols) != (rc.rows, rc.cols);
+            let (pr, pc) = flat(&plan.dims)?;
+            let grows = (pr, pc) != (rc.rows, rc.cols);
             let known = rc.field_index(f);
             if grows || known.is_none() {
                 // `s(2^27).a = 1` is within the element cap and far past the
                 // bytes a double array may take (cycle 13b).
                 let nf = rc.fields.len() + usize::from(known.is_none());
-                crate::builtins::args::check_struct(plan.rows, plan.cols, nf)?;
+                crate::builtins::args::check_struct(pr, pc, nf)?;
             }
             match (grows, known) {
                 (false, Some(i)) => assign_chain(&mut Rc::make_mut(rc).elems[p][i], rest, rhs),
@@ -3308,13 +3412,10 @@ fn assign_chain(cur: &mut Value, links: &[Link], rhs: Value) -> R<()> {
                     let s = Rc::make_mut(rc);
                     let i = s.ensure_field(f);
                     let nf = s.fields.len();
-                    regrid(
-                        &mut s.elems,
-                        (s.rows, s.cols),
-                        (plan.rows, plan.cols),
-                        || vec![blank(); nf],
-                    );
-                    (s.rows, s.cols) = (plan.rows, plan.cols);
+                    regrid(&mut s.elems, &[s.rows, s.cols], &[pr, pc], || {
+                        vec![blank(); nf]
+                    });
+                    (s.rows, s.cols) = (pr, pc);
                     s.elems[p][i] = child;
                     Ok(())
                 }
@@ -3343,11 +3444,12 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
             Ok(())
         }
         (Value::Cell(rc), Value::Cell(r)) => {
-            let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
-            crate::builtins::args::check_cell(plan.rows, plan.cols)?;
+            let plan = resolve_write(&[rc.rows, rc.cols], sel, &[r.rows, r.cols])?;
+            let (pr, pc) = flat(&plan.dims)?;
+            crate::builtins::args::check_cell(pr, pc)?;
             let c = Rc::make_mut(rc);
-            regrid(&mut c.data, (c.rows, c.cols), (plan.rows, plan.cols), blank);
-            (c.rows, c.cols) = (plan.rows, plan.cols);
+            regrid(&mut c.data, &[c.rows, c.cols], &[pr, pc], blank);
+            (c.rows, c.cols) = (pr, pc);
             for (k, &p) in plan.pos.iter().enumerate() {
                 c.data[p] = r.data[if r.data.len() == 1 { 0 } else { k }].clone();
             }
@@ -3357,17 +3459,15 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
             if !rc.same_fields(&r) {
                 bail!(error::dissimilar_structs());
             }
-            let plan = resolve_write(rc.rows, rc.cols, sel, (r.rows, r.cols))?;
-            crate::builtins::args::check_struct(plan.rows, plan.cols, rc.fields.len())?;
+            let plan = resolve_write(&[rc.rows, rc.cols], sel, &[r.rows, r.cols])?;
+            let (pr, pc) = flat(&plan.dims)?;
+            crate::builtins::args::check_struct(pr, pc, rc.fields.len())?;
             let s = Rc::make_mut(rc);
             let nf = s.fields.len();
-            regrid(
-                &mut s.elems,
-                (s.rows, s.cols),
-                (plan.rows, plan.cols),
-                || vec![blank(); nf],
-            );
-            (s.rows, s.cols) = (plan.rows, plan.cols);
+            regrid(&mut s.elems, &[s.rows, s.cols], &[pr, pc], || {
+                vec![blank(); nf]
+            });
+            (s.rows, s.cols) = (pr, pc);
             for (k, &p) in plan.pos.iter().enumerate() {
                 let vals = s.reordered(&r, if r.numel() == 1 { 0 } else { k });
                 s.elems[p] = vals;
@@ -3411,13 +3511,9 @@ fn assign_paren(cur: &mut Value, sel: &[Sel], rhs: Value) -> R<()> {
 /// (cycle 10's review); the imaginary parts are now scattered in place
 /// beside the real ones, so the loop is linear, as a real one is.
 fn assign_matrix(m: &mut Matrix, sel: &[Sel], rhs: Matrix) -> R<()> {
-    let class = if m.class == Class::Double && m.rows == 0 && m.cols == 0 {
-        rhs.class
-    } else {
-        m.class
-    };
+    let class = if m.is_blank() { rhs.class } else { m.class };
     let rhs = rhs.to_class(class)?;
-    let plan = resolve_write(m.rows, m.cols, sel, (rhs.rows, rhs.cols))?;
+    let plan = resolve_write(&m.dims(), sel, &rhs.dims())?;
     m.class = class;
     let complex = m.is_complex() || rhs.is_complex();
     if complex {
@@ -3428,7 +3524,7 @@ fn assign_matrix(m: &mut Matrix, sel: &[Sel], rhs: Matrix) -> R<()> {
         // first becomes complex.
         let n = m.data.len();
         let im_data = m.im.take().unwrap_or_else(|| vec![0.0; n]);
-        let mut im = Matrix::new(m.rows, m.cols, im_data);
+        let mut im = Matrix::from_dims(&m.dims(), im_data);
         scatter(&mut im, &plan, &rhs.imag_part());
         scatter(m, &plan, &rhs.real_part());
         m.im = Some(im.data);
@@ -3445,27 +3541,32 @@ fn delete_in(v: &mut Value, sel: &[Sel]) -> R<()> {
     if matches!(v, Value::Exception(_) | Value::Func(_)) {
         bail!(error::not_an_array(v.class_name()));
     }
-    let (rows, cols) = v.dims();
-    let keep = resolve_delete(rows, cols, sel)?;
+    let keep = resolve_delete(&v.dims(), sel)?;
     match v {
         Value::Mat(m) => {
             m.data = keep.pos.iter().map(|&p| m.data[p]).collect();
-            if let Some(im) = m.im.take() {
-                m.im = Some(keep.pos.iter().map(|&p| im[p]).collect());
+            let im =
+                m.im.take()
+                    .map(|im| keep.pos.iter().map(|&p| im[p]).collect());
+            m.set_dims(&keep.dims);
+            if im.is_some() {
+                m.im = im;
                 let taken = std::mem::replace(m, Matrix::empty());
                 *m = taken.normalized();
             }
-            (m.rows, m.cols) = (keep.rows, keep.cols);
         }
+        // What a deletion leaves of a 2-D array is 2-D.
         Value::Cell(rc) => {
-            let c = Rc::make_mut(rc);
-            c.data = keep_positions(std::mem::take(&mut c.data), &keep.pos);
-            (c.rows, c.cols) = (keep.rows, keep.cols);
+            let (r, c) = flat(&keep.dims)?;
+            let cell = Rc::make_mut(rc);
+            cell.data = keep_positions(std::mem::take(&mut cell.data), &keep.pos);
+            (cell.rows, cell.cols) = (r, c);
         }
         Value::Struct(rc) => {
+            let (r, c) = flat(&keep.dims)?;
             let s = Rc::make_mut(rc);
             s.elems = keep_positions(std::mem::take(&mut s.elems), &keep.pos);
-            (s.rows, s.cols) = (keep.rows, keep.cols);
+            (s.rows, s.cols) = (r, c);
         }
         Value::Exception(_) | Value::Func(_) => {}
     }
@@ -3490,7 +3591,7 @@ fn nav_mut<'a>(mut cur: &'a mut Value, links: &[Link]) -> R<&'a mut Value> {
             }
             (Value::Struct(_), Link::Field(_)) => bail!(error::scalar_struct_required()),
             (Value::Cell(c), Link::Brace(sel)) => {
-                let g = resolve_read(c.rows, c.cols, sel)?;
+                let g = resolve_read(&[c.rows, c.cols], sel)?;
                 let [p] = g.pos[..] else {
                     bail!(error::cs_list_count(g.pos.len()));
                 };
@@ -3500,7 +3601,7 @@ fn nav_mut<'a>(mut cur: &'a mut Value, links: &[Link]) -> R<&'a mut Value> {
                 let Some(Link::Field(f)) = links.get(k + 1) else {
                     bail!(error::invalid_assignment_target());
                 };
-                let g = resolve_read(s.rows, s.cols, sel)?;
+                let g = resolve_read(&[s.rows, s.cols], sel)?;
                 let [p] = g.pos[..] else {
                     bail!(error::cs_list_count(g.pos.len()));
                 };
@@ -3562,7 +3663,7 @@ fn is_deletion(e: &Expr) -> bool {
 
 /// A logical subscript: the positions of its `true` elements, shaped as
 /// `find(mask)` would shape them. A row mask gives a row, a `0x0` mask a
-/// `0x0`, and any other mask a column.
+/// `0x0`, and any other mask a column, an N-D one included (cycle 14).
 fn mask_positions(v: &Matrix) -> Sel {
     let idx: Vec<usize> = v
         .data
@@ -3573,24 +3674,22 @@ fn mask_positions(v: &Matrix) -> Sel {
         .collect();
     let max = idx.last().map_or(0.0, |&k| k as f64 + 1.0);
     let n = idx.len();
-    let (rows, cols) = if v.rows == 0 && v.cols == 0 {
-        (0, 0)
+    let shape = if v.is_nd() {
+        vec![n, 1]
+    } else if v.rows == 0 && v.cols == 0 {
+        vec![0, 0]
     } else if v.rows == 1 {
-        (1, n)
+        vec![1, n]
     } else {
-        (n, 1)
+        vec![n, 1]
     };
-    Sel::List {
-        idx,
-        rows,
-        cols,
-        max,
-    }
+    Sel::List { idx, shape, max }
 }
 
 /// A numeric (or char) subscript in position `pos`: each element must be a
 /// positive integer. It becomes zero-based here; a position past `usize`
-/// saturates, and `max` keeps it exactly for growth to name.
+/// saturates, and `max` keeps it exactly for growth to name. The index's
+/// shape is every dimension of it (cycle 14).
 fn index_positions(v: &Matrix, pos: usize) -> R<Sel> {
     // A complex subscript is not a position, whatever its real part.
     if v.is_complex() {
@@ -3607,114 +3706,141 @@ fn index_positions(v: &Matrix, pos: usize) -> R<Sel> {
     }
     Ok(Sel::List {
         idx,
-        rows: v.rows,
-        cols: v.cols,
+        shape: v.dims(),
         max,
     })
 }
 
-/// The subscripts past the second, which index trailing singleton
-/// dimensions. Each must select position 1 exactly once: `:`, `1`, `end` or
-/// a mask `true`. A position past 1 is the ordinary bounds error when
-/// reading; `grows` says the caller is assigning, where it would need an N-D
-/// array, as would selecting position 1 twice or not at all.
-fn check_trailing(sel: &[Sel], grows: bool) -> R<()> {
-    for (k, s) in sel.iter().enumerate().skip(2) {
-        if let Sel::List { idx, .. } = s {
-            if idx.iter().any(|&i| i > 0) {
-                if grows {
-                    bail!(error::nd_unsupported());
-                }
-                bail!(error::index_exceeds_bound(k + 1, 1));
-            }
-            if idx.len() != 1 {
-                bail!(error::nd_unsupported());
-            }
-        }
+/// What `end` is in position `p` of `k` subscripts into an array of
+/// `dims` (cycle 14): with one subscript the number of elements; in any
+/// position but the last the size of that dimension, `1` past `ndims`
+/// (the trailing singleton of QA D22); and in the last position the
+/// product of every dimension from `p` on, so `A(1, end)` of a 2x3x4 is
+/// `A(1, 12)`. It is also the size of the dimension that subscript
+/// indexes, which [`fold_dims`] collects.
+fn end_value(dims: &[usize], k: usize, p: usize) -> usize {
+    if k == 1 {
+        dims_product(dims)
+    } else if p + 1 < k {
+        dims.get(p).copied().unwrap_or(1)
+    } else {
+        dims.get(p..).map_or(1, dims_product)
     }
-    Ok(())
 }
 
-/// Which elements `m(sel)` reads from an array of `rows x cols`, and the
-/// shape of the result. Every position is bounds-checked here.
+/// The dimensions `k >= 2` subscripts index in an array of `dims` (cycle
+/// 14): with fewer subscripts than dimensions, those from the `k`-th on
+/// are folded into the last, so `A(i, j)` of a 2x3x4 indexes a 2x12; with
+/// more, every one past `ndims` is a 1. Column-major storage makes the
+/// fold free: a position's linear offset is the same in both.
+fn fold_dims(dims: &[usize], k: usize) -> Vec<usize> {
+    (0..k).map(|p| end_value(dims, k, p)).collect()
+}
+
+/// The linear positions several subscripts select, in column-major order
+/// of the subscripts, the first moving fastest: subscript `p` spans
+/// `span[p]` positions of dimension `p` of an array laid out as `dims`.
+/// The caller has judged the count, which is not zero.
+fn sel_positions(sel: &[Sel], span: &[usize], dims: &[usize]) -> Vec<usize> {
+    let mut pos = vec![0usize];
+    let mut stride = 1usize;
+    for (p, s) in sel.iter().enumerate() {
+        let at = s.positions(span[p]);
+        // A subscript that selects the first position once moves none, so
+        // it is passed over rather than copying every position listed so
+        // far: the walk stays linear in the positions however many such
+        // subscripts there are (`x(:, 1, 1, ..., 1)`).
+        if at[..] != [0] {
+            let mut next = Vec::with_capacity(pos.len() * at.len());
+            for &q in &at {
+                for &b in &pos {
+                    next.push(b + q * stride);
+                }
+            }
+            pos = next;
+        }
+        stride = stride.saturating_mul(dims[p]);
+    }
+    pos
+}
+
+/// How many positions each subscript selects, judged by `check_dims` as
+/// the shape it is before anything is allocated.
+fn sel_counts(sel: &[Sel], span: &[usize]) -> R<Vec<usize>> {
+    let counts: Vec<f64> = sel
+        .iter()
+        .zip(span)
+        .map(|(s, &n)| s.count(n) as f64)
+        .collect();
+    crate::builtins::args::check_dims(&counts)
+}
+
+/// Which elements `m(sel)` reads from an array of `dims`, and the shape of
+/// the result. Every position is bounds-checked here.
 ///
-/// One subscript is linear: a vector indexed by a vector keeps the source's
-/// orientation, anything else takes the shape of the index, and `:` is a
-/// column. Two or more are rows by columns, with the result's size judged by
-/// `check_shape` before anything is allocated.
-fn resolve_read(rows: usize, cols: usize, sel: &[Sel]) -> R<Gather> {
-    let numel = rows * cols;
+/// One subscript is linear over every element in column-major order: a
+/// vector indexed by a vector keeps the source's orientation, anything
+/// else takes the shape of the index, every dimension of it, and `:` is a
+/// column. Two or more have one dimension each (cycle 14), the dimensions
+/// of the array folded or padded to their number ([`fold_dims`]): each is
+/// bounds-checked against its dimension, and the result has one dimension
+/// per subscript, the number of positions it selects, its size judged by
+/// `check_dims` before anything is allocated. A subscript past `ndims`
+/// may select position 1 any number of times, so `A(:, :, [1 1])` of a
+/// matrix is 2-D doubled into two pages.
+fn resolve_read(dims: &[usize], sel: &[Sel]) -> R<Gather> {
+    let numel = dims_product(dims);
     if let [one] = sel {
         return match one {
             Sel::All => Ok(Gather {
                 pos: (0..numel).collect(),
-                rows: numel,
-                cols: 1,
+                dims: vec![numel, 1],
             }),
-            Sel::List {
-                idx,
-                rows: ir,
-                cols: ic,
-                ..
-            } => {
+            Sel::List { idx, shape, .. } => {
                 if idx.iter().any(|&k| k >= numel) {
                     bail!(error::index_exceeds_numel(numel));
                 }
-                let is_vector = rows == 1 || cols == 1;
-                let (r, c) = if is_vector && (*ir == 1 || *ic == 1) {
-                    if rows == 1 {
-                        (1, idx.len())
+                let vector = |d: &[usize]| d.len() == 2 && (d[0] == 1 || d[1] == 1);
+                let out = if vector(dims) && vector(shape) {
+                    if dims[0] == 1 {
+                        vec![1, idx.len()]
                     } else {
-                        (idx.len(), 1)
+                        vec![idx.len(), 1]
                     }
                 } else {
-                    (*ir, *ic)
+                    shape.clone()
                 };
                 Ok(Gather {
                     pos: idx.clone(),
-                    rows: r,
-                    cols: c,
+                    dims: out,
                 })
             }
         };
     }
-    if let Sel::List { idx, .. } = &sel[0] {
-        if idx.iter().any(|&r| r >= rows) {
-            bail!(error::index_exceeds_bound(1, rows));
+    let d = fold_dims(dims, sel.len());
+    for (p, (s, &n)) in sel.iter().zip(&d).enumerate() {
+        if let Sel::List { idx, .. } = s {
+            if idx.iter().any(|&i| i >= n) {
+                bail!(error::index_exceeds_bound(p + 1, n));
+            }
         }
     }
-    if let Sel::List { idx, .. } = &sel[1] {
-        if idx.iter().any(|&c| c >= cols) {
-            bail!(error::index_exceeds_bound(2, cols));
-        }
-    }
-    check_trailing(sel, false)?;
     // A read of several subscripts sizes its result from the subscripts, not
     // from the array: `A(ones(1, 1e5), ones(1, 1e5))` asks for 1e10 elements
     // out of a 2x2 `A`. The bounds tests come first, so an out-of-range
     // subscript is still reported as one.
-    let (nr, nc) = (sel[0].count(rows), sel[1].count(cols));
-    crate::builtins::args::check_shape(nr as f64, nc as f64)?;
-    if nr * nc == 0 {
-        // Nothing to read, and a colon over the other dimension must not
+    let counts = sel_counts(sel, &d)?;
+    if counts.contains(&0) {
+        // Nothing to read, and a colon over another dimension must not
         // list its positions: `x(:, :)` of a 0x1e12 `x` (cycle 13b).
         return Ok(Gather {
             pos: Vec::new(),
-            rows: nr,
-            cols: nc,
+            dims: counts,
         });
     }
-    let (rs, cs) = (sel[0].positions(rows), sel[1].positions(cols));
-    let mut pos = Vec::with_capacity(nr * nc);
-    for &c in &cs {
-        for &r in &rs {
-            pos.push(c * rows + r);
-        }
-    }
     Ok(Gather {
-        pos,
-        rows: nr,
-        cols: nc,
+        pos: sel_positions(sel, &d, &d),
+        dims: counts,
     })
 }
 
@@ -3725,103 +3851,113 @@ fn resolve_read(rows: usize, cols: usize, sel: &[Sel]) -> R<Gather> {
 fn gather(m: &Matrix, g: &Gather) -> Matrix {
     let data = g.pos.iter().map(|&p| m.data[p]).collect();
     let im = m.im.as_ref().map(|v| g.pos.iter().map(|&p| v[p]).collect());
-    Matrix::new(g.rows, g.cols, data)
+    Matrix::from_dims(&g.dims, data)
         .with_class(m.class)
         .with_im(im)
 }
 
-/// Where `m(sel) = rhs` stores into an array of `rows x cols`, and the shape
-/// the array grows to. Nothing is changed; see `scatter`.
+/// Where `m(sel) = rhs` stores into an array of `dims`, and the shape the
+/// array grows to. Nothing is changed; see `scatter`.
 ///
 /// A position past the end grows the array: a single subscript grows a
-/// vector along its length (an empty becomes a row) and cannot grow a matrix
-/// at all; two subscripts grow either dimension. The grown size stays an
-/// `f64` until `check_shape` has judged it, so `x = []; x(1e300) = 1` names
-/// `1x1e+300` rather than the `usize` it would have saturated to. The
-/// right-hand side is a scalar, which fills every position, or has exactly
-/// one element per position.
-fn resolve_write(rows: usize, cols: usize, sel: &[Sel], (rr, rc): (usize, usize)) -> R<Scatter> {
-    let numel = rows * cols;
-    let (nr, nc, pos) = if let [one] = sel {
+/// vector along its length (an empty becomes a row) and cannot grow a
+/// matrix or an N-D array at all. With two or more subscripts, as many as
+/// the array has dimensions or more, any dimension grows, a new page
+/// included, and a subscript past `ndims` makes a new dimension: `B(:, :,
+/// 2) = 1` of a 2x2 is 2x2x2 (cycle 14). With fewer subscripts than
+/// dimensions the last one indexes the fold of the rest, which cannot
+/// grow. The grown shape stays in `f64` until `check_dims` has judged it,
+/// so `x = []; x(1e300) = 1` names `1x1e+300` rather than the `usize` it
+/// would have saturated to, and so does the count of positions, which
+/// repeated subscripts can make far larger than the array. The
+/// right-hand side is a scalar, which fills every position, or has
+/// exactly one element per position.
+fn resolve_write(dims: &[usize], sel: &[Sel], rhs: &[usize]) -> R<Scatter> {
+    let numel = dims_product(dims);
+    let rhs_n = dims_product(rhs);
+    let (grown, pos) = if let [one] = sel {
         let need = one.extent(numel);
-        let (nr, nc) = if need <= numel as f64 {
-            (rows, cols)
+        let grown = if need <= numel as f64 {
+            dims.to_vec()
         } else {
-            let (r, c) = if numel == 0 || rows == 1 {
+            let (r, c) = if dims.len() > 2 {
+                bail!(error::ambiguous_growth());
+            } else if numel == 0 || dims[0] == 1 {
                 (1.0, need)
-            } else if cols == 1 {
+            } else if dims[1] == 1 {
                 (need, 1.0)
             } else {
                 bail!(error::ambiguous_growth());
             };
-            crate::builtins::args::check_shape(r, c)?
+            let (r, c) = crate::builtins::args::check_shape(r, c)?;
+            vec![r, c]
         };
-        (nr, nc, one.positions(numel))
+        (grown, one.positions(numel))
     } else {
-        check_trailing(sel, true)?;
+        let k = sel.len();
+        let d = fold_dims(dims, k);
         // A colon over a dimension the target does not have yet takes the
-        // right-hand side's extent: `A = []; A(:, 1) = [1; 2]` is 2x1.
-        let span = |s: &Sel, have: usize, theirs: usize| match s {
-            Sel::All if have == 0 => theirs,
-            _ => have,
-        };
-        let (rspan, cspan) = (span(&sel[0], rows, rr), span(&sel[1], cols, rc));
-        let r = sel[0].extent(rspan).max(rows as f64);
-        let c = sel[1].extent(cspan).max(cols as f64);
-        let (nr, nc) = crate::builtins::args::check_shape(r, c)?;
-        if sel[0].count(rspan) * sel[1].count(cspan) == 0 {
+        // right-hand side's extent in that position: `A = []; A(:, 1) =
+        // [1; 2]` is 2x1. An empty target has none of the dimensions past
+        // its own either, so there a colon takes the extent too, and `x =
+        // []; x(:, :, :) = reshape(1:8, 2, 2, 2)` is 2x2x2 (cycle 14); past
+        // the dimensions of an array with elements, a colon selects the one
+        // position it has.
+        let empty = numel == 0;
+        let span: Vec<usize> = sel
+            .iter()
+            .enumerate()
+            .map(|(p, s)| match s {
+                Sel::All if d[p] == 0 || (empty && p >= dims.len()) => {
+                    rhs.get(p).copied().unwrap_or(1)
+                }
+                _ => d[p],
+            })
+            .collect();
+        let asked: Vec<f64> = sel
+            .iter()
+            .enumerate()
+            .map(|(p, s)| s.extent(span[p]).max(d[p] as f64))
+            .collect();
+        let folded = k < dims.len();
+        if folded && asked.iter().zip(&d).any(|(&a, &n)| a > n as f64) {
+            bail!(error::ambiguous_growth());
+        }
+        let new = crate::builtins::args::check_dims(&asked)?;
+        let counts = sel_counts(sel, &span)?;
+        let grown = if folded { dims.to_vec() } else { new.clone() };
+        if counts.contains(&0) {
             // Nowhere to store, so no positions to list (cycle 13b).
-            if rr * rc > 1 {
-                bail!(error::assignment_size(0, rr * rc));
+            if rhs_n > 1 {
+                bail!(error::assignment_size(0, rhs_n));
             }
             return Ok(Scatter {
-                rows: nr,
-                cols: nc,
+                dims: grown,
                 pos: Vec::new(),
             });
         }
-        let (rs, cs) = (sel[0].positions(rspan), sel[1].positions(cspan));
-        let mut pos = Vec::with_capacity(rs.len() * cs.len());
-        for &c in &cs {
-            for &r in &rs {
-                pos.push(c * nr + r);
-            }
-        }
-        (nr, nc, pos)
+        (grown, sel_positions(sel, &span, &new))
     };
-    if rr * rc != 1 && rr * rc != pos.len() {
-        bail!(error::assignment_size(pos.len(), rr * rc));
+    if rhs_n != 1 && rhs_n != pos.len() {
+        bail!(error::assignment_size(pos.len(), rhs_n));
     }
-    Ok(Scatter {
-        rows: nr,
-        cols: nc,
-        pos,
-    })
+    Ok(Scatter { dims: grown, pos })
 }
 
 /// Carries out a write planned by `resolve_write`, growing `m` in place.
 ///
-/// When the growth keeps every existing element at its linear position (the
-/// row count is unchanged, or a column grows longer, or there was nothing to
-/// keep), the storage is resized where it lies; otherwise the elements move
-/// to their new column-major positions. New elements are zero, which for a
-/// char is the code unit 0.
+/// When the growth keeps every existing element at its linear position (a
+/// row gaining columns, a column gaining rows, a matrix gaining columns or
+/// an array gaining pages, or nothing to keep), the storage is resized
+/// where it lies; otherwise the elements move to their new column-major
+/// positions ([`regrid`]). New elements are zero, which for a char is the
+/// code unit 0.
 fn scatter(m: &mut Matrix, plan: &Scatter, rhs: &Matrix) {
-    let (nr, nc) = (plan.rows, plan.cols);
-    if (nr, nc) != (m.rows, m.cols) {
-        let in_place = m.rows == nr || m.data.is_empty() || (m.cols == 1 && nc == 1);
-        if in_place {
-            m.data.resize(nr * nc, 0.0);
-        } else {
-            let mut data = vec![0.0; nr * nc];
-            for c in 0..m.cols {
-                data[c * nr..c * nr + m.rows]
-                    .copy_from_slice(&m.data[c * m.rows..(c + 1) * m.rows]);
-            }
-            m.data = data;
-        }
-        m.rows = nr;
-        m.cols = nc;
+    let new = normalize_dims(&plan.dims);
+    let old = m.dims();
+    if new != old {
+        regrid(&mut m.data, &old, &new, || 0.0);
+        m.set_dims(&new);
     }
     if rhs.is_scalar() {
         let v = rhs.data[0];
@@ -3835,28 +3971,32 @@ fn scatter(m: &mut Matrix, plan: &Scatter, rhs: &Matrix) {
     }
 }
 
-/// What `m(sel) = []` leaves of an array of `rows x cols`.
+/// What `m(sel) = []` leaves of an array of `dims`.
 ///
-/// One subscript deletes elements by linear position: a vector keeps its
-/// orientation, a matrix becomes a row, and `x(:) = []` leaves a 0x0. With
-/// two or more, at most one of the first two may select part of its
-/// dimension; a subscript that selects all of it (`:`, `1:end`) counts as a
-/// colon, and that one removes whole rows or columns. Every subscript past
-/// the second must be a colon too, as a singleton it can only select all of.
-/// A deletion that removes nothing leaves the array as it is.
-fn resolve_delete(rows: usize, cols: usize, sel: &[Sel]) -> R<Keep> {
-    let numel = rows * cols;
+/// One subscript deletes elements by linear position: a column vector
+/// stays a column, anything else, a matrix or an N-D array, becomes a row,
+/// and `x(:) = []` leaves a 0x0. With two or more, the dimensions are
+/// folded or padded to their number as a read's are, and at most one
+/// subscript may select part of its dimension; a subscript that selects
+/// all of it (`:`, `1:end`) counts as a colon, and the one that does not
+/// removes those positions along its dimension (cycle 14 generalised it
+/// from rows and columns to any dimension: `A(:, :, 2) = []`). When every
+/// subscript selects everything, the last one written as a list deletes,
+/// and the first dimension when all are `:`. A subscript past `ndims`
+/// must be a colon too, as a singleton it can only select all of, and
+/// never deletes. A deletion that removes nothing leaves the array as it
+/// is.
+fn resolve_delete(dims: &[usize], sel: &[Sel]) -> R<Keep> {
+    let numel = dims_product(dims);
     let unchanged = || Keep {
         pos: (0..numel).collect(),
-        rows,
-        cols,
+        dims: dims.to_vec(),
     };
     if let [one] = sel {
         let Sel::List { idx, .. } = one else {
             return Ok(Keep {
                 pos: Vec::new(),
-                rows: 0,
-                cols: 0,
+                dims: vec![0, 0],
             });
         };
         if idx.iter().any(|&k| k >= numel) {
@@ -3871,93 +4011,76 @@ fn resolve_delete(rows: usize, cols: usize, sel: &[Sel]) -> R<Keep> {
             return Ok(unchanged());
         }
         let n = pos.len();
-        let (r, c) = if cols == 1 && rows != 1 {
-            (n, 1)
-        } else {
-            (1, n)
-        };
-        return Ok(Keep {
-            pos,
-            rows: r,
-            cols: c,
-        });
+        let column = dims.len() == 2 && dims[1] == 1 && dims[0] != 1;
+        let out = if column { vec![n, 1] } else { vec![1, n] };
+        return Ok(Keep { pos, dims: out });
     }
-    for (k, (s, n)) in sel.iter().zip([rows, cols]).enumerate() {
+    let k = sel.len();
+    let d = fold_dims(dims, k);
+    for (p, (s, &n)) in sel.iter().zip(&d).enumerate() {
         if let Sel::List { idx, .. } = s {
             if idx.iter().any(|&i| i >= n) {
-                bail!(error::index_exceeds_bound(k + 1, n));
+                bail!(error::index_exceeds_bound(p + 1, n));
             }
         }
     }
-    for (k, s) in sel.iter().enumerate().skip(2) {
-        if let Sel::List { idx, .. } = s {
-            if idx.iter().any(|&i| i > 0) {
-                bail!(error::index_exceeds_bound(k + 1, 1));
-            }
-            if !s.covers(1) {
-                bail!(error::null_assignment_indices());
-            }
+    // The dimensions the array has, folded; any subscript after them
+    // indexes a trailing singleton.
+    let real = k.min(dims.len());
+    for s in &sel[real..] {
+        if !s.covers(1) {
+            bail!(error::null_assignment_indices());
         }
     }
-    let (row_all, col_all) = (sel[0].covers(rows), sel[1].covers(cols));
+    let partial: Vec<usize> = (0..real).filter(|&p| !sel[p].covers(d[p])).collect();
     // The dimension that loses something: the one subscript that is not a
-    // colon, or, when both select everything, the one written as a list, or
-    // the rows when both are `:`.
-    let by_cols = match (row_all, col_all) {
-        (false, false) => bail!(error::null_assignment_indices()),
-        (true, false) => true,
-        (false, true) => false,
-        (true, true) => matches!(sel[1], Sel::List { .. }),
+    // colon, or, when all select everything, the last written as a list,
+    // or the first when all are `:`.
+    let del = match partial[..] {
+        [] => (0..real)
+            .rev()
+            .find(|&p| matches!(sel[p], Sel::List { .. }))
+            .unwrap_or(0),
+        [p] => p,
+        _ => bail!(error::null_assignment_indices()),
     };
-    let (dim_sel, n) = if by_cols {
-        (&sel[1], cols)
-    } else {
-        (&sel[0], rows)
-    };
+    let (dim_sel, n) = (&sel[del], d[del]);
+    let mut left = d.clone();
     if numel == 0 {
         // No elements to keep, only a size to work out, which must not
-        // cost the length of the other dimension: `x(:, 5) = []` of a
+        // cost the length of another dimension: `x(:, 5) = []` of a
         // 0x1e12 `x` (cycle 13b).
         let lost = match dim_sel {
             Sel::All => n,
             Sel::List { idx, .. } => {
-                let mut k = idx.clone();
-                k.sort_unstable();
-                k.dedup();
-                k.len()
+                let mut i = idx.clone();
+                i.sort_unstable();
+                i.dedup();
+                i.len()
             }
         };
         if lost == 0 {
             return Ok(unchanged());
         }
-        let (r, c) = if by_cols {
-            (rows, n - lost)
-        } else {
-            (n - lost, cols)
-        };
+        left[del] = n - lost;
         return Ok(Keep {
             pos: Vec::new(),
-            rows: r,
-            cols: c,
+            dims: left,
         });
     }
     let mut gone = vec![false; n];
-    for k in dim_sel.positions(n) {
-        gone[k] = true;
+    for i in dim_sel.positions(n) {
+        gone[i] = true;
     }
     if !gone.iter().any(|&g| g) {
         return Ok(unchanged());
     }
-    let left = gone.iter().filter(|&&g| !g).count();
-    let pos: Vec<usize> = (0..numel)
-        .filter(|&p| !gone[if by_cols { p / rows } else { p % rows }])
-        .collect();
-    let (r, c) = if by_cols { (rows, left) } else { (left, cols) };
-    Ok(Keep {
-        pos,
-        rows: r,
-        cols: c,
-    })
+    left[del] = gone.iter().filter(|&&g| !g).count();
+    // Position `q` lies at subscript `(q / stride) % n` along the deleted
+    // dimension.
+    let stride: usize = d[..del].iter().product();
+    let pos: Vec<usize> = (0..numel).filter(|&q| !gone[(q / stride) % n]).collect();
+    Ok(Keep { pos, dims: left })
 }
 
 /// The class of a concatenation: `Char` if any operand is a char, else
@@ -3968,7 +4091,7 @@ fn resolve_delete(rows: usize, cols: usize, sel: &[Sel]) -> R<Keep> {
 /// contributes no elements. Only when every operand is one does the vote
 /// fall back to all of them, which makes `[[] []]` the double it always was.
 fn concat_class(mats: &[Matrix]) -> Class {
-    let is_blank = |m: &&Matrix| m.class == Class::Double && m.rows == 0 && m.cols == 0;
+    let is_blank = |m: &&Matrix| m.is_blank();
     let voters: Vec<&Matrix> = if mats.iter().all(|m| is_blank(&m)) {
         mats.iter().collect()
     } else {
@@ -4105,6 +4228,15 @@ pub(crate) fn concat_rows(rows: Vec<Vec<Value>>) -> R<Value> {
     vcat(joined)
 }
 
+/// The refusal of an N-D operand by a bracket that joins it to anything
+/// (cycle 14): N-D concatenation is cycle 14b's.
+fn refuse_nd_concat(vals: &[Value]) -> R<()> {
+    if vals.iter().any(|v| matches!(v, Value::Mat(m) if m.is_nd())) {
+        bail!(error::nd_concatenation());
+    }
+    Ok(())
+}
+
 fn hcat(mut vals: Vec<Value>) -> R<Value> {
     if let Some(r) = concat_containers(&mut vals, false) {
         return r;
@@ -4114,6 +4246,15 @@ fn hcat(mut vals: Vec<Value>) -> R<Value> {
     if vals.iter().any(|v| matches!(v, Value::Func(_))) {
         bail!(error::handle_concatenation());
     }
+    // A bracket of one N-D array joins it to nothing, so `[A]` and
+    // `cell2mat({A})` are `A`, stored by the flag rule as any bracket's
+    // result is; with anything beside it, it is refused (cycle 14).
+    if let [Value::Mat(m)] = vals.as_slice() {
+        if m.is_nd() {
+            return Ok(Value::Mat(m.clone().normalized()));
+        }
+    }
+    refuse_nd_concat(&vals)?;
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
@@ -4151,6 +4292,7 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     if let Some(r) = concat_containers(&mut vals, true) {
         return r;
     }
+    refuse_nd_concat(&vals)?;
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
@@ -4181,6 +4323,14 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     }
     let im = complex.then_some(im.data);
     Ok(Value::Mat(out.with_im(im).to_class(class)?))
+}
+
+/// Writes `s` to an interpreter's output sink: the body of
+/// [`Interp::emit`], for a caller that holds another field of the
+/// interpreter borrowed, as [`Interp::show_var`] holds the variable it
+/// displays.
+fn emit_to(out: &mut dyn Write, s: &str) -> R<()> {
+    out.write_all(s.as_bytes()).map_err(error::output)
 }
 
 // ---- number formatting -----------------------------------------------
@@ -4718,7 +4868,7 @@ mod tests {
         let a = rmat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
         // 20000 squared is past the 2^28-element cap; every subscript is 1,
         // so the 2x2 source is never the problem.
-        let read = |sel: &[Sel]| resolve_read(a.rows, a.cols, sel).map(|g| gather(&a, &g));
+        let read = |sel: &[Sel]| resolve_read(&a.dims(), sel).map(|g| gather(&a, &g));
         let big = || Sel::row(vec![0; 20_000]);
         let e = read(&[big(), big()]).unwrap_err().msg;
         assert_eq!(
@@ -5344,8 +5494,7 @@ mod tests {
             mask_positions(&row),
             Sel::List {
                 idx: vec![1, 2],
-                rows: 1,
-                cols: 2,
+                shape: vec![1, 2],
                 max: 3.0
             }
         );
@@ -5354,8 +5503,7 @@ mod tests {
             mask_positions(&col),
             Sel::List {
                 idx: vec![0, 2],
-                rows: 2,
-                cols: 1,
+                shape: vec![2, 1],
                 max: 3.0
             }
         );
@@ -5365,8 +5513,7 @@ mod tests {
             mask_positions(&sq),
             Sel::List {
                 idx: vec![0, 3],
-                rows: 2,
-                cols: 1,
+                shape: vec![2, 1],
                 max: 4.0
             }
         );
@@ -5375,8 +5522,7 @@ mod tests {
             mask_positions(&none),
             Sel::List {
                 idx: vec![],
-                rows: 0,
-                cols: 0,
+                shape: vec![0, 0],
                 max: 0.0
             }
         );
@@ -5385,8 +5531,7 @@ mod tests {
             mask_positions(&falses),
             Sel::List {
                 idx: vec![],
-                rows: 1,
-                cols: 0,
+                shape: vec![1, 0],
                 max: 0.0
             }
         );
@@ -5576,39 +5721,36 @@ mod tests {
     #[test]
     fn the_deletion_resolver_keeps_what_is_left() {
         // 2x3, deleting column 2.
-        let k = resolve_delete(2, 3, &[Sel::All, Sel::row(vec![1])]).unwrap();
+        let k = resolve_delete(&[2, 3], &[Sel::All, Sel::row(vec![1])]).unwrap();
         assert_eq!(
             k,
             Keep {
                 pos: vec![0, 1, 4, 5],
-                rows: 2,
-                cols: 2
+                dims: vec![2, 2],
             }
         );
         // Deleting row 1.
-        let k = resolve_delete(2, 3, &[Sel::row(vec![0]), Sel::All]).unwrap();
+        let k = resolve_delete(&[2, 3], &[Sel::row(vec![0]), Sel::All]).unwrap();
         assert_eq!(
             k,
             Keep {
                 pos: vec![1, 3, 5],
-                rows: 1,
-                cols: 3
+                dims: vec![1, 3],
             }
         );
         // Linear deletion from a matrix makes a row; repeats count once.
-        let k = resolve_delete(2, 2, &[Sel::row(vec![1, 1])]).unwrap();
+        let k = resolve_delete(&[2, 2], &[Sel::row(vec![1, 1])]).unwrap();
         assert_eq!(
             k,
             Keep {
                 pos: vec![0, 2, 3],
-                rows: 1,
-                cols: 3
+                dims: vec![1, 3],
             }
         );
         // Both colons remove every row.
-        let k = resolve_delete(2, 3, &[Sel::All, Sel::All]).unwrap();
-        assert_eq!((k.rows, k.cols, k.pos.len()), (0, 3, 0));
-        let e = resolve_delete(2, 2, &[Sel::row(vec![0]), Sel::row(vec![1])]);
+        let k = resolve_delete(&[2, 3], &[Sel::All, Sel::All]).unwrap();
+        assert_eq!((k.dims, k.pos.len()), (vec![0, 3], 0));
+        let e = resolve_delete(&[2, 2], &[Sel::row(vec![0]), Sel::row(vec![1])]);
         assert_eq!(
             e.unwrap_err().msg,
             "A null assignment can have only one non-colon index."
@@ -5619,46 +5761,83 @@ mod tests {
 
     #[test]
     fn the_write_resolver_plans_growth_without_touching_anything() {
-        let rhs = Matrix::scalar(9.0);
+        let rhs = Matrix::scalar(9.0).dims();
         // A row grows along its length.
-        let p = resolve_write(1, 2, &[Sel::row(vec![3])], (rhs.rows, rhs.cols)).unwrap();
+        let p = resolve_write(&[1, 2], &[Sel::row(vec![3])], &rhs).unwrap();
         assert_eq!(
             p,
             Scatter {
-                rows: 1,
-                cols: 4,
+                dims: vec![1, 4],
                 pos: vec![3]
             }
         );
         // A column grows down; an empty becomes a row.
-        let p = resolve_write(2, 1, &[Sel::row(vec![2])], (rhs.rows, rhs.cols)).unwrap();
-        assert_eq!((p.rows, p.cols), (3, 1));
-        let p = resolve_write(0, 0, &[Sel::row(vec![2])], (rhs.rows, rhs.cols)).unwrap();
-        assert_eq!((p.rows, p.cols), (1, 3));
+        let p = resolve_write(&[2, 1], &[Sel::row(vec![2])], &rhs).unwrap();
+        assert_eq!(p.dims, [3, 1]);
+        let p = resolve_write(&[0, 0], &[Sel::row(vec![2])], &rhs).unwrap();
+        assert_eq!(p.dims, [1, 3]);
         // Two subscripts grow either dimension, and positions are in the
         // grown shape.
-        let p = resolve_write(
-            2,
-            2,
-            &[Sel::row(vec![2]), Sel::row(vec![2])],
-            (rhs.rows, rhs.cols),
-        )
-        .unwrap();
+        let p = resolve_write(&[2, 2], &[Sel::row(vec![2]), Sel::row(vec![2])], &rhs).unwrap();
         assert_eq!(
             p,
             Scatter {
-                rows: 3,
-                cols: 3,
+                dims: vec![3, 3],
                 pos: vec![8]
             }
         );
         // A matrix cannot grow through one subscript.
-        let e = resolve_write(2, 2, &[Sel::row(vec![4])], (rhs.rows, rhs.cols)).unwrap_err();
+        let e = resolve_write(&[2, 2], &[Sel::row(vec![4])], &rhs).unwrap_err();
         assert_eq!(e.msg, "Attempt to grow array along ambiguous dimension.");
         // The count is checked against the positions.
         let two = Matrix::row(vec![1.0, 2.0]);
-        let e = resolve_write(1, 3, &[Sel::row(vec![0, 1, 2])], (two.rows, two.cols)).unwrap_err();
+        let e = resolve_write(&[1, 3], &[Sel::row(vec![0, 1, 2])], &two.dims()).unwrap_err();
         assert!(e.msg.contains("left side has 3 elements"), "{}", e.msg);
+    }
+
+    /// Cycle 14: a colon over an empty target takes the right-hand side's
+    /// extent in every position the target has no extent of its own, a
+    /// dimension of 0 or one past its dimensions, the general case of
+    /// cycle 03's rule; a dimension an empty target has, and every position
+    /// past the dimensions of an array with elements, keep their extent.
+    #[test]
+    fn a_colon_over_an_empty_target_takes_the_right_sides_extent() {
+        let all = |k: usize| vec![Sel::All; k];
+        let p = resolve_write(&[0, 0], &all(3), &[2, 2, 2]).unwrap();
+        assert_eq!(
+            p,
+            Scatter {
+                dims: vec![2, 2, 2],
+                pos: (0..8).collect()
+            }
+        );
+        // An N-D empty, and a fourth position past its dimensions.
+        let p = resolve_write(&[2, 0, 3], &all(4), &[2, 2, 3, 2]).unwrap();
+        assert_eq!((p.dims, p.pos.len()), (vec![2, 2, 3, 2], 24));
+        // Cycle 03's rule, unchanged: a 0x3 keeps its three columns, which
+        // a scalar fills.
+        let p = resolve_write(&[0, 3], &all(2), &[1, 1]).unwrap();
+        assert_eq!(
+            p,
+            Scatter {
+                dims: vec![1, 3],
+                pos: vec![0, 1, 2]
+            }
+        );
+        let p = resolve_write(&[0, 0], &[Sel::All, Sel::row(vec![0])], &[2, 1]).unwrap();
+        assert_eq!(p.dims, [2, 1]);
+        // An array with elements does not grow through a colon.
+        let e = resolve_write(&[2, 2], &all(3), &[2, 2, 2]).unwrap_err();
+        assert!(
+            e.msg
+                .contains("left side has 4 elements and the right side has 8"),
+            "{}",
+            e.msg
+        );
+        assert_eq!(
+            ok_out("x = []; x(:, :, :) = reshape(1:8, 2, 2, 2); disp(size(x)); disp(x(:)')"),
+            "     2     2     2\n     1     2     3     4     5     6     7     8\n"
+        );
     }
 
     /// Acceptance test 17: the size asked for is named, not the `usize` it
@@ -5669,11 +5848,10 @@ mod tests {
         assert_eq!(err_msg("x = []; x(1e300) = 1"), msg);
         let huge = Sel::List {
             idx: vec![usize::MAX],
-            rows: 1,
-            cols: 1,
+            shape: vec![1, 1],
             max: 1e300,
         };
-        let e = resolve_write(0, 0, &[huge], (1, 1)).unwrap_err();
+        let e = resolve_write(&[0, 0], &[huge], &[1, 1]).unwrap_err();
         assert_eq!(e.msg, msg);
         assert_eq!(
             err_msg("x = zeros(3, 1); x(1e300) = 1;"),
@@ -5770,13 +5948,23 @@ mod tests {
             err_msg("A = [1 2; 3 4]; A(1, 1, 1, 3)"),
             "Index in position 4 exceeds array bounds. Index must not exceed 1."
         );
-        // A page past the first would need an N-D array.
+        // A page past the first makes an N-D array (cycle 14), as does
+        // selecting the first page twice.
         assert_eq!(
-            err_msg("A = [1 2; 3 4]; A(1, 1, 2) = 5;"),
+            ok_out("A = [1 2; 3 4]; A(1, 1, 2) = 5; disp(size(A)); disp(A(:)')"),
+            "     2     2     2\n     1     3     2     4     5     0     0     0\n"
+        );
+        assert_eq!(
+            ok_out("A = [1 2; 3 4]; B = A(:, :, [1 1]); disp(size(B)); disp(B(:)')"),
+            "     2     2     2\n     1     3     2     4     1     3     2     4\n"
+        );
+        // A cell stays 2-D, and refuses what would make it N-D as it did.
+        assert_eq!(
+            err_msg("c = {1, 2}; c(1, 1, 2) = {5};"),
             "N-D arrays are not supported."
         );
         assert_eq!(
-            err_msg("A = [1 2; 3 4]; A(:, :, [1 1])"),
+            err_msg("c = {1, 2}; d = c(:, :, [1 1]);"),
             "N-D arrays are not supported."
         );
         // No subscripts at all is still refused.
@@ -8076,21 +8264,71 @@ mod tests {
     #[test]
     fn regrid_and_keep_positions_respect_column_major_order() {
         let mut v = vec![1, 2, 3, 4];
-        regrid(&mut v, (2, 2), (3, 2), || 0);
+        regrid(&mut v, &[2, 2], &[3, 2], || 0);
         assert_eq!(v, [1, 2, 0, 3, 4, 0]);
         let mut v = vec![1, 2];
-        regrid(&mut v, (1, 2), (1, 4), || 0);
+        regrid(&mut v, &[1, 2], &[1, 4], || 0);
         assert_eq!(v, [1, 2, 0, 0]);
         let mut v: Vec<i32> = Vec::new();
-        regrid(&mut v, (0, 0), (2, 1), || 7);
+        regrid(&mut v, &[0, 0], &[2, 1], || 7);
         assert_eq!(v, [7, 7]);
+        // Cycle 14: a new page is appended where it lies, and growth of an
+        // N-D array's rows moves every run of a column to its new place.
+        let mut v = vec![1, 2, 3, 4];
+        regrid(&mut v, &[2, 2], &[2, 2, 2], || 0);
+        assert_eq!(v, [1, 2, 3, 4, 0, 0, 0, 0]);
+        let mut v = vec![1, 2, 3, 4];
+        regrid(&mut v, &[1, 2, 2], &[2, 2, 2], || 0);
+        assert_eq!(v, [1, 0, 2, 0, 3, 0, 4, 0]);
+        let mut v = vec![1, 2, 3, 4];
+        regrid(&mut v, &[2, 1, 2], &[2, 2, 2], || 0);
+        assert_eq!(v, [1, 2, 0, 0, 3, 4, 0, 0]);
+        assert!(keeps_layout(&[2, 3], &[2, 3, 4]));
+        assert!(keeps_layout(&[2, 1], &[4, 3]));
+        assert!(!keeps_layout(&[2, 2], &[3, 2]));
+        assert!(!keeps_layout(&[2, 2, 2], &[2, 3, 2]));
         assert_eq!(
             keep_positions(vec!['a', 'b', 'c', 'd'], &[0, 2, 3]),
             ['a', 'c', 'd']
         );
-        assert_eq!(one_position(2, 2, &[Sel::row(vec![3])]), Some(3));
-        assert_eq!(one_position(2, 2, &[Sel::row(vec![4])]), None);
-        assert_eq!(one_position(2, 2, &[Sel::row(vec![0, 1])]), None);
+        assert_eq!(one_position(&[2, 2], &[Sel::row(vec![3])]), Some(3));
+        assert_eq!(one_position(&[2, 2], &[Sel::row(vec![4])]), None);
+        assert_eq!(one_position(&[2, 2], &[Sel::row(vec![0, 1])]), None);
+    }
+
+    /// Cycle 14: a subscript that selects the first position once moves no
+    /// position, and a dimension of 1 moves no run, so a read through a
+    /// hundred thousand such subscripts and a growth of an array with as
+    /// many singleton dimensions cost what they would with none, where
+    /// walking each would take the positions times the dimensions.
+    #[test]
+    fn singleton_subscripts_and_dimensions_cost_nothing_extra() {
+        let n = 100_000;
+        let start = Instant::now();
+        let mut dims = vec![20_000usize];
+        dims.extend(std::iter::repeat_n(1, n));
+        dims.push(2);
+        let mut sel = vec![Sel::All];
+        sel.extend((0..n).map(|_| Sel::row(vec![0])));
+        sel.push(Sel::All);
+        let g = resolve_read(&dims, &sel).unwrap();
+        assert_eq!(g.pos, (0..40_000).collect::<Vec<_>>());
+        sel[n + 1] = Sel::row(vec![1]);
+        let g = resolve_read(&dims, &sel).unwrap();
+        assert_eq!(g.pos, (20_000..40_000).collect::<Vec<_>>());
+        // Rows added to a 1x1x...x1x4000: every element moves, to twice its
+        // place.
+        let mut old = vec![1usize];
+        old.extend(std::iter::repeat_n(1, n));
+        old.push(4000);
+        let mut new = old.clone();
+        new[0] = 2;
+        let mut v: Vec<usize> = (0..4000).collect();
+        regrid(&mut v, &old, &new, || usize::MAX);
+        assert_eq!(v.len(), 8000);
+        assert!((0..4000).all(|k| v[2 * k] == k && v[2 * k + 1] == usize::MAX));
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     }
 
     /// Cycle 13b: reading, writing and deleting through a colon over an
@@ -8098,17 +8336,248 @@ mod tests {
     #[test]
     fn indexing_an_empty_array_with_a_huge_dimension_costs_nothing() {
         let big = 1usize << 40;
-        let g = resolve_read(0, big, &[Sel::All, Sel::All]).unwrap();
-        assert_eq!((g.rows, g.cols, g.pos.len()), (0, big, 0));
-        let g = resolve_read(big, 0, &[Sel::All, Sel::row(vec![])]).unwrap();
-        assert_eq!((g.rows, g.cols, g.pos.len()), (big, 0, 0));
-        let w = resolve_write(0, big, &[Sel::All, Sel::All], (0, 0)).unwrap();
-        assert_eq!((w.rows, w.cols, w.pos.len()), (0, big, 0));
-        let k = resolve_delete(0, big, &[Sel::All, Sel::row(vec![4, 4, 7])]).unwrap();
-        assert_eq!((k.rows, k.cols, k.pos.len()), (0, big - 2, 0));
-        let k = resolve_delete(big, 0, &[Sel::row(vec![0]), Sel::All]).unwrap();
-        assert_eq!((k.rows, k.cols), (big - 1, 0));
+        let g = resolve_read(&[0, big], &[Sel::All, Sel::All]).unwrap();
+        assert_eq!((g.dims, g.pos.len()), (vec![0, big], 0));
+        let g = resolve_read(&[big, 0], &[Sel::All, Sel::row(vec![])]).unwrap();
+        assert_eq!((g.dims, g.pos.len()), (vec![big, 0], 0));
+        let w = resolve_write(&[0, big], &[Sel::All, Sel::All], &[0, 0]).unwrap();
+        assert_eq!((w.dims, w.pos.len()), (vec![0, big], 0));
+        let k = resolve_delete(&[0, big], &[Sel::All, Sel::row(vec![4, 4, 7])]).unwrap();
+        assert_eq!((k.dims, k.pos.len()), (vec![0, big - 2], 0));
+        let k = resolve_delete(&[big, 0], &[Sel::row(vec![0]), Sel::All]).unwrap();
+        assert_eq!(k.dims, [big - 1, 0]);
         assert!(!Sel::row(vec![0, 1]).covers(big));
+        // The same for an N-D empty (cycle 14).
+        let g = resolve_read(&[0, big, 3], &[Sel::All, Sel::All, Sel::All]).unwrap();
+        assert_eq!((g.dims, g.pos.len()), (vec![0, big, 3], 0));
+        let k = resolve_delete(&[0, big, 3], &[Sel::All, Sel::All, Sel::row(vec![1])]).unwrap();
+        assert_eq!((k.dims, k.pos.len()), (vec![0, big, 2], 0));
+    }
+
+    // ---- N-D arrays (cycle 14) -----------------------------------------
+
+    /// Element `(i1, i2, ..., ik)`, zero-based, sits at `i1 + d1*(i2 +
+    /// d2*(i3 + ...))`, and several subscripts list their positions with the
+    /// first moving fastest.
+    #[test]
+    fn an_nd_subscript_lands_at_its_column_major_offset() {
+        let g = resolve_read(
+            &[2, 3, 4],
+            &[Sel::row(vec![1]), Sel::row(vec![2]), Sel::row(vec![3])],
+        )
+        .unwrap();
+        assert_eq!((g.pos, g.dims), (vec![1 + 2 * (2 + 3 * 3)], vec![1, 1, 1]));
+        let g = resolve_read(
+            &[2, 3, 4],
+            &[Sel::All, Sel::row(vec![0]), Sel::row(vec![1, 3])],
+        )
+        .unwrap();
+        assert_eq!((g.pos, g.dims), (vec![6, 7, 18, 19], vec![2, 1, 2]));
+        // A subscript past `ndims` may select its one position any number
+        // of times.
+        let g = resolve_read(&[1, 2], &[Sel::All, Sel::All, Sel::row(vec![0, 0])]).unwrap();
+        assert_eq!((g.pos, g.dims), (vec![0, 1, 0, 1], vec![1, 2, 2]));
+        let e = resolve_read(
+            &[2, 3, 4],
+            &[Sel::row(vec![0]), Sel::row(vec![0]), Sel::row(vec![4])],
+        )
+        .unwrap_err()
+        .msg;
+        assert_eq!(
+            e,
+            "Index in position 3 exceeds array bounds. Index must not exceed 4."
+        );
+        let a = "A = reshape(1:24, 2, 3, 4); ";
+        assert_eq!(ok_out(&format!("{a}disp(A(2, 3, 4))")), "    24\n");
+        assert_eq!(
+            ok_out(&format!("{a}disp(A(:, :, 2))")),
+            "     7     9    11\n     8    10    12\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}disp(size(A(1, :, :)))")),
+            "     1     3     4\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}disp(size(A(:, 1, :)))")),
+            "     2     1     4\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}disp(A(A > 20)')")),
+            "    21    22    23    24\n"
+        );
+        assert_eq!(ok_out(&format!("{a}disp(A(1, 1, 1, 1))")), "     1\n");
+    }
+
+    /// Fewer subscripts than dimensions fold the rest into the last, and
+    /// `end` in the last position is the product of every dimension from it
+    /// on; a single subscript's `end` is `numel`.
+    #[test]
+    fn fewer_subscripts_fold_the_trailing_dimensions_and_end() {
+        assert_eq!(fold_dims(&[2, 3, 4], 2), [2, 12]);
+        assert_eq!(fold_dims(&[2, 3, 4], 3), [2, 3, 4]);
+        assert_eq!(fold_dims(&[2, 3, 4, 5], 3), [2, 3, 20]);
+        assert_eq!(fold_dims(&[2, 3], 4), [2, 3, 1, 1]);
+        assert_eq!(end_value(&[2, 3, 4], 1, 0), 24);
+        assert_eq!(end_value(&[2, 3, 4], 2, 0), 2);
+        assert_eq!(end_value(&[2, 3, 4], 2, 1), 12);
+        assert_eq!(end_value(&[2, 3, 4], 3, 2), 4);
+        assert_eq!(end_value(&[2, 3], 3, 2), 1);
+        assert_eq!(end_value(&[2, 3], 4, 3), 1);
+        let a = "A = reshape(1:24, 2, 3, 4); ";
+        assert_eq!(ok_out(&format!("{a}disp(A(2, 7))")), "    14\n");
+        assert_eq!(ok_out(&format!("{a}disp(A(end))")), "    24\n");
+        assert_eq!(ok_out(&format!("{a}disp(A(1, end))")), "    23\n");
+        assert_eq!(ok_out(&format!("{a}disp(A(end, end, end))")), "    24\n");
+        assert_eq!(
+            ok_out(&format!("{a}B = A(:, :); disp(size(B))")),
+            "     2    12\n"
+        );
+        assert_eq!(ok_out(&format!("{a}disp(size(A(:)))")), "    24     1\n");
+    }
+
+    /// Growth into new pages and new dimensions, judged before anything is
+    /// allocated; a linear subscript, or fewer subscripts than dimensions,
+    /// cannot grow an N-D array.
+    #[test]
+    fn an_assignment_grows_an_array_into_new_pages() {
+        let b = "B = zeros(2, 2); B(:, :, 2) = [1 2; 3 4]; ";
+        assert_eq!(
+            ok_out(&format!("{b}disp(size(B)); disp(B(:, :, 2))")),
+            "     2     2     2\n     1     2\n     3     4\n"
+        );
+        assert_eq!(
+            ok_out(&format!(
+                "{b}B(1, 1, 3) = 9; disp(size(B)); disp(B(2, 2, 3))"
+            )),
+            "     2     2     3\n     0\n"
+        );
+        assert_eq!(
+            ok_out(&format!(
+                "{b}B(1, 1, 3) = 9; B(1, 1, 1, 2) = 5; disp(size(B)); disp(B(13))"
+            )),
+            "     2     2     3     2\n     5\n"
+        );
+        // A page grows under an earlier one without moving it, and rows grow
+        // by moving every column.
+        assert_eq!(
+            ok_out("C = reshape(1:4, 1, 2, 2); C(2, 1, 1) = 9; disp(C(:)')"),
+            "     1     9     2     0     3     0     4     0\n"
+        );
+        assert_eq!(
+            ok_out("c = 'ab'; c(:, :, 2) = 'cd'; disp(class(c)); disp(size(c))"),
+            "char\n     1     2     2\n"
+        );
+        assert_eq!(
+            ok_out("L = true(1, 2); L(:, :, 2) = false; disp(class(L)); disp(size(L))"),
+            "logical\n     1     2     2\n"
+        );
+        assert_eq!(
+            ok_out("z = zeros(1, 1, 2); z(:, :, 2) = 1i; disp(isreal(z)); disp(size(z))"),
+            "   0\n     1     1     2\n"
+        );
+        let ambiguous = "Attempt to grow array along ambiguous dimension.";
+        assert_eq!(err_msg("A = zeros(2, 2, 2); A(9) = 1;"), ambiguous);
+        assert_eq!(err_msg("A = zeros(2, 2, 2); A(3, 1) = 1;"), ambiguous);
+        assert_eq!(err_msg("A = zeros(2, 2, 2); A(1, 5) = 1;"), ambiguous);
+        assert_eq!(
+            err_msg("B = zeros(2, 2); B(1, 1, 1e10) = 1;"),
+            "Requested 2x2x10000000000 array exceeds the maximum array size."
+        );
+        // A failed growth changes nothing.
+        assert_eq!(
+            ok_out("B = zeros(2, 2); try, B(1, 1, 1e10) = 1; catch, end, disp(size(B))"),
+            "     2     2\n"
+        );
+    }
+
+    /// Deletion along one dimension of an N-D array, a linear deletion
+    /// leaving a row, and the one-non-colon rule.
+    #[test]
+    fn deletion_removes_positions_along_one_dimension() {
+        let a = "A = reshape(1:24, 2, 3, 4); ";
+        assert_eq!(
+            ok_out(&format!(
+                "{a}A(:, :, 2) = []; disp(size(A)); disp(A(:, :, 2))"
+            )),
+            "     2     3     3\n    13    15    17\n    14    16    18\n"
+        );
+        assert_eq!(
+            ok_out(&format!(
+                "{a}A(:, :, 2) = []; A(1, :, :) = []; disp(size(A))"
+            )),
+            "     1     3     3\n"
+        );
+        assert_eq!(
+            ok_out("A = zeros(2, 2, 2); A(3) = []; disp(size(A))"),
+            "     1     7\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}A(:, :, [1 2 3]) = []; disp(size(A))")),
+            "     2     3\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}A(:) = []; disp(size(A))")),
+            "     0     0\n"
+        );
+        assert_eq!(
+            err_msg(&format!("{a}A(1, 2, :) = [];")),
+            "A null assignment can have only one non-colon index."
+        );
+        let k = resolve_delete(&[2, 3, 4], &[Sel::All, Sel::All, Sel::row(vec![1])]).unwrap();
+        assert_eq!(k.dims, [2, 3, 3]);
+        assert_eq!(k.pos[..6], [0, 1, 2, 3, 4, 5]);
+        assert_eq!(k.pos[6], 12);
+    }
+
+    /// The element-wise operators and `for` across every dimension, and
+    /// the refusals of what is not element-wise.
+    #[test]
+    fn operators_and_for_see_every_dimension() {
+        let a = "A = reshape(1:8, 2, 2, 2); ";
+        assert_eq!(
+            ok_out(&format!("{a}B = A .* A + 1; disp(size(B)); disp(B(:)')")),
+            "     2     2     2\n     2     5    10    17    26    37    50    65\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}B = 2 \\ A; C = A / 2; disp(isequal(B, C))")),
+            "   1\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}B = ~(A > 4); disp(class(B)); disp(B(:)')")),
+            "logical\n   1   1   1   1   0   0   0   0\n"
+        );
+        assert_eq!(
+            ok_out("for col = reshape(1:8, 2, 2, 2), disp(col'), end"),
+            "     1     2\n     3     4\n     5     6\n     7     8\n"
+        );
+        let matrix = "Matrix operations are not defined for N-D arrays.";
+        assert_eq!(err_msg(&format!("{a}A * ones(2, 2)")), matrix);
+        assert_eq!(err_msg(&format!("{a}ones(2, 2) * A")), matrix);
+        assert_eq!(err_msg(&format!("{a}A / ones(2, 2)")), matrix);
+        assert_eq!(err_msg(&format!("{a}A \\ ones(2, 2)")), matrix);
+        assert_eq!(err_msg(&format!("{a}A ^ 2")), matrix);
+        assert_eq!(err_msg(&format!("{a}2 ^ A")), matrix);
+        assert_eq!(err_msg(&format!("{a}(A * 1i) ^ 2")), matrix);
+        assert_eq!(
+            err_msg(&format!("{a}A'")),
+            "Transpose is not defined for N-D arrays."
+        );
+        assert_eq!(
+            err_msg(&format!("{a}A.'")),
+            "Transpose is not defined for N-D arrays."
+        );
+        let concat = "Concatenation of N-D arrays is not supported.";
+        assert_eq!(err_msg(&format!("{a}[A, 1]")), concat);
+        assert_eq!(err_msg(&format!("{a}[A; A]")), concat);
+        // A bracket of one joins nothing.
+        assert_eq!(
+            ok_out(&format!("{a}B = [A]; disp(size(B))")),
+            "     2     2     2\n"
+        );
+        assert_eq!(
+            err_msg(&format!("{a}sum(A)")),
+            "N-D arrays are not supported by 'sum'."
+        );
     }
 
     /// Cycle 13b: every way of making or growing a cell or struct array is

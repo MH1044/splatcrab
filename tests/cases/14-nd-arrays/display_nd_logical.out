@@ -1,0 +1,14 @@
+L(:,:,1) =
+
+  2×2 logical array
+
+   1   1
+   0   0
+
+
+L(:,:,2) =
+
+  2×2 logical array
+
+   1   1
+   0   0

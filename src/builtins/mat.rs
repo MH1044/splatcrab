@@ -128,10 +128,18 @@ fn matrix(out: &mut Vec<u8>, name: &str, v: &Value, var: &str, depth: usize) -> 
     if depth > MAX_DEPTH {
         return Err(error::save_too_deep(var));
     }
+    // An N-D array would be written as its first page with the rest of
+    // its storage after it, a file no reader could trust, so it is refused
+    // with the N-D gate's text, before a byte is written, wherever it sits:
+    // a variable, a cell element or a field (cycle 14).
+    if matches!(v, Value::Mat(m) if m.is_nd()) {
+        return Err(error::nd_argument("save"));
+    }
     let start = out.len();
     out.extend_from_slice(&MI_MATRIX.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    let (rows, cols) = v.dims();
+    let dims = v.dims();
+    let (rows, cols) = (dims[0], dims[1]);
     let flags = |out: &mut Vec<u8>, class: u32, bits: u32| -> R<()> {
         let mut d = (class | (bits << 8)).to_le_bytes().to_vec();
         d.extend_from_slice(&0u32.to_le_bytes());
@@ -773,7 +781,7 @@ mod tests {
         let past = MAX_FIELDLESS as i32 + 1;
         assert!(err(&fieldless(1, past)).contains("no fields"));
         let v = read(&fieldless(1, MAX_FIELDLESS as i32), "t.mat").unwrap();
-        assert_eq!(v[0].1.dims(), (1, MAX_FIELDLESS));
+        assert_eq!(v[0].1.dims(), [1, MAX_FIELDLESS]);
         // `save` writes none that `load` would refuse, and the rest survive.
         let n = MAX_FIELDLESS + 1;
         let s = Value::strukt(StructArray::new(1, n, Vec::new(), vec![Vec::new(); n]));
@@ -782,7 +790,24 @@ mod tests {
             "Unable to save variable 's': a struct array with no fields and more than 1048576 elements cannot be saved."
         );
         let s = Value::strukt(StructArray::new(2, 3, Vec::new(), vec![Vec::new(); 6]));
-        assert_eq!(round_trip(vec![("s".into(), s)])[0].1.dims(), (2, 3));
+        assert_eq!(round_trip(vec![("s".into(), s)])[0].1.dims(), [2, 3]);
+    }
+
+    /// Cycle 14: an N-D array would be written as its first page, so the
+    /// writer refuses one, as a variable, a cell element or a field.
+    #[test]
+    fn an_nd_array_is_refused_wherever_it_sits() {
+        let nd = Value::Mat(Matrix::filled_dims(&[2, 1, 3], 0.0));
+        let refusal = "N-D arrays are not supported by 'save'.";
+        assert_eq!(write(&[("a".into(), nd.clone())]).unwrap_err().msg, refusal);
+        let c = Value::cell(CellArray::new(
+            1,
+            2,
+            vec![Value::Mat(Matrix::scalar(1.0)), nd.clone()],
+        ));
+        assert_eq!(write(&[("c".into(), c)]).unwrap_err().msg, refusal);
+        let s = Value::strukt(StructArray::scalar(vec!["f".into()], vec![nd]));
+        assert_eq!(write(&[("s".into(), s)]).unwrap_err().msg, refusal);
     }
 
     /// A tag holds a length in 32 bits, so a variable past 4 GiB would be

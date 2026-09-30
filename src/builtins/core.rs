@@ -2,7 +2,9 @@
 
 use std::f64::consts::PI;
 
-use super::args::{at_most, check_shape, dim, mat, need, scalar, shape, string};
+use super::args::{
+    at_most, check_dims, check_shape, dim, mat, need, scalar, shape, shape_dims, string,
+};
 pub use super::printf::{MAX_FIELD, format_printf};
 use super::{Registry, add, none, one, one_as, one_mat};
 use crate::error;
@@ -33,6 +35,7 @@ pub fn register(r: &mut Registry) {
 
     // ---- shape queries -----------------------------------------------
     add(r, "size", size, "size(A), size(A,dim), [r,c] = size(A) - the dimensions of A.");
+    add(r, "ndims", ndims, "ndims(A) - the number of dimensions of A, 2 or more.");
     add(r, "numel", numel, "numel(A) - the number of elements of A.");
     add(r, "length", length, "length(A) - the longest dimension, or 0 if empty.");
     add(r, "isempty", isempty, "isempty(A) - true when A has no elements.");
@@ -92,11 +95,11 @@ fn constant(args: &[Value], name: &str, v: f64) -> R<Vec<Value>> {
 }
 
 /// A constant that fills a matrix when given a size, as `NaN(2)` does. It
-/// takes every size form a constructor does, trailing ones included.
+/// takes every size form a constructor does, trailing ones included, and
+/// since cycle 14 any number of sizes: `NaN(2, 1, 3)`.
 fn filled_constant(args: &[Value], name: &str, v: f64, class: Class) -> R<Vec<Value>> {
-    let (r, c) = shape(args, 0, name, usize::MAX)?;
-    let (r, c) = check_shape(r, c)?;
-    one_as(Matrix::filled(r, c, v).with_class(class))
+    let dims = check_dims(&shape_dims(args, 0, name)?)?;
+    one_as(Matrix::filled_dims(&dims, v).with_class(class))
 }
 
 fn pi(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -171,29 +174,29 @@ enum Fill {
     Rand,
 }
 
-/// The shape comes from `args::shape`, which takes a scalar, a size vector or
-/// several sizes with trailing ones. `eye` alone keeps MATLAB's limit of two
-/// sizes, as arguments and as the elements of a size vector.
+/// The shape comes from `args::shape_dims`, which takes a scalar, a size
+/// vector or several sizes, trailing ones dropped, and since cycle 14 any
+/// number of them: `zeros(2, 3, 4)` is 2x3x4 and `ones(2, 3, 0)` an empty
+/// 2x3x0. `eye` alone keeps MATLAB's limit of two sizes, as arguments and
+/// as the elements of a size vector, through `args::shape`.
 fn construct(it: &mut Interp, args: &[Value], name: &str, kind: Fill) -> R<Vec<Value>> {
-    let max_dims = if matches!(kind, Fill::Eye) {
+    if matches!(kind, Fill::Eye) {
         at_most(args, 2, name)?;
-        2
-    } else {
-        usize::MAX
-    };
-    let (r, c) = shape(args, 0, name, max_dims)?;
-    let (r, c) = check_shape(r, c)?;
+        let (r, c) = shape(args, 0, name, 2)?;
+        let (r, c) = check_shape(r, c)?;
+        return one_mat(Matrix::identity(r, c));
+    }
+    let dims = check_dims(&shape_dims(args, 0, name)?)?;
     let m = match kind {
-        Fill::Zeros => Matrix::filled(r, c, 0.0),
-        Fill::Ones => Matrix::filled(r, c, 1.0),
-        Fill::Eye => Matrix::identity(r, c),
+        Fill::Ones => Matrix::filled_dims(&dims, 1.0),
         Fill::Rand => {
-            let mut m = Matrix::filled(r, c, 0.0);
+            let mut m = Matrix::filled_dims(&dims, 0.0);
             for v in &mut m.data {
                 *v = it.next_rand();
             }
             m
         }
+        Fill::Zeros | Fill::Eye => Matrix::filled_dims(&dims, 0.0),
     };
     one_mat(m)
 }
@@ -250,65 +253,86 @@ fn linspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 // ---- shape queries ---------------------------------------------------
 
-/// `size(A)` is the row `[rows cols]`. Asked for several outputs, it gives
-/// one dimension each, and MATLAB's rule is that the last output takes the
-/// product of every dimension from its own on: `[n] = size(A)` is still the
-/// row, `[r, c] = size(A)` is the two sizes, and outputs past the second are
-/// the trailing singletons, `1`. `size(A, dim)` is one value.
+/// `size(A)` is the row of every dimension, `[rows cols]` of a 2-D value
+/// and `[2 3 4]` of a 2x3x4 (cycle 14). Asked for several outputs, it
+/// gives one dimension each, by the MathWorks `size` page's rules: with
+/// fewer outputs than `ndims(A)`, "all remaining dimension lengths are
+/// collapsed into the last argument", so `[r, c] = size(zeros(2, 3, 4))`
+/// gives `c` 12, and with more, "the extra trailing arguments are returned
+/// as 1". `[n] = size(A)` is still the row. `size(A, dim)` is one value,
+/// and `1` for a dimension past `ndims(A)`.
 fn size(_: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(args, 2, "size")?;
-    let (rows, cols) = arg_dims(args, 0, "size")?;
+    let dims = arg_dims(args, 0, "size")?;
+    let d: Vec<f64> = dims.iter().map(|&k| k as f64).collect();
     if args.len() >= 2 {
         // A dimension past the array's is a singleton; `0` is an error.
-        let v = match dim(args, 1, "size")? {
-            1 => rows,
-            2 => cols,
-            _ => 1,
-        };
-        one_mat(Matrix::scalar(v as f64))
+        let k = dim(args, 1, "size")?;
+        let v = d.get(k - 1).copied().unwrap_or(1.0);
+        one_mat(Matrix::scalar(v))
     } else if nargout >= 2 {
-        let dims = [rows as f64, cols as f64];
+        // In `f64`, so the product of an empty's huge dimensions is named
+        // as it is rather than saturated.
         Ok((0..nargout)
-            .map(|k| Value::Mat(Matrix::scalar(dims.get(k).copied().unwrap_or(1.0))))
+            .map(|k| {
+                let v = if k + 1 < nargout {
+                    d.get(k).copied().unwrap_or(1.0)
+                } else {
+                    d.get(k..).map_or(1.0, |rest| rest.iter().product())
+                };
+                Value::Mat(Matrix::scalar(v))
+            })
             .collect())
     } else {
-        one_mat(Matrix::row(vec![rows as f64, cols as f64]))
+        one_mat(Matrix::row(d))
     }
 }
 
+/// `ndims(A)` (cycle 14): 2 for every 2-D value, cells, structs, handles
+/// and `MException`s included, and one more per dimension past the second.
+fn ndims(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(args, 1, "ndims")?;
+    let dims = arg_dims(args, 0, "ndims")?;
+    one_mat(Matrix::scalar(dims.len() as f64))
+}
+
 /// The dimensions of argument `i`, of any value (cycle 07): an array's,
-/// a cell's or a struct array's own, and `1x1` for a function handle or
-/// an `MException`, each of which is one object.
-fn arg_dims(args: &[Value], i: usize, name: &str) -> R<(usize, usize)> {
+/// every one of them since cycle 14, a cell's or a struct array's own, and
+/// `1x1` for a function handle or an `MException`, each of which is one
+/// object.
+fn arg_dims(args: &[Value], i: usize, name: &str) -> R<Vec<usize>> {
     args.get(i)
         .map(Value::dims)
         .ok_or_else(|| error::not_enough_args(name))
 }
 
+/// `numel(A)`: the product of every dimension.
 fn numel(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "numel")?;
-    let (r, c) = arg_dims(args, 0, "numel")?;
-    one_mat(Matrix::scalar((r * c) as f64))
+    need(args, 1, "numel")?;
+    one_mat(Matrix::scalar(args[0].numel() as f64))
 }
 
+/// `length(A)`: 0 when any dimension is 0, and the largest dimension
+/// otherwise.
 fn length(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "length")?;
-    let (r, c) = arg_dims(args, 0, "length")?;
-    let n = if r == 0 || c == 0 { 0 } else { r.max(c) };
+    let dims = arg_dims(args, 0, "length")?;
+    let n = if dims.contains(&0) {
+        0
+    } else {
+        dims.iter().copied().max().unwrap_or(0)
+    };
     one_mat(Matrix::scalar(n as f64))
 }
 
 /// A predicate on the shape of one argument of any value, answered with a
 /// logical scalar, as every MATLAB `is*` function answers (cycle 07 let it
-/// answer for every value).
-fn shape_predicate(
-    args: &[Value],
-    name: &str,
-    test: impl Fn(usize, usize) -> bool,
-) -> R<Vec<Value>> {
+/// answer for every value). It sees every dimension (cycle 14).
+fn shape_predicate(args: &[Value], name: &str, test: impl Fn(&[usize]) -> bool) -> R<Vec<Value>> {
     at_most(args, 1, name)?;
-    let (r, c) = arg_dims(args, 0, name)?;
-    one_as(Matrix::from_bool(test(r, c)))
+    let dims = arg_dims(args, 0, name)?;
+    one_as(Matrix::from_bool(test(&dims)))
 }
 
 /// A predicate on the class of one argument of any value; a value that is
@@ -321,16 +345,21 @@ fn class_predicate(args: &[Value], name: &str, test: impl Fn(Class) -> bool) -> 
     ))
 }
 
+/// True when any dimension is 0.
 fn isempty(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    shape_predicate(args, "isempty", |r, c| r * c == 0)
+    shape_predicate(args, "isempty", |d| d.contains(&0))
 }
 
+/// False for every N-D array, which never has one element.
 fn isscalar(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    shape_predicate(args, "isscalar", |r, c| r * c == 1)
+    shape_predicate(args, "isscalar", |d| d.iter().all(|&k| k == 1))
 }
 
+/// 1-by-N or N-by-1, and so false for every N-D array.
 fn isvector(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
-    shape_predicate(args, "isvector", |r, c| r == 1 || c == 1)
+    shape_predicate(args, "isvector", |d| {
+        d.len() == 2 && (d[0] == 1 || d[1] == 1)
+    })
 }
 
 // ---- classes ---------------------------------------------------------
@@ -405,8 +434,8 @@ fn double(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 fn disp(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(args, 1, "disp")?;
     need(args, 1, "disp")?;
-    let text = it.disp_text(&args[0]);
-    it.emit(&text)?;
+    // An N-D array is written a page at a time (cycle 14).
+    it.emit_disp(&args[0])?;
     none()
 }
 
@@ -527,12 +556,19 @@ fn isequal(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 
 /// One pair for [`isequal`]. Two `MException`s are equal when their message
 /// and identifier are; an `MException` equals no array.
+///
+/// Two arrays compare every dimension before any element (cycle 14), so
+/// arrays of different shapes are unequal and no comparison reads past
+/// either array: `isequal(zeros(2, 2, 2), zeros(2, 2))` is false where the
+/// rows and columns alone agree.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         // Complex values compare both parts, as `==` does (cycle 10), so
         // `complex(1, 0)` equals `1`: the storage is not the value.
         (Value::Mat(a), Value::Mat(b)) => {
-            a.rows == b.rows && a.cols == b.cols && (0..a.numel()).all(|k| a.c(k) == b.c(k))
+            a.dims() == b.dims()
+                && a.numel() == b.numel()
+                && (0..a.numel()).all(|k| a.c(k) == b.c(k))
         }
         (Value::Exception(a), Value::Exception(b)) => {
             a.msg == b.msg && a.identifier() == b.identifier()
@@ -630,10 +666,9 @@ fn whos(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         .into_iter()
         .map(|n| {
             let v = &it.vars()[&n];
-            let (r, c) = v.dims();
             [
                 n.clone(),
-                format!("{}x{}", r, c),
+                crate::value::dims_text(&v.dims(), "x"),
                 bytes(v).to_string(),
                 v.class_name().to_string(),
             ]
@@ -647,15 +682,24 @@ fn whos(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
 }
 
 /// The table `whos` prints for rows of name, size, bytes and class.
+///
+/// Every column is padded by hand (cycle 14): an N-D array's size text
+/// has no length limit, `2x1x1x...x2`, nor has a name, and Rust's
+/// formatter panics on a runtime width past 65,535.
 fn whos_text(rows: &[[String; 4]]) -> String {
-    let width = |k: usize| rows.iter().map(|r| r[k].len()).max().unwrap_or(0);
+    use crate::value::{push_left, push_right};
+    let width = |k: usize| rows.iter().map(|r| r[k].chars().count()).max().unwrap_or(0);
     let (wn, ws, wb) = (width(0).max(12), width(1), width(2) + 3);
     let mut text = String::new();
     for [name, size, bytes, class] in rows {
-        text.push_str(&format!(
-            "  {:<wn$} {:>ws$}{:>wb$}  {}\n",
-            name, size, bytes, class
-        ));
+        text.push_str("  ");
+        push_left(&mut text, name, wn);
+        text.push(' ');
+        push_right(&mut text, size, ws);
+        push_right(&mut text, bytes, wb);
+        text.push_str("  ");
+        text.push_str(class);
+        text.push('\n');
     }
     text.push('\n');
     text
@@ -914,7 +958,10 @@ mod tests {
         assert_eq!(shape_of(tru, &[num(2.0), num(2.0), num(1.0)]), (2, 2));
         assert!(mat_of(tru, &[num(3.0)]).data.iter().all(|v| *v == 1.0));
         assert!(mat_of(fls, &[num(3.0)]).data.iter().all(|v| *v == 0.0));
-        assert!(call(tru, &[num(2.0), num(2.0), num(2.0)], 1).is_err());
+        // Cycle 14: any number of sizes, and still logical.
+        let t = mat_of(tru, &[num(2.0), num(2.0), num(2.0)]);
+        assert_eq!((t.dims(), t.class), (vec![2, 2, 2], Class::Logical));
+        assert!(t.data.iter().all(|v| *v == 1.0));
     }
 
     #[test]
@@ -978,13 +1025,45 @@ mod tests {
             Value::Mat(m) => assert_eq!(m.data, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
             other => panic!("expected a matrix, got {other:?}"),
         }
-        let nd = "N-D arrays are not supported.";
+        // Cycle 14: three sizes or more make an N-D array; a trailing 1
+        // is still dropped, one before another size is not.
         assert_eq!(
-            call(zeros, &[num(2.0), num(3.0), num(4.0)], 1)
+            mat_of(zeros, &[num(2.0), num(3.0), num(4.0)]).dims(),
+            [2, 3, 4]
+        );
+        assert_eq!(mat_of(ones, &[row(&[2.0, 2.0, 2.0])]).dims(), [2, 2, 2]);
+        assert_eq!(
+            mat_of(zeros, &[num(2.0), num(3.0), num(1.0), num(4.0)]).dims(),
+            [2, 3, 1, 4]
+        );
+        assert_eq!(
+            mat_of(zeros, &[num(2.0), num(3.0), num(1.0)]).dims(),
+            [2, 3]
+        );
+        let empty = mat_of(ones, &[num(2.0), num(3.0), num(0.0)]);
+        assert_eq!((empty.dims(), empty.data.len()), (vec![2, 3, 0], 0));
+        let r = mat_of(rand, &[num(2.0), num(2.0), num(2.0)]);
+        assert!(r.data.iter().all(|&v| v > 0.0 && v < 1.0) && r.data.len() == 8);
+        assert!(
+            mat_of(nan, &[num(2.0), num(1.0), num(3.0)])
+                .data
+                .iter()
+                .all(|v| v.is_nan())
+        );
+        // A 1x1x3 is no size vector, though it has one row.
+        let nd_size = Value::Mat(Matrix::from_dims(&[1, 1, 3], vec![2.0; 3]));
+        assert_eq!(
+            call(zeros, &[nd_size], 1).unwrap_err().msg,
+            "Size vector for 'zeros' must be a row vector."
+        );
+        // Every size is named when the shape is too large.
+        assert_eq!(
+            call(zeros, &[num(1e5), num(1e5), num(1e5)], 1)
                 .unwrap_err()
                 .msg,
-            nd
+            "Requested 100000x100000x100000 array exceeds the maximum array size."
         );
+        let nd = "N-D arrays are not supported.";
         // eye keeps its two-size limit.
         assert_eq!(
             call(eye, &[num(2.0), num(3.0), num(1.0)], 1)
@@ -1473,5 +1552,96 @@ mod tests {
         };
         assert_eq!(text_of(&cell), "cell");
         assert_eq!(text_of(&strukt), "struct");
+    }
+
+    fn nd(dims: &[usize]) -> Value {
+        Value::Mat(Matrix::filled_dims(dims, 0.0))
+    }
+
+    /// Cycle 14: the shape queries by the MathWorks `size` page's rules.
+    #[test]
+    fn shape_queries_see_every_dimension() {
+        let a = nd(&[2, 3, 4]);
+        assert_eq!(mat_of(size, std::slice::from_ref(&a)).data, [2.0, 3.0, 4.0]);
+        let outs = |n: usize| -> Vec<f64> {
+            call(size, std::slice::from_ref(&a), n)
+                .unwrap()
+                .iter()
+                .map(|v| v.mat().unwrap().data[0])
+                .collect()
+        };
+        assert_eq!(outs(2), [2.0, 12.0]);
+        assert_eq!(outs(3), [2.0, 3.0, 4.0]);
+        assert_eq!(outs(4), [2.0, 3.0, 4.0, 1.0]);
+        assert_eq!(mat_of(size, &[a.clone(), num(3.0)]).data, [4.0]);
+        assert_eq!(mat_of(size, &[a.clone(), num(5.0)]).data, [1.0]);
+        let ndims_of = |v: Value| mat_of(ndims, &[v]).data[0];
+        assert_eq!(ndims_of(a.clone()), 3.0);
+        assert_eq!(ndims_of(nd(&[1, 1, 1, 2])), 4.0);
+        assert_eq!(ndims_of(num(5.0)), 2.0);
+        assert_eq!(ndims_of(Value::str("ab")), 2.0);
+        assert_eq!(
+            ndims_of(Value::cell(crate::value::CellArray::default())),
+            2.0
+        );
+        assert_eq!(mat_of(numel, std::slice::from_ref(&a)).data, [24.0]);
+        assert_eq!(mat_of(length, &[nd(&[2, 5, 3])]).data, [5.0]);
+        assert_eq!(mat_of(length, &[nd(&[2, 0, 3])]).data, [0.0]);
+        assert_eq!(mat_of(isempty, &[nd(&[2, 0, 3])]).data, [1.0]);
+        assert_eq!(mat_of(isvector, &[nd(&[1, 1, 3])]).data, [0.0]);
+        assert_eq!(mat_of(isscalar, &[nd(&[1, 1, 3])]).data, [0.0]);
+        assert!(call(ndims, &[], 1).is_err());
+    }
+
+    /// Cycle 14: `values_equal` compares every dimension before any
+    /// element, so arrays of different shapes are unequal and neither is
+    /// read past its end.
+    #[test]
+    fn values_equal_compares_every_dimension_first() {
+        let a = nd(&[2, 2, 2]);
+        assert!(values_equal(&a, &nd(&[2, 2, 2])));
+        assert!(!values_equal(&a, &nd(&[2, 4])));
+        assert!(!values_equal(&a, &nd(&[2, 2])));
+        assert!(!values_equal(&nd(&[2, 2]), &a));
+        assert!(!values_equal(&a, &nd(&[2, 2, 1, 2])));
+        assert!(!values_equal(&nd(&[2, 1, 2]), &nd(&[2, 2, 1])));
+    }
+
+    #[test]
+    fn whos_writes_every_dimension() {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        it.vars_mut().insert("A".into(), nd(&[2, 3, 4]));
+        let rows: Vec<[String; 4]> = vec![[
+            "A".into(),
+            crate::value::dims_text(&it.vars()["A"].dims(), "x"),
+            bytes(&it.vars()["A"]).to_string(),
+            "double".into(),
+        ]];
+        assert_eq!(whos_text(&rows), "  A            2x3x4   192  double\n\n");
+    }
+
+    /// Cycle 14: a size text or a name longer than the 65,535 characters
+    /// Rust's formatter takes as a width is written whole, padded by hand,
+    /// where a formatted width panicked.
+    #[test]
+    fn whos_pads_a_column_wider_than_any_format_width() {
+        let mut dims = vec![2usize];
+        dims.extend(std::iter::repeat_n(1, 40_000));
+        dims.push(2);
+        let long = crate::value::dims_text(&dims, "x");
+        assert!(long.len() > 65_535);
+        let name = "b".repeat(70_000);
+        let rows: Vec<[String; 4]> = vec![
+            ["A".into(), long.clone(), "32".into(), "double".into()],
+            [name.clone(), "1x1".into(), "8".into(), "double".into()],
+        ];
+        let text = whos_text(&rows);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        let first = format!("  A{} {long}   32  double", " ".repeat(69_999));
+        assert_eq!(lines[0], first);
+        let pad = " ".repeat(long.len() - 3);
+        assert_eq!(lines[1], format!("  {name} {pad}1x1    8  double"));
+        assert_eq!(lines[2], "");
     }
 }

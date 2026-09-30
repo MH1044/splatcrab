@@ -76,9 +76,33 @@ What SplatCrab does today, with the golden case that proves each area works.
 | Growth names the size asked for | 03 | `err_growth_size_named` | `x = []; x(1e300) = 1` reports `Requested 1x1e+300 array exceeds the maximum array size.`, not the `1x18446744073709551615` of the saturated `usize`: the grown size stays an `f64` until `check_shape` judges it |
 | An empty result costs nothing | 13b | `empty_wide_elementwise`, `empty_tall_transpose_negate` | `zeros(0, 1e12) + 1`, `.* 1i`, `== 1i`, `power(x, 0.5)`, `complex(x, x)`, the transposes, the scans, `sort`, `fft`, `kron`, the flips, `triu`, and `x(:, :)` or `x(:, 5) = []` of it return at once: every element-wise kernel and dimension loop does work in proportion to the elements it produces or reads. Before 13b the broadcast loop ran once per column of the empty operand, and `sort` or `x(:, :)` asked the allocator for terabytes |
 | Cell and struct arrays are bounded by bytes | 13b | `err_cell_over_byte_budget`, `err_struct_growth_over_byte_budget`, `cell_struct_within_budget` | A cell or struct array is held to the 2 GiB a double array at the element cap takes, a cell element counted as one value and a struct element as one per field plus one, so `cell(1, 2^27)` and `s(2^27).a = 1` are `Requested 1x134217728 array exceeds the maximum array size.` rather than a request for gigabytes; `cell`, `struct`, `num2cell`, `cellfun` and `arrayfun` with `UniformOutput` false, indexed reads and growth, concatenation and `load` all judge it. Arrays within the budget are as before |
-| Trailing singleton subscripts | 03 | `trailing_singleton_subscripts`, `trailing_singleton_end`, `err_trailing_singleton_bound` | `A(2, 1, 1)`, `A(:, :, 1)` and `A(1, 2, 1) = 9` index a 2-D matrix, `end` is `1` in a third or later position, and a third subscript past 1 is `Index in position 3 exceeds array bounds. Index must not exceed 1.` (QA D22). Selecting a second page, or growing into one, is `N-D arrays are not supported.` |
+| Trailing singleton subscripts | 03 | `trailing_singleton_subscripts`, `trailing_singleton_end`, `err_trailing_singleton_bound` | `A(2, 1, 1)`, `A(:, :, 1)` and `A(1, 2, 1) = 9` index a 2-D matrix, `end` is `1` in a third or later position, and reading a third subscript past 1 is `Index in position 3 exceeds array bounds. Index must not exceed 1.` (QA D22). Since cycle 14 selecting the page more than once, `A(:, :, [1 1])`, or growing into a second page makes an N-D array (see [N-D arrays](#n-d-arrays)); until then both were `N-D arrays are not supported.` |
 | The invalid-index message names logical values | 03 | `err_index_zero_ending` | `x(0)` is `Index in position 1 is invalid. Array indices must be positive integers or logical values.`, MATLAB's text, now that logical indices exist |
 | Brace and dot access on a matrix are errors | 03 | `err_brace_on_matrix`, `err_dot_on_matrix` | `x{1}` is `Brace indexing is not supported for variables of this type.` and `x.a` is `Dot indexing is not supported for variables of this type.`, reading; assigning is MATLAB's assignment form, `Unable to perform assignment because brace indexing is not supported for variables of this type.` and the same with `dot`, since cycle 07. A second `(...)` indexes the value so far, `x(2:3)(2)` |
+
+## N-D arrays
+
+Cycle 14. Numeric, logical and char arrays of any number of dimensions; the
+dimensions past the second sit beside `rows` and `cols` in `Matrix`,
+never ending in a 1, and the Design notes of
+`docs/modules/14-nd-arrays.md` record every choice. Cases in
+`14-nd-arrays/`.
+
+| Feature | Since | Golden case | Notes |
+|---|---|---|---|
+| The constructors make N-D arrays | 14 | `constructors_nd_sizes`, `constructors_nd_empty_huge`, `err_constructor_size_every_dim`, `err_cell_third_size` | `zeros`, `ones`, `rand`, `NaN`, `nan`, `Inf`, `inf`, `true` and `false` take three or more sizes or a size vector of any length: `zeros(2, 3, 4)`, `ones([2 2 2])`. Trailing sizes of 1 are dropped, so `zeros(2, 3, 1)` is 2x3 and `zeros(2, 3, 1, 4)` is 2x3x1x4, and `ones(2, 3, 0)` is an empty 2x3x0, a size of 0 making the product 0 wherever it stands, so `zeros(2^40, 2^40, 0)` is as empty as `zeros(0, 2^40, 2^40)`. A shape too large is judged before anything is allocated and refused naming every size, `Requested 100000x100000x100000 array exceeds the maximum array size.` `eye` stays 2-D, and `cell(2, 3, 4)` is still `N-D arrays are not supported.` |
+| Shape queries of every dimension, and `ndims` | 14 | `shape_queries_nd` | By the MathWorks `size` page's rules: `size(A)` is every dimension; with fewer outputs than `ndims(A)` the last takes the product of the rest, so `[r, c] = size(zeros(2, 3, 4))` gives `c` 12, and outputs past the dimensions are 1, as is `size(A, k)` past `ndims(A)`. `ndims` is new, 2 for every 2-D value, cells, structs, handles and exceptions included. `numel` is the product of every dimension, `length` 0 when any is 0 and the largest otherwise, `isempty` true when any is 0; `isscalar` and `isvector` are false for every N-D array |
+| `reshape` to and from N-D | 14 | `reshape_nd`, `reshape_nd_empty_huge`, `err_reshape_nd_count`, `err_reshape_nd_placeholder_count`, `err_reshape_two_placeholders`, `err_reshape_nd_numel` | Several sizes, a size vector, and one `[]` placeholder anywhere, in column-major order, trailing sizes of 1 dropped. A count that does not match names every size, `(6 vs 2x2x2)` (`err_reshape_nd_numel`), and the count of an empty shape is its 0 however large the other sizes |
+| Indexing with any number of subscripts | 14 | `index_read_nd`, `err_index_folded_past_end`, `err_index_linear_past_end`, `err_index_page_past_end`, `err_index_trailing_past_one` | A single subscript is linear over every element, `A(:)` a column of all of them and a mask the positions `find` gives. With fewer subscripts than dimensions the rest fold into the last, so `A(2, 7)` of a 2x3x4 indexes it as 2x12, and `end` there is the product of the dimensions it spans; every subscript past the dimensions must select position 1. A read has one dimension per subscript, trailing ones dropped: `A(:, :, 2)` is 2x3, `A(1, :, :)` 1x3x4. One-based subscripts still become zero-based only in `eval_index_args` |
+| Growth into new pages | 14 | `grow_nd_pages`, `grow_nd_keeps_class`, `err_grow_nd_linear_ambiguous`, `err_grow_nd_size_every_dim`, `grow_nd_colon_empty` | `B = zeros(2, 2); B(:, :, 2) = 1` makes 2x2x2 and `B(1, 1, 1, 3) = 5` 2x2x2x3, the class's zero filling what is new and a char or a logical keeping its class. The grown shape is judged by `check_dims` first. A colon over an empty target takes the right-hand side's extent where the target has none of its own, a dimension of 0 or one past its dimensions, so `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` is 2x2x2. A linear subscript past the end of an N-D array, or past the end of the fold fewer subscripts index, is `Attempt to grow array along ambiguous dimension.` |
+| Deletion along one dimension | 14 | `delete_nd`, `err_delete_nd_two_indices` | One subscript that is not `:` removes those positions along its dimension, `A(:, :, 2) = []` a page and `A(1, :, :) = []` a row across the pages; one linear subscript leaves a row; two or more non-colon subscripts are `A null assignment can have only one non-colon index.` |
+| Element-wise operators across every dimension | 14 | `elementwise_nd_arithmetic`, `elementwise_nd_logical`, `broadcast_nd`, `complex_nd_elementwise`, `err_operator_nd_sizes`, `err_operator_nd_sizes_2d_operand` | `+`, `-`, `.*`, `./`, `.\`, `.^`, the comparisons, `&`, `\|`, `~` and unary `-` and `+`, real and complex, and `*`, `/` and `\` with a scalar where a matrix takes one. Broadcasting: two dimensions agree when they are equal or one of them is 1, and a dimension past an operand's `ndims` is 1. The refusal names every dimension, `Arrays have incompatible sizes for operator '+' (2x3x4 vs 2x3x5).` |
+| What refuses an N-D operand | 14 | `err_mtimes_nd`, `err_mrdivide_nd`, `err_mldivide_nd`, `err_mpower_nd`, `err_mpower_nd_exponent`, `err_ctranspose_nd`, `err_transpose_nd`, `err_hcat_nd`, `err_vcat_nd`, `err_save_nd`, `err_save_nd_workspace` | `*` unless one operand is a scalar, `/` unless the divisor is, `\` unless the left operand is, and every `^`: `Matrix operations are not defined for N-D arrays.`; `'` and `.'`: `Transpose is not defined for N-D arrays.`; a bracket joining one to anything: `Concatenation of N-D arrays is not supported.`, while `[A]` is `A`; `save` of one, in a variable, a cell or a field: `N-D arrays are not supported by 'save'.`, with no file left behind. `load` keeps its refusal of a file holding one |
+| The N-D gate | 14 | `err_gate_sum`, `err_gate_feval_abs`, `err_gate_second_argument`, `passthrough_nd`, `err_set_cell_nd_char`, `str2double_cell_nd_char`, `strcmp_cell_nd_char` | `builtins::ND_OK` names the builtins that take an N-D argument: the constructors, the shape and class queries, `isreal`, `isequal`, `reshape`, `disp`, `double`, `logical`, `char`, `fprintf`, `sprintf`, `feval` and `deal`. Every other refuses one before it runs, naming itself, `N-D arrays are not supported by 'sum'.`, whichever argument it is; `feval` and `deal` pass theirs on, so the callee's gate judges them. The gate judges a matrix argument only, so a builtin that reads a cell judges an N-D element itself: a set function refuses a cell holding an N-D char, which is no character vector however few its rows, `str2double` reads one as `NaN`, as it reads a char matrix, and `strcmp` and `strcmpi` compare one by every dimension, so the same characters in another shape are not the same text |
+| `for` over an N-D array | 14 | `for_nd_columns` | The columns of its 2-D fold, `numel(A(1, :))` of them, each a column of `rows` elements, as the MathWorks `for` page says |
+| The page-by-page display | 14 | `display_nd_double`, `display_nd_logical`, `display_nd_char`, `display_nd_complex`, `display_nd_fourth_dim`, `display_nd_empty`, `display_nd_page_scale`, `display_nd_page_columns`, `disp_nd_pages` | Each page in column-major page order under `name(:,:,k) =`, every index past the second written (`x(:,:,1,2) =`), a blank line, and the page as the named display of that page alone writes it, its own scale factor, column wrapping, class line and quoted rows, two blank lines between pages; a page of a complex array is complex. `disp` writes the same pages under `(:,:,k) =`. An empty N-D array is `  2×0×3 empty double array` (and `logical`, `char`). The page layout is the MathWorks page's; the per-page class line, the `disp` headers and the empty wording are the spec's stated rules, in Known deviations, verify first. The display is written a page at a time, so it holds one page's text however many pages there are |
+| Sizes shown elsewhere | 14 | `whos_nd_size`, `workspace_nd_size`, `cell_struct_nd_summary`, `whos_nd_long_size`, `struct_field_name_past_width` | `whos` writes `2x3x4`, a size text of any length written whole, as a struct's display writes a field name of any length; the protocol's `workspace` answers `"size":[2,3,4]` and its preview `2×3×4 double`, never the elements of an N-D array; the page's workspace pane shows `2×3×4`; a cell's display writes an element as `{2×3×4 double}` and a struct's a field as `[2×3×4 double]` |
+| `isequal` compares every dimension first | 14 | `isequal_nd_shapes` | Arrays of different shapes are unequal, `isequal(zeros(2, 2, 2), zeros(2, 4))` is false, and no comparison reads past either array |
 
 ## Control flow
 
@@ -86,7 +110,7 @@ What SplatCrab does today, with the golden case that proves each area works.
 |---|---|---|---|
 | `if` / `elseif` / `else` | 00 | `control_flow` | |
 | `for` over a range | 00 | `control_flow` | |
-| `for` over matrix columns | 00 | `control_flow` | |
+| `for` over matrix columns | 00 | `control_flow` | Over an N-D array, the columns of its 2-D fold since cycle 14 (`for_nd_columns`) |
 | `for` over a char, and `if` on a char | 02 | `for_over_char`, `if_condition_classes` | `for k = 'abc'` iterates one char at a time, each a `char`; `if 'abc'` is true, as a non-empty array with no zero is |
 | `while` | 00 | `control_flow` | |
 | `break` and `continue` | 00 | `control_flow` | |
@@ -148,7 +172,7 @@ Cases in `07-cells-and-structs/`.
 
 ## Builtins
 
-231 names, each an ordinary function in `src/builtins/` (the plotting ones
+251 names, each an ordinary function in `src/builtins/` (the plotting ones
 in `src/plot/`) registered by name in
 `Interp::new`. Every one is exercised by `builtins_sample`, `reductions` or
 `demo_smoke`, or for the class builtins by the cases in
@@ -175,7 +199,11 @@ string, regular-expression and file functions, exercised by the
 `11-strings-and-io` cases (see
 [Strings, regular expressions and files](#strings-regular-expressions-and-files)).
 Cycle 12 added twenty, the plotting builtins, exercised by the
-`12-plotting` cases (see [Plotting](#plotting)). Cycle 01c removed `e`, which
+`12-plotting` cases (see [Plotting](#plotting)). Cycle 13 added nineteen,
+the environment builtins of `environ.rs`, exercised by the
+`13-environment` cases (see [Environment](#environment)). Cycle 14 added
+`ndims`, exercised by `shape_queries_nd` (see [N-D arrays](#n-d-arrays)).
+Cycle 01c removed `e`, which
 MATLAB does not have: `exp(1)` is the MATLAB spelling, and `e` is now an
 ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 `err_e_undefined`, `err_e_undefined_after_clear`).
@@ -184,7 +212,7 @@ ordinary name, free to be a variable (`e_is_an_ordinary_name`,
 |---|---|---|---|
 | Constants | `pi Inf inf NaN nan eps true false` | 00 | `core.rs` |
 | Constructors | `zeros ones eye rand linspace` | 00 | `core.rs` |
-| Shape queries | `size numel length isempty isscalar isvector` | 00 | `core.rs` |
+| Shape queries | `size ndims numel length isempty isscalar isvector` | 00; `ndims` 14 | `core.rs` |
 | Rearrangement | `reshape repmat fliplr flipud` | 00 | `linalg.rs` |
 | Reductions | `sum prod mean any all max min cumsum cumprod` | 00 | `math.rs` |
 | Elementwise math | `abs sqrt exp log log2 log10 sin cos tan asin acos atan sinh cosh tanh floor ceil round fix sign` | 00 | `math.rs` |
@@ -250,7 +278,7 @@ takes are in [Builtin arguments](#builtin-arguments).
 | ... and its two errors | 03 | `err_multi_assign_insufficient`, `err_multi_assign_too_many` | `[a, b] = 5`, or any value that is not a call, is `Insufficient number of outputs from right hand side of equal sign to satisfy assignment.`; a builtin asked for more values than it has, `[a, b] = sum(x)`, is `Too many output arguments.` |
 | `[m, i] = max(...)`, `[m, i] = min(...)` | 03 | `multi_assign_max_display`, `multi_assign_tilde_min` | The index of each extremum along the dimension reduced, the first of a tie, ignoring `NaN`; with `'all'` a linear index. The two-array form has no index |
 | `[s, i] = sort(...)` | 03 | `multi_assign_sort` | The permutation, so `s` is `v(i)`; stable in both directions |
-| `[r, c] = size(A)` | 03 | `multi_assign_size` | One dimension per output, and outputs past the second are `1`, the trailing singletons; `[n] = size(A)` is still the size row |
+| `[r, c] = size(A)` | 03 | `multi_assign_size` | One dimension per output, and outputs past the dimensions are `1`, the trailing singletons; `[n] = size(A)` is still the size row. Since cycle 14 the last output takes the product of every dimension from its own on, so `[r, c] = size(zeros(2, 3, 4))` gives `c` 12 (`shape_queries_nd`) |
 | `[r, c] = find(X)`, `[r, c, v] = find(X)` | 03 | `multi_assign_find` | Row and column subscripts, and the values in the argument's class, in `find`'s shape; the count and direction still apply |
 | A deeply nested expression does not overflow the stack | 01 | `deep_nesting` | The interpreter runs on a 256 MB thread, and since 01e the parser and the evaluator refuse anything past 10,000 levels, so the stack is never reached at all |
 
@@ -268,7 +296,7 @@ implements the ones MATLAB code actually uses. Cases are in
 | `logical`, `char`, `double` | 02 | `conversion_builtins`, `err_logical_nan` | `double('A')` is `65`, `char([72 105])` is `'Hi'`, `logical([2 0 -1])` is `1 0 1`. `logical(NaN)` is `NaN's cannot be converted to logicals.` |
 | Size vectors: `zeros(size(A))` | 01c | `size_vectors_constructors`, `err_size_vector_column` | `zeros`, `ones`, `eye`, `rand`, `NaN`, `Inf`, `true`, `false`. The vector must be a row |
 | `reshape(A, sz)`, `reshape(A, r, [])`, `repmat(A, sz)` | 01c | `size_vectors_reshape_repmat`, `err_reshape_placeholder_divisible`, `err_reshape_two_placeholders` | One `[]` placeholder, for the size that makes the count come out |
-| Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_third_size`, `err_nd_zero_third_size`, `err_nd_fourth_size`, `err_nd_size_vector`, `err_nd_reshape` | `zeros(2, 3, 1)` is 2x3. Any other third size, `0` included, is "N-D arrays are not supported."; N-D arrays are not built yet. `eye` still takes two sizes |
+| Trailing sizes of `1` | 01c | `trailing_singleton_sizes`, `err_nd_size_vector` | `zeros(2, 3, 1)` is 2x3. Since cycle 14 any other third size makes an N-D array (see [N-D arrays](#n-d-arrays)), where it was "N-D arrays are not supported."; `repmat` keeps that refusal until 14b and `cell` until a later cycle, and `eye` still takes two sizes |
 | A size past `usize` is named as asked | 01c | `err_size_overflow_named`, `err_size_overflow_g_form`, `err_size_overflow_range_inf` | `zeros(1e300)` reports `1e+300x1e+300`, and `0:1e-300:1e300` reports `1xInf`, not the `usize::MAX` clamp. Indexed growth does too since cycle 03 (`err_growth_size_named`) |
 | `linspace` floors its count | 01c | `linspace_floor_count` | `linspace(0, 1, 2.7)` is two points; a count below 1 is 1x0 |
 | `linspace` includes both end points exactly | 01d | `range_hits_end_point` | The last element is the end point itself, not `a + (b-a)*(n-1)/(n-1)` |

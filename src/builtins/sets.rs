@@ -77,7 +77,7 @@ impl Set {
                 let mut keys = Vec::with_capacity(c.data.len());
                 for item in &c.data {
                     match item {
-                        Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => {
+                        Value::Mat(m) if m.is_char_row() => {
                             keys.push(m.data.clone());
                         }
                         _ => return Err(error::set_cell_contents(name)),
@@ -164,7 +164,7 @@ impl Set {
 /// the same kind: a character vector beside a cell becomes one text.
 fn pair(a: &Value, b: &Value, name: &str) -> R<(Set, Set)> {
     let as_text = |s: Set| match s {
-        Set::Num(m) if m.class == Class::Char && m.rows <= 1 => Ok(Set::one_text(m)),
+        Set::Num(m) if m.is_char_row() => Ok(Set::one_text(m)),
         Set::Num(_) => Err(error::set_mixed(name)),
         t => Ok(t),
     };
@@ -430,11 +430,31 @@ mod tests {
         }
     }
 
+    /// Cycle 14: a cell holding an N-D char is not a cell of character
+    /// vectors, however few its rows, so it is refused as a char matrix is,
+    /// never compared by its text with a row of the same characters.
+    #[test]
+    fn a_cell_holding_an_nd_char_is_not_a_cell_of_character_vectors() {
+        let nd = Value::Mat(
+            Matrix::from_dims(&[1, 2, 2], "abcd".bytes().map(f64::from).collect())
+                .with_class(Class::Char),
+        );
+        let c = Value::cell(CellArray::row(vec![nd, Value::str("abcd")]));
+        assert_eq!(
+            run(unique, std::slice::from_ref(&c), 1).unwrap_err().msg,
+            "Cell arrays for 'unique' must hold character vectors only."
+        );
+        assert_eq!(
+            run(ismember, &[Value::str("abcd"), c], 1).unwrap_err().msg,
+            "Cell arrays for 'ismember' must hold character vectors only."
+        );
+    }
+
     #[test]
     fn unique_sorts_and_gives_both_index_vectors() {
         let out = run(unique, &[row(&[3.0, 1.0, 2.0, 1.0])], 3).unwrap();
         assert_eq!(data(&out[0]), [1.0, 2.0, 3.0]);
-        assert_eq!(out[0].dims(), (1, 3));
+        assert_eq!(out[0].dims(), [1, 3]);
         assert_eq!(data(&out[1]), [2.0, 3.0, 1.0]);
         assert_eq!(data(&out[2]), [3.0, 1.0, 2.0, 1.0]);
         let out = run(unique, &[row(&[3.0, 1.0, 3.0]), Value::str("stable")], 3).unwrap();
@@ -447,7 +467,7 @@ mod tests {
         assert!(d[1].is_nan() && d[2].is_nan());
         // A column or a matrix gives a column; a char stays a char.
         let m = Value::Mat(Matrix::new(2, 2, vec![2.0, 1.0, 2.0, 1.0]));
-        assert_eq!(run(unique, &[m], 1).unwrap()[0].dims(), (2, 1));
+        assert_eq!(run(unique, &[m], 1).unwrap()[0].dims(), [2, 1]);
         let c = run(unique, &[Value::str("hello")], 1).unwrap();
         assert_eq!(c[0].text().unwrap(), "ehlo");
         assert!(run(unique, &[num(1.0), Value::str("rows")], 1).is_err());
@@ -457,7 +477,7 @@ mod tests {
     fn unique_of_a_cell_sorts_texts_by_code_unit() {
         let out = run(unique, &[cellstr(&["b", "a", "b", "ab", ""])], 3).unwrap();
         assert_eq!(words(&out[0]), ["", "a", "ab", "b"]);
-        assert_eq!(out[0].dims(), (1, 4));
+        assert_eq!(out[0].dims(), [1, 4]);
         assert_eq!(data(&out[1]), [5.0, 2.0, 4.0, 1.0]);
         assert_eq!(data(&out[2]), [4.0, 2.0, 4.0, 3.0, 1.0]);
         let upper = run(unique, &[cellstr(&["b", "B", "a"])], 1).unwrap();
@@ -517,14 +537,14 @@ mod tests {
         let c = Value::Mat(Matrix::col(vec![2.0, 5.0]));
         assert_eq!(
             run(union, &[c.clone(), row(&[3.0])], 1).unwrap()[0].dims(),
-            (3, 1)
+            [3, 1]
         );
         assert_eq!(
             run(setdiff, &[row(&[1.0, 2.0]), c], 1).unwrap()[0].dims(),
-            (1, 1)
+            [1, 1]
         );
         let e = run(setdiff, &[Value::Mat(Matrix::empty()), row(&[1.0])], 1).unwrap();
-        assert_eq!(e[0].dims(), (1, 0));
+        assert_eq!(e[0].dims(), [1, 0]);
     }
 
     #[test]

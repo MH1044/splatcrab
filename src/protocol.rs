@@ -521,7 +521,8 @@ fn evaluated(it: &Interp, id: Json, result: R<()>, out: Json, line: bool, stack:
 
 /// One `{name, size, class}` per variable, sorted by name, and with
 /// `preview` a `value` after `class`: [`env::preview`] in the session's
-/// display format.
+/// display format. `size` holds every dimension, `[2,3,4]` for an N-D
+/// array (cycle 14).
 fn workspace(it: &Interp, id: Json, preview: bool) -> Json {
     let mut names: Vec<&String> = it.vars().keys().collect();
     names.sort();
@@ -529,13 +530,10 @@ fn workspace(it: &Interp, id: Json, preview: bool) -> Json {
         .into_iter()
         .map(|name| {
             let v = &it.vars()[name];
-            let (rows, cols) = v.dims();
+            let size = v.dims().iter().map(|&d| Json::Number(d as f64)).collect();
             let mut pairs = vec![
                 ("name".to_string(), Json::String(name.clone())),
-                (
-                    "size".to_string(),
-                    Json::Array(vec![Json::Number(rows as f64), Json::Number(cols as f64)]),
-                ),
+                ("size".to_string(), Json::Array(size)),
                 (
                     "class".to_string(),
                     Json::String(v.class_name().to_string()),
@@ -867,6 +865,21 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Cycle 14: `size` holds every dimension of an N-D array, and the
+    /// preview names them.
+    #[test]
+    fn workspace_answers_every_dimension() {
+        let got = session(concat!(
+            "{\"op\":\"eval\",\"code\":\"A = zeros(2, 3, 4);\"}\n",
+            "{\"id\":1,\"op\":\"workspace\",\"preview\":true}\n",
+        ));
+        assert_eq!(
+            got[1],
+            "{\"id\":1,\"ok\":true,\"vars\":[\
+             {\"name\":\"A\",\"size\":[2,3,4],\"class\":\"double\",\"value\":\"2×3×4 double\"}]}"
+        );
     }
 
     /// The preview is made in the session's display format.

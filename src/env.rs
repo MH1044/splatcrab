@@ -39,7 +39,8 @@ pub const PREVIEW_ELEMENTS: usize = 10;
 ///    writes it, each `'` doubled: `'it''s'`, `''`;
 /// 3. a function handle: its text, `@(x)x+1` or `@sin`;
 /// 4. anything else: its size and class, `2×3 double`, `1×1 struct`, with
-///    `complex ` before `double` for complex storage.
+///    `complex ` before `double` for complex storage. An N-D array always
+///    takes this rule, with every dimension: `2×3×4 double` (cycle 14).
 ///
 /// A preview longer than [`PREVIEW_CHARS`] is cut to that many and followed
 /// by `…`. Rule 2 decodes only the code units the cut can keep, so a long
@@ -49,21 +50,24 @@ pub const PREVIEW_ELEMENTS: usize = 10;
 pub fn preview(v: &Value, format: Format) -> String {
     match v {
         Value::Mat(m)
-            if m.class != Class::Char && !m.is_empty() && m.numel() <= PREVIEW_ELEMENTS =>
+            if m.class != Class::Char
+                && !m.is_empty()
+                && !m.is_nd()
+                && m.numel() <= PREVIEW_ELEMENTS =>
         {
             cut(elements(m, format))
         }
-        Value::Mat(m) if m.class == Class::Char && m.rows <= 1 => {
+        Value::Mat(m) if m.is_char_row() => {
             // One row, or none: `data` is the row in order.
             quoted(m.data.iter().map(|&u| code_unit(u) as u16))
         }
         // Rendered only as far as the cut needs to know it is cut.
         Value::Func(f) => cut(f.shown_up_to(PREVIEW_CHARS + 1)),
         v => {
-            let (rows, cols) = v.dims();
+            let size = crate::value::dims_text(&v.dims(), "×");
             let complex = matches!(v, Value::Mat(m) if m.is_complex());
             let prefix = if complex { "complex " } else { "" };
-            cut(format!("{rows}×{cols} {prefix}{}", v.class_name()))
+            cut(format!("{size} {prefix}{}", v.class_name()))
         }
     }
 }
@@ -343,6 +347,27 @@ mod tests {
                 "1×1 struct",
                 "1×2 struct",
                 "1×1 MException",
+            ]
+        );
+    }
+
+    /// Cycle 14: an N-D array always takes rule 4, with every dimension,
+    /// however few elements it has and whatever its class.
+    #[test]
+    fn preview_rule_four_names_every_dimension_of_an_nd_array() {
+        let got = previews(
+            "a = zeros(2, 3, 4); b = true(1, 1, 2); c = 'ab'; c(:, :, 2) = 'cd'; \
+             z = zeros(1, 1, 2) * 1i; z(2) = 1i; e = zeros(2, 0, 3);",
+            &["a", "b", "c", "z", "e"],
+        );
+        assert_eq!(
+            got,
+            [
+                "2×3×4 double",
+                "1×1×2 logical",
+                "1×2×2 char",
+                "1×1×2 complex double",
+                "2×0×3 double",
             ]
         );
     }
