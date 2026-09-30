@@ -1,0 +1,9 @@
+{"id":1,"ok":false,"out":"","error":{"message":"Cannot CD to ..: it is outside the file root.","line":1}}
+{"id":2,"ok":true,"cwd":""}
+{"id":3,"ok":true,"out":""}
+{"id":4,"ok":true,"cwd":"tree"}
+{"id":5,"ok":false,"out":"","error":{"message":"Cannot CD to ../..: it is outside the file root.","line":1}}
+{"id":6,"ok":true,"cwd":"tree"}
+{"id":7,"ok":true,"out":""}
+{"id":8,"ok":true,"cwd":""}
+{"id":9,"ok":false,"out":"","error":{"message":"Cannot CD to nope (Name is nonexistent or not a directory).","line":1}}

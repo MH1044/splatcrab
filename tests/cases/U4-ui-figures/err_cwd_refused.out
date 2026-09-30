@@ -1,0 +1,11 @@
+{"id":1,"ok":false,"error":{"message":"Path '..' is outside the file root.","line":null}}
+{"id":2,"ok":true,"cwd":""}
+{"id":3,"ok":true,"cwd":"tree"}
+{"id":4,"ok":false,"error":{"message":"Path '..' is outside the file root.","line":null}}
+{"id":5,"ok":true,"cwd":"tree"}
+{"id":6,"ok":false,"error":{"message":"Path 'tree/a.txt' is not a folder.","line":null}}
+{"id":7,"ok":true,"cwd":"tree"}
+{"id":8,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":9,"ok":true,"cwd":"tree"}
+{"id":10,"ok":false,"error":{"message":"Malformed request: 'path' must be a string.","line":null}}
+{"id":11,"ok":true,"cwd":"tree"}

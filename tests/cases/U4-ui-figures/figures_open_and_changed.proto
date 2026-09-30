@@ -1,0 +1,11 @@
+% covers: 1 - figures answers the open figures' numbers ascending and the open figures changed since the last figures: none at the start; figure(3) opens figure 3 and changes it; a second figures has nothing changed; plot(1:3) draws into figure 3 and changes it; figure(5) then close(3) leaves 5 open and changed and forgets 3; close all leaves none open and none changed
+{"id":1,"op":"figures"}
+{"id":2,"op":"eval","code":"figure(3);"}
+{"id":3,"op":"figures"}
+{"id":4,"op":"figures"}
+{"id":5,"op":"eval","code":"plot(1:3);"}
+{"id":6,"op":"figures"}
+{"id":7,"op":"eval","code":"figure(5); close(3);"}
+{"id":8,"op":"figures"}
+{"id":9,"op":"eval","code":"close all"}
+{"id":10,"op":"figures"}

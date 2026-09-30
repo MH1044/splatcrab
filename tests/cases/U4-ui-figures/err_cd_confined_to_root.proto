@@ -1,0 +1,10 @@
+% covers: 6 - cd in an eval is confined to the file root, each refusal an eval answer with line 1, the line within the submitted code: at the root cd .. is outside the file root, dir as written, and cwd stays ""; cd tree moves cwd to tree; cd ../.. from tree is outside the file root and cwd stays tree; cd .. then returns to the root; and cd nope, a target that is not a folder, keeps cycle 13's message
+{"id":1,"op":"eval","code":"cd .."}
+{"id":2,"op":"cwd"}
+{"id":3,"op":"eval","code":"cd tree"}
+{"id":4,"op":"cwd"}
+{"id":5,"op":"eval","code":"cd ../.."}
+{"id":6,"op":"cwd"}
+{"id":7,"op":"eval","code":"cd .."}
+{"id":8,"op":"cwd"}
+{"id":9,"op":"eval","code":"cd nope"}

@@ -1,0 +1,11 @@
+% covers: 3 - figure refusals, each an answer with line null, with figure 5 open: no n is no 'n' field; an n of 0, -1, 1.5, the string "5" and null is not a figure number, the string refused though figure 5 is open; 7, which no open figure has, and 1e12, past any figure's number, are not open, each written as an integer; and no refusal opens a figure, so figures then has 5 alone
+{"id":1,"op":"eval","code":"figure(5);"}
+{"id":2,"op":"figure"}
+{"id":3,"op":"figure","n":0}
+{"id":4,"op":"figure","n":-1}
+{"id":5,"op":"figure","n":1.5}
+{"id":6,"op":"figure","n":"5"}
+{"id":7,"op":"figure","n":null}
+{"id":8,"op":"figure","n":7}
+{"id":9,"op":"figure","n":1e12}
+{"id":10,"op":"figures"}

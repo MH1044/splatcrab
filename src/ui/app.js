@@ -1,25 +1,35 @@
 // SplatCrab desktop.
 //
 // Five regions over the evaluation protocol (docs/modules/U0-ui-foundations.md,
-// docs/modules/U2-ui-desktop.md and docs/modules/U3-ui-editor.md): in the
-// middle the editor above the command window, the file browser on the left,
-// and the workspace above the command history on the right, with a splitter
-// between each pair.
+// docs/modules/U2-ui-desktop.md, docs/modules/U3-ui-editor.md and
+// docs/modules/U4-ui-figures.md): in the middle the editor above the
+// command window, the file browser on the left, and the workspace above the
+// command history on the right, with a splitter between each pair.
 //
 // Every request is one POST /api carrying the session token from this
 // page's URL fragment in the X-SplatCrab-Token header, and every request
 // goes through one queue, one at a time in the order the page made them, so
 // the panes' refreshes never race the command window, the editor or each
-// other.
+// other. Entries run one at a time too, each once the one before has shown
+// the figures it changed, so a figure is shown as its own entry left it.
 //
 // Everything a request returns reaches the page as text (textContent,
 // createTextNode and the editor's value), never as markup: variable names,
 // previews, file names, file text, paths, messages, frame names and history
-// entries are the user's own. The page's Content-Security-Policy forbids
-// inline script and style, which is why this file is separate and why pane
-// sizes and the gutter's mark are custom properties set through the CSS
-// object model rather than style attributes. The editor asks its questions
-// in the page itself, never in a dialog of the browser's.
+// entries are the user's own. A figure's SVG text is shown as an image, from
+// a blob: URL this script makes and revokes once the image has loaded, and
+// is never put into the document, so nothing in it can run. The page's
+// Content-Security-Policy forbids inline script and style, which is why
+// this file is separate and why pane sizes and the gutter's mark are custom
+// properties set through the CSS object model rather than style attributes;
+// it admits blob: images and nothing else new. The editor asks its
+// questions in the page itself, never in a dialog of the browser's.
+//
+// The file browser is the current folder: it lists what cwd answers, and
+// walking it moves the current folder, so cd in the command window and a
+// click in the file browser move the same folder. Tab in the command
+// window completes a name through completions, or inside a quoted string a
+// file or folder name of the current folder through files.
 
 'use strict';
 
@@ -43,6 +53,7 @@
   const side = byId('side');
   const transcript = byId('transcript');
   const input = byId('input');
+  const completionList = byId('completions');
   const filesPath = byId('files-path');
   const filesList = byId('files-list');
   const varsBody = byId('vars-body');
@@ -131,6 +142,9 @@
   let place = 0; // index into history; history.length is the draft
   let draft = '';
   let busy = false;
+  // An entry is running, from the command window, the history or the
+  // editor: Tab completes nothing until it has shown its figures.
+  let entryRunning = false;
 
   function block(className, text) {
     return element('pre', className, text);
@@ -198,33 +212,106 @@
       .catch(function () {});
   }
 
-  // Runs one entry: `shown` in the transcript, then its output exactly as
-  // the interpreter wrote it, then its error, if any, set apart, the
-  // request being `request`. The entry goes to the shared history as shown
-  // as it is run, and the workspace and the file browser are refreshed
-  // afterwards, whatever the evaluation answered. Resolves to the answer,
-  // or null when the server refused the request.
-  async function runEntry(shown, request) {
-    const entry = element('div', 'entry');
-    entry.appendChild(block('in', shown));
-    transcript.appendChild(entry);
-    scrollToEnd();
-    remember(shown);
-    let answer = null;
+  // A figure as its entry left it: its label, then an image of its SVG
+  // text through a blob: URL, revoked once the image has loaded or failed
+  // to. The text is never parsed into the page: an image runs no script.
+  function figureImage(n, svg) {
+    const label = 'Figure ' + n;
+    const holder = element('figure', 'plot');
+    holder.appendChild(element('figcaption', null, label));
+    const img = element('img');
+    img.alt = label;
+    const url = URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }));
+    function done() {
+      URL.revokeObjectURL(url);
+    }
+    img.addEventListener('load', function () {
+      done();
+      scrollToEnd();
+    });
+    img.addEventListener('error', done);
+    img.src = url;
+    holder.appendChild(img);
+    return holder;
+  }
+
+  // The figures the entry changed, each shown under its output in the
+  // order `figures` names them: a snapshot, so a later entry that draws
+  // into the same figure adds one of its own and this one stays. A figure
+  // refused (too large to show) is shown in its place in the error style.
+  async function showFigures(entry) {
+    let answer;
     try {
-      answer = await call(request);
-      if (answer.out) {
-        entry.appendChild(block('out', answer.out));
-      }
-      if (!answer.ok) {
-        entry.appendChild(errorBlock(answer.error));
-      }
+      answer = await call({ op: 'figures' });
     } catch (e) {
       entry.appendChild(block('err', e.message));
+      return;
     }
-    scrollToEnd();
-    refreshWorkspace();
-    refreshFiles();
+    if (!answer.ok) {
+      entry.appendChild(block('err', answer.error.message));
+      return;
+    }
+    for (const n of answer.changed) {
+      try {
+        const figure = await call({ op: 'figure', n: n });
+        entry.appendChild(figure.ok ? figureImage(figure.n, figure.svg) : block('err', figure.error.message));
+      } catch (e) {
+        entry.appendChild(block('err', e.message));
+      }
+    }
+  }
+
+  // Runs one entry: `shown` in the transcript, then its output exactly as
+  // the interpreter wrote it, then its error, if any, set apart, then the
+  // figures it changed, the request being `request`. The entry goes to the
+  // shared history as shown as it is run, and the workspace and the file
+  // browser are refreshed afterwards, whatever the evaluation answered.
+  // The completion list goes as the entry starts, whichever pane ran it,
+  // and Tab completes nothing until the entry is done. Resolves to the
+  // answer, or null when the server refused the request.
+  async function runOne(shown, request) {
+    entryRunning = true;
+    hideCompletions();
+    try {
+      const entry = element('div', 'entry');
+      entry.appendChild(block('in', shown));
+      transcript.appendChild(entry);
+      scrollToEnd();
+      remember(shown);
+      let answer = null;
+      try {
+        answer = await call(request);
+        if (answer.out) {
+          entry.appendChild(block('out', answer.out));
+        }
+        if (!answer.ok) {
+          entry.appendChild(errorBlock(answer.error));
+        }
+      } catch (e) {
+        entry.appendChild(block('err', e.message));
+      }
+      await showFigures(entry);
+      scrollToEnd();
+      refreshWorkspace();
+      refreshFiles();
+      return answer;
+    } finally {
+      entryRunning = false;
+    }
+  }
+
+  // Entries, from the command window, the history or the editor, run one
+  // at a time, each once the one before has shown its figures, so no entry
+  // can change a figure before the one before it has been shown as it was.
+  let entries = Promise.resolve();
+
+  function runEntry(shown, request) {
+    const answer = entries.then(function () {
+      return runOne(shown, request);
+    });
+    entries = answer.catch(function () {
+      return null;
+    });
     return answer;
   }
 
@@ -235,6 +322,7 @@
 
   async function enter() {
     const entry = input.value;
+    hideCompletions();
     if (busy || entry.trim() === '') {
       return;
     }
@@ -280,7 +368,189 @@
     return input.value.indexOf('\n', input.selectionEnd) === -1;
   }
 
+  // ---- Tab completion ----------------------------------------------------
+
+  // Escape was pressed in the input: the next Tab moves the focus on.
+  let inputTabMoves = false;
+
+  function hideCompletions() {
+    if (!completionList.hidden) {
+      completionList.hidden = true;
+      completionList.replaceChildren();
+    }
+  }
+
+  // Several completions, listed under the prompt until the next key.
+  function listCompletions(items) {
+    completionList.replaceChildren();
+    items.forEach(function (item) {
+      completionList.appendChild(element('span', 'item', item));
+    });
+    completionList.hidden = false;
+  }
+
+  // The longest prefix every item shares, compared a character (a code
+  // point) at a time, so a character outside the basic plane is never cut.
+  function commonPrefix(items) {
+    let shared = Array.from(items[0]);
+    items.slice(1).forEach(function (item) {
+      const chars = Array.from(item);
+      let k = 0;
+      while (k < shared.length && k < chars.length && shared[k] === chars[k]) {
+        k += 1;
+      }
+      shared = shared.slice(0, k);
+    });
+    return shared.join('');
+  }
+
+  // Where the quoted string the cursor is in opens, or -1 when it is in
+  // none: the cursor's line read as the lexer reads quotes. A ' after a
+  // letter, a digit, _, ), ], }, . or a quote that closed a string is a
+  // transpose, and any other ' opens a string; a " always opens one; inside
+  // a string its quote doubled is one quote of the text.
+  function stringStart(text, cursor) {
+    const from = text.lastIndexOf('\n', cursor - 1) + 1;
+    let open = -1;
+    let quote = '';
+    let closed = false;
+    for (let k = from; k < cursor; k += 1) {
+      const c = text[k];
+      if (open !== -1) {
+        if (c === quote) {
+          if (k + 1 < cursor && text[k + 1] === quote) {
+            k += 1;
+          } else {
+            open = -1;
+            closed = true;
+          }
+        }
+        continue;
+      }
+      if (c === '"') {
+        open = k;
+        quote = c;
+      } else if (c === "'") {
+        const before = k > from ? text[k - 1] : '';
+        if (!closed && !/[A-Za-z0-9_)\]}.]/.test(before)) {
+          open = k;
+          quote = c;
+        }
+      }
+      closed = false;
+    }
+    return open;
+  }
+
+  // Puts `text` in place of the `length` characters before the cursor,
+  // provided the input still holds what it held when Tab was pressed.
+  function replaceBefore(snapshot, length, text) {
+    if (input.value !== snapshot.value || input.selectionStart !== snapshot.at || input.selectionEnd !== snapshot.at) {
+      return false;
+    }
+    input.setRangeText(text, snapshot.at - length, snapshot.at, 'end');
+    resize();
+    return true;
+  }
+
+  // One completion replaces what was typed; several replace it with what
+  // they share and are listed; none does nothing.
+  function applyCompletions(snapshot, typed, items, escape) {
+    if (items.length === 0) {
+      return;
+    }
+    const replacement = items.length === 1 ? items[0] : commonPrefix(items);
+    if (replaceBefore(snapshot, typed.length, escape(replacement)) && items.length > 1) {
+      listCompletions(items);
+    }
+  }
+
+  // Tab outside a string: the name before the cursor, through
+  // completions, as the terminal completes it; no name, or one that starts
+  // with a digit, completes nothing.
+  async function completeName(snapshot) {
+    const word = /[A-Za-z0-9_]*$/.exec(snapshot.value.slice(0, snapshot.at))[0];
+    if (word === '' || /^[0-9]/.test(word)) {
+      return;
+    }
+    const answer = await call({ op: 'completions', prefix: word });
+    if (answer.ok) {
+      applyCompletions(snapshot, word, answer.items, function (text) {
+        return text;
+      });
+    }
+  }
+
+  // Tab inside a quoted string: a file or folder name of the current
+  // folder, the string's folder part joined to it, through cwd and files;
+  // a folder gets a trailing /. A folder the listing refuses, or an
+  // absolute one, completes nothing.
+  async function completePath(snapshot, open) {
+    const quote = snapshot.value[open];
+    const raw = snapshot.value.slice(open + 1, snapshot.at);
+    const cut = raw.lastIndexOf('/') + 1;
+    const rawName = raw.slice(cut);
+    const doubled = quote + quote;
+    const unquote = function (text) {
+      return text.split(doubled).join(quote);
+    };
+    const dir = unquote(raw.slice(0, cut));
+    if (dir.startsWith('/') || dir.indexOf(':') !== -1 || dir.indexOf('\\') !== -1) {
+      return;
+    }
+    const here = await call({ op: 'cwd' });
+    if (!here.ok || here.cwd === null) {
+      return;
+    }
+    const listing = await call({ op: 'files', path: joined(here.cwd, dir) });
+    if (!listing.ok) {
+      return;
+    }
+    const name = unquote(rawName);
+    const items = listing.entries
+      .filter(function (e) {
+        return e.name.startsWith(name);
+      })
+      .map(function (e) {
+        return e.dir ? e.name + '/' : e.name;
+      });
+    applyCompletions(snapshot, rawName, items, function (text) {
+      return text.split(quote).join(doubled);
+    });
+  }
+
+  function complete() {
+    const at = input.selectionStart;
+    if (busy || entryRunning || at !== input.selectionEnd) {
+      return;
+    }
+    const snapshot = { value: input.value, at: at };
+    const open = stringStart(snapshot.value, at);
+    const done = open === -1 ? completeName(snapshot) : completePath(snapshot, open);
+    done.catch(function () {});
+  }
+
   input.addEventListener('keydown', function (ev) {
+    // A modifier pressed on its way to another key is not the next key.
+    if (ev.key === 'Shift' || ev.key === 'Control' || ev.key === 'Alt' || ev.key === 'Meta') {
+      return;
+    }
+    hideCompletions();
+    if (ev.key === 'Escape') {
+      inputTabMoves = true;
+      return;
+    }
+    if (ev.key === 'Tab' && !ev.ctrlKey && !ev.altKey && !ev.metaKey && !ev.isComposing) {
+      if (inputTabMoves || ev.shiftKey) {
+        // The browser moves the focus on, so the keyboard can leave.
+        inputTabMoves = false;
+        return;
+      }
+      ev.preventDefault();
+      complete();
+      return;
+    }
+    inputTabMoves = false;
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
       enter();
@@ -291,6 +561,10 @@
       ev.preventDefault();
       walk(1);
     }
+  });
+
+  input.addEventListener('blur', function () {
+    inputTabMoves = false;
   });
 
   input.addEventListener('input', resize);
@@ -343,8 +617,11 @@
 
   // ---- The file browser --------------------------------------------------
 
-  // The folder listed, relative to the file root and normalised as the
-  // server answered it: '' is the root.
+  // The file browser is the current folder: it lists the folder cwd
+  // answers, and a click on a folder, or on .., moves the current folder
+  // there with cwd before listing it. `folder` is the folder listed,
+  // relative to the file root and normalised as the server answered it:
+  // '' is the root.
   let folder = '';
 
   function joined(path, name) {
@@ -390,7 +667,7 @@
     button.type = 'button';
     button.title = label;
     button.addEventListener('click', function () {
-      listFolder(path, true);
+      enterFolder(path);
     });
     li.appendChild(button);
     return li;
@@ -417,7 +694,7 @@
     return li;
   }
 
-  function showFiles(answer) {
+  function showFiles(answer, remark) {
     filesPath.textContent = where(answer.root, answer.path);
     filesList.replaceChildren();
     // The way up is the page's own, and there is none at the root.
@@ -436,22 +713,27 @@
         element('li', 'note', 'Only the first ' + answer.entries.length + ' entries are shown.')
       );
     }
+    if (remark) {
+      filesList.appendChild(element('li', 'note', remark));
+    }
   }
 
   function showFilesError(text) {
     filesList.replaceChildren(element('li', 'note', text));
   }
 
-  // Lists `path`; when it cannot be listed, most often because code
-  // deleted it, falls back to the root once.
-  function listFolder(path, fallBack) {
+  // Lists `path`, with `remark`, when there is one, noted under it. A
+  // folder that cannot be listed, gone between the question and the
+  // listing, gives way to the root, with the reason noted, so there is
+  // always a folder to click.
+  function listFolder(path, remark) {
     return call({ op: 'files', path: path })
       .then(function (answer) {
         if (answer.ok) {
           folder = answer.path;
-          showFiles(answer);
-        } else if (fallBack && path !== '') {
-          return listFolder('', false);
+          showFiles(answer, remark);
+        } else if (path !== '') {
+          return listFolder('', answer.error.message);
         } else {
           showFilesError(answer.error.message);
         }
@@ -462,8 +744,48 @@
       });
   }
 
-  function refreshFiles() {
-    return listFolder(folder, true);
+  // Lists the folder a cwd answer names. A current folder that is not
+  // under the root, which confinement prevents unless it was deleted, is
+  // answered null: the root is listed then, with a note, so a click there
+  // moves the current folder back under it.
+  function listCurrent(answer, remark) {
+    if (answer.cwd === null) {
+      return listFolder('', 'The current folder is not under the file root; this is the root.');
+    }
+    return listFolder(answer.cwd, remark);
+  }
+
+  // The current folder, listed: when the page loads, after every entry and
+  // after every save.
+  function refreshFiles(remark) {
+    return call({ op: 'cwd' })
+      .then(function (answer) {
+        if (!answer.ok) {
+          showFilesError(answer.error.message);
+          return undefined;
+        }
+        return listCurrent(answer, remark);
+      })
+      .catch(function (e) {
+        showFilesError(e.message);
+      });
+  }
+
+  // A click on a folder, or on ..: the current folder moves there, as cd
+  // would move it, and the file browser lists it. A folder that cannot be
+  // entered, most often because code deleted it, leaves the current folder
+  // where it was, listed again with the reason.
+  function enterFolder(path) {
+    return call({ op: 'cwd', path: path })
+      .then(function (answer) {
+        if (!answer.ok) {
+          return refreshFiles(answer.error.message);
+        }
+        return listCurrent(answer, null);
+      })
+      .catch(function (e) {
+        showFilesError(e.message);
+      });
   }
 
   // ---- The editor --------------------------------------------------------

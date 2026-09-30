@@ -109,11 +109,14 @@ are `eval` (with the error's stack of frames on request), `complete` (is
 this entry finished?), `workspace` (with value previews on request),
 `completions`, `files` (one folder under the folder the session started
 in), `history` and `history_add` (the command history the terminal keeps),
-and `read_file`, `write_file` and `run_file` (one file under that folder,
-read, saved or run); a failed evaluation or a malformed line is an answer,
-and the process exits 0 at end of input. `docs/modules/U0-ui-foundations.md`,
-`docs/modules/U2-ui-desktop.md` and `docs/modules/U3-ui-editor.md` are the
-full description.
+`read_file`, `write_file` and `run_file` (one file under that folder,
+read, saved or run), `figures` and `figure` (the open figures, and one of
+them as SVG text) and `cwd` (the current folder, read or moved); a failed
+evaluation or a malformed line is an answer, and the process exits 0 at
+end of input. In every client mode `cd` cannot leave the folder the
+session started in. `docs/modules/U0-ui-foundations.md`,
+`docs/modules/U2-ui-desktop.md`, `docs/modules/U3-ui-editor.md` and
+`docs/modules/U4-ui-figures.md` are the full description.
 
 ```
 $ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
@@ -124,11 +127,14 @@ $ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
 middle is the command window: type an entry, press Enter, and its output
 appears exactly as the terminal would print it. Enter inserts a newline
 instead while a `for`, an `if` or a bracket is still open, Shift+Enter
-always does, and Up and Down walk the command history. Around it are a file
-browser of the folder the server started in, a workspace listing every
-variable with a preview of its value, its size and its class, and the
-command history, shared with the terminal, where a click recalls an entry
-and a double-click runs it. Above the command window is an editor:
+always does, Up and Down walk the command history, and Tab completes a
+name, or a file name inside a quoted string. A plot appears inline, under
+the entry that drew it. Around it are a file browser of the current
+folder, which `cd` moves and a click on a folder moves in turn, inside the
+folder the server started in, a workspace listing every variable with a
+preview of its value, its size and its class, and the command history,
+shared with the terminal, where a click recalls an entry and a
+double-click runs it. Above the command window is an editor:
 double-click a file in the file browser to open it in a tab, with line
 numbers, edit it, save it with Ctrl+S, run it with F5 or run a selection
 with F9; an error takes the cursor to the line that raised it, and each
@@ -391,6 +397,12 @@ z
   operations confined to the file root, never through a link out of it,
   and every API call refused unless `Sec-Fetch-Site`, when a browser
   sends it, says the page is the server's own
+- the desktop's figures and folder: every plot shown inline under the
+  entry that drew it, as an image of its SVG and never as markup, a
+  snapshot per entry; Tab completion in the command window, of names and
+  of file names inside a string; the file browser as the current folder,
+  moved by `cd` and moving it, and `cd` in every client mode confined to
+  the folder the session started in
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.

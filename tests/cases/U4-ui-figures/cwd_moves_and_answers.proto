@@ -1,0 +1,6 @@
+% covers: 4 - cwd answers the current folder relative to the file root with / separators, "" at the root; cwd with path tree moves it there and answers tree, and an eval of ls then writes tree's names, a.txt and sub, one per line; cwd with tree/sub, a path from the root, answers tree/sub; cwd with "" moves back to the root and answers ""
+{"id":1,"op":"cwd"}
+{"id":2,"op":"cwd","path":"tree"}
+{"id":3,"op":"eval","code":"ls"}
+{"id":4,"op":"cwd","path":"tree/sub"}
+{"id":5,"op":"cwd","path":""}

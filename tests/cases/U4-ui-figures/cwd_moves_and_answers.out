@@ -1,0 +1,5 @@
+{"id":1,"ok":true,"cwd":""}
+{"id":2,"ok":true,"cwd":"tree"}
+{"id":3,"ok":true,"out":"a.txt\nsub\n"}
+{"id":4,"ok":true,"cwd":"tree/sub"}
+{"id":5,"ok":true,"cwd":""}

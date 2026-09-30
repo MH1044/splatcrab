@@ -1,8 +1,9 @@
 //! Tree-walking interpreter.
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent, is_separator};
 use std::rc::Rc;
 use std::time::{Instant, SystemTime};
 
@@ -165,14 +166,17 @@ pub struct Interp {
     /// `addpath` and `rmpath`, every file builtin, `ls`, `dir` and
     /// `system`. Seeded from the process's working directory and never read
     /// from `std::env` again; `cd` changes it through [`Interp::set_cwd`]
-    /// (cycle 13), and nothing ever changes the process's own.
+    /// (cycle 13), and the protocol's `cwd` through
+    /// [`Interp::enter_folder`] (cycle U4), and nothing ever changes the
+    /// process's own.
     pub cwd: PathBuf,
     /// The folder the protocol's `files` lists under (cycle U2): fixed once
     /// by each client mode as it starts, `--protocol`, `--ui` and
     /// `--http-stdio`, to [`crate::files::session_root`], and never changed
     /// afterwards, whatever `cd` does to `cwd`. `None` for a script, the
     /// REPL and an interpreter a test builds, where `files` refuses every
-    /// path as outside the root.
+    /// path as outside the root. Since cycle U4 it also confines `cd`
+    /// ([`Interp::set_cwd`]) whenever it is set.
     pub file_root: Option<PathBuf>,
     /// The folders `addpath` added, first searched first. The current
     /// folder is searched before all of them.
@@ -771,14 +775,37 @@ impl Interp {
     /// `pwd` never shows a `..`; the process's own working directory is
     /// never touched. Every cached file lookup is stale afterwards, since
     /// the current folder is the first folder of the path.
+    ///
+    /// When [`Interp::file_root`] is set, which every client mode does and
+    /// nothing else does (cycle U4), a folder whose canonical path is not
+    /// the root or inside it, compared component by component, is refused
+    /// as outside the root, so the command window and the file browser stay
+    /// on one folder; a target that is not a folder keeps its own message.
+    /// The target is canonicalised once, whole: the root, being canonical,
+    /// is a verbatim `\\?\` path on Windows, and nothing is pushed onto it.
     pub(crate) fn set_cwd(&mut self, dir: &str) -> R<()> {
         let target = normalize(&self.resolve_dir(dir));
         if !target.is_dir() {
             bail!(error::cd_not_a_folder(dir));
         }
-        self.cwd = target;
-        self.generation += 1;
+        if let Some(root) = &self.file_root {
+            let inside = std::fs::canonicalize(&target).is_ok_and(|c| c.starts_with(root));
+            if !inside {
+                bail!(error::cd_outside_root(dir));
+            }
+        }
+        self.enter_folder(target);
         Ok(())
+    }
+
+    /// Makes `folder`, a full path already judged, the current folder, and
+    /// makes every cached lookup stale, since the current folder is the
+    /// first folder of the path: what `cd` does once it has judged its
+    /// target, and the protocol's `cwd` once it has judged its path (cycle
+    /// U4).
+    pub(crate) fn enter_folder(&mut self, folder: PathBuf) {
+        self.cwd = folder;
+        self.generation += 1;
     }
 
     /// The folders a name is looked up in, in order: the current folder,
@@ -2536,10 +2563,34 @@ fn file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
 /// `p` with its `.` components dropped and each `..` taking the component
 /// before it away, without asking the file system: `cd ..` goes up a
 /// folder, and `pwd` never shows a `..`. A `..` at the root stays there.
+///
+/// The rule since cycle 13 is a walk: `p`'s components pushed one at a
+/// time onto an empty `PathBuf`, a `..` popping the last one unless that is
+/// the root or the prefix ([`walk`]). A push onto a verbatim `\\?\` path
+/// rebuilds the whole path, so the walk costs time quadratic in the
+/// components there: 186 s for a `cd` of 64,000 from a verbatim current
+/// folder (cycle U4). This builds the walk's result instead, in
+/// time linear in `p`'s length (invariant 6), and the text is the walk's,
+/// byte for byte, on every path: `tests::normalize_is_the_walk` holds the
+/// walk as its reference. As [`crate::files`]'s `joined` does, it pushes
+/// nothing a component; it keeps the names the walk would keep and writes
+/// them once. Three things a walk does on Windows are kept with them: a
+/// component that names a drive or a share (`a\C:`) is put in place of
+/// everything before it; a push onto a verbatim path splits the component
+/// on `/` too, which a verbatim path does not read as a separator; and a
+/// `\\?\UNC\server\` with no share takes the first name after it as the
+/// share, which no `..` takes away.
 pub(crate) fn normalize(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for c in p.components() {
+    build(p).unwrap_or_else(|| walk(PathBuf::new(), p.components()))
+}
+
+/// The walk [`normalize`] builds the result of: `comps` pushed onto `out`
+/// one at a time, each `..` popping the last component unless that is the
+/// root or the prefix. Reached only if [`build`] meets a parse no path
+/// has, which `tests::normalize_is_the_walk` checks it never does; the
+/// tests hold it as the reference `build` is checked against.
+fn walk<'a>(mut out: PathBuf, comps: impl IntoIterator<Item = Component<'a>>) -> PathBuf {
+    for c in comps {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
@@ -2554,6 +2605,309 @@ pub(crate) fn normalize(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// [`walk`]'s result, built in time linear in `p`'s length: `None` only on
+/// a parse no path has, a prefix or a root after a name, or a component
+/// whose text and whose own parse as a path disagree.
+fn build(p: &Path) -> Option<PathBuf> {
+    let comps: Vec<Component> = p.components().collect();
+    // A push of a component that names a drive or a share puts it in place
+    // of all the walk had, so only what follows the last one counts.
+    let last = comps.iter().rposition(|c| match c {
+        Component::Normal(name) => replaces(name),
+        _ => false,
+    });
+    if let Some(i) = last {
+        let Component::Normal(first) = comps[i] else {
+            return None;
+        };
+        return Raw::after(first)?.walk(&comps[i + 1..]);
+    }
+    let mut prefix = None;
+    let mut root = false;
+    let mut body = 0;
+    for c in &comps {
+        match c {
+            Component::Prefix(pc) => prefix = Some(*pc),
+            Component::RootDir => root = true,
+            Component::CurDir => {}
+            _ => break,
+        }
+        body += 1;
+    }
+    match prefix {
+        Some(pc) if pc.kind().is_verbatim() => verbatim(pc, root, &comps[body..]),
+        _ => Raw::head(prefix, root).walk(&comps[body..]),
+    }
+}
+
+/// True when a push of `name` puts it in place of the whole path: it has a
+/// prefix of its own, a drive (`C:`, `c:x`) or a share (`//server/share`),
+/// or is absolute. Never on Unix, where no component starts with `/`.
+fn replaces(name: &OsStr) -> bool {
+    let path = Path::new(name);
+    path.is_absolute() || matches!(path.components().next(), Some(Component::Prefix(_)))
+}
+
+/// A verbatim path's walk: `prefix`, a root if `root`, then `body`. Every
+/// push onto a verbatim path rebuilds it from its components with `\`
+/// between them, splitting the pushed text on `/` and `\` and resolving
+/// its own `.`, `..` and root, so the walk is the names it keeps, written
+/// once after the prefix. A `\\?\UNC\server\` with no share reads the first
+/// name written after it as the share once the path is rebuilt, and from
+/// then on that name is part of the prefix.
+fn verbatim<'a>(
+    prefix: PrefixComponent<'a>,
+    root: bool,
+    body: &[Component<'a>],
+) -> Option<PathBuf> {
+    let unshared = matches!(prefix.kind(), Prefix::VerbatimUNC(_, share) if share.is_empty());
+    let mut share: Option<&OsStr> = None;
+    let mut root = root;
+    let mut names: Vec<&OsStr> = Vec::new();
+    for &c in body {
+        match c {
+            Component::Normal(name) => {
+                for part in Path::new(name).components() {
+                    match part {
+                        Component::RootDir => {
+                            names.clear();
+                            root = true;
+                        }
+                        Component::ParentDir => {
+                            names.pop();
+                        }
+                        Component::Normal(n) => names.push(n),
+                        Component::CurDir => {}
+                        Component::Prefix(_) => return None,
+                    }
+                }
+                // The rebuilt text is read again: anything written after
+                // the prefix starts with the root's `\`.
+                root |= !names.is_empty();
+                if unshared && share.is_none() && !names.is_empty() {
+                    share = Some(names.remove(0));
+                    root = !names.is_empty();
+                }
+            }
+            Component::ParentDir => {
+                names.pop();
+            }
+            Component::CurDir => {}
+            Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    let mut text = OsString::from(prefix.as_os_str());
+    if let Some(share) = share {
+        text.push("\\");
+        text.push(share);
+    }
+    if root {
+        text.push("\\");
+    }
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            text.push("\\");
+        }
+        text.push(name);
+    }
+    Some(PathBuf::from(text))
+}
+
+/// The walk on a path that is not verbatim, held as the pieces of its text
+/// so a push appends and a `..` truncates, each in time linear in what it
+/// adds or takes away, as `PathBuf` itself does apart from reading the
+/// prefix again at every step, which this reads once.
+struct Raw<'a> {
+    /// The text in order: the prefix, each separator as it was written,
+    /// `.`s, and the names and `..`s a `..` can take away.
+    segs: Vec<&'a OsStr>,
+    /// `segs.len()` just after each name or `..` after the root.
+    ends: Vec<usize>,
+    /// How many of `segs` are the prefix: none, one, or two once a bare
+    /// `\\.\` has read the name written straight after it as its device.
+    prefix: usize,
+    /// The prefix is a drive, `C:`: a name pushed onto it alone follows it
+    /// with no separator, and a `.` straight after it is not the body's.
+    drive: bool,
+    /// The prefix names a share or a device, below which a path has a root
+    /// with no separator written.
+    implicit_root: bool,
+    /// The prefix is `\\.\` with no device named.
+    unnamed_device: bool,
+}
+
+impl<'a> Raw<'a> {
+    fn new(prefix: Option<PrefixComponent<'a>>) -> Raw<'a> {
+        let kind = prefix.map(|pc| pc.kind());
+        Raw {
+            segs: prefix.map(|pc| pc.as_os_str()).into_iter().collect(),
+            ends: Vec::new(),
+            prefix: usize::from(prefix.is_some()),
+            drive: matches!(kind, Some(Prefix::Disk(_))),
+            implicit_root: kind.is_some_and(|k| !matches!(k, Prefix::Disk(_))),
+            unnamed_device: matches!(kind, Some(Prefix::DeviceNS(name)) if name.is_empty()),
+        }
+    }
+
+    /// The walk once it has pushed a prefix and a root, which it writes as
+    /// the prefix and then `\` (or `/` on Unix).
+    fn head(prefix: Option<PrefixComponent<'a>>, root: bool) -> Raw<'a> {
+        let mut raw = Raw::new(prefix);
+        if root {
+            raw.segs.push(OsStr::new(std::path::MAIN_SEPARATOR_STR));
+        }
+        raw
+    }
+
+    /// The walk once it has pushed `first`, a component that puts itself
+    /// in place of the path: `first`'s own text, read as a path.
+    fn after(first: &'a OsStr) -> Option<Raw<'a>> {
+        let Some(Component::Prefix(pc)) = Path::new(first).components().next() else {
+            return None;
+        };
+        if pc.kind().is_verbatim() {
+            return None;
+        }
+        let mut raw = Raw::new(Some(pc));
+        raw.split(first, pc.as_os_str().as_encoded_bytes().len(), false)?;
+        Some(raw)
+    }
+
+    /// The rest of the walk, `rest` pushed and popped, and its text.
+    fn walk(mut self, rest: &[Component<'a>]) -> Option<PathBuf> {
+        for &c in rest {
+            match c {
+                Component::Normal(name) => self.push(name)?,
+                Component::ParentDir => self.pop(),
+                Component::CurDir => {}
+                Component::Prefix(_) | Component::RootDir => return None,
+            }
+        }
+        let mut text = OsString::new();
+        for seg in &self.segs {
+            text.push(seg);
+        }
+        Some(PathBuf::from(text))
+    }
+
+    /// A push of `name`, which has no prefix: one that starts with a
+    /// separator keeps only the prefix before it; any other follows a
+    /// separator unless the text ends in one or is a drive alone.
+    fn push(&mut self, name: &'a OsStr) -> Option<()> {
+        let rooted = name
+            .as_encoded_bytes()
+            .first()
+            .is_some_and(|&b| is_separator(char::from(b)));
+        let device = !rooted && self.unnamed_device && self.segs.len() == self.prefix;
+        if rooted {
+            self.segs.truncate(self.prefix);
+            self.ends.clear();
+        } else if !device && self.needs_separator() {
+            self.segs.push(OsStr::new(std::path::MAIN_SEPARATOR_STR));
+        }
+        self.split(name, 0, device)
+    }
+
+    /// A `..`: the last name or `..` after the root goes, with whatever
+    /// follows it and the separators before it; with none, nothing does.
+    fn pop(&mut self) {
+        if self.ends.pop().is_some() {
+            let to = match self.ends.last() {
+                Some(&end) => end,
+                None => self.before_body(),
+            };
+            self.segs.truncate(to);
+        }
+    }
+
+    fn needs_separator(&self) -> bool {
+        if self.drive && self.segs.len() == self.prefix {
+            return false;
+        }
+        self.segs
+            .last()
+            .and_then(|seg| seg.as_encoded_bytes().last())
+            .is_some_and(|&b| !is_separator(char::from(b)))
+    }
+
+    /// How many of `segs` a `..` never takes: the prefix, a root, and a
+    /// `.` straight after a drive with no root.
+    fn before_body(&self) -> usize {
+        let n = self.prefix;
+        match self.segs.get(n) {
+            Some(seg) if is_separator_seg(seg) => n + 1,
+            Some(seg)
+                if !self.implicit_root
+                    && seg.as_encoded_bytes() == b"."
+                    && self
+                        .segs
+                        .get(n + 1)
+                        .is_none_or(|next| is_separator_seg(next)) =>
+            {
+                n + 1
+            }
+            _ => n,
+        }
+    }
+
+    /// Appends `text` from byte `from` on as its pieces: each separator,
+    /// each `.`, and each name or `..`, the names taken from `text`'s own
+    /// parse as a path, since safe code cannot cut an `OsStr` at a byte;
+    /// `None` if the bytes and the parse disagree. With `device`, the first
+    /// run of `text` joins the prefix, as the name of a bare `\\.\`'s
+    /// device.
+    fn split(&mut self, text: &'a OsStr, from: usize, device: bool) -> Option<()> {
+        let bytes = text.as_encoded_bytes();
+        let mut names = Path::new(text).components().filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            Component::ParentDir => Some(OsStr::new("..")),
+            _ => None,
+        });
+        let mut device = device;
+        let mut i = from;
+        while i < bytes.len() {
+            if is_separator(char::from(bytes[i])) {
+                self.segs.push(if bytes[i] == b'/' {
+                    OsStr::new("/")
+                } else {
+                    OsStr::new("\\")
+                });
+                i += 1;
+                continue;
+            }
+            let end = bytes[i..]
+                .iter()
+                .position(|&b| is_separator(char::from(b)))
+                .map_or(bytes.len(), |k| i + k);
+            let run = &bytes[i..end];
+            if run == b"." {
+                self.segs.push(OsStr::new("."));
+            } else {
+                let name = names.next()?;
+                if name.as_encoded_bytes() != run {
+                    return None;
+                }
+                self.segs.push(name);
+                if !device {
+                    self.ends.push(self.segs.len());
+                }
+            }
+            if device {
+                self.prefix += 1;
+                self.unnamed_device = false;
+                device = false;
+            }
+            i = end;
+        }
+        names.next().is_none().then_some(())
+    }
+}
+
+/// True when `seg` is one separator.
+fn is_separator_seg(seg: &OsStr) -> bool {
+    matches!(seg.as_encoded_bytes(), [b] if is_separator(char::from(*b)))
 }
 
 /// True when `p` is a file whose name is spelled exactly as asked.
@@ -5991,6 +6345,318 @@ mod tests {
         assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
         assert_eq!(normalize(Path::new("/..")), PathBuf::from("/"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder under the temporary folder holding `root/sub` and
+    /// `outside`, removed when dropped; the interpreter's file root is
+    /// `root` canonicalised, as a client mode fixes it, and its current
+    /// folder `root` as spelled.
+    struct CdFixture(PathBuf);
+
+    impl Drop for CdFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cd_fixture(name: &str) -> (CdFixture, Interp) {
+        let dir =
+            std::env::temp_dir().join(format!("splatcrab-cd-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("root").join("sub")).unwrap();
+        std::fs::create_dir_all(dir.join("outside")).unwrap();
+        std::fs::write(dir.join("root").join("file.txt"), "x").unwrap();
+        let mut it = Interp::with_output(Box::new(io::sink()));
+        it.file_root = Some(std::fs::canonicalize(dir.join("root")).unwrap());
+        it.cwd = dir.join("root");
+        (CdFixture(dir), it)
+    }
+
+    /// Cycle U4: with a file root, `cd` to a folder outside it is refused
+    /// with the target as written, and nothing moves; a target that is not
+    /// a folder keeps cycle 13's message; inside the root `cd` works as
+    /// before and bumps the generation; with no root it is unconfined.
+    #[test]
+    fn cd_is_confined_to_the_file_root_when_one_is_set() {
+        let (d, mut it) = cd_fixture("confined");
+        let root = d.0.join("root");
+        for dir in ["..", "../..", "sub/../..", "../outside"] {
+            assert_eq!(
+                it.set_cwd(dir).unwrap_err().msg,
+                format!("Cannot CD to {dir}: it is outside the file root.")
+            );
+            assert_eq!(it.cwd, root, "{dir}");
+        }
+        let absolute = d.0.join("outside").display().to_string();
+        assert_eq!(
+            it.set_cwd(&absolute).unwrap_err().msg,
+            format!("Cannot CD to {absolute}: it is outside the file root.")
+        );
+        for dir in ["nope", "../missing", "file.txt"] {
+            assert_eq!(
+                it.set_cwd(dir).unwrap_err().msg,
+                format!("Cannot CD to {dir} (Name is nonexistent or not a directory).")
+            );
+        }
+        let g = it.generation;
+        it.set_cwd("sub").unwrap();
+        assert_eq!(it.cwd, root.join("sub"));
+        assert_eq!(it.generation, g + 1);
+        assert_eq!(
+            it.set_cwd("../..").unwrap_err().msg,
+            "Cannot CD to ../..: it is outside the file root."
+        );
+        it.set_cwd("..").unwrap();
+        assert_eq!(it.cwd, root);
+        // The root itself, spelled any way that reaches it, is inside.
+        it.set_cwd(&root.display().to_string()).unwrap();
+        it.set_cwd(".").unwrap();
+        assert_eq!(it.cwd, root);
+        // No root, as in the REPL and script mode: `cd` goes anywhere.
+        it.file_root = None;
+        it.set_cwd("..").unwrap();
+        assert_eq!(it.cwd, d.0);
+        it.set_cwd("outside").unwrap();
+        assert_eq!(it.cwd, d.0.join("outside"));
+    }
+
+    /// Cycle U4, on Unix: a `cd` through a link that leads out of the root
+    /// is refused, judged on the canonical path, and one through a link
+    /// that stays inside is accepted, the current folder keeping the
+    /// link's own name.
+    #[cfg(unix)]
+    #[test]
+    fn cd_through_a_link_is_judged_by_where_it_leads() {
+        use std::os::unix::fs::symlink;
+        let (d, mut it) = cd_fixture("links");
+        let root = d.0.join("root");
+        symlink(d.0.join("outside"), root.join("out")).unwrap();
+        symlink(root.join("sub"), root.join("in")).unwrap();
+        assert_eq!(
+            it.set_cwd("out").unwrap_err().msg,
+            "Cannot CD to out: it is outside the file root."
+        );
+        assert_eq!(it.cwd, root);
+        it.set_cwd("in").unwrap();
+        assert_eq!(it.cwd, root.join("in"));
+        it.set_cwd("..").unwrap();
+        assert_eq!(it.cwd, root);
+    }
+
+    /// The same on Windows where a directory link can be made, which needs
+    /// developer mode or elevation; elsewhere the test has nothing to do.
+    #[cfg(windows)]
+    #[test]
+    fn cd_through_a_link_is_judged_by_where_it_leads() {
+        use std::os::windows::fs::symlink_dir;
+        let (d, mut it) = cd_fixture("links");
+        let root = d.0.join("root");
+        if symlink_dir(d.0.join("outside"), root.join("out")).is_err() {
+            return;
+        }
+        symlink_dir(root.join("sub"), root.join("in")).unwrap();
+        assert_eq!(
+            it.set_cwd("out").unwrap_err().msg,
+            "Cannot CD to out: it is outside the file root."
+        );
+        assert_eq!(it.cwd, root);
+        it.set_cwd("in").unwrap();
+        assert_eq!(it.cwd, root.join("in"));
+    }
+
+    /// The paths `normalize_is_the_walk` checks by hand: every shape of
+    /// prefix, `.` and `..` at the root and past it, and on Windows the
+    /// three things a walk does that a stack of names alone would not.
+    fn tricky_paths() -> Vec<String> {
+        let mut paths: Vec<String> = [
+            "",
+            ".",
+            "..",
+            "./a",
+            "a/..",
+            "a/../..",
+            "../a",
+            "a/./b/../c",
+            "a//b///",
+            "a/b/.",
+            "/",
+            "/..",
+            "/a/./b/../c",
+            "//a//b/../",
+            "/a/b/../../..",
+            "/a\\b/..",
+        ]
+        .map(String::from)
+        .to_vec();
+        if cfg!(windows) {
+            paths.extend(
+                [
+                    r"C:",
+                    r"C:\",
+                    r"C:a\..\..",
+                    r"C:.\a\..",
+                    r"C:\x\..\..\y",
+                    r"c:/x/./y",
+                    r"\x\..\..",
+                    r"\\server\share",
+                    r"\\server\share\a\..\..",
+                    r"//server/share/a/b/..",
+                    r"\\.\COM1\a\..",
+                    r"\\.\\x\..",
+                    r"\\.\",
+                    r"\\?\",
+                    r"\\?\\a\..",
+                    r"\\?\C:",
+                    r"\\?\C:\x.\a\..\..\..",
+                    r"\\?\C:\x\.\a\.\..",
+                    r"\\?\Volume{1}\a\..\b",
+                    r"\\?\UNC",
+                    r"\\?\UNC\",
+                    r"\\?\UNC\s",
+                    r"\\?\UNC\s\",
+                    r"\\?\UNC\s\sh\a\..\..",
+                    r"\\?\UNC\s\\a",
+                    r"\\?\UNC\s\\a\..",
+                    r"\\?\UNC\s\\a\b\..\..\c",
+                    r"\\?\UNC\\\a\b\..",
+                    r"\\?\UNC\s\\a/b\..",
+                    r"\\?\UNC\s\\x/..\y",
+                    r"\\?\C:\x\a/b\..",
+                    r"\\?\C:\x\a/../b",
+                    r"\\?\C:\x\/a\..",
+                    r"\\?\C:\x\./.\..",
+                    r"\\?\C:\x\a/C:\..",
+                    r"C:\x\a\C:\b",
+                    r"C:\x\a\D:\..\y",
+                    r"C:\x\D:..\..\y",
+                    r"C:\x\D:.\y\..",
+                    r"C:\x\d:x\..\..",
+                    r"\\?\C:\x\D:\y",
+                    r"\\?\C:\x\D:/foo/\a\..",
+                    r"\\?\C:\x\D:/./././\..\a/./\..",
+                    r"\\?\C:\x\D:./a\..",
+                    r"\\?\C:\x\//s/sh\a\..\..",
+                    r"\\?\C:\x\//s/sh/\a\..",
+                    r"\\?\C:\x\//./\name\..\y",
+                    r"\\?\C:\x\//./\./y\..",
+                    r"\\?\C:\x\//./\/y\..",
+                    r"\\?\C:\x\//./x/y\..\..",
+                    r"\\?\C:\x\//?/C:/a\..",
+                    r"\\?\C:\x\//s\a",
+                ]
+                .map(String::from),
+            );
+        }
+        paths
+    }
+
+    /// Short paths made of the pieces a path can hold, drawn by a fixed
+    /// generator so every run checks the same ones.
+    fn drawn_paths(count: usize) -> Vec<String> {
+        let starts: &[&str] = if cfg!(windows) {
+            &[
+                "",
+                "/",
+                "\\",
+                "C:",
+                "C:\\",
+                "c:/",
+                "\\\\s\\sh\\",
+                "//s/sh/",
+                "\\\\.\\",
+                "\\\\.\\d\\",
+                "//./",
+                "\\\\?\\",
+                "\\\\?\\C:\\",
+                "\\\\?\\C:",
+                "\\\\?\\x\\",
+                "\\\\?\\UNC\\",
+                "\\\\?\\UNC\\s\\",
+                "\\\\?\\UNC\\s\\\\",
+                "\\\\?\\UNC\\s\\sh\\",
+            ]
+        } else {
+            &["", "/", "//", "./", "../"]
+        };
+        let pieces: &[&str] = &[
+            "a", "b", "x.", "..", ".", "", "...", "a b", "\u{e9}", "C:", "d:", "c:x", "UNC", "?",
+            "s", "//", "/", "\\", ".\\.", "//./", "//s/sh",
+        ];
+        let seps: &[&str] = if cfg!(windows) {
+            &["\\", "\\", "/", ""]
+        } else {
+            &["/", "/", ""]
+        };
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        (0..count)
+            .map(|_| {
+                let mut p = starts[next(starts.len())].to_string();
+                for _ in 0..next(9) {
+                    p.push_str(pieces[next(pieces.len())]);
+                    p.push_str(seps[next(seps.len())]);
+                }
+                p
+            })
+            .collect()
+    }
+
+    /// Cycle U4's fix: `normalize` builds exactly the text the walk of
+    /// pushes and pops gives, byte for byte, on every path checked, and
+    /// never needs the walk to do it.
+    #[test]
+    fn normalize_is_the_walk() {
+        for p in tricky_paths().iter().chain(drawn_paths(20_000).iter()) {
+            let walked = walk(PathBuf::new(), Path::new(p).components());
+            let built = build(Path::new(p));
+            assert_eq!(
+                built.as_ref().map(|b| b.as_os_str()),
+                Some(walked.as_os_str()),
+                "{p:?}"
+            );
+        }
+    }
+
+    /// Cycle U4's fix: 100,000 components, with `.`s and `..`s among
+    /// them, normalise in well under the bound on a verbatim path, where
+    /// the walk took minutes, and on a plain one, each to the right text.
+    #[test]
+    fn normalize_is_linear_in_the_components() {
+        let mut parts = Vec::new();
+        let mut kept = Vec::new();
+        for i in 0..100_000 {
+            if i % 5 == 4 {
+                parts.push("..".to_string());
+                kept.pop();
+            } else if i % 7 == 6 {
+                parts.push(".".to_string());
+            } else {
+                parts.push(format!("n{i}"));
+                kept.push(format!("n{i}"));
+            }
+        }
+        let sep = std::path::MAIN_SEPARATOR_STR;
+        let mut heads = vec![if cfg!(windows) { r"C:\x\" } else { "/x/" }];
+        if cfg!(windows) {
+            heads.push(r"\\?\C:\x\");
+        }
+        for head in heads {
+            let path = format!("{head}{}", parts.join(sep));
+            let start = Instant::now();
+            let got = normalize(Path::new(&path));
+            let took = start.elapsed();
+            assert_eq!(
+                got.as_os_str(),
+                OsStr::new(&format!("{head}{}", kept.join(sep))),
+                "{head}"
+            );
+            assert!(took < std::time::Duration::from_secs(5), "{head}: {took:?}");
+        }
     }
 
     #[test]

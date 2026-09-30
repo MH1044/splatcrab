@@ -1,0 +1,4 @@
+% covers: 2 - figure of an empty figure: after figure(5), figure with n 5 answers n and svg, the svg exactly the four LF-ended lines the spec's Design notes record for the empty figure, JSON-escaped; reading a figure is not figures, so the figures after it still has 5 changed
+{"id":1,"op":"eval","code":"figure(5);"}
+{"id":2,"op":"figure","n":5}
+{"id":3,"op":"figures"}

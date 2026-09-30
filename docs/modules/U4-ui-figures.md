@@ -101,14 +101,14 @@ bullet in Scope must be demonstrable by at least one acceptance test below.
 
 ## Design notes
 
-Filled in as decisions are made. Start from the
+Recorded as decisions are made. Start from the
 "Key designs to preserve" section of docs/ARCHITECTURE.md and record here:
 which files and types changed, which invariants were preserved (column-major
 storage, 1-based to 0-based conversion at the index boundary, the `end` stack,
 name resolution order, the output sink), and any deviation from this spec
 that was accepted deliberately.
 
-Settled at planning:
+Settled before the build:
 
 - **Separate operations again.** The eval answer does not carry the changed
   figures or the current folder, since U0's bytes are pinned; `figures`,
@@ -125,8 +125,8 @@ Settled at planning:
   record honest when a later entry changes the figure.
 - **The empty figure's SVG** is the one figure answer a golden case pins
   whole: it holds no coordinate a roundoff could change. `figure(5)` with
-  nothing drawn is, as cycle 12 writes it and as the binary gives it at
-  this cycle's planning, these four lines, each ending in LF:
+  nothing drawn is, as cycle 12 writes it and as the binary gave it before
+  this cycle's build, these four lines, each ending in LF:
 
   ```text
   <?xml version="1.0" encoding="UTF-8"?>
@@ -146,6 +146,140 @@ Settled at planning:
   flag of its own, and a script run with `run_file` or `run` inside a
   client session is confined too.
 
+Recorded during the build.
+
+**Files and types.** Changed: `src/protocol.rs` gains `figures`,
+`figure` (its bound a parameter), `figure_number`, `cwd`, the constant
+`MAX_INLINE_SVG` (33,554,432) and three rows of its module table;
+`src/files.rs` gains `current_folder(root, path)` and
+`folder_relative(root, dir)`, and the private `folder` (the three steps of
+the rule for a folder, which `list` now calls) and `under_root` (which
+`relative` now calls); `src/interp.rs`'s `Interp::set_cwd` gains the
+confinement and hands its judged target to the new
+`Interp::enter_folder(folder)`, which `cwd` calls too, so both bump the
+lookup generation alike, and `interp::normalize` builds its walk's
+result instead of walking (see the Deviations below);
+`src/error.rs` gains `request_figure_number`, `figure_not_open`,
+`figure_too_large` and `cd_outside_root` (`'path' must be a string` is
+U0's `request_not_string`); `src/http.rs`'s `CSP` gains
+`img-src 'self' blob:`; `src/ui/` gains the inline figures, Tab
+completion, the completion list under the prompt and the file browser on
+`cwd`; `tests/ui_server.rs` gains
+`figures_and_the_current_folder_answer_over_the_socket` and the policy
+checked exactly. `src/main.rs`, `src/plot/` and `tests/golden.rs` are
+unchanged.
+
+**Invariants.** Column-major storage, the one-based conversion in
+`eval_index_args`, the `end` stack and the name resolution order are
+untouched. The output sink is untouched: `figure` reads
+`Interp::figure_svg`, a string, and nothing reaches the writer but a
+response. Invariant 6: a figure's render is bounded by cycle 12's
+`MAX_POINTS`, and its answer by the 32 MiB bound, judged on the text's
+length; `cwd` judges a path in time linear in its length, by U2's
+`normalise` and one join; `cd` canonicalises its target once, whole, and
+nothing is pushed onto a verbatim root: the folder `cwd` stores is the
+root joined with the components in one push and put in its plain form, so
+on Windows the current folder is a plain path except for a folder no
+plain path can spell, which keeps its `\\?\` form (the Deviations below).
+`cd`'s walk over its target's components, `interp::normalize`, builds the
+walk's result in time linear in the path's length on every path, verbatim
+or plain; it was quadratic from a verbatim current folder. No `unwrap` or `expect` reads anything a request or the file
+system controls.
+
+**Choices where the spec was silent.**
+
+- **`n`.** A JSON number that is finite, at least 1 and whole; `1e400`,
+  which the JSON parser reads as an infinity, and `-0` are `'n' must be a
+  figure number.`, as are `[5]` and `true`; `5.0` and `0.5e1` name figure
+  5. A whole number past a `u32` is no open figure. `<n>` is written as
+  the JSON writer writes a number, the shortest digits that name the
+  double padded with zeros, so `1e12` is `1000000000000` and `1e300` a `1`
+  and 300 zeros. The checks run `n` (missing, then not a figure number),
+  then open, then the bound, which counts the SVG's UTF-8 bytes and
+  answers a text of exactly 32 MiB.
+- **`cwd`'s `path`.** `null` is present, so it is `'path' must be a
+  string.` With no root, which only a test builds, the answer is `null`
+  and a path is judged on its text and then refused as outside, as `files`
+  does. A current folder that was deleted, or that holds a component that
+  is not Unicode, is `null` too, since it has no canonical path under the
+  root to answer. The answer after a move is judged on the canonical path
+  like any other, so a link inside the root is answered by its target's
+  path, while the folder stored keeps the link's own name, as `cd` would.
+- **`cd`'s confinement** is judged after the not-a-folder check, so a
+  missing target keeps cycle 13's message wherever it would be. `..` is
+  still resolved on the text first, as cycle 13's `cd` resolves it, so `cd
+  link/..` stays where it is; the target is then canonicalised once and
+  compared with the canonical root component by component, and a folder
+  that exists but cannot be canonicalised counts as outside. `run` and
+  `run_file` still move into the file's folder for the length of the run
+  without `cd`'s check, and move back.
+- **Entries run one at a time in the page**, each after the one before has
+  shown its figures (`runEntry` chains `runOne` on the one before, as
+  `call` chains requests), so an editor Run pressed while a command-window
+  entry is in flight cannot change a figure before the first entry's
+  snapshot is taken. Each figure is a `<figure class="plot">` holding a
+  `<figcaption>` `Figure <n>` above an `<img alt="Figure <n>">`; its URL is
+  revoked on `load` and on `error`, and the transcript scrolls to its end
+  when an image loads. A refusal of `figures` or `figure`, or a transport
+  failure, is a block in the error style where the image would be.
+- **Tab in the command window.** The word is the run of letters, digits
+  and `_` before the cursor, as the terminal's editor takes it; none, or
+  one that starts with a digit, completes nothing. With a selection, or
+  while an entry runs, Tab completes nothing. The quote rule counts `_`
+  with the letters, since only a name ends with one, and a `"` always opens
+  a string, which nothing transposes. The rule looks only at the character
+  before the quote, where the lexer's is on tokens, so `x 'a`, with a
+  space before the quote, is a transpose to the lexer and a string to the
+  page: harmless for completion, and right for command syntax, where
+  `cd 'tr` holds a string. The cursor's line alone is scanned, a string
+  not spanning lines, and a quote doubled inside a string is one quote of
+  it, read as one and written back doubled. A folder part that starts
+  with `/` or holds `:` or `\` completes nothing without asking.
+  The current folder is asked with `cwd` at each Tab, then its `files`
+  joined with the folder part, so a Tab right after a `cd` sees the new
+  folder; names match by prefix, case-sensitively, `.` files included.
+  Several completions insert what they share and are always listed, even
+  when that adds nothing (the terminal lists only then). An answer that
+  arrives after the input changed is dropped. Shift+Tab moves the focus
+  back, as the browser does; Escape makes the next Tab move it on, and any
+  other key but a modifier, or leaving the input, cancels that. The list
+  is a row of names under the prompt, cleared by any key but a modifier
+  and when an entry runs.
+- **The file browser.** It asks `cwd` and lists the folder it answers
+  when the page loads, after every entry and after every save; a `null`
+  answer lists the root with a note saying so, and a click there moves the
+  current folder back under it. A click on a folder or on `..` sends `cwd`
+  with that path and lists the answer; a refusal (a folder code deleted)
+  lists the current folder again with the reason as a note. A `files`
+  refusal of the folder `cwd` named, one deleted between the two
+  requests, lists the root with the reason, as U2's pane fell back, so
+  there is always a folder to click.
+
+**Deviations.** One from Scope, accepted deliberately. On Windows a folder
+whose name no plain path can spell, one ending in a dot or a space, or a
+device name such as `con`, which only a `\\?\` path can make, has no
+plain form that names it, so `cwd` into it stores its `\\?\` form, which
+`pwd` then shows, where Scope says never. The file browser lists such a
+folder like any other, and a click on it moves into it this way. `cd`'s
+walk over a current folder in that form, or over a `\\?\` path typed to
+`cd`, is linear: `interp::normalize` pushed one
+component at a time, and a push onto a verbatim path rebuilds the whole
+path, so a `cd` of 64,000 components from such a folder took 168 s; it
+now builds the walk's result once, the walk's text byte for byte
+(`interp::tests::normalize_is_the_walk`), and the same `cd` takes 0.025 s.
+
+- **The folder stored.** `files::current_folder` is U3's `run_file`
+  approach: the root joined with the normalised components in one push,
+  then `plain`, the root's form without `\\?\` (or `\\?\UNC\`) when that
+  canonicalises to the same folder, and the verbatim form otherwise, as a
+  run file is named. It is the canonical root's own spelling, which may
+  differ from the `pwd` a session starts with: on Unix when the working
+  directory is reached through a link (`/var` and `/private/var` on
+  macOS), and on Windows when it is spelled through a `subst` or mapped
+  drive, an 8.3 name or a letter case the folder's names do not have,
+  each of which changes to the canonical root's plain form after the
+  first `cwd`; `cd` below it keeps that spelling.
+
 ## Acceptance tests
 
 Each numbered item becomes at least one golden case in
@@ -157,18 +291,18 @@ bytes `ab`) and `sub/deep.txt` (the 3 bytes `abc`), with no line ends, and
 `.gitattributes` marks it binary. The root is the case folder, named
 `U4-ui-figures`.
 
-1. `figures` at the start → `{"id":1,"ok":true,"open":[],"changed":[]}`; after an `eval` of `figure(3);` → `"open":[3],"changed":[3]`; again → `"changed":[]`; after `plot(1:3);` → `"changed":[3]`; after `figure(5); close(3);` → `"open":[5],"changed":[5]`; after `close all` → `"open":[],"changed":[]`.
-2. `figure` of an empty figure: after `figure(5);`, `{"op":"figure","n":5}` → `"n":5` and `"svg"` holding exactly the four lines the Design notes record, JSON-escaped.
-3. `figure` refusals: no `n` → `Malformed request: no 'n' field.`; `"n":0`, `"n":-1`, `"n":1.5`, `"n":"5"` and `"n":null` → `Malformed request: 'n' must be a figure number.`; `"n":7` with no figure 7 open → `Figure 7 is not open.`; `"n":1e12` → `Figure 1000000000000 is not open.`
-4. `cwd` at the start → `"cwd":""`; `{"op":"cwd","path":"tree"}` → `"cwd":"tree"`; an `eval` of `ls` → `a.txt` and `sub` on their own lines, as cycle 13's `ls` writes a folder's names; `cwd` with `tree/sub` → `"cwd":"tree/sub"`; `cwd` with `""` → `"cwd":""`.
-5. `cwd` refusals: `..` → outside the file root; `tree/a.txt` → not a folder; `/etc` → the malformed path message; `"path":3` → `Malformed request: 'path' must be a string.`; and after each refusal `cwd` still answers the folder it was in.
-6. `cd` in an `eval`: at the root `cd ..` → `Cannot CD to ..: it is outside the file root.` with `"line":1`, then `cwd` → `""`; `cd tree` then `cwd` → `"tree"`; `cd ../..` → `Cannot CD to ../..: it is outside the file root.`; `cd ..` → `cwd` `""`; `cd nope` → `Cannot CD to nope (Name is nonexistent or not a directory).`
-7. A `.m` case in script mode: `cd ..` then `cd U4-ui-figures` then `disp(1)` → `     1`: with no root set, `cd` above the case folder still works.
-8. Unit tests: a plotted figure's `svg` equal to `saveas`'s bytes and holding its title; the 32 MiB bound reached with a smaller bound; on Windows, `pwd` after `cwd` moves the folder has no `\\?\` prefix; on Unix, a `cd` through a link that leads out of the root refused and one that stays inside accepted; the policy constant.
-9. `tests/ui_server.rs`: `figures` and `figure` over the socket after a `plot`; the page's `Content-Security-Policy` header exactly `default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'`.
-10. Every existing case passes unchanged.
-11. A hand check in Chrome: a `plot` appears inline under its entry; a second entry drawing into the same figure adds a second snapshot and keeps the first; a figure made by Run from the editor appears under the `run(...)` entry; `cd tree` in the command window moves the file browser, and a click on a folder there moves `pwd`; `..` is offered everywhere but at the root; Tab completes `dis` to `disp`, lists the names for `di`, and completes `cd('tr` to `cd('tree/`; Escape then Tab moves the focus on; the transcript holds no `<svg>` element, only `<img>`s.
+1. `figures` at the start → `{"id":1,"ok":true,"open":[],"changed":[]}`; after an `eval` of `figure(3);` → `"open":[3],"changed":[3]`; again → `"changed":[]`; after `plot(1:3);` → `"changed":[3]`; after `figure(5); close(3);` → `"open":[5],"changed":[5]`; after `close all` → `"open":[],"changed":[]`. Cases: figures_open_and_changed.
+2. `figure` of an empty figure: after `figure(5);`, `{"op":"figure","n":5}` → `"n":5` and `"svg"` holding exactly the four lines the Design notes record, JSON-escaped. Cases: figure_empty_svg_exact.
+3. `figure` refusals: no `n` → `Malformed request: no 'n' field.`; `"n":0`, `"n":-1`, `"n":1.5`, `"n":"5"` and `"n":null` → `Malformed request: 'n' must be a figure number.`; `"n":7` with no figure 7 open → `Figure 7 is not open.`; `"n":1e12` → `Figure 1000000000000 is not open.` Cases: err_figure_refused, err_figure_too_large.
+4. `cwd` at the start → `"cwd":""`; `{"op":"cwd","path":"tree"}` → `"cwd":"tree"`; an `eval` of `ls` → `a.txt` and `sub` on their own lines, as cycle 13's `ls` writes a folder's names; `cwd` with `tree/sub` → `"cwd":"tree/sub"`; `cwd` with `""` → `"cwd":""`. Cases: cwd_moves_and_answers.
+5. `cwd` refusals: `..` → outside the file root; `tree/a.txt` → not a folder; `/etc` → the malformed path message; `"path":3` → `Malformed request: 'path' must be a string.`; and after each refusal `cwd` still answers the folder it was in. Cases: err_cwd_refused.
+6. `cd` in an `eval`: at the root `cd ..` → `Cannot CD to ..: it is outside the file root.` with `"line":1`, then `cwd` → `""`; `cd tree` then `cwd` → `"tree"`; `cd ../..` → `Cannot CD to ../..: it is outside the file root.`; `cd ..` → `cwd` `""`; `cd nope` → `Cannot CD to nope (Name is nonexistent or not a directory).` Cases: err_cd_confined_to_root, handbook_figures_example.
+7. A `.m` case in script mode: `cd ..` then `cd U4-ui-figures` then `disp(1)` → `     1`: with no root set, `cd` above the case folder still works. Cases: cd_unconfined_in_script_mode.
+8. Unit tests: a plotted figure's `svg` equal to `saveas`'s bytes and holding its title; the 32 MiB bound reached with a smaller bound; on Windows, `pwd` after `cwd` moves the folder has no `\\?\` prefix; on Unix, a `cd` through a link that leads out of the root refused and one that stays inside accepted; the policy constant. Tests: protocol::tests::a_plotted_figures_svg_is_what_saveas_writes, protocol::tests::the_inline_bound_holds_at_and_past_its_length, protocol::tests::pwd_after_cwd_is_the_plain_form_cd_gives, interp::tests::cd_through_a_link_is_judged_by_where_it_leads, http::tests::the_policy_admits_blob_images_and_nothing_else_new.
+9. `tests/ui_server.rs`: `figures` and `figure` over the socket after a `plot`; the page's `Content-Security-Policy` header exactly `default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'`. Tests: figures_and_the_current_folder_answer_over_the_socket, the_server_answers_over_a_loopback_socket.
+10. Every existing case passes unchanged. Tests: golden_cases.
+11. A hand check in Chrome: a `plot` appears inline under its entry; a second entry drawing into the same figure adds a second snapshot and keeps the first; a figure made by Run from the editor appears under the `run(...)` entry; `cd tree` in the command window moves the file browser, and a click on a folder there moves `pwd`; `..` is offered everywhere but at the root; Tab completes `dis` to `disp`, lists the names for `di`, and completes `cd('tr` to `cd('tree/`; Escape then Tab moves the focus on; the transcript holds no `<svg>` element, only `<img>`s. Tests: the hand check.
 
 ## Status
 
-Planned
+Done (2026-09-30)

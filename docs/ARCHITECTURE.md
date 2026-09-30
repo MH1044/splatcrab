@@ -18,12 +18,14 @@
 
  JSON line ──► protocol.rs ──► json.rs      parse the request, write the reply
                    │
-                   ├──► interp.rs           eval, output captured
+                   ├──► interp.rs           eval, output captured; figures, figure: the
+                   │                        figures in memory, as SVG text
                    ├──► syntax.rs           complete: is the entry finished?
                    ├──► env.rs              completions: variables + path files + builtins;
                    │                        workspace's value previews
                    ├──► files.rs            files: one folder under the file root;
-                   │                        read_file, write_file, run_file: one file there
+                   │                        read_file, write_file, run_file: one file there;
+                   │                        cwd: the current folder, judged as files judges
                    └──► history.rs          history, history_add: the shared history file
 
  browser ──► server.rs ──────────────► http.rs ──► protocol::respond
@@ -367,7 +369,11 @@ in the Design notes of `docs/modules/12-plotting.md`.
 Nothing is drawn until a figure is saved, printed or asked for:
 `Interp::figure_svg(n)` renders figure `n` from what it holds and
 `Interp::figure_numbers()` lists the open ones, so a front end can show a
-figure inline without a file (cycle U4 adds the protocol operation). A
+figure inline without a file. Since cycle U4 the protocol's `figures`
+answers the open figures and those `Interp::take_changed_figures` names,
+and `figure` one figure's SVG text, at most 32 MiB of it, which the
+browser page shows inline under the entry that changed it, as an `<img>`
+of a `blob:` URL, never as markup. A
 plotting call is judged whole before it copies or changes anything: its
 data's pairing, then the figure's point budget (`figure::MAX_POINTS`),
 counted from the arguments in place, each thing drawn weighted by the SVG
@@ -420,6 +426,11 @@ names the path to run it by, on Windows the plain form of the verbatim
 root's when that names the same file. `relative(root, file)` names an
 error frame's file relative to the root, judged on its canonical path.
 The bound is `MAX_TEXT`, 4 MiB, a parameter so a unit test reaches it.
+Since cycle U4 `current_folder(root, path)` judges the folder the
+protocol's `cwd` moves to exactly as `list` judges one, and names it as
+`run_file` names a file, the root joined with the components in one push,
+in its plain form; `folder_relative(root, dir)` answers the current folder
+relative to the root, `""` for the root itself.
 
 **`editor.rs`** (cycle 13) is the terminal's line editor as a pure state
 machine: `Decoder` turns the characters a terminal sends, ANSI escape
@@ -474,7 +485,14 @@ only at end of input. The message texts live in `error.rs`. Since cycle U3
 root through `files.rs`, `run_file` capturing its run as `eval` does and
 `write_file` calling `Interp::file_written` with the file it wrote, and an
 error object carries its `stack`, the frames innermost first, on `eval`
-when the request's `stack` is `true` and always on `run_file`.
+when the request's `stack` is `true` and always on `run_file`. Since cycle
+U4 `figures` answers the open figures and those changed since it was last
+asked, `figure` one figure's SVG text, the text `saveas` writes, refused
+past `MAX_INLINE_SVG` (32 MiB, a parameter of the function so a unit test
+reaches it), and `cwd` the current folder relative to the root, after
+moving it, with `path`, to a folder judged as `files` judges one, through
+`Interp::enter_folder`, which `cd` uses too. All three are asked for, as
+`workspace` and `history` are, since `eval`'s bytes are U0's.
 
 **`http.rs`** is the UI server's HTTP, as a pure function:
 `handle(request_bytes, &mut Interp, &Config) -> Vec<u8>`, with `Config`
@@ -519,6 +537,17 @@ that does not wrap, Save, Run (`run_file`) and Run Selection (an `eval`),
 its questions asked in the page and never in a browser dialog; every
 `eval` the page makes asks for the stack, whose frames the command window
 lists under an error, a frame with a file being a link that opens it.
+Since cycle U4 every entry, typed, recalled, Run or Run Selection, is
+followed by `figures` and a `figure` for each figure it changed, each
+shown under the entry's output as an `<img>` whose source is a `blob:` URL
+the script makes from the SVG text and revokes once it has loaded, a
+snapshot a later entry does not change; entries run one at a time, each
+after the one before has shown its figures. Tab in the command window
+completes the name before the cursor through `completions`, or inside a
+quoted string a file or folder name of the current folder through `cwd`
+and `files`, several listed under the prompt until the next key. The file
+browser is the current folder: it lists what `cwd` answers, and a click
+on a folder or on `..` moves the current folder there with `cwd`.
 
 **`main.rs`** is the CLI. Since cycle 13 it answers `--help` and
 `--version` (the version is `env!("CARGO_PKG_VERSION")`, as the banner's
@@ -585,7 +614,9 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    cycle U3 `read_file` judges a file's length before reading a byte and
    reads at most 4 MiB and one byte of it, `write_file` judges the text's
    length before writing, and neither opens anything but a regular file,
-   so no device or pipe can make one wait. Anything
+   so no device or pipe can make one wait; since cycle U4 `figure` answers
+   at most 32 MiB of SVG text, a figure's render being bounded by the
+   point budget below, and `cwd` judges its path as `files` does. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
    the recipe below. An iteration that has no fixed trip count has a cap
@@ -896,8 +927,12 @@ is the design, and every part of it is in `http.rs` except the binding:
   static routes are not checked, since a navigation is not same-origin.
 - A refused request never reaches the interpreter: only the last arm of
   `handle` calls `protocol::respond`, after every check has passed.
-- The page's `Content-Security-Policy: default-src 'self'; frame-ancestors
-  'none'` forbids inline script, anything from another origin, and framing.
+- The page's `Content-Security-Policy: default-src 'self'; img-src 'self'
+  blob:; frame-ancestors 'none'` forbids inline script, anything from
+  another origin, and framing. Cycle U4 added `img-src 'self' blob:`, the
+  one change to U1's headers: a figure is shown as an image of a `blob:`
+  URL, which only the page's own script can make, and script is still
+  `/app.js` alone, so the SVG text is never markup and nothing in it runs.
 
 Since cycle U2 the token guards the file system and the history too:
 `files` lists folders under the root and `history` returns everything typed
@@ -924,9 +959,10 @@ afterwards: `files` lists relative to it, whatever `cd` does to
 refused before anything on disk is touched, and then by its canonical form,
 which catches links and junctions, judged inside the root before its kind
 so a refusal says nothing about what lies outside. The token guards it as
-it guards `eval`. The file browser following `cd` is cycle U4's, which will
-add the current folder to the answer on purpose. The Design notes of
-`docs/modules/U2-ui-desktop.md` have the details. Since cycle U3 the
+it guards `eval`. The Design notes of `docs/modules/U2-ui-desktop.md` have
+the details. Since cycle U4 the file browser is the current folder, asked
+for with the protocol's `cwd`, which also moves it; the root itself still
+never moves. Since cycle U3 the
 editor's `read_file`, `write_file` and `run_file` are confined by the same
 rule, `write_file` judging the name, the folder and whatever is at the
 name before it writes, so it never follows a link out of the root, and
@@ -940,6 +976,24 @@ and `system` resolve against it, and `cd` changes it through
 refuses a path that is not a folder, and bumps the lookup generation. The
 process's working directory is never changed, so the golden harness's
 per-case folder and the interface's file root hold whatever the code does.
+Since cycle U4 `cd` is confined to the file root whenever
+`Interp::file_root` is set, which every client mode does and nothing else
+does: a target that is a folder whose canonical path is not the root or
+inside it, compared component by component, is `Cannot CD to <dir>: it is
+outside the file root.`, and one that is not a folder keeps its message;
+the REPL and script mode set no root, and `cd` there goes anywhere, as
+before. This keeps the command window and the file browser on one folder;
+it is not a sandbox, since every file builtin still takes any absolute
+path. The protocol's `cwd` moves the current folder too, through the same
+`Interp::enter_folder`, to a folder judged as `files` judges one and held
+in the root's plain form, so `pwd` never shows a `\\?\`, except on
+Windows for a folder no plain path can spell (a name ending in a dot or a
+space, or a device name, made through a `\\?\` path), which keeps its
+verbatim form. `interp::normalize`, which resolves `cd`'s `.` and `..`,
+builds what pushing the components one at a time gives, byte for byte,
+without that walk's pushes, so it takes time linear in the path's length
+on a verbatim path too, where each push rebuilt the whole path (cycle
+U4).
 
 **Display format (cycle 13, in place).** `format` is `Interp::format`; the
 display reads it through `value::with_format`, which sets a thread-local

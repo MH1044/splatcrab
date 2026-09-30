@@ -55,6 +55,12 @@
 //!
 //! [`relative`] names an error frame's file relative to the root, for the
 //! stack the protocol answers.
+//!
+//! Since cycle U4 the protocol's `cwd` moves the current folder to a
+//! folder of the root judged exactly as `files` judges one
+//! ([`current_folder`]), named in the plain form a file `run_file` runs is
+//! named in, and answers the current folder relative to the root, judged
+//! on its canonical path ([`folder_relative`]).
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -220,10 +226,11 @@ fn joined(root: &Path, parts: &[&str]) -> PathBuf {
     joined
 }
 
-/// The listing of the folder `path` names under `root`, at most `bound`
-/// entries of it; see the module comment for the rule every step follows.
-/// `path` appears in a refusal exactly as it was sent.
-pub fn list(root: &Path, path: &str, bound: usize) -> Result<Listing, MError> {
+/// The three steps of the rule for a folder: the components of the folder
+/// `path` names under `root`, and its canonical path, which must be the
+/// root or inside it, judged first, and a folder. What [`list`] and
+/// [`current_folder`] share, so `files` and `cwd` judge a path alike.
+fn folder<'a>(root: &Path, path: &'a str) -> Result<(Vec<&'a str>, PathBuf), MError> {
     let parts = normalise(path)?;
     let Ok(canonical) = std::fs::canonicalize(joined(root, &parts)) else {
         return Err(error::files_not_a_folder(path));
@@ -234,6 +241,14 @@ pub fn list(root: &Path, path: &str, bound: usize) -> Result<Listing, MError> {
     if !canonical.is_dir() {
         return Err(error::files_not_a_folder(path));
     }
+    Ok((parts, canonical))
+}
+
+/// The listing of the folder `path` names under `root`, at most `bound`
+/// entries of it; see the module comment for the rule every step follows.
+/// `path` appears in a refusal exactly as it was sent.
+pub fn list(root: &Path, path: &str, bound: usize) -> Result<Listing, MError> {
+    let (parts, canonical) = folder(root, path)?;
     let Ok(read) = std::fs::read_dir(&canonical) else {
         return Err(error::files_not_a_folder(path));
     };
@@ -477,6 +492,20 @@ pub fn run_file(root: &Path, path: &str) -> Result<Runnable, MError> {
     })
 }
 
+/// `cwd` with a path (cycle U4): the folder `path` names under `root`,
+/// judged exactly as [`list`] judges it, named as the current folder is
+/// to be held: the root joined with the normalised components in one push,
+/// in the plain form [`run_file`] names a file by, so `pwd` afterwards
+/// shows what `cd` to the same folder would, with no `\\?\` on Windows
+/// unless no plain path names the folder (a name ending in a dot or a
+/// space, or a device name), which keeps its verbatim form, the one
+/// deviation U4's spec records. `path` appears in a refusal exactly as it
+/// was sent.
+pub fn current_folder(root: &Path, path: &str) -> Result<PathBuf, MError> {
+    let (parts, canonical) = folder(root, path)?;
+    Ok(plain(&joined(root, &parts), &canonical))
+}
+
 /// `full` without the `\\?\` a canonical root gives it on Windows, when
 /// the plain form names the same file, `canonical`: a script run from it
 /// then sees its folder as `pwd` writes any other, and can join a path to
@@ -515,7 +544,23 @@ fn plain(full: &Path, _canonical: &Path) -> PathBuf {
 /// outside the root or is the root, or holds a component that is not
 /// Unicode, which the page could not name back.
 pub fn relative(root: &Path, file: &Path) -> Option<String> {
-    let canonical = std::fs::canonicalize(file).ok()?;
+    under_root(root, file).filter(|rest| !rest.is_empty())
+}
+
+/// The current folder `dir` relative to `root` with `/` separators, as
+/// `cwd` answers it (cycle U4), judged on its canonical path: `""` for the
+/// root itself, and `None` when it cannot be canonicalised (it was
+/// deleted), lies outside the root, or holds a component that is not
+/// Unicode, which the page could not name back.
+pub fn folder_relative(root: &Path, dir: &Path) -> Option<String> {
+    under_root(root, dir)
+}
+
+/// `path` canonicalised and cut to `root`, its components joined with
+/// `/`: `""` for the root itself, `None` outside it, when it cannot be
+/// canonicalised, or with a component that is not Unicode.
+fn under_root(root: &Path, path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
     let rest = canonical.strip_prefix(root).ok()?;
     let parts = rest
         .components()
@@ -524,9 +569,6 @@ pub fn relative(root: &Path, file: &Path) -> Option<String> {
             _ => None,
         })
         .collect::<Option<Vec<&str>>>()?;
-    if parts.is_empty() {
-        return None;
-    }
     Some(parts.join("/"))
 }
 
@@ -1223,6 +1265,60 @@ mod tests {
         assert_eq!(relative(&root, &root), None);
         assert_eq!(relative(&root, &root.join("missing.m")), None);
         assert_eq!(relative(&root, Path::new("")), None);
+    }
+
+    /// Cycle U4: `cwd`'s folder is judged exactly as a listing is, and
+    /// named in the plain form, the root joined with the normalised
+    /// components; and the current folder is answered relative to the
+    /// root, `""` at the root itself.
+    #[test]
+    fn current_folder_is_judged_as_a_listing_and_named_plainly() {
+        let d = fixture("current");
+        let root = root_of(&d);
+        let got = current_folder(&root, "tree/./sub/../sub/").unwrap();
+        assert!(
+            !got.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            got.display()
+        );
+        assert!(
+            got.ends_with(Path::new("tree").join("sub")),
+            "{}",
+            got.display()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&got).unwrap(),
+            root.join("tree").join("sub")
+        );
+        let top = current_folder(&root, "").unwrap();
+        assert_eq!(std::fs::canonicalize(&top).unwrap(), root);
+        for path in [
+            "..",
+            "tree/a.txt",
+            "nope",
+            "/etc",
+            "tree\\sub",
+            "tree/../..",
+        ] {
+            assert_eq!(
+                current_folder(&root, path).unwrap_err().msg,
+                msg(list(&root, path, MAX_ENTRIES)),
+                "{path:?}"
+            );
+        }
+        assert_eq!(folder_relative(&root, &root).as_deref(), Some(""));
+        assert_eq!(folder_relative(&root, &got).as_deref(), Some("tree/sub"));
+        // Spelled with a `..` and not canonical, as `cd` may leave it.
+        let spelled =
+            d.0.join("U2-ui-desktop")
+                .join("tree")
+                .join("sub")
+                .join("..");
+        assert_eq!(folder_relative(&root, &spelled).as_deref(), Some("tree"));
+        assert_eq!(folder_relative(&root, &d.0), None);
+        assert_eq!(folder_relative(&root, &root.join("missing")), None);
+        // `relative`, for a frame's file, still has no answer for the root.
+        assert_eq!(relative(&root, &root), None);
     }
 
     /// Acceptance test 11, on Unix: a dangling link and a link out of the

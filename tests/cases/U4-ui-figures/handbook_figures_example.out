@@ -1,0 +1,4 @@
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":true,"open":[2],"changed":[2]}
+{"id":3,"ok":true,"cwd":"tree"}
+{"id":4,"ok":false,"out":"","error":{"message":"Cannot CD to ..: it is outside the file root.","line":1}}

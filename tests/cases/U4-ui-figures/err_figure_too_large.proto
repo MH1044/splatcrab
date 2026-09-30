@@ -1,0 +1,4 @@
+% covers: 3 - figure of a figure whose SVG text is longer than 32 MiB (a scatter of 420,000 points) is refused with SplatCrab's own text and line null, and the figure stays open and changed, since figure only reads
+{"id":1,"op":"eval","code":"scatter(1:420000, 1:420000);"}
+{"id":2,"op":"figure","n":1}
+{"id":3,"op":"figures"}

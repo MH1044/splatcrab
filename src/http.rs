@@ -43,8 +43,11 @@ pub const SCRIPT: &str = include_str!("ui/app.js");
 pub const STYLE: &str = include_str!("ui/app.css");
 
 /// Sent with the page only: no inline script or style, nothing from another
-/// origin, and no framing by another page.
-pub const CSP: &str = "default-src 'self'; frame-ancestors 'none'";
+/// origin, and no framing by another page. Since cycle U4 an image may also
+/// come from a `blob:` URL, which only the page's own script can make: how
+/// a figure's SVG is shown inline as an `<img>`, never as markup, since
+/// `default-src 'self'` alone refuses one.
+pub const CSP: &str = "default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'";
 
 /// The header that carries the session token on every `/api` call.
 pub const TOKEN_HEADER: &str = "X-SplatCrab-Token";
@@ -703,6 +706,11 @@ mod tests {
         let page = one(&get("/"));
         assert_eq!(page.names(), with(&["Content-Security-Policy"]));
         assert_eq!(page.header("Content-Security-Policy"), Some(CSP));
+        // Cycle U4: the policy exactly, the one change to U1's headers.
+        assert_eq!(
+            page.header("Content-Security-Policy"),
+            Some("default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'")
+        );
         assert_eq!(page.header("Cache-Control"), Some("no-store"));
         assert_eq!(page.header("X-Content-Type-Options"), Some("nosniff"));
         assert_eq!(page.header("Referrer-Policy"), Some("no-referrer"));
@@ -755,6 +763,37 @@ mod tests {
             assert!(!file.contains("http://") && !file.contains("https://"));
         }
         assert!(SCRIPT.contains(TOKEN_HEADER));
+    }
+
+    /// Cycle U4: the policy is U1's with one source added, `blob:` for
+    /// images alone; script stays `'self'`, so the one script that can make
+    /// a `blob:` URL is `/app.js`, and no `data:`, `'unsafe-inline'` or
+    /// wildcard is let in anywhere.
+    #[test]
+    fn the_policy_admits_blob_images_and_nothing_else_new() {
+        assert_eq!(
+            CSP,
+            "default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'"
+        );
+        let directives: Vec<&str> = CSP.split(';').map(str::trim).collect();
+        assert_eq!(
+            directives,
+            [
+                "default-src 'self'",
+                "img-src 'self' blob:",
+                "frame-ancestors 'none'"
+            ]
+        );
+        for loose in ["unsafe", "data:", "*", "script-src", "style-src"] {
+            assert!(!CSP.contains(loose), "{loose}");
+        }
+        // The page is still the only response that carries it.
+        assert_eq!(one(&get("/")).header("Content-Security-Policy"), Some(CSP));
+        assert!(
+            one(&get("/app.css"))
+                .header("Content-Security-Policy")
+                .is_none()
+        );
     }
 
     /// Every CSS named colour, CSS Color Module Level 4's list, in lower
@@ -1392,6 +1431,100 @@ mod tests {
             r#"id="split-mid" class="splitter" role="separator" aria-orientation="horizontal""#
         ));
         assert!(PAGE.contains(r#"<textarea id="code" wrap="off""#));
+    }
+
+    /// Cycle U4: a figure reaches the page as an image of a `blob:` URL the
+    /// script makes from the SVG text and revokes once the image has
+    /// loaded, never as markup; every entry asks `figures` after it and
+    /// `figure` for each changed number; the file browser is `cwd`'s
+    /// folder; Tab completes through `completions` and `files`, its list
+    /// under the prompt.
+    #[test]
+    fn figures_are_images_and_the_browser_is_the_current_folder() {
+        for want in [
+            "URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' }))",
+            "URL.revokeObjectURL(url)",
+            "img.addEventListener('load'",
+            "element('img')",
+            "op: 'figures'",
+            "op: 'figure', n: n",
+            "op: 'cwd'",
+            "op: 'cwd', path: path",
+            "op: 'completions', prefix: word",
+            "op: 'files', path: joined(here.cwd, dir)",
+            "await showFigures(entry);",
+        ] {
+            assert!(SCRIPT.contains(want), "{want}");
+        }
+        // No way of putting SVG into the document as markup, or of
+        // embedding it as a document of its own, exists in the script.
+        for never in [
+            "DOMParser",
+            "createElementNS",
+            "createContextualFragment",
+            "srcdoc",
+            "'object'",
+            "'embed'",
+            "'iframe'",
+            "'svg'",
+            "onload",
+            "onerror",
+            "data:",
+        ] {
+            assert!(!SCRIPT.contains(never), "{never}");
+        }
+        for never in ["<svg", "<object", "<embed", "<iframe"] {
+            assert!(!PAGE.to_ascii_lowercase().contains(never), "{never}");
+        }
+        // The one image source the script makes is the blob: URL.
+        assert_eq!(SCRIPT.matches(".src = ").count(), 1);
+        assert!(SCRIPT.contains("img.src = url;"));
+        assert!(PAGE.contains(
+            r#"<div id="completions" aria-live="polite" aria-label="Completions" hidden></div>"#
+        ));
+        // A click on a folder moves the current folder; nothing lists a
+        // folder but through the current folder's answer.
+        assert!(SCRIPT.contains("enterFolder(path);"));
+        assert_eq!(SCRIPT.matches("listFolder(path, true)").count(), 0);
+    }
+
+    /// Cycle U4: every entry, the editor's Run and Run Selection
+    /// included, runs through `runOne`, which clears the completion list
+    /// as it starts and marks an entry running until it is done, however
+    /// it ends; and Tab completes nothing while one runs, as while the
+    /// command window's own entry is on its way.
+    #[test]
+    fn tab_completes_nothing_while_any_entry_runs() {
+        // Whitespace squeezed, so the checkout's line ends do not matter.
+        let squeezed = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let run_one = squeezed(&SCRIPT[function_span(SCRIPT, "runOne")]);
+        assert!(
+            run_one.starts_with(
+                "function runOne(shown, request) { entryRunning = true; hideCompletions(); try {"
+            ),
+            "{run_one}"
+        );
+        assert!(
+            run_one.ends_with("} finally { entryRunning = false; } }"),
+            "{run_one}"
+        );
+        assert_eq!(
+            word_offsets(SCRIPT, "runOne").len(),
+            2,
+            "defined, and called by runEntry"
+        );
+        let run_entry = &SCRIPT[function_span(SCRIPT, "runEntry")];
+        assert!(run_entry.contains("return runOne(shown, request);"));
+        assert!(SCRIPT[function_span(SCRIPT, "runFile")].contains("await runEntry(shown,"));
+        assert!(SCRIPT[function_span(SCRIPT, "runSelection")].contains("await run(chosen);"));
+        let complete = squeezed(&SCRIPT[function_span(SCRIPT, "complete")]);
+        assert!(
+            complete.contains("if (busy || entryRunning || at !== input.selectionEnd) { return; }"),
+            "{complete}"
+        );
+        // Only `runOne` sets the mark, and it starts clear.
+        assert_eq!(SCRIPT.matches("entryRunning = ").count(), 3);
+        assert!(SCRIPT.contains("let entryRunning = false;"));
     }
 
     #[test]

@@ -26,6 +26,12 @@
 //! and checks that a request carrying `Sec-Fetch-Site: cross-site` is
 //! refused before the interpreter sees it.
 //!
+//! Since cycle U4 (acceptance test 9) it runs `figures` and `figure` over
+//! the socket after a `plot`, in a fixture folder of its own, the figure's
+//! SVG the very text `saveas` writes there, and `cwd` and a `cd` refused at
+//! the root; and it checks the page's policy exactly, `blob:` images
+//! admitted.
+//!
 //!   cargo test --test ui_server
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -193,14 +199,29 @@ fn the_server_answers_over_a_loopback_socket() {
         r#"{"id":5,"ok":true,"vars":[{"name":"x","size":[1,1],"class":"double"}]}"#
     );
 
-    // The page, with its Content-Security-Policy.
+    // The page, with its Content-Security-Policy: since cycle U4 exactly
+    // U1's with `blob:` images admitted, which is how a figure is shown.
     let reply = exchange(port, &format!("GET / HTTP/1.1\r\n{host}\r\n"));
     assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
     assert!(
         reply.contains(
-            "\r\nContent-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\n"
+            "\r\nContent-Security-Policy: default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'\r\n"
         ),
         "{reply}"
+    );
+    let policies: Vec<&str> = reply
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("Content-Security-Policy:"))
+        .collect();
+    assert_eq!(
+        policies,
+        [
+            "Content-Security-Policy: default-src 'self'; img-src 'self' blob:; frame-ancestors 'none'"
+        ],
+        "one policy, exactly"
     );
     assert!(body(&reply).starts_with("<!doctype html>"));
 
@@ -487,6 +508,99 @@ fn the_editor_operations_answer_over_the_socket() {
         r#"{"id":7,"op":"eval","code":"disp(exist('crossed'))"}"#,
     );
     assert_eq!(body(&reply), r#"{"id":7,"ok":true,"out":"     0\n"}"#);
+}
+
+/// `s` as a quoted JSON string, escaped as the protocol's writer escapes
+/// one: `"`, `\`, newline, carriage return and tab by name, any other
+/// control character as `\u00xx`, everything else raw.
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Cycle U4's acceptance test 9: `figures` and `figure` over the socket
+/// after a `plot`, in a fixture folder the test makes under the temporary
+/// folder and starts the server in, so the folder is the file root: the
+/// figure's `svg` is the very text `saveas` writes there, and holds its
+/// title; `cwd` moves the current folder and `cd` cannot leave the root.
+#[test]
+fn figures_and_the_current_folder_answer_over_the_socket() {
+    let top = scratch("figures");
+    let _ = std::fs::remove_dir_all(&top);
+    let root = top.join("U4-ui-figures");
+    std::fs::create_dir_all(root.join("tree")).expect("make the fixture's folder");
+    let _guard = Fixture(top);
+    let server = start_in(Some(&root));
+    let port = server.port;
+    let authorised = format!("Host: 127.0.0.1:{port}\r\nX-SplatCrab-Token: {TOKEN}\r\n");
+    let ask = |request: &str| {
+        let reply = api(port, &authorised, request);
+        assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+        body(&reply).to_string()
+    };
+
+    assert_eq!(
+        ask(r#"{"id":1,"op":"figures"}"#),
+        r#"{"id":1,"ok":true,"open":[],"changed":[]}"#
+    );
+    assert_eq!(
+        ask(
+            r#"{"id":2,"op":"eval","code":"plot(1:3, [2 4 3]); title('Over the socket'); saveas(1, 'f.svg')"}"#
+        ),
+        r#"{"id":2,"ok":true,"out":""}"#
+    );
+    assert_eq!(
+        ask(r#"{"id":3,"op":"figures"}"#),
+        r#"{"id":3,"ok":true,"open":[1],"changed":[1]}"#
+    );
+    assert_eq!(
+        ask(r#"{"id":4,"op":"figures"}"#),
+        r#"{"id":4,"ok":true,"open":[1],"changed":[]}"#
+    );
+    let saved = std::fs::read_to_string(root.join("f.svg")).expect("saveas wrote the figure");
+    assert!(saved.contains(">Over the socket<"), "{saved}");
+    assert!(saved.contains("<polyline"), "{saved}");
+    assert_eq!(
+        ask(r#"{"id":5,"op":"figure","n":1}"#),
+        format!(
+            r#"{{"id":5,"ok":true,"n":1,"svg":{}}}"#,
+            json_string(&saved)
+        )
+    );
+    assert_eq!(
+        ask(r#"{"id":6,"op":"figure","n":2}"#),
+        r#"{"id":6,"ok":false,"error":{"message":"Figure 2 is not open.","line":null}}"#
+    );
+
+    // The current folder: moved by `cwd`, confined for `cd`.
+    assert_eq!(
+        ask(r#"{"id":7,"op":"cwd"}"#),
+        r#"{"id":7,"ok":true,"cwd":""}"#
+    );
+    assert_eq!(
+        ask(r#"{"id":8,"op":"cwd","path":"tree"}"#),
+        r#"{"id":8,"ok":true,"cwd":"tree"}"#
+    );
+    assert_eq!(
+        ask(r#"{"id":9,"op":"eval","code":"cd ..; cd .."}"#),
+        r#"{"id":9,"ok":false,"out":"","error":{"message":"Cannot CD to ..: it is outside the file root.","line":1}}"#
+    );
+    assert_eq!(
+        ask(r#"{"id":10,"op":"cwd"}"#),
+        r#"{"id":10,"ok":true,"cwd":""}"#
+    );
 }
 
 /// Kills a child however the test ends; `refused` runs under one, so an

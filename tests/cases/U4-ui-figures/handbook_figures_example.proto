@@ -1,0 +1,5 @@
+% covers: Scope: figures, cwd and cd confined to the file root - the figures and current folder example in docs/HANDBOOK.md, byte for byte: an eval of figure(2), figures with 2 open and changed, cwd moving to tree, and an eval of cd ..; cd .. whose first cd returns to the root and whose second is refused as outside the file root with line 1, in one session
+{"id":1,"op":"eval","code":"figure(2);"}
+{"id":2,"op":"figures"}
+{"id":3,"op":"cwd","path":"tree"}
+{"id":4,"op":"eval","code":"cd ..; cd .."}

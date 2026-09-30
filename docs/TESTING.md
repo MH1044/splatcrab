@@ -109,7 +109,8 @@ a case next to it calls by name. Each case runs with its own directory as the
 working directory, so helpers resolve without a path. Under `--protocol` and
 `--http-stdio` that directory is also the file root the `files` operation
 lists (cycle U2), so a `.proto` case names its fixtures relative to its own
-folder.
+folder, and since cycle U4 the folder a `cd` in such a case cannot leave;
+a `.m` case sets no root, and its `cd` goes anywhere.
 
 A case that writes a file (cycle U3's `write_file`) names it `scratch_*` in
 its own folder and deletes it before it ends, with an `eval` of `delete`;
@@ -288,7 +289,10 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   Unix a dangling link and a link out of the root refused with nothing
   created (on Windows where a link can be made); `run_file`'s `.m` rule and
   its plain path; `relative` on a path that is not canonical, outside the
-  root and missing.
+  root and missing. Since cycle U4 `current_folder` judged as `list`
+  judges a folder, refusal for refusal, and named in its plain form, and
+  `folder_relative` at the root, below it, outside it and on a folder
+  gone.
 - `protocol.rs`: `serve` driven with an in-memory reader and writer, through
   every operation, every malformed-request text, blank lines, a `\r`, and the
   flush after each response; since cycle U2 the key order of `files`,
@@ -300,7 +304,15 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   `run_file` from the root after `cd` with its output, warnings and a
   refused `input` captured, `eval`'s `stack` flag against U0's bytes, and
   the stack's relative file for a function found on the path by a folder
-  that is not canonical.
+  that is not canonical. Since cycle U4 the key order of `figures`,
+  `figure` and `cwd`; `figures` after `figure(n)`, a plot, a close and
+  `close all`; the empty figure's four lines exact; `n` through the
+  spec's table, `1e12` and `1e300` included; a plotted figure's `svg`
+  equal to the bytes `saveas` writes and holding its title; the 32 MiB
+  bound reached with a bound of the figure's own length; `cwd`'s moves,
+  its refusals leaving the folder where it was, `cd` stopping at the root,
+  no root and a folder gone answering `null`; and `pwd` after `cwd` in the
+  plain form `cd` gives, never `\\?\`.
 - `http.rs`: `handle` driven with byte strings, through every status, the
   header order, `Content-Length` against the body on every response, the
   static routes against the embedded files, the `Host`, `Origin` and token
@@ -315,13 +327,35 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   interpreter, after the token and before the content type, the static
   routes unchecked; and a static test that `app.js` opens no browser
   dialog and writes no markup, the page has no inline handler, and every
-  `eval` the page makes asks for the stack.
+  `eval` the page makes asks for the stack. Since cycle U4 the policy
+  constant exactly, `blob:` for images and nothing else new; and a static
+  test that a figure reaches the page only as an `<img>` of a `blob:` URL
+  made from its text and revoked on `load`, with no `DOMParser`,
+  `createElementNS`, `<object>`, `<embed>`, `<iframe>` or `data:` URL
+  anywhere, each entry asking `figures` and `figure`, the file browser
+  moved with `cwd`, and Tab asking `completions` and `files`; and that
+  every entry, the editor's Run and Run Selection included, runs through
+  `runOne`, which clears the completion list as it starts and marks an
+  entry running until it ends, however it ends, while Tab completes
+  nothing.
 - `interp.rs`, since cycle U3: a write dropping the parse of the file it
   wrote, named through its canonical path, so a function file rewritten
   with the same length and its old modification time runs its new text,
   and keeping every other file's parse (the same `Rc` after a loop of
   writes); a file a write makes shadowing a builtin at the next call; a
   deleted function file made again read again; `run_file` as an entry.
+  Since cycle U4 `cd` with a file root: `..`, `../..` and an absolute
+  folder outside refused with the target as written and nothing moved, a
+  target that is not a folder keeping cycle 13's message, the generation
+  bumped by a move, and no root unconfined; on Unix a `cd` through a link
+  out of the root refused and one through a link inside accepted (on
+  Windows where a link can be made); `normalize` against the walk of
+  pushes it builds the result of, byte for byte, over hand-picked paths
+  (on Windows every prefix, a component naming a drive or a share, `/`
+  inside a verbatim component, a `\\?\UNC\server\` with no share) and
+  20,000 drawn from a fixed generator; and 100,000 components, `.`s and
+  `..`s among them, normalised to the right text within a bound, on a
+  verbatim path and a plain one.
 - `server.rs`: the token's form and freshness, the URL, and since cycle U2
   the connection bound (sixteen slots, the seventeenth refused, a slot freed
   from another thread free again) and the interpreter loop answering jobs in
@@ -341,7 +375,11 @@ folder it makes under the temporary folder and starts the server in, with
 the page, the script and the stylesheet still served. Since cycle U3 it
 runs `write_file`, `read_file` and `run_file` in a fixture folder of its
 own, a rewrite of the same length included, and a request carrying
-`Sec-Fetch-Site: cross-site` refused. Every server it
+`Sec-Fetch-Site: cross-site` refused. Since cycle U4 it runs `figures` and
+`figure` after a `plot` in a fixture folder of its own, the `svg` compared
+with the file `saveas` wrote there, and `cwd` and a `cd` refused at the
+root, and checks the page's `Content-Security-Policy` exactly, `default-src
+'self'; img-src 'self' blob:; frame-ancestors 'none'`. Every server it
 starts has `SPLATCRAB_HISTORY` pointing at a file of its own. The child is
 killed by a guard's `Drop`, so an assertion that fails still kills it, and
 the fixture is removed the same way; the test binds nothing itself. It also

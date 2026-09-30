@@ -7,8 +7,9 @@
 //! there for the next. The operations, their fields and the order of the keys
 //! in each response are fixed by `docs/modules/U0-ui-foundations.md`, for
 //! the desktop's three and `workspace`'s `preview` by
-//! `docs/modules/U2-ui-desktop.md`, and for the editor's three and `eval`'s
-//! `stack` by `docs/modules/U3-ui-editor.md`:
+//! `docs/modules/U2-ui-desktop.md`, for the editor's three and `eval`'s
+//! `stack` by `docs/modules/U3-ui-editor.md`, and for the figures and the
+//! current folder by `docs/modules/U4-ui-figures.md`:
 //!
 //! | `op` | needs | answers, after `id` and `ok` |
 //! |---|---|---|
@@ -22,6 +23,9 @@
 //! | `read_file` | `path` | `path` and `text`, [`files::read_file`] |
 //! | `write_file` | `path`, then `text` | `path` and `size`, [`files::write_file`], after which the file's parse and every lookup are dropped ([`Interp::file_written`]) |
 //! | `run_file` | `path` | as `eval`: `out`, then `error` when it failed, whose `line` is `null` and whose `stack` is always there; [`files::run_file`] and [`Interp::run_file`] |
+//! | `figures` | | `open`, the open figures' numbers ascending ([`Interp::figure_numbers`]), and `changed`, those changed since the last `figures` ([`Interp::take_changed_figures`]) |
+//! | `figure` | `n`, a positive whole number | `n` and `svg`, [`Interp::figure_svg`], at most [`MAX_INLINE_SVG`] bytes of it |
+//! | `cwd` | `path`, optional | `cwd`, [`Interp::cwd`] relative to the root ([`files::folder_relative`]) or `null`, after moving there when `path` is given ([`files::current_folder`]) |
 //!
 //! A stack is the error's frames, innermost first, each `{file, name,
 //! line}`: `file` relative to the root with `/` separators ([`files::relative`]),
@@ -51,6 +55,11 @@ use crate::history;
 use crate::interp::{InputSource, Interp};
 use crate::json::{self, Json, ParseError};
 use crate::syntax;
+
+/// The longest SVG text `figure` answers inline, 32 MiB: a longer figure
+/// is refused with a word to save it with `saveas`. What the protocol
+/// passes to `figure` as its bound, a parameter so a unit test reaches it.
+pub const MAX_INLINE_SVG: usize = 32 * 1024 * 1024;
 
 /// Serves requests from `input` until it ends, against a fresh interpreter
 /// whose file root is fixed now, to the working directory.
@@ -145,6 +154,9 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
             write_file(it, id.clone(), path, text)
         }),
         "run_file" => field(&req, "path").and_then(|path| run_file(it, id.clone(), path)),
+        "figures" => Ok(figures(it, id.clone())),
+        "figure" => figure_number(&req).and_then(|n| figure(it, id.clone(), n, MAX_INLINE_SVG)),
+        "cwd" => cwd(it, id.clone(), &req),
         other => Err(error::unknown_operation(other)),
     };
     result.unwrap_or_else(|e| refused(id, e))
@@ -285,6 +297,83 @@ fn run_file(it: &mut Interp, id: Json, path: &str) -> Result<Json, MError> {
     let target = files::run_file(root, path)?;
     let (result, out) = captured(it, |it| it.run_file(&target.path, &target.name));
     Ok(evaluated(it, id, result, out, false, true))
+}
+
+/// `figures`: the open figures' numbers, ascending, and those of them
+/// changed since the last `figures`, ascending, which asking forgets.
+fn figures(it: &mut Interp, id: Json) -> Json {
+    let numbers =
+        |ns: Vec<u32>| Json::Array(ns.into_iter().map(|n| Json::Number(f64::from(n))).collect());
+    let open = numbers(it.figure_numbers());
+    let changed = numbers(it.take_changed_figures());
+    Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("open", open),
+        ("changed", changed),
+    ])
+}
+
+/// `figure`'s `n`: required, and a JSON number holding a positive whole
+/// number. Anything else, `0`, a negative, a fraction, an infinity, a
+/// string, `null` or a boolean, is refused.
+fn figure_number(req: &Json) -> Result<f64, MError> {
+    match req.get("n") {
+        None => Err(error::request_missing("n")),
+        Some(Json::Number(n)) if n.is_finite() && *n >= 1.0 && n.fract() == 0.0 => Ok(*n),
+        Some(_) => Err(error::request_figure_number()),
+    }
+}
+
+/// `figure`: figure `n` as SVG text, the text `saveas(n, 'f.svg')` writes,
+/// at most `bound` bytes of it. `n` is a positive whole number; one past
+/// any figure's, a `u32`'s included, is no open figure. The render's own
+/// cost is bounded by the figure's point budget, [`crate::plot::figure::MAX_POINTS`].
+fn figure(it: &Interp, id: Json, n: f64, bound: usize) -> Result<Json, MError> {
+    // A whole number is written with no decimal point and no exponent:
+    // `1e12` is `1000000000000`.
+    let shown = n.to_string();
+    let svg = (n <= f64::from(u32::MAX))
+        .then_some(n as u32)
+        .and_then(|k| it.figure_svg(k))
+        .ok_or_else(|| error::figure_not_open(&shown))?;
+    if svg.len() > bound {
+        return Err(error::figure_too_large(&shown));
+    }
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("n", Json::Number(n)),
+        ("svg", Json::String(svg)),
+    ]))
+}
+
+/// `cwd`: with no `path`, the current folder relative to the root; with
+/// one, a string judged as `files` judges a folder, the current folder
+/// moved there first, as `cd` moves it. The answer is [`Interp::cwd`]
+/// relative to the root with `/` separators, judged on its canonical path:
+/// `""` at the root, and `null` should it lie outside, which `cd`'s
+/// confinement prevents, or be gone.
+fn cwd(it: &mut Interp, id: Json, req: &Json) -> Result<Json, MError> {
+    match req.get("path") {
+        None => {}
+        Some(Json::String(path)) => {
+            let root = root_for(it, path)?;
+            let folder = files::current_folder(root, path)?;
+            it.enter_folder(folder);
+        }
+        Some(_) => return Err(error::request_not_string("path")),
+    }
+    let cwd = it
+        .file_root
+        .as_deref()
+        .and_then(|root| files::folder_relative(root, &it.cwd))
+        .map_or(Json::Null, Json::String);
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("cwd", cwd),
+    ]))
 }
 
 /// A string field the operation needs.
@@ -1240,6 +1329,382 @@ mod tests {
             )),
             "{got}"
         );
+    }
+
+    /// A refusal as every operation writes one: `"line":null`.
+    fn refusal(id: u32, msg: &str) -> String {
+        format!(r#"{{"id":{id},"ok":false,"error":{{"message":"{msg}","line":null}}}}"#)
+    }
+
+    /// Cycle U4: `figures` answers `open` then `changed` after `id` and
+    /// `ok`, ascending, and asking forgets what it answered as changed;
+    /// `figure(n)`, a close and `close all` follow cycle 12's rule.
+    #[test]
+    fn figures_answers_open_then_changed() {
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        let mut ask = |line: &str| respond(&mut it, line).to_string();
+        assert_eq!(
+            ask(r#"{"id":1,"op":"figures"}"#),
+            r#"{"id":1,"ok":true,"open":[],"changed":[]}"#
+        );
+        ask(r#"{"op":"eval","code":"figure(3); figure(1);"}"#);
+        assert_eq!(
+            ask(r#"{"id":2,"op":"figures"}"#),
+            r#"{"id":2,"ok":true,"open":[1,3],"changed":[1,3]}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":3,"op":"figures"}"#),
+            r#"{"id":3,"ok":true,"open":[1,3],"changed":[]}"#
+        );
+        ask(r#"{"op":"eval","code":"figure(3); plot(1:3); figure(5); close(3);"}"#);
+        assert_eq!(
+            ask(r#"{"id":"s","op":"figures"}"#),
+            r#"{"id":"s","ok":true,"open":[1,5],"changed":[5]}"#
+        );
+        ask(r#"{"op":"eval","code":"close all"}"#);
+        assert_eq!(
+            ask(r#"{"op":"figures"}"#),
+            r#"{"id":null,"ok":true,"open":[],"changed":[]}"#
+        );
+    }
+
+    /// Cycle U4: `figure` answers `n` then `svg` after `id` and `ok`; the
+    /// empty figure's text is exactly the four lines the spec records;
+    /// and `n` is judged by the spec's table.
+    #[test]
+    fn figure_answers_n_then_svg_and_judges_n() {
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        let mut ask = |line: &str| respond(&mut it, line).to_string();
+        ask(r#"{"op":"eval","code":"figure(5);"}"#);
+        let empty = concat!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"560\" ",
+            "height=\"420\" viewBox=\"0 0 560 420\" font-family=\"Helvetica, Arial, sans-serif\">\n",
+            "<rect class=\"figure\" x=\"0\" y=\"0\" width=\"560\" height=\"420\" fill=\"#ffffff\" stroke=\"none\"/>\n",
+            "</svg>\n"
+        );
+        let mut want = String::from(r#"{"id":1,"ok":true,"n":5,"svg":"#);
+        json::write_string(&mut want, empty);
+        want.push('}');
+        assert_eq!(ask(r#"{"id":1,"op":"figure","n":5}"#), want);
+        for (id, n, msg) in [
+            (2, None, "Malformed request: no 'n' field."),
+            (
+                3,
+                Some("0"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                4,
+                Some("-1"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                5,
+                Some("1.5"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                6,
+                Some(r#""5""#),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                7,
+                Some("null"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                8,
+                Some("true"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                9,
+                Some("[5]"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                10,
+                Some("-0"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (
+                11,
+                Some("1e400"),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (12, Some("7"), "Figure 7 is not open."),
+            (13, Some("1e12"), "Figure 1000000000000 is not open."),
+            (14, Some("4294967295"), "Figure 4294967295 is not open."),
+            (15, Some("4294967296"), "Figure 4294967296 is not open."),
+            (
+                16,
+                Some("1e300"),
+                &format!("Figure 1{} is not open.", "0".repeat(300)),
+            ),
+        ] {
+            let field = n.map_or(String::new(), |n| format!(r#","n":{n}"#));
+            assert_eq!(
+                ask(&format!(r#"{{"id":{id},"op":"figure"{field}}}"#)),
+                refusal(id, msg),
+                "{n:?}"
+            );
+        }
+        // A whole number written with a decimal point or an exponent names
+        // the same figure.
+        assert!(
+            ask(r#"{"id":17,"op":"figure","n":5.0}"#).starts_with(r#"{"id":17,"ok":true,"n":5,"#)
+        );
+        assert!(
+            ask(r#"{"id":18,"op":"figure","n":0.5e1}"#).starts_with(r#"{"id":18,"ok":true,"n":5,"#)
+        );
+    }
+
+    /// Acceptance test 8: a plotted figure's `svg` is the very text
+    /// `saveas` writes, and holds its title.
+    #[test]
+    fn a_plotted_figures_svg_is_what_saveas_writes() {
+        let d = scratch("figure-saveas");
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        it.cwd = d.0.clone();
+        let got = respond(
+            &mut it,
+            r#"{"op":"eval","code":"plot(1:4, [3 1 4 1], 'r--o'); title('Crab & co'); xlabel('t'); saveas(1, 'f.svg')"}"#,
+        )
+        .to_string();
+        assert_eq!(got, r#"{"id":null,"ok":true,"out":""}"#);
+        let saved = std::fs::read_to_string(d.0.join("f.svg")).unwrap();
+        let r = respond(&mut it, r#"{"id":1,"op":"figure","n":1}"#);
+        assert_eq!(r.get("n"), Some(&Json::Number(1.0)));
+        let svg = r.get("svg").and_then(Json::as_str).expect("an svg");
+        assert_eq!(svg, saved);
+        assert!(svg.contains(">Crab &amp; co<"), "{svg}");
+        assert!(svg.contains("<polyline"), "{svg}");
+        assert!(svg.starts_with("<?xml "));
+    }
+
+    /// Acceptance test 8: an SVG text past the bound is refused, and one
+    /// exactly at it answered; the bound is a parameter, so a figure of a
+    /// few kilobytes reaches it.
+    #[test]
+    fn the_inline_bound_holds_at_and_past_its_length() {
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        respond(&mut it, r#"{"op":"eval","code":"figure(2); plot(1:100);"}"#);
+        let len = it.figure_svg(2).expect("figure 2 is open").len();
+        assert!(len > 1000, "{len}");
+        let at = figure(&it, Json::Number(1.0), 2.0, len)
+            .unwrap()
+            .to_string();
+        assert!(
+            at.starts_with(r#"{"id":1,"ok":true,"n":2,"svg":"<?xml "#),
+            "{at}"
+        );
+        let past = figure(&it, Json::Number(1.0), 2.0, len - 1).unwrap_err();
+        assert_eq!(
+            refused(Json::Number(1.0), past).to_string(),
+            refusal(
+                1,
+                "Figure 2 is too large to show inline; save it with saveas."
+            )
+        );
+        // The protocol's own bound is 32 MiB.
+        assert_eq!(MAX_INLINE_SVG, 33_554_432);
+        assert!(
+            respond(&mut it, r#"{"op":"figure","n":2}"#)
+                .get("svg")
+                .is_some()
+        );
+    }
+
+    /// A root `U4` under a scratch folder, holding `tree/a.txt` and
+    /// `tree/sub/deep.txt`, the spec's fixture, as a client mode fixes it,
+    /// and the current folder there as the process's working directory
+    /// would be spelled.
+    fn folder_session(name: &str) -> (Dir, Interp) {
+        let d = scratch(name);
+        let root = d.0.join("U4");
+        std::fs::create_dir_all(root.join("tree").join("sub")).unwrap();
+        std::fs::write(root.join("tree").join("a.txt"), "ab").unwrap();
+        std::fs::write(root.join("tree").join("sub").join("deep.txt"), "abc").unwrap();
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        it.file_root = Some(std::fs::canonicalize(&root).unwrap());
+        it.cwd = root;
+        (d, it)
+    }
+
+    /// Cycle U4: `cwd` answers `cwd` after `id` and `ok`; with a path it
+    /// moves the current folder, judged as `files` judges a folder, and a
+    /// refusal leaves the folder where it was; `cd` in an `eval` moves
+    /// what `cwd` answers, and cannot leave the root.
+    #[test]
+    fn cwd_answers_and_moves_the_current_folder() {
+        let (_d, mut it) = folder_session("cwd");
+        let mut ask = |line: &str| respond(&mut it, line).to_string();
+        assert_eq!(
+            ask(r#"{"id":1,"op":"cwd"}"#),
+            r#"{"id":1,"ok":true,"cwd":""}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":2,"op":"cwd","path":"tree"}"#),
+            r#"{"id":2,"ok":true,"cwd":"tree"}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":3,"op":"eval","code":"ls"}"#),
+            r#"{"id":3,"ok":true,"out":"a.txt\nsub\n"}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":4,"op":"cwd","path":"tree/./sub/"}"#),
+            r#"{"id":4,"ok":true,"cwd":"tree/sub"}"#
+        );
+        for (id, field, msg) in [
+            (5, r#""path":"..""#, "Path '..' is outside the file root."),
+            (
+                6,
+                r#""path":"tree/a.txt""#,
+                "Path 'tree/a.txt' is not a folder.",
+            ),
+            (7, r#""path":"nope""#, "Path 'nope' is not a folder."),
+            (
+                8,
+                r#""path":"/etc""#,
+                "Malformed request: 'path' must be a relative path with '/' separators.",
+            ),
+            (
+                9,
+                r#""path":"tree\\sub""#,
+                "Malformed request: 'path' must be a relative path with '/' separators.",
+            ),
+            (
+                10,
+                r#""path":3"#,
+                "Malformed request: 'path' must be a string.",
+            ),
+            (
+                11,
+                r#""path":null"#,
+                "Malformed request: 'path' must be a string.",
+            ),
+        ] {
+            assert_eq!(
+                ask(&format!(r#"{{"id":{id},"op":"cwd",{field}}}"#)),
+                refusal(id, msg),
+                "{field}"
+            );
+            assert_eq!(
+                ask(r#"{"id":12,"op":"cwd"}"#),
+                r#"{"id":12,"ok":true,"cwd":"tree/sub"}"#,
+                "unmoved by {field}"
+            );
+        }
+        assert_eq!(
+            ask(r#"{"id":13,"op":"cwd","path":""}"#),
+            r#"{"id":13,"ok":true,"cwd":""}"#
+        );
+        // `cd` moves what `cwd` answers, and stops at the root.
+        assert_eq!(
+            ask(r#"{"id":14,"op":"eval","code":"cd .."}"#),
+            r#"{"id":14,"ok":false,"out":"","error":{"message":"Cannot CD to ..: it is outside the file root.","line":1}}"#
+        );
+        ask(r#"{"op":"eval","code":"cd tree"}"#);
+        assert_eq!(
+            ask(r#"{"id":15,"op":"cwd"}"#),
+            r#"{"id":15,"ok":true,"cwd":"tree"}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":16,"op":"eval","code":"cd ../.."}"#),
+            r#"{"id":16,"ok":false,"out":"","error":{"message":"Cannot CD to ../..: it is outside the file root.","line":1}}"#
+        );
+        assert_eq!(
+            ask(r#"{"id":17,"op":"eval","code":"cd nope"}"#),
+            r#"{"id":17,"ok":false,"out":"","error":{"message":"Cannot CD to nope (Name is nonexistent or not a directory).","line":1}}"#
+        );
+        ask(r#"{"op":"eval","code":"cd .."}"#);
+        assert_eq!(
+            ask(r#"{"id":18,"op":"cwd"}"#),
+            r#"{"id":18,"ok":true,"cwd":""}"#
+        );
+    }
+
+    /// `cwd` with no root, which only a test builds: the folder is outside
+    /// any root, so `null`, and a path is judged on its text and then
+    /// refused as outside, as `files` refuses it. A current folder that is
+    /// gone is `null` too.
+    #[test]
+    fn cwd_without_a_root_or_with_the_folder_gone() {
+        let mut bare = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        assert_eq!(
+            respond(&mut bare, r#"{"id":1,"op":"cwd"}"#).to_string(),
+            r#"{"id":1,"ok":true,"cwd":null}"#
+        );
+        assert_eq!(
+            respond(&mut bare, r#"{"id":2,"op":"cwd","path":"tree"}"#).to_string(),
+            refusal(2, "Path 'tree' is outside the file root.")
+        );
+        assert_eq!(
+            respond(&mut bare, r#"{"id":3,"op":"cwd","path":"/x"}"#).to_string(),
+            refusal(
+                3,
+                "Malformed request: 'path' must be a relative path with '/' separators."
+            )
+        );
+        let (d, mut it) = folder_session("cwd-gone");
+        respond(&mut it, r#"{"op":"cwd","path":"tree/sub"}"#);
+        std::fs::remove_dir_all(d.0.join("U4").join("tree").join("sub")).unwrap();
+        assert_eq!(
+            respond(&mut it, r#"{"id":4,"op":"cwd"}"#).to_string(),
+            r#"{"id":4,"ok":true,"cwd":null}"#
+        );
+    }
+
+    /// Acceptance test 8: the folder `cwd` moves to is written in the
+    /// root's plain form, so `pwd` afterwards shows what `cd` to the same
+    /// folder shows, never the `\\?\` a canonical root has on Windows; and
+    /// the move makes a file there callable at once.
+    #[test]
+    fn pwd_after_cwd_is_the_plain_form_cd_gives() {
+        let (d, mut it) = folder_session("cwd-plain");
+        let root = it.file_root.clone().unwrap();
+        if cfg!(windows) {
+            assert!(
+                root.to_string_lossy().starts_with(r"\\?\"),
+                "{}",
+                root.display()
+            );
+        }
+        std::fs::write(
+            d.0.join("U4").join("tree").join("sub").join("here.m"),
+            "disp(9)\n",
+        )
+        .unwrap();
+        let pwd = |it: &mut Interp| {
+            let r = respond(it, r#"{"op":"eval","code":"disp(pwd)"}"#);
+            r.get("out")
+                .and_then(Json::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        respond(&mut it, r#"{"op":"cwd","path":"tree/sub"}"#);
+        let moved = pwd(&mut it);
+        assert!(!moved.starts_with(r"\\?\"), "{moved}");
+        assert!(moved.trim_end().ends_with("sub"), "{moved}");
+        assert_eq!(
+            respond(&mut it, r#"{"op":"eval","code":"here"}"#).to_string(),
+            r#"{"id":null,"ok":true,"out":"     9\n"}"#
+        );
+        // `cd` up and back down to the same folder shows the same text.
+        respond(&mut it, r#"{"op":"eval","code":"cd ../..; cd tree/sub"}"#);
+        assert_eq!(pwd(&mut it), moved);
+        // And so does the root.
+        respond(&mut it, r#"{"op":"cwd","path":""}"#);
+        let top = pwd(&mut it);
+        assert!(!top.starts_with(r"\\?\"), "{top}");
+        assert_eq!(
+            std::fs::canonicalize(top.trim_end()).unwrap(),
+            root,
+            "{top}"
+        );
+        assert_eq!(it.cwd, std::path::PathBuf::from(top.trim_end()));
     }
 
     /// `history_add` needs a string `entry`, judged before any file.

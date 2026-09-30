@@ -200,6 +200,25 @@ pre {
   color: var(--err);
 }
 
+/* A figure an entry drew, under its output: its label, then the image of
+   its SVG, framed by the rule. */
+.plot {
+  margin: 8px 0 0;
+}
+
+.plot figcaption {
+  color: var(--muted);
+  font: 12px/1.4 var(--sans);
+}
+
+.plot img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin-top: 4px;
+  border: 1px solid var(--rule);
+}
+
 /* A frame of an error's stack whose file is under the root: a link that
    opens the file at its line. */
 .err .link {
@@ -245,6 +264,24 @@ pre {
 
 #input[readonly] {
   color: var(--muted);
+}
+
+/* Tab's completions, when there are several, listed under the prompt
+   until the next key. */
+#completions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 16px;
+  max-height: 30vh;
+  overflow-y: auto;
+  margin-top: -6px;
+  padding: 0 16px 12px 42px;
+  background: var(--bg);
+  color: var(--muted);
+}
+
+#completions .item {
+  white-space: pre;
 }
 
 /* The workspace: name, value, size and class per variable. */

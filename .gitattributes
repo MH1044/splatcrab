@@ -15,3 +15,4 @@ src/ui/* text eol=lf
 tests/cases/U2-ui-desktop/tree/** binary
 *.history text eol=lf
 tests/cases/U3-ui-editor/prog/crlf.txt binary
+tests/cases/U4-ui-figures/tree/** binary

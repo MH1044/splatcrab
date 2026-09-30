@@ -98,7 +98,7 @@ It writes nothing to stderr and exits 0 at end of input, whatever the
 requests did: a failed evaluation and a line that is not a request are both
 answers, and the session goes on.
 
-There are ten operations. `eval` runs `code` as a REPL entry, possibly
+There are thirteen operations. `eval` runs `code` as a REPL entry, possibly
 several lines, and answers with the output it would have printed (`out`)
 and, if it failed, an `error` holding the REPL's message and the one-based
 line within `code`, and with `"stack": true` the error's frames too.
@@ -112,9 +112,12 @@ file root, the folder the session started in. `history` returns the command
 history the terminal's line editor keeps, and `history_add` adds an entry
 to it. `read_file` answers the text of one file under the file root,
 `write_file` saves a text to one, and `run_file` runs one `.m` file there
-as `run` would, answering as `eval` does. Every response starts with the
-request's `id` (a number or a string, or `null` when it sent none) and
-`ok`.
+as `run` would, answering as `eval` does. `figures` lists the open figures
+and those changed since it was last asked, `figure` answers one figure as
+the SVG text `saveas` would write, and `cwd` answers the current folder
+relative to the file root, or moves it first to the folder `path` names.
+Every response starts with the request's `id` (a number or a string, or
+`null` when it sent none) and `ok`.
 
 This input, one request per line:
 
@@ -231,6 +234,46 @@ The keys, the order of the checks and every message are specified in
 `tests/cases/U3-ui-editor/handbook_editor_example`, which sends these three
 requests from that case's folder and expects these three lines.
 
+**The figures and the current folder.** Three operations serve the
+browser's inline figures and its file browser. `figures` answers `open`,
+the numbers of the open figures, ascending, and `changed`, those of them
+changed since the last `figures` (made current with `figure(n)`, drawn
+into, decorated), which asking forgets. `figure` answers figure `n` as
+`svg`, the text `saveas(n, 'f.svg')` would write; `n` must be a positive
+whole number, a figure that is not open says so, and one whose SVG is
+longer than 32 MiB is refused with a word to save it with `saveas`
+instead. `cwd` answers the current folder relative to the file root, `""`
+at the root itself; with a `path`, judged as `files` judges one, it moves
+the current folder there first, exactly as `cd` would. In every client
+mode `cd` cannot leave the file root: a `cd` to a folder outside it is
+refused, so the command window and the file browser always show the same
+folder, while the REPL and scripts are unconfined as before. Started in a
+folder named `U4-ui-figures` that holds `tree/a.txt` and
+`tree/sub/deep.txt`, these requests:
+
+```text
+{"id":1,"op":"eval","code":"figure(2);"}
+{"id":2,"op":"figures"}
+{"id":3,"op":"cwd","path":"tree"}
+{"id":4,"op":"eval","code":"cd ..; cd .."}
+```
+
+get exactly these answers:
+
+```text
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":true,"open":[2],"changed":[2]}
+{"id":3,"ok":true,"cwd":"tree"}
+{"id":4,"ok":false,"out":"","error":{"message":"Cannot CD to ..: it is outside the file root.","line":1}}
+```
+
+The first `cd ..` of the last request climbs from `tree` back to the root;
+the second would leave it, and is refused on line 1 of the code. The keys,
+the rules for `n` and every message are specified in
+`docs/modules/U4-ui-figures.md`. This example is pinned by the golden case
+`tests/cases/U4-ui-figures/handbook_figures_example`, which sends these
+four requests from that case's folder and expects these four lines.
+
 **The command window in a browser.** `splatcrab --ui` serves a command
 window on your own machine and prints the one line you need:
 
@@ -244,13 +287,29 @@ choose one. The page is a desktop of four panes. In the middle is the
 command window, an input with a transcript above it: Enter runs the entry
 when it is complete and adds a line when it is not, Up and Down walk the
 command history, and each entry's output is shown exactly as the terminal
-would print it. On the left the file browser lists the folder the server
-was started in, one folder at a time, folders first: click a folder to open
-it and `..` to go back up. On the right the workspace lists every variable
-with a preview of its value, its size and its class, and below it the
-command history lists what has been run, in the page and at the terminal
-alike, oldest first: click an entry to put it in the input, double-click it
-to run it. The workspace and the file browser refresh after every entry.
+would print it. A figure the entry made or drew into appears under its
+output, labelled `Figure 1` and so on, as the entry left it: a later
+entry that draws into the same figure adds a picture of its own under
+itself, and the earlier one stays, so the transcript keeps each plot
+beside the code that made it. The picture is an image of the figure's SVG,
+never put into the page as markup, and a figure too large to show (past
+32 MiB of SVG) says so in its place; `saveas` still writes any figure to a
+file. Tab in the input completes the name before the cursor, as the
+terminal's Tab does: one match replaces it, several are shortened to what
+they share and listed under the prompt until the next key. Inside a quoted
+string it completes a file or folder name instead, from the current
+folder, so `cd('tr` becomes `cd('tree/`. Escape, then Tab, moves the focus
+out of the input. On the left the file browser shows the current folder,
+one folder at a time, folders first: click a folder to move into it, and
+`..`, offered in every folder but the one the server was started in, to go
+back up. It is the command window's folder too: `cd tree` in the command
+window moves the file browser into `tree`, and a click there moves `pwd`.
+`cd` cannot leave the folder the server was started in. On the right the
+workspace lists every variable with a preview of its value, its size and
+its class, and below it the command history lists what has been run, in
+the page and at the terminal alike, oldest first: click an entry to put it
+in the input, double-click it to run it. The workspace and the file
+browser refresh after every entry.
 
 Above the command window is the editor. Double-click a file in the file
 browser to open it in a tab of its own, or choose New for an empty
@@ -285,13 +344,16 @@ is ever run. The server listens on the loopback address `127.0.0.1` only,
 so no other machine can reach it, and because any web page you visit could
 still send requests to a local port, every request must name this server in
 its `Host` header and, when it sends an `Origin`, there too; a request to run
-code, list a folder, read or save a file, or read or add to the history must
-also carry the token. A request a browser marks as made by another site (its
-`Sec-Fetch-Site` header is anything but `same-origin`) is refused even with
-the token; a client that sends no such header, a script, is unaffected.
+code, list a folder, read or save a file, read or add to the history, see a
+figure or move the current folder must also carry the token. A request a
+browser marks as made by another site (its `Sec-Fetch-Site` header is
+anything but `same-origin`) is refused even with the token; a client that
+sends no such header, a script, is unaffected.
 Anything else is refused `403 Forbidden` before the interpreter sees
 it. The page, its script and its stylesheet need no token: they hold nothing
-secret.
+secret. The page runs only its own script, and shows a figure as an image
+made from its SVG by that script, the one kind of image source it admits
+beyond its own server.
 
 Under the page, the server speaks the evaluation protocol over HTTP: each
 request is one `POST /api` whose body is one protocol request and whose
@@ -4694,7 +4756,8 @@ Error: Line 6: Unsupported format 'jpg' for 'saveas'; SplatCrab writes svg and p
 **The viewer.** At the REPL, when standard input is a terminal, every
 figure an entry changed opens in the system's viewer, as a temporary SVG
 file. A script never opens one, and neither do `--protocol`, `--ui` and
-`--http-stdio`.
+`--http-stdio`: in the browser desktop a figure appears inline instead,
+under the entry that changed it (see "The command window in a browser").
 
 ### Workspace
 
@@ -4744,9 +4807,13 @@ and has no heading row. `clear x`, without parentheses, is
 getenv system version exit quit`. The current folder belongs to the
 interpreter: `cd` moves it, and every path it resolves (files on the path,
 the file functions, `ls`, `dir`, `run`, `system`) follows, while the
-process's own folder never changes. `help name` prints a builtin's help line,
-or a file's leading `%` comment block; `which name` says where a call of
-`name` goes. `eval(code)` runs text in the workspace, `v = eval(expr)`
+process's own folder never changes. Under `--protocol`, `--ui` and
+`--http-stdio`, `cd` cannot leave the folder the session started in:
+`cd ..` in that folder is `Cannot CD to ..: it is outside the file root.`
+At the REPL and in a script it goes anywhere. `help name` prints a
+builtin's help line, or a file's leading `%` comment block; `which name`
+says where a call of `name` goes. `eval(code)` runs text in the workspace,
+`v = eval(expr)`
 evaluates it, and `evalc(code)` returns what it printed, less the final line
 end. `pause(n)` waits `n` seconds, up to a day; a bare `pause` waits for
 Enter at a terminal and is an error in a pipe, so a piped script never

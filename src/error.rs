@@ -1862,6 +1862,40 @@ pub fn file_not_m(path: &str) -> MError {
     MError::new(format!("Path '{}' is not a .m file.", path))
 }
 
+// The figures and the current folder (cycle U4,
+// docs/modules/U4-ui-figures.md). A figure's `<n>` is written as an
+// integer, with no decimal point and no exponent.
+
+/// `figure` with an `n` that is not a JSON number holding a positive whole
+/// number: `0`, a negative, a fraction, a string, `null`, a boolean.
+pub fn request_figure_number() -> MError {
+    malformed("'n' must be a figure number")
+}
+
+/// `figure` of a number no open figure has, one past any figure's
+/// included.
+pub fn figure_not_open(n: &str) -> MError {
+    MError::new(format!("Figure {} is not open.", n))
+}
+
+/// `figure` of a figure whose SVG text is longer than the inline bound,
+/// 32 MiB.
+pub fn figure_too_large(n: &str) -> MError {
+    MError::new(format!(
+        "Figure {} is too large to show inline; save it with saveas.",
+        n
+    ))
+}
+
+/// `cd` under a client mode, whose file root is set, to a folder whose
+/// canonical path is not the root or inside it. `dir` is as written.
+pub fn cd_outside_root(dir: &str) -> MError {
+    MError::new(format!(
+        "Cannot CD to {}: it is outside the file root.",
+        dir
+    ))
+}
+
 // ---- the environment (cycle 13) ---------------------------------------
 
 /// `exit` or `quit` under `--protocol`, `--ui` or `--http-stdio`, where the
@@ -2107,6 +2141,38 @@ mod tests {
             (
                 request_stack(),
                 "Malformed request: 'stack' must be true or false.",
+            ),
+        ] {
+            assert_eq!(got.msg, want);
+            assert_eq!(got.line, None);
+        }
+    }
+
+    /// Cycle U4's texts, byte for byte as the spec writes them.
+    #[test]
+    fn the_figure_and_folder_messages() {
+        for (got, want) in [
+            (
+                request_figure_number(),
+                "Malformed request: 'n' must be a figure number.",
+            ),
+            (figure_not_open("7"), "Figure 7 is not open."),
+            (
+                figure_not_open("1000000000000"),
+                "Figure 1000000000000 is not open.",
+            ),
+            (
+                figure_too_large("5"),
+                "Figure 5 is too large to show inline; save it with saveas.",
+            ),
+            (
+                cd_outside_root("../.."),
+                "Cannot CD to ../..: it is outside the file root.",
+            ),
+            (request_missing("n"), "Malformed request: no 'n' field."),
+            (
+                request_not_string("path"),
+                "Malformed request: 'path' must be a string.",
             ),
         ] {
             assert_eq!(got.msg, want);

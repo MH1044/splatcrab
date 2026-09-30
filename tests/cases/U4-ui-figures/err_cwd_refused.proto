@@ -1,0 +1,12 @@
+% covers: 5 - cwd refusals, each an answer with line null, the path judged from the file root exactly as files judges it: .. is outside the file root, at the root and again from tree; tree/a.txt is not a folder; /etc is a malformed path; a path of 3 is not a string; and after each refusal cwd still answers the folder it was in, "" and then tree
+{"id":1,"op":"cwd","path":".."}
+{"id":2,"op":"cwd"}
+{"id":3,"op":"cwd","path":"tree"}
+{"id":4,"op":"cwd","path":".."}
+{"id":5,"op":"cwd"}
+{"id":6,"op":"cwd","path":"tree/a.txt"}
+{"id":7,"op":"cwd"}
+{"id":8,"op":"cwd","path":"/etc"}
+{"id":9,"op":"cwd"}
+{"id":10,"op":"cwd","path":3}
+{"id":11,"op":"cwd"}
