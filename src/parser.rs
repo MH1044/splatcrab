@@ -1433,6 +1433,19 @@ impl Parser {
     fn parse_primary(&mut self) -> R<Expr> {
         let line = self.line();
         match self.next() {
+            // A signed hexadecimal or binary literal with its top bit set
+            // (cycle 16), `0xFFs8`, is the one number token that is
+            // negative. It is the negation of its magnitude, the tree `-1`
+            // makes, so it keeps a negation's precedence wherever it is
+            // rendered back: `@() 0xFFs8^2` is `@()(-1)^2`, never `@()-1^2`,
+            // which reads back as `-(1^2)`. The negation is one level of
+            // nesting, as the sign of `-1` is, so the evaluator can walk
+            // whatever this accepts.
+            Token::Num(v) if v < 0.0 => {
+                self.deepen()?;
+                self.depth -= 1;
+                Ok(Expr::Neg(Box::new(Expr::Num(-v))))
+            }
             Token::Num(v) => Ok(Expr::Num(v)),
             Token::Imag(v) => Ok(Expr::Imag(v)),
             Token::Str(s) => Ok(Expr::Str(s)),
@@ -2192,14 +2205,15 @@ mod tests {
             msg("for 1 = 1:2\nend"),
             "expected loop variable after 'for', found '1'"
         );
-        // A number shows its value and an identifier its name. `0x1F` lexes
-        // as `0` then the identifier `x1F`, which is the message QA D30 left
-        // as `unexpected Ident("x1F")`.
-        assert_eq!(msg("x = 0x1F"), "unexpected 'x1F'");
+        // A number shows its value and an identifier its name. `00x1F` lexes
+        // as `00` then the identifier `x1F`, the message that once read
+        // `unexpected Ident("x1F")`. It was `0x1F` until cycle 16 made that
+        // a hexadecimal literal; a `0` before it keeps the old reading.
+        assert_eq!(msg("x = 00x1F"), "unexpected 'x1F'");
         assert_eq!(msg("x = 1 2"), "unexpected '2'");
         assert_eq!(msg("x = 1 0.3"), "unexpected '0.3'");
         // Nothing in a message says `Token` or a variant name any more.
-        for src in ["y = x + ;", "end", "x = 0x1F", "y = (1 + 2;"] {
+        for src in ["y = x + ;", "end", "x = 00x1F", "y = (1 + 2;"] {
             let m = msg(src);
             assert!(!m.contains("Semi") && !m.contains("Ident("), "{src}: {m}");
         }
@@ -2911,10 +2925,55 @@ mod tests {
             "@(a) a & ~(a | a) || a && a",
             "@(s) s.b{2}.(n)(1)",
             "@(q) ((q))",
+            // A negative literal (cycle 16), as a base, an exponent, under
+            // a transpose and under a sign of its own.
+            "@() 0xFFs8^2 + 2^0x80s8'",
+            "@() -0xFFs8^2",
+            "@(x) [0x80s8.^2 x; 0b11111111s8' -x]",
         ] {
             let e = parse_expr(src);
             assert_eq!(parse_expr(&render(&e)), e, "{src} -> {}", render(&e));
         }
+    }
+
+    /// A signed literal with its top bit set (cycle 16) is the one number
+    /// token that is negative. It parses as the negation of its magnitude,
+    /// the tree the same value written in decimal makes, so its value is
+    /// unchanged and it renders with a negation's precedence.
+    #[test]
+    fn a_negative_literal_is_the_negation_of_its_magnitude() {
+        assert_eq!(parse_expr("0xFFs8"), neg(num(1.0)));
+        assert_eq!(parse_expr("0xFFs8"), parse_expr("-1"));
+        assert_eq!(parse_expr("0x80s8"), parse_expr("-128"));
+        assert_eq!(parse_expr("0b10000000s8"), neg(num(128.0)));
+        assert_eq!(
+            parse_expr("0x8000000000000000s64"),
+            neg(num(9_223_372_036_854_775_808.0))
+        );
+        // A literal that is not negative is a number as before.
+        assert_eq!(parse_expr("0x7Fs8"), num(127.0));
+        assert_eq!(parse_expr("0xFFu8"), num(255.0));
+        assert_eq!(parse_expr("0x0s8"), num(0.0));
+        // As a base it keeps the negation's precedence: `(-1)^2`.
+        assert_eq!(
+            parse_expr("0xFFs8^2"),
+            bin(BinOp::Pow, neg(num(1.0)), num(2.0))
+        );
+        assert_eq!(
+            parse_expr("-0xFFs8^2"),
+            neg(bin(BinOp::Pow, neg(num(1.0)), num(2.0)))
+        );
+        let text = |src: &str| match parse_expr(src) {
+            Expr::AnonFn(f) => f.text(),
+            e => panic!("not a handle: {e:?}"),
+        };
+        assert_eq!(text("@() 0xFFs8^2"), "@()(-1)^2");
+        assert_eq!(text("@() 0x80s8.^2"), "@()(-128).^2");
+        assert_eq!(text("@() -0xFFs8^2"), "@()-(-1)^2");
+        assert_eq!(text("@() 2^0x80s8"), "@()2^-128");
+        assert_eq!(text("@() 0xFFs8'"), "@()(-1)'");
+        assert_eq!(text("@() [1 0xFFs8]"), "@()[1,-1]");
+        assert_eq!(text("@() 0x2A"), "@()42");
     }
 
     /// `str2func`'s parse: one handle form, and nothing after it.

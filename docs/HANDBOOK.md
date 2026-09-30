@@ -446,10 +446,74 @@ v =
 ```
 
 Every number is an IEEE 754 double. There are no integer classes and no
-`single`; complex numbers are the next section. Note `w`: a scalar that is not a whole number
+`single`; hexadecimal and binary literals are the next section, and complex
+numbers the one after. Note `w`: a scalar that is not a whole number
 switches to short exponential form below 0.01 and from 1000 up, as MATLAB's
 does. [`disp` and automatic display](#disp-and-automatic-display) gives the
 rules.
+
+### Hexadecimal and binary literals
+
+Cycle 16. A number that starts with `0x` or `0X` is hexadecimal, digits
+`0`-`9`, `A`-`F` and `a`-`f`, and one that starts with `0b` or `0B` is
+binary, digits `0` and `1`. Leading zeros count for nothing:
+
+```matlab
+a = 0x2A
+disp([0b101010 0XFF 0B11 0x000F])
+disp(class(a))
+```
+
+```
+a =
+
+    42
+
+    42   255     3    15
+double
+```
+
+The class is the difference from MATLAB, which stores a literal as the
+smallest unsigned integer type that holds it, `uint8` for `0x2A`. SplatCrab
+has no integer classes, so a literal is the double nearest its value, exact
+up to 2^53.
+
+An optional suffix names the integer type the digits are written for: `u8`,
+`u16`, `u32` or `u64`, unsigned, or `s8`, `s16`, `s32` or `s64`, signed. The
+value must fit the type, and a signed suffix reads the digits in two's
+complement, so a value with the top bit set is negative. Past 2^53 the
+double is the nearest one, as `fprintf` shows:
+
+```matlab
+disp([0xFFs8 0x80s8 0x7Fs8 0xFFu8])
+disp(0xFFFFs16 + 0b1)
+fprintf('%d\n', 0xFFFFFFFFu32);
+fprintf('%d %d\n', [0xFF000000001F123As64 0x1234FFFFFFFFFFFs64]);
+```
+
+```
+     -1   -128    127    255
+     0
+4294967295
+-72057594035891656 81997179153022976
+```
+
+MATLAB's `int64` holds the last two exactly, `-72057594035891654` and
+`81997179153022975`. A literal is one number, so `[0x1 0x2]` is two elements
+and `-0x10` is `-16`, while `00x1F` and `1x2` are still a number followed by
+a name. The literal runs over every letter, digit and underscore after the
+prefix, and anything there but digits of the base and one suffix, or a
+value its type cannot hold, is `invalid number`, which stops a script before
+any of it runs:
+
+```matlab
+disp(1)
+x = 0x100u8
+```
+
+```
+Error: Line 2: invalid number '0x100u8'
+```
 
 ### Complex numbers
 
@@ -6558,8 +6622,16 @@ from the names the script has assigned by then; a name cleared and then used
 in command form stays an expression. Chained ranges parse as
 MATLAB reads them,
 `1:2:3:4` as `(1:2:3):4`, but a colon operand that is not a scalar is then an
-error. Hex literals (`0x1F`) are rejected. A UTF-8 byte-order mark at the
-start of a file is skipped; a UTF-16 file is not read.
+error. Hexadecimal and binary literals (`0x1F`, `0b101`) are read since
+cycle 16, as doubles rather than MATLAB's integer types ([Hexadecimal and
+binary literals](#hexadecimal-and-binary-literals)). A UTF-8 byte-order mark at the
+start of a file is skipped. Since cycle 13b a UTF-16 file is read too: one
+that starts with a UTF-16 byte-order mark, little- or big-endian, or one
+without a mark whose first 64 bytes show the pattern of ASCII text in
+UTF-16, a zero byte as the second of every pair of bytes (little-endian) or
+as the first (big-endian) and none elsewhere. A UTF-16 file with no mark
+whose first 64 bytes hold a character past U+00FF shows no such pattern
+and is read as UTF-8.
 
 A `break` or `continue` outside a loop is an error, as in MATLAB. It used to
 end the script silently with exit 0:

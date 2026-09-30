@@ -5303,6 +5303,13 @@ mod tests {
             let signs = |n: usize| format!("y = {}1;", "-".repeat(n));
             assert!(run(&signs(MAX_DEPTH - 2)).0.is_ok());
             assert_eq!(err_msg(&signs(MAX_DEPTH - 1)), TOO_DEEP);
+            // A negative literal (cycle 16) is a sign and a number, as `-1`
+            // is, so it is counted as one and refused before anything runs.
+            let literal = |n: usize| format!("disp(0);\ny = {}0xFFs8;", "-".repeat(n));
+            assert!(run(&literal(MAX_DEPTH - 3)).0.is_ok());
+            let (r, out) = run(&literal(MAX_DEPTH - 2));
+            assert_eq!(r.unwrap_err().msg, TOO_DEEP);
+            assert_eq!(out, "", "nothing runs");
         });
     }
 
@@ -7949,6 +7956,37 @@ mod tests {
             ("unexpected end of input in expression", Some(2))
         );
         assert_eq!(err_msg("f = str2func('@sin + 1');"), "unexpected '+'");
+    }
+
+    /// A negative literal (cycle 16) keeps its value, and the function
+    /// `str2func` makes of `func2str`'s text gives the same value as the
+    /// handle it was rendered from.
+    #[test]
+    fn a_negative_literal_keeps_its_value_through_func2str() {
+        assert_eq!(
+            ok_out(
+                "disp(isequal([0xFFs8 0x80s8 0xFFs8^2 0x80s8.^2 -0xFFs8^2 2^0xFFs8], [-1 -128 1 16384 -1 0.5]))"
+            ),
+            "   1\n"
+        );
+        assert_eq!(
+            ok_out("f = @() 0xFFs8^2; disp(func2str(f)); disp([f() feval(str2func(func2str(f)))])"),
+            "@()(-1)^2\n     1     1\n"
+        );
+        for src in [
+            "@() 0x80s8.^2",
+            "@() -0xFFs8^2",
+            "@() 2^0x80s8'",
+            "@() [0xFFs8 1; 2 0x80s8]'",
+        ] {
+            assert_eq!(
+                ok_out(&format!(
+                    "f = {src}; g = str2func(func2str(f)); disp(isequal(f(), g()))"
+                )),
+                "   1\n",
+                "{src}"
+            );
+        }
     }
 
     #[test]

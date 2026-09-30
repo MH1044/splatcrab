@@ -412,6 +412,84 @@ fn header_names(line: &[Token]) -> Vec<String> {
     names
 }
 
+/// The integer-type suffixes a hexadecimal or binary literal may end in
+/// (cycle 16), each with its width in bits and whether it is signed: the
+/// eight of MATLAB's "Hexadecimal and Binary Values" page, and nothing else.
+const INT_SUFFIXES: [(&str, u32, bool); 8] = [
+    ("u8", 8, false),
+    ("u16", 16, false),
+    ("u32", 32, false),
+    ("u64", 64, false),
+    ("s8", 8, true),
+    ("s16", 16, true),
+    ("s32", 32, true),
+    ("s64", 64, true),
+];
+
+/// Where the hexadecimal or binary literal starting at `start` ends, and
+/// its value (cycle 16). `chars[start]` is the `0` and `chars[start + 1]`
+/// its `x`, `X`, `b` or `B`. The literal is the prefix and the whole run of
+/// letters, digits and underscores after it, so a malformed one is refused
+/// as the text it is, `0x1Fz` whole, rather than read as a number and a
+/// name. The value is `None` when the run is malformed; see
+/// [`radix_value`].
+fn radix_literal(chars: &[char], start: usize) -> (usize, Option<f64>) {
+    let base = if matches!(chars[start + 1], 'x' | 'X') {
+        16
+    } else {
+        2
+    };
+    let mut end = start + 2;
+    while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    (end, radix_value(&chars[start + 2..end], base))
+}
+
+/// The value of a literal's run after its prefix, in `base` 16 or 2: one or
+/// more digits of the base, then at most one of [`INT_SUFFIXES`], and
+/// nothing else, or `None`.
+///
+/// The digits' value is computed exactly. Every type holds less than 2^64,
+/// so accumulation stops as soon as the value passes 2^64 - 1: a `u128`
+/// then never overflows, and a run of a million digits costs one pass over
+/// its characters. Leading zeros add nothing, so the value, not the digit
+/// count, decides whether a type holds it. With no suffix the value must be
+/// below 2^64, with `uN` below 2^N, and with `sN` below 2^N too, a value of
+/// 2^(N-1) or more then standing for itself minus 2^N, its two's
+/// complement. The result is the double nearest the value, exact up to
+/// 2^53, since SplatCrab has no integer classes.
+fn radix_value(run: &[char], base: u32) -> Option<f64> {
+    let digits = run.iter().take_while(|c| c.is_digit(base)).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &run[digits..];
+    let (bits, signed) = if rest.is_empty() {
+        (64, false)
+    } else {
+        INT_SUFFIXES
+            .iter()
+            .find(|(s, _, _)| s.chars().eq(rest.iter().copied()))
+            .map(|&(_, bits, signed)| (bits, signed))?
+    };
+    let mut value: u128 = 0;
+    for c in &run[..digits] {
+        value = value * u128::from(base) + u128::from(c.to_digit(base)?);
+        if value > u128::from(u64::MAX) {
+            return None;
+        }
+    }
+    if value >= 1u128 << bits {
+        return None;
+    }
+    if signed && value >= 1u128 << (bits - 1) {
+        // Between -2^(N-1) and -1: the pattern read in two's complement.
+        return Some((value as i128 - (1i128 << bits)) as f64);
+    }
+    Some(value as f64)
+}
+
 /// The text of a source file's bytes (cycle 13b). A file that starts with a
 /// UTF-16 byte-order mark, `FF FE` little-endian or `FE FF` big-endian, is
 /// UTF-16 and the mark is dropped; so is one without a mark whose first 64
@@ -660,6 +738,24 @@ pub fn scan_known(src: &str, known: &dyn Fn(&str) -> bool) -> R<Lexed> {
                 line,
             );
             line += 1;
+            continue;
+        }
+
+        // A hexadecimal or binary literal (cycle 16), `0x2A`, `0b101010`,
+        // `0xFFs8`: a number that starts with `0` straight followed by `x`,
+        // `X`, `b` or `B`. Any other number, `00x1F` and `1x2` among them,
+        // is read below as it always was.
+        if c == '0' && matches!(chars.get(i + 1), Some('x' | 'X' | 'b' | 'B')) {
+            let start = i;
+            let (end, value) = radix_literal(&chars, i);
+            i = end;
+            match value {
+                Some(v) => toks.push(Token::Num(v), line),
+                None => {
+                    let text: String = chars[start..end].iter().collect();
+                    bail!(error::invalid_number(&text).at(line));
+                }
+            }
             continue;
         }
 
@@ -1230,6 +1326,284 @@ mod tests {
         assert_eq!(
             lx("3.'"),
             vec![Token::Num(3.0), Token::DotTranspose, Token::Eof]
+        );
+    }
+
+    // ---- hexadecimal and binary literals (cycle 16) ----------------------
+
+    fn num(v: f64) -> Vec<Token> {
+        vec![Token::Num(v), Token::Eof]
+    }
+
+    /// `0x`, `0X`, `0b` and `0B` each start one number, with or without any
+    /// of the eight suffixes. The literal ends and starts a value as any
+    /// number does, and every other number, and a name, lexes as before.
+    #[test]
+    fn hex_and_binary_literals_are_numbers() {
+        for src in ["0x2A", "0X2a", "0x2a", "0X2A", "0b101010", "0B101010"] {
+            assert_eq!(lx(src), num(42.0), "{src}");
+        }
+        assert_eq!(lx("0b10010110"), num(150.0));
+        assert_eq!(lx("0x0"), num(0.0));
+        assert_eq!(lx("0b0"), num(0.0));
+        assert_eq!(lx("0xABCDEF"), num(11_259_375.0));
+        // `e` is a hexadecimal digit, never an exponent.
+        assert_eq!(lx("0x1e3"), num(483.0));
+        for s in ["u8", "u16", "u32", "u64", "s8", "s16", "s32", "s64"] {
+            assert_eq!(lx(&format!("0x2A{s}")), num(42.0), "{s}");
+            assert_eq!(lx(&format!("0X2a{s}")), num(42.0), "{s}");
+            assert_eq!(lx(&format!("0b101010{s}")), num(42.0), "{s}");
+            assert_eq!(lx(&format!("0B101010{s}")), num(42.0), "{s}");
+        }
+        // One token, which ends a value and starts one.
+        assert_eq!(
+            lx("[0x1 0x2 0b11]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Num(2.0),
+                Token::Comma,
+                Token::Num(3.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("[0x1 -0b1]"),
+            vec![
+                Token::LBracket,
+                Token::Num(1.0),
+                Token::Comma,
+                Token::Minus,
+                Token::Num(1.0),
+                Token::RBracket,
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lx("-0x10"),
+            vec![Token::Minus, Token::Num(16.0), Token::Eof]
+        );
+        assert_eq!(
+            lx("0x10'"),
+            vec![Token::Num(16.0), Token::Transpose, Token::Eof]
+        );
+        assert_eq!(
+            lx("0x10+0b1"),
+            vec![Token::Num(16.0), Token::Plus, Token::Num(1.0), Token::Eof]
+        );
+        assert_eq!(
+            lx("v(0x2)"),
+            vec![
+                id("v"),
+                Token::LParen,
+                Token::Num(2.0),
+                Token::RParen,
+                Token::Eof
+            ]
+        );
+        // The run ends at anything but a letter, a digit or an underscore.
+        assert_eq!(
+            lx("0x1F.^2"),
+            vec![
+                Token::Num(31.0),
+                Token::DotCaret,
+                Token::Num(2.0),
+                Token::Eof
+            ]
+        );
+        assert_eq!(
+            lx("0xFFs8;"),
+            vec![Token::Num(-1.0), Token::Semi, Token::Eof]
+        );
+        // A command's word is text, as any word is.
+        assert_eq!(
+            lx("disp 0x1F"),
+            vec![
+                id("disp"),
+                Token::LParen,
+                st("0x1F"),
+                Token::RParen,
+                Token::Eof
+            ]
+        );
+        // A number that starts any other way, and a name, are unchanged.
+        assert_eq!(lx("00x1F"), vec![Token::Num(0.0), id("x1F"), Token::Eof]);
+        assert_eq!(lx("1x2"), vec![Token::Num(1.0), id("x2"), Token::Eof]);
+        assert_eq!(lx("10b1"), vec![Token::Num(10.0), id("b1"), Token::Eof]);
+        assert_eq!(lx("0.0x1"), vec![Token::Num(0.0), id("x1"), Token::Eof]);
+        assert_eq!(lx(".0x1"), vec![Token::Num(0.0), id("x1"), Token::Eof]);
+        assert_eq!(lx("a0x1"), vec![id("a0x1"), Token::Eof]);
+        assert_eq!(lx("x0b1"), vec![id("x0b1"), Token::Eof]);
+        assert_eq!(lx("0"), num(0.0));
+        assert_eq!(lx("0.5"), num(0.5));
+        assert_eq!(lx("0e5"), num(0.0));
+        assert_eq!(lx("0i"), vec![Token::Imag(0.0), Token::Eof]);
+        assert_eq!(lx("1i"), vec![Token::Imag(1.0), Token::Eof]);
+    }
+
+    /// `sN` reads the digits as an `N`-bit pattern in two's complement: at
+    /// each width, zero and the largest positive value are themselves, and
+    /// 2^(N-1) up to 2^N - 1 are those values minus 2^N.
+    #[test]
+    fn a_signed_suffix_reads_twos_complement() {
+        let lit = |v: u64, radix: u32, s: &str| match radix {
+            16 => format!("0x{v:X}{s}"),
+            _ => format!("0b{v:b}{s}"),
+        };
+        for (bits, s) in [(8u32, "s8"), (16, "s16"), (32, "s32"), (64, "s64")] {
+            let half = 1u64 << (bits - 1);
+            let all = u64::MAX >> (64 - bits);
+            for radix in [16, 2] {
+                let at = |v: u64| lx(&lit(v, radix, s));
+                assert_eq!(at(0), num(0.0), "{s}");
+                assert_eq!(at(1), num(1.0), "{s}");
+                assert_eq!(at(half - 1), num((half - 1) as f64), "{s}");
+                assert_eq!(at(half), num(-(half as f64)), "{s}");
+                assert_eq!(at(half + 1), num(-((half - 1) as f64)), "{s}");
+                assert_eq!(at(all - 1), num(-2.0), "{s}");
+                assert_eq!(at(all), num(-1.0), "{s}");
+            }
+        }
+        // The page's own values.
+        assert_eq!(lx("0x2As32"), num(42.0));
+        assert_eq!(lx("0xFFs8"), num(-1.0));
+        assert_eq!(lx("0x7Fs8"), num(127.0));
+        assert_eq!(lx("0x80s8"), num(-128.0));
+        assert_eq!(lx("0xFFFFs16"), num(-1.0));
+        assert_eq!(lx("0xFFFFFFFFs32"), num(-1.0));
+        assert_eq!(lx("0xFFFFFFFFFFFFFFFFs64"), num(-1.0));
+        assert_eq!(lx("0b10010110s8"), num(-106.0));
+        // Past 2^53 a value is the double nearest it, the value the page's
+        // own conversion through a double gives.
+        let low = -72_057_594_035_891_654_i64 as f64;
+        let high = 81_997_179_153_022_975_i64 as f64;
+        assert_eq!(low as i64, -72_057_594_035_891_656);
+        assert_eq!(high as i64, 81_997_179_153_022_976);
+        assert_eq!(lx("0xFF000000001F123As64"), num(low));
+        assert_eq!(lx("0x1234FFFFFFFFFFFs64"), num(high));
+        // An unsigned suffix never reads a negative value.
+        assert_eq!(lx("0xFFu8"), num(255.0));
+        assert_eq!(lx("0x80u8"), num(128.0));
+        assert_eq!(lx("0xFFFFFFFFu32"), num(4_294_967_295.0));
+        assert_eq!(lx("0xFFFFFFFFFFFFFFFFu64"), num(u64::MAX as f64));
+    }
+
+    /// The value, not the number of digits, decides whether a type holds a
+    /// literal: below 2^64 with no suffix, below 2^N with `uN` or `sN`.
+    /// Leading zeros count for nothing, and a million digits lex in one pass.
+    #[test]
+    fn a_literal_fits_its_type_by_value() {
+        let refused = |src: &str| {
+            assert_eq!(
+                lex(src).unwrap_err().msg,
+                format!("invalid number '{src}'"),
+                "{src}"
+            );
+        };
+        // 2^64 - 1 is the largest literal with no suffix, and 2^64 too large.
+        assert_eq!(lx("0xFFFFFFFFFFFFFFFF"), num(u64::MAX as f64));
+        assert_eq!(lx(&format!("0b{}", "1".repeat(64))), num(u64::MAX as f64));
+        refused("0x10000000000000000");
+        refused(&format!("0b1{}", "0".repeat(64)));
+        refused("0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF");
+        // 2^53 exactly, the last integer every double below it can hold.
+        assert_eq!(lx("0x20000000000000"), num(9_007_199_254_740_992.0));
+        // Each width's largest value, and one more.
+        for bits in [8u32, 16, 32, 64] {
+            let max = u64::MAX >> (64 - bits);
+            let over = u128::from(max) + 1;
+            for s in [format!("u{bits}"), format!("s{bits}")] {
+                let top = lx(&format!("0x{max:X}{s}"));
+                let want = if s.starts_with('u') { max as f64 } else { -1.0 };
+                assert_eq!(top, num(want), "{s}");
+                refused(&format!("0x{over:X}{s}"));
+                refused(&format!("0b{over:b}{s}"));
+            }
+        }
+        // Leading zeros are free.
+        assert_eq!(lx("0x000000000000000000FF"), num(255.0));
+        assert_eq!(lx("0x00"), num(0.0));
+        assert_eq!(lx(&format!("0x{}FFu8", "0".repeat(100))), num(255.0));
+        assert_eq!(lx(&format!("0b{}1s8", "0".repeat(100))), num(1.0));
+        assert_eq!(
+            lx(&format!("0x{}FFFFFFFFFFFFFFFF", "0".repeat(1000))),
+            num(u64::MAX as f64)
+        );
+        // A million digits, small or too large, in one pass.
+        assert_eq!(lx(&format!("0x{}F", "0".repeat(1_000_000))), num(15.0));
+        assert_eq!(lx(&format!("0b{}1", "0".repeat(1_000_000))), num(1.0));
+        refused(&format!("0x{}", "F".repeat(1_000_000)));
+        refused(&format!("0b{}", "1".repeat(1_000_000)));
+    }
+
+    /// Each malformed form is `invalid number` naming the whole literal as
+    /// written, at its line: no digit after the prefix, a digit outside the
+    /// base, a letter that begins no suffix or a suffix not among the eight,
+    /// and a value its type cannot hold.
+    #[test]
+    fn a_malformed_literal_is_an_invalid_number() {
+        for src in [
+            "0x",
+            "0X",
+            "0b",
+            "0B",
+            "0xu8",
+            "0bs8",
+            "0x_1",
+            "0xG",
+            "0b102",
+            "0b2",
+            "0b1F",
+            "0b1e3",
+            "0x1Fz",
+            "0x1Fu9",
+            "0x1Fi",
+            "0x1Fj",
+            "0x1u",
+            "0x1s",
+            "0x1U8",
+            "0x1S8",
+            "0x1u08",
+            "0x1u128",
+            "0x1s7",
+            "0x1u8x",
+            "0x1s64_",
+            "0x1Fu8u8",
+            "0x1_0",
+            "0x100u8",
+            "0x100s8",
+            "0x10000000000000000",
+        ] {
+            let e = lex(&format!("x = {src};")).unwrap_err();
+            assert_eq!(e.msg, format!("invalid number '{src}'"), "{src}");
+        }
+        // Inside brackets, and after a statement on an earlier line.
+        assert_eq!(lex("[1 0b12 3]").unwrap_err().msg, "invalid number '0b12'");
+        let e = scan("disp(1)\n\nx = 0b2").unwrap_err();
+        assert_eq!((e.msg.as_str(), e.line), ("invalid number '0b2'", Some(3)));
+        let e = scan("disp(1)\nx = 0x100u8").unwrap_err();
+        assert_eq!(
+            (e.msg.as_str(), e.line),
+            ("invalid number '0x100u8'", Some(2))
+        );
+        // A tail of a million letters is still the one literal.
+        let tail = format!("0x1{}", "z".repeat(1_000_000));
+        assert_eq!(
+            lex(&tail).unwrap_err().msg,
+            format!("invalid number '{tail}'")
+        );
+        // The run's letters and digits are ASCII, as a name's are: a letter
+        // past ASCII ends the literal and is the stray character it is after
+        // any number, and a digit past ASCII is no digit of the base.
+        assert_eq!(
+            lex("x = 0x1F\u{e9}").unwrap_err().msg,
+            "unexpected character '\u{e9}'"
+        );
+        assert_eq!(
+            lex("x = 0x\u{ff11}").unwrap_err().msg,
+            "invalid number '0x'"
         );
     }
 

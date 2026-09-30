@@ -229,9 +229,27 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 - `lexer.rs`: token streams. The whitespace rule inside brackets, quote versus
   transpose, numbers such as `2.*x` where the dot must not be swallowed,
   identical output for CRLF and LF input, and since cycle 04 block comments
-  and the command-syntax rule, variables known and unknown.
+  and the command-syntax rule, variables known and unknown. Since cycle 16
+  the hexadecimal and binary literals: `hex_and_binary_literals_are_numbers`
+  (each prefix and each suffix one number token, the literal ending and
+  starting a value, and `00x1F`, `1x2`, `a0x1`, `0.5`, `0e5` and `1i`
+  lexing as before), `a_signed_suffix_reads_twos_complement` (each signed
+  width at its bounds, in both bases, and the MathWorks page's values past
+  2^53 as their nearest doubles), `a_literal_fits_its_type_by_value`
+  (2^64 - 1 and 2^64, each width's largest value and one more, leading
+  zeros, and a million digits in one pass) and
+  `a_malformed_literal_is_an_invalid_number` (each malformed form, named
+  whole at its line, a million-letter tail included, and a letter or a
+  digit past ASCII after the prefix).
 - `parser.rs`: tree shapes and precedence. `Expr`, `Stmt`, `BinOp` and `Token`
   all derive `PartialEq`, so trees can be compared directly.
+  `a_rendered_body_parses_back_to_itself` renders a body and parses the text
+  back to the same tree; since cycle 16 its entries include negative
+  literals, `@() 0xFFs8^2 + 2^0x80s8'` and `@() -0xFFs8^2`, as a base, an
+  exponent, under a transpose and under a sign of their own, and
+  `a_negative_literal_is_the_negation_of_its_magnitude` holds the tree a
+  negative literal makes, the tree of the same value in decimal, and its
+  rendering, `@()(-1)^2`.
 - `value.rs`: numerics with tolerances. Broadcasting, matmul shapes, `solve`
   including pivoting and singular systems, `inv`, `det`, and the display
   format branches. Since cycle 14 the N-D representation: no stored
@@ -259,7 +277,12 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   along either dimension, and a mismatch refused; since cycle 14c
   `a_folded_size_is_named_as_asked`, a read and a write through a fold
   whose product passes `usize` refused naming the product as asked, and
-  `fold_asked` equal to `fold_dims` wherever the product fits.
+  `fold_asked` equal to `fold_dims` wherever the product fits. Since cycle
+  16 `a_negative_literal_keeps_its_value_through_func2str`: each negative
+  literal's value, and the function `str2func` makes of `func2str`'s text
+  equal to the handle it came from; and
+  `the_parser_refuses_nesting_past_the_limit` counts a negative literal as
+  a sign and a number, refused before anything runs.
 - `builtins/`: the builtins themselves, called directly as functions.
   `mod.rs` checks the registry holds every name exactly once and that every
   entry is callable; `args.rs` the message text of each helper and the size

@@ -70,6 +70,25 @@ identifiers, which the evaluator resolves by invariant 4, so a variable of
 the name shadows the builtin unit. `.'` became a token of its own,
 `DotTranspose`, the plain transpose, and `'` after a value the conjugate one.
 
+Since cycle 16 a number that starts with `0` straight followed by `x`, `X`,
+`b` or `B` is a hexadecimal or binary literal, read in a branch of its own
+just before the number branch: `0x2A`, `0b101010`, `0xFFs8`. The literal is
+the prefix and the whole run of letters, digits and underscores after it,
+which must be one or more digits of the base and then at most one of the
+eight suffixes `u8` to `u64` and `s8` to `s64` (`INT_SUFFIXES`).
+`radix_literal` finds the run and `radix_value` its value, computed exactly
+in a `u128` that stops accumulating once the value passes 2^64 - 1, so a
+literal of any length is read in one pass and never overflows. The value
+must fit its type, below 2^64 with no suffix and below 2^N with `uN` or
+`sN`, and with `sN` a value of 2^(N-1) or more is its two's complement,
+`0xFFs8` being `-1`. It is one `Token::Num` holding the nearest double, so
+every consumer of a number takes it as it takes any other; the one number
+token that can be negative, a signed literal with its top bit set, becomes
+the negation of its magnitude in the parser (below). A malformed run,
+`0x`, `0b102`, `0x1Fz`, `0x100u8`, is `invalid number '<text>'` naming the
+whole run as written, at its line. Every other number is read as before,
+so `00x1F` and `1x2` are still a number followed by a name.
+
 A `...` continuation is a gap between tokens exactly as whitespace is, and
 goes through the same separator check, which is what makes `[1 ...` newline
 `-2]` two elements. The number lexer's "do not swallow the dot" exclusion list
@@ -155,6 +174,16 @@ operators, commas between bracket elements, and parentheses only where the
 precedence needs them, since the tree keeps none; a rendered body parses back
 to the same tree. `Parser::parse_handle` reads a `str2func` text, one handle
 form and nothing after it.
+
+Since cycle 16 a negative number token, which only a signed hexadecimal or
+binary literal with its top bit set makes (`0xFFs8`), is parsed as the
+negation of its magnitude, `Expr::Neg(Expr::Num(1))`, the tree `-1` written
+in decimal makes, and counts as one level of nesting as that sign does. The
+value is the same double, and `render` gives it a negation's precedence:
+`@() 0xFFs8^2` renders `@()(-1)^2`, where a bare `Expr::Num(-1)` rendered
+`@()-1^2`, which reads back as `-(1^2)`. So every `Expr::Num` the parser
+makes holds a number that is not negative, and a rendered body still parses
+back to the same tree.
 
 Cycle 04 added `Stmt::Switch(subject, Vec<CaseArm>, otherwise)` and
 `Stmt::Try(body, Option<String>, handler)`. A `CaseArm` carries its values
@@ -1390,6 +1419,7 @@ cycle named:
 | The environment, cycle 13: `format` has `short` and `long` only; `whos` has no heading row and its layout is SplatCrab's; `ls` and `dir` print one name per line with no `.` or `..`, and `dir` returns no `date` or `datenum`; a bare `pause` waits for Enter rather than any key; `evalc` drops the final line end of what it captured, as the spec records; `datestr` takes date numbers or one date vector and no format; `exit(n)` takes 0 to 255; `which` and `help` do not report local functions. The Design notes of `docs/modules/13-environment.md` have each | by design |
 | N-D arrays, cycles 14, 14b and 14c: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`num2str`, `mat2str`, the strings, the sets, the linear algebra, `trapz`, `cumtrapz`, `filter`, `interp1`, `cellfun` and every other not taught N-D in cycles 14b and 14c), where MATLAB takes most of them, and so does `save -ascii`; `cat`, and since cycle 14c `horzcat` and `vertcat`, take arrays only, where MATLAB's join cells too, and `flip`, `circshift`, `fliplr` and `flipud` refuse a cell or a struct, which their pages allow; `arrayfun` with `'UniformOutput', false` refuses an N-D argument, since SplatCrab's cells are never N-D; `median` answers a double whatever `A`'s class, where its page keeps `A`'s; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md`, `docs/modules/14b-nd-functions.md` and `docs/modules/14c-more-nd-builtins.md` have each. Cycle 15 took the display's edges, and growth and deletion through fewer subscripts than dimensions, to the MathWorks "Multidimensional Arrays" page, which does not settle them: its displays are of double pages alone, with no logical or char page, no `disp` of an N-D array and no empty N-D array, and it says nothing of growth or deletion through fewer subscripts, nor of a colon over an empty target taking the right-hand side's extent (cycle 14's rule, `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` making a 2x2x2), which stays SplatCrab's stated rule, verify first | later for the rest of the builtins; the display later (verify first) |
 | A `-0` run through `cumsum` along a dimension of size 1 within `ndims` is `+0`, verify first: `cumsum(-0, 1)` is `+0`, each element its own running sum from `+0`, as a matrix's always was, while past `ndims` it is handed back, so `1/cumsum(-0, 3)` is `-Inf`. The MathWorks `cumsum` page says it "returns `A` if `dim` is greater than `ndims(A)`" and nothing of a dimension of size 1, so it does not settle the case. Recorded in testing cycle 14b; cycle 15 narrowed the row to `cumsum`, since the `sum` and `mean` pages settle theirs ("or when `size(A,dim)` is `1`", now `-0`, `sum_mean_dim_of_size_one`); `prod`, `max`, `min` and `cumprod` keep a `-0` by their own arithmetic | later (verify first) |
+| Hexadecimal and binary literals, cycle 16: a literal is a double, where MATLAB stores it as the smallest unsigned integer type that holds its value, or as its suffix's type (the MathWorks "Hexadecimal and Binary Values" page: "By default, MATLAB stores the number as the smallest unsigned integer type that can accommodate it"). So `class(0x2A)` is `double` where the page's is `uint8`, and `0xFFs8` the double `-1` where the page's is the `int8` `-1`; arithmetic on a literal is double arithmetic, not the integer arithmetic of MATLAB's class, and its display is a double's; and a value past 2^53 is the nearest double, `[0xFF000000001F123As64 0x1234FFFFFFFFFFFs64]` holding `-72057594035891656 81997179153022976`, the values the page's own conversion through a double gives, where MATLAB's `int64` holds `-72057594035891654 81997179153022975` exactly. SplatCrab has no integer classes. `func2str` and a handle's display show a literal by its value, `@() 0x2A` as `@()42`, since `func2str` renders from the parse tree (the cycle 06 row), and a negative one as the negation of its magnitude, `@() 0xFFs8^2` as `@()(-1)^2`. The Design notes of `docs/modules/16-hex-binary-literals.md` record it | by design, until integer classes exist |
 | Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
@@ -1483,6 +1513,8 @@ string-functions row, the builtins that read a name from a char of
 several rows, which no page was taken to, as a row of its own, and
 recorded a bound found in testing: a program's memory is judged one array
 at a time.
+Cycle 16 fixed the hex and binary literals row (QA D30): `0x1F` and
+`0b101` are numbers, stored as doubles, which Known deviations records.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -1496,7 +1528,6 @@ spec also lists, it removes the row from that spec in the same commit.
 | `1:NaN` is an empty, verify first | `1:NaN` is 1x0; Octave 8.4 gives the 1x1 `NaN` and MATLAB is unverified, so cycle 01d deliberately left it as it found it while refusing the infinite end points beside it. No golden case asserts either way. Cycle 15 took it to the MathWorks `colon` page, which does not settle it: its operands are each "a real numeric scalar" and its empty results are listed, but it names no rule for a `NaN` operand | later (verify first) |
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it. Cycle 15 took it to the MathWorks `for` page, which does not settle it: its "numel(valArray(1,:))" indexes a row a 0-by-n array does not have, and "a maximum of `n` times" allows fewer than `n` | later (verify first) |
 | `cell` takes two sizes only | `cell(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds the 2-by-3-by-4 cell. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `cell(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Cycle 14 built N-D arrays and taught the other constructors (`zeros`, `ones`, `rand`, `NaN`, `Inf`, `true`, `false`) and `reshape` to make them, which narrowed this row from "Constructors take two sizes only" to `repmat` and `cell`, and cycle 14b taught `repmat`, which narrowed it to `cell`. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D cells |
-| Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found in testing cycle 04. Cycle 15 took it to the MathWorks "Choose Command Syntax or Function Syntax" page, which does not settle it: MATLAB uses "the current workspace, and path" at the command line while the Code Analyzer and the Editor "operate without reference to the path or workspace", and the page says nothing of a name a script assigns implicitly | later (verify first) |
 | The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found in testing cycle U2 | later, needs a spec |
 | Name arguments read a char of several rows as one row, verify first | `isfield(struct('ab', 1), {['a'; 'b']})` is 1, reading the column as `'ab'`, its code units in column-major order; `rmfield`, `getfield`, `setfield`, `str2func`, `feval` and `cellfun` read a field or function name the same way. Cycle 15 settled the text functions whose pages take character vectors, which now refuse such a char (the `iscellstr` page's note: "Most text-processing functions and conversion functions require input cell arrays to contain only character row vectors"); these builtins were not taken to their pages, and keep the reading the removed string-functions row recorded | later (verify first) |

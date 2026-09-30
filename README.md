@@ -180,6 +180,14 @@ z
 - Numbers, strings, variables, `ans`, comments, `%{ ... %}` block comments
   (nestable), line continuation. A `...` separates elements inside brackets
   just as a space does, so `[1 ...` newline `-2]` is two elements
+- Hexadecimal and binary literals (cycle 16): `0x2A` and `0b101010` are
+  `42`, with the optional suffixes `u8` to `u64` and `s8` to `s64`, the
+  signed ones read in two's complement, so `0xFFs8` is `-1`; each is stored
+  as a double, exact up to 2^53, where MATLAB stores an integer type, and a
+  malformed one such as `0b102` or `0x100u8` is `invalid number` (cases
+  `hex_binary_values`, `hex_binary_large`, `hex_binary_in_expressions`,
+  `hex_binary_func2str`, `hex_binary_malformed`, `err_hex_binary_digit` and
+  `err_hex_binary_too_large` in `16-hex-binary-literals/`)
 - Command syntax by MATLAB's rule: `clear x y`, `clear all` and `disp hello`
   call the name with char arguments, while `x -1` with `x` a variable stays
   an expression
