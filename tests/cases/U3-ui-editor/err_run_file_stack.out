@@ -1,0 +1,7 @@
+{"id":1,"ok":false,"out":"start\n","error":{"message":"Unrecognized function or variable 'nosuch'.","line":null,"stack":[{"file":"prog/s1.m","name":"helper","line":6},{"file":"prog/s1.m","name":"s1","line":3}]}}
+{"id":2,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'undefined_thing'.","line":null,"stack":[{"file":"prog/s2.m","name":"s2","line":2}]}}
+{"id":3,"ok":false,"error":{"message":"Path 'prog/crlf.txt' is not a .m file.","line":null}}
+{"id":4,"ok":false,"error":{"message":"Path 'nope.m' is not a file.","line":null}}
+{"id":5,"ok":false,"error":{"message":"Path '../x.m' is outside the file root.","line":null}}
+{"id":6,"ok":false,"error":{"message":"Malformed request: no 'path' field.","line":null}}
+{"id":7,"ok":true,"out":"     3\n"}

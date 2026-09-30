@@ -1,0 +1,3 @@
+{"id":1,"ok":true,"path":"prog/s2.m","text":"q = 1;\nw = undefined_thing + 1;\n"}
+{"id":2,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'undefined_thing'.","line":null,"stack":[{"file":"prog/s2.m","name":"s2","line":2}]}}
+{"id":3,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1,"stack":[]}}

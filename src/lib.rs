@@ -25,7 +25,8 @@
 //!
 //! Since cycle U2, `files` lists one folder under the file root for the
 //! desktop's file browser, by the confinement rule its module comment
-//! records.
+//! records; since cycle U3 it also reads, writes and runs one file there
+//! for the desktop's editor, by the same rule.
 
 pub mod builtins;
 pub mod editor;

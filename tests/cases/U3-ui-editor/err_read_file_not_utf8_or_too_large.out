@@ -1,0 +1,6 @@
+{"id":1,"ok":true,"out":""}
+{"id":2,"ok":false,"error":{"message":"Path 'scratch_bad.txt' is not UTF-8 text.","line":null}}
+{"id":3,"ok":true,"out":""}
+{"id":4,"ok":false,"error":{"message":"Path 'scratch_big.txt' is larger than 4 MiB.","line":null}}
+{"id":5,"ok":true,"out":""}
+{"id":6,"ok":true,"out":""}

@@ -1,0 +1,25 @@
+% covers: 10 - two Sec-Fetch-Site headers fail the check even when both say same-origin, and the check is judged before the content type, so cross-site with Content-Type: text/plain is 403 Forbidden, not 415; a following valid disp(x) finds x unassigned
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Sec-Fetch-Site: same-origin
+Sec-Fetch-Site: same-origin
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Sec-Fetch-Site: cross-site
+X-SplatCrab-Token: test-token
+Content-Type: text/plain
+Content-Length: 39
+
+{"id":2,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 37
+
+{"id":3,"op":"eval","code":"disp(x)"}

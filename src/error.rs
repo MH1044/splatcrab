@@ -1793,7 +1793,8 @@ pub fn files_outside_root(path: &str) -> MError {
 }
 
 /// A `files` path inside the root that does not exist, cannot be read or
-/// is not a folder.
+/// is not a folder. (`read_file`, `write_file` and `run_file`, cycle U3,
+/// share the malformed and outside messages above.)
 pub fn files_not_a_folder(path: &str) -> MError {
     MError::new(format!("Path '{}' is not a folder.", path))
 }
@@ -1802,6 +1803,63 @@ pub fn files_not_a_folder(path: &str) -> MError {
 /// text, so the answer is the same on every platform.
 pub fn history_not_written() -> MError {
     MError::new("The history file could not be written.")
+}
+
+// The editor's operations (cycle U3, docs/modules/U3-ui-editor.md). Each
+// `path` is the path as the request sent it, and none carries
+// operating-system text, so an answer is the same on every platform.
+
+/// `eval` with a `stack` that is neither `true` nor `false`.
+pub fn request_stack() -> MError {
+    malformed("'stack' must be true or false")
+}
+
+/// A `read_file` or `run_file` path that names no file inside the root: it
+/// cannot be canonicalised, is the root, is a folder or is not a regular
+/// file; or a `write_file` path with no last component, or one that names a
+/// Windows device or ends in `.` or a space, or a link there that resolves
+/// nowhere.
+pub fn file_not_a_file(path: &str) -> MError {
+    MError::new(format!("Path '{}' is not a file.", path))
+}
+
+/// `read_file` of a file past 4 MiB, judged from its length before a byte
+/// is read, or found past it while reading.
+pub fn file_too_large(path: &str) -> MError {
+    MError::new(format!("Path '{}' is larger than 4 MiB.", path))
+}
+
+/// `read_file` of a file whose bytes are not UTF-8.
+pub fn file_not_utf8(path: &str) -> MError {
+    MError::new(format!("Path '{}' is not UTF-8 text.", path))
+}
+
+/// `write_file` of a path whose folder is missing or is not a folder.
+pub fn file_no_folder(path: &str) -> MError {
+    MError::new(format!(
+        "Path '{}' is not in a folder of the file root.",
+        path
+    ))
+}
+
+/// `write_file` of a path where a folder already is.
+pub fn file_is_a_folder(path: &str) -> MError {
+    MError::new(format!("Path '{}' is a folder.", path))
+}
+
+/// `write_file` of a text past 4 MiB in UTF-8.
+pub fn text_too_large(path: &str) -> MError {
+    MError::new(format!("Text for '{}' is larger than 4 MiB.", path))
+}
+
+/// `write_file` whose write failed.
+pub fn file_not_written(path: &str) -> MError {
+    MError::new(format!("Path '{}' could not be written.", path))
+}
+
+/// `run_file` of a file whose name does not end in `.m`.
+pub fn file_not_m(path: &str) -> MError {
+    MError::new(format!("Path '{}' is not a .m file.", path))
 }
 
 // ---- the environment (cycle 13) ---------------------------------------
@@ -2022,6 +2080,38 @@ mod tests {
             "Conversion to cell from double is not possible."
         );
         assert_eq!(no_such_field("b").msg, "Unrecognized field name \"b\".");
+    }
+
+    /// Cycle U3's texts, byte for byte as the spec writes them.
+    #[test]
+    fn the_editor_messages() {
+        let p = "prog/s1.m";
+        for (got, want) in [
+            (file_not_a_file(p), "Path 'prog/s1.m' is not a file."),
+            (file_too_large(p), "Path 'prog/s1.m' is larger than 4 MiB."),
+            (file_not_utf8(p), "Path 'prog/s1.m' is not UTF-8 text."),
+            (
+                file_no_folder(p),
+                "Path 'prog/s1.m' is not in a folder of the file root.",
+            ),
+            (file_is_a_folder(p), "Path 'prog/s1.m' is a folder."),
+            (
+                text_too_large(p),
+                "Text for 'prog/s1.m' is larger than 4 MiB.",
+            ),
+            (
+                file_not_written(p),
+                "Path 'prog/s1.m' could not be written.",
+            ),
+            (file_not_m(p), "Path 'prog/s1.m' is not a .m file."),
+            (
+                request_stack(),
+                "Malformed request: 'stack' must be true or false.",
+            ),
+        ] {
+            assert_eq!(got.msg, want);
+            assert_eq!(got.line, None);
+        }
     }
 
     #[test]

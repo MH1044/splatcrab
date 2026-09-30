@@ -1,0 +1,32 @@
+% covers: 10 - POST /api with the token and Sec-Fetch-Site: cross-site, same-site or none is 403 Forbidden each, and a following valid disp(x) finds x unassigned: none of the refused requests reached the interpreter
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Sec-Fetch-Site: cross-site
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":1,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Sec-Fetch-Site: same-site
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":2,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+Sec-Fetch-Site: none
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 39
+
+{"id":3,"op":"eval","code":"x = 1 + 2"}
+POST /api HTTP/1.1
+Host: 127.0.0.1:8123
+X-SplatCrab-Token: test-token
+Content-Type: application/json
+Content-Length: 37
+
+{"id":4,"op":"eval","code":"disp(x)"}

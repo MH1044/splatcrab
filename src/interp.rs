@@ -112,7 +112,45 @@ struct CachedFile {
     /// Its modification time and length when it was read, which is how a
     /// stale entry is told apart from a changed file.
     stamp: Option<(SystemTime, u64)>,
+    /// Which file it is, whatever path it was read through: what a write
+    /// the interpreter makes is matched against (cycle U3).
+    id: FileId,
     unit: Rc<Unit>,
+}
+
+/// Which file a path names, as the file cache tells files apart (cycle
+/// U3): the file's canonical path, and the path itself normalised. A file
+/// written through one spelling and read through another, a relative path
+/// and the full one, a link and its target, a verbatim `\\?\` path and a
+/// plain one, has one canonical path. A file that cannot be canonicalised,
+/// deleted or a link that leads nowhere, takes its folder's canonical path
+/// joined to its name, and one whose folder cannot be either has none, so
+/// only its normalised path can match it. Matching more than the one file
+/// costs a reread; matching less would run a stale parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FileId {
+    canonical: Option<PathBuf>,
+    plain: PathBuf,
+}
+
+impl FileId {
+    /// The file `path` names, asking the file system at most twice.
+    pub(crate) fn of(path: &Path) -> FileId {
+        let canonical = std::fs::canonicalize(path).ok().or_else(|| {
+            let name = path.file_name()?;
+            let dir = path.parent().filter(|d| !d.as_os_str().is_empty())?;
+            Some(std::fs::canonicalize(dir).ok()?.join(name))
+        });
+        FileId {
+            canonical,
+            plain: normalize(path),
+        }
+    }
+
+    /// True when `self` and `other` may name the same file.
+    fn same_file(&self, other: &FileId) -> bool {
+        self.plain == other.plain || (self.canonical.is_some() && self.canonical == other.canonical)
+    }
 }
 
 pub struct Interp {
@@ -139,8 +177,9 @@ pub struct Interp {
     /// The folders `addpath` added, first searched first. The current
     /// folder is searched before all of them.
     search_path: Vec<PathBuf>,
-    /// Bumped by `addpath`, `rmpath` and every `run`, so that no cached
-    /// lookup or file from before is used without being checked again.
+    /// Bumped by `addpath`, `rmpath`, `cd`, every `run` and every write the
+    /// interpreter makes, so that no cached lookup or file from before is
+    /// used without being checked again.
     generation: u64,
     /// Parsed files, keyed by path.
     files: HashMap<PathBuf, CachedFile>,
@@ -553,10 +592,38 @@ impl Interp {
         self.resolve_dir(name)
     }
 
-    /// Marks every cached file lookup stale, after a builtin has written or
-    /// deleted a file: a `.m` file a script writes is then found.
-    pub(crate) fn files_changed(&mut self) {
+    /// What a builtin or the protocol's `write_file` calls once it has
+    /// written or deleted the file at `path`, a full path; see
+    /// [`Interp::file_written_as`].
+    pub(crate) fn file_written(&mut self, path: &Path) {
+        self.file_written_as(path, &mut None);
+    }
+
+    /// Forgets the parse of the file at `path`, under whatever path it was
+    /// read, and every name the interpreter has resolved, and bumps the
+    /// generation (cycle U3): a `.m` file a script writes is then found,
+    /// shadowing a builtin or a file later on the path, and the next call
+    /// of a function in the file written reads it again. Bumping the
+    /// generation alone kept a parse whose file's modification time and
+    /// length were unchanged, so a file rewritten with the same length
+    /// inside the file system's timestamp tick ran from its old text. The
+    /// parses of every other file are kept, judged by their stamps at their
+    /// next use as after any bump, so a loop that writes a log file and
+    /// calls a large function reads the function once. `id` is the file's
+    /// [`FileId`], asked for here if it is `None` and there is a parse to
+    /// match it against, and kept, so `fopen` and `fclose` of one file
+    /// canonicalise it once between them. Every lookup is dropped, those
+    /// that found nothing too, since one is cheap to make again and a file
+    /// just made must be found. A frame or a handle that holds a parse
+    /// keeps its own `Rc` of it.
+    pub(crate) fn file_written_as(&mut self, path: &Path, id: &mut Option<FileId>) {
         self.generation += 1;
+        self.lookups.clear();
+        if self.files.is_empty() {
+            return;
+        }
+        let id = id.get_or_insert_with(|| FileId::of(path));
+        self.files.retain(|_, c| !c.id.same_file(id));
     }
 
     /// The expression `text` evaluated in the running workspace: what
@@ -620,6 +687,27 @@ impl Interp {
     }
 
     fn run_with(&mut self, src: &str, functions: bool) -> R<()> {
+        self.start_entry();
+        let result = self.run_entry(src, functions);
+        self.finish_entry(&result);
+        result
+    }
+
+    /// The file at `path`, called `name`, run as a command-line entry of
+    /// `run` with its full path would run it: what the protocol's
+    /// `run_file` does (cycle U3). The counters are reset as for any entry,
+    /// the file runs in the base workspace, a function file called with no
+    /// arguments, and [`Interp::run_path`] moves into the file's folder for
+    /// the run and back, so it runs from there wherever `cd` has gone.
+    pub fn run_file(&mut self, path: &Path, name: &str) -> R<()> {
+        self.start_entry();
+        let result = self.run_path(path, name);
+        self.finish_entry(&result);
+        result
+    }
+
+    /// What every command-line entry starts from.
+    fn start_entry(&mut self) {
         // An entry that failed part-way left its counters raised, and the
         // REPL hands the same interpreter the next line. Without this, one
         // over-deep expression would make every later statement too deep and
@@ -633,13 +721,15 @@ impl Interp {
         self.frame_mut().end_stack.clear();
         // A file edited since the last entry is read again.
         self.generation += 1;
-        let result = self.run_entry(src, functions);
-        if let Err(e) = &result {
+    }
+
+    /// What every command-line entry leaves: its error for `lasterr`.
+    fn finish_entry(&mut self, result: &R<()>) {
+        if let Err(e) = result {
             if e.exit_code().is_none() {
                 self.last_err = e.msg.clone();
             }
         }
-        result
     }
 
     fn run_entry(&mut self, src: &str, functions: bool) -> R<()> {
@@ -2345,11 +2435,14 @@ impl Interp {
         let mut unit = Unit::from_program(prog);
         unit.file = path.display().to_string();
         let unit = Rc::new(unit);
+        // Asked once a parse, never at a reuse.
+        let id = FileId::of(path);
         self.files.insert(
             path.to_path_buf(),
             CachedFile {
                 generation,
                 stamp,
+                id,
                 unit: unit.clone(),
             },
         );
@@ -6338,6 +6431,157 @@ mod tests {
             it.run("f()").unwrap_err().msg,
             "Unrecognized function or variable 'f'."
         );
+    }
+
+    /// `path` given back the modification time `stamp`, as a rewrite
+    /// inside the file system's timestamp tick leaves it.
+    fn put_back(path: &Path, stamp: SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert_eq!(file_stamp(path).map(|s| s.0), Some(stamp));
+    }
+
+    /// Cycle U3, acceptance test 11: a write drops the parse of the file it
+    /// wrote, named through any spelling of it, so a function file
+    /// rewritten with the same length and the same modification time, as a
+    /// rewrite inside the file system's timestamp tick leaves it, is read
+    /// again. Bumping the generation alone ran the old text: this printed
+    /// `1` twice.
+    #[test]
+    fn a_write_drops_the_parse_of_the_file_it_wrote() {
+        let dir = TempDir::new("stale");
+        dir.write("ff.m", "function ff\ndisp(1)\nend\n");
+        let path = dir.0.join("ff.m");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("ff").unwrap();
+        assert_eq!(take(&buf), "     1\n");
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        dir.write("ff.m", "function ff\ndisp(2)\nend\n");
+        put_back(&path, stamp);
+        // Read through `path`, written through its canonical path: on
+        // Windows the verbatim `\\?\` form, on macOS through `/private`.
+        it.file_written(&std::fs::canonicalize(&path).unwrap());
+        assert!(!it.files.contains_key(&path) && it.lookups.is_empty());
+        it.run("ff").unwrap();
+        assert_eq!(take(&buf), "     2\n");
+        // Within one entry too: a loop that writes the file and calls it
+        // runs each text once, as `fopen` for writing and `fclose` after a
+        // write call `file_written_as`.
+        it.run(
+            "for k = 3:5\n\
+             fid = fopen('ff.m', 'w'); fprintf(fid, 'function ff\\ndisp(%d)\\nend\\n', k); fclose(fid);\n\
+             ff\n\
+             end",
+        )
+        .unwrap();
+        assert_eq!(take(&buf), "     3\n     4\n     5\n");
+    }
+
+    /// Cycle U3's review: a write drops the parse of the file it wrote and
+    /// of no other, so a loop that writes a log file and calls a function
+    /// parses the function once, whatever writes the log: its parse is the
+    /// same `Rc` after every write. Dropping every parse made such a loop
+    /// with a 118 KB function fifty times slower.
+    #[test]
+    fn a_write_keeps_every_other_files_parse() {
+        let dir = TempDir::new("keep");
+        dir.write("helper.m", "function s = helper(s)\ns = s + 1;\nend\n");
+        dir.write("sub/x.txt", "");
+        let helper = dir.0.join("helper.m");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("s = helper(0);").unwrap();
+        let parsed = it.files[&helper].unit.clone();
+        it.run(
+            "for k = 1:3\n\
+             fid = fopen('log.txt', 'w'); fprintf(fid, '%d\\n', k); fclose(fid);\n\
+             s = helper(s);\n\
+             end\n\
+             csvwrite('log.csv', s); save('log.mat', 's'); delete('log.txt');\n\
+             disp(helper(s))",
+        )
+        .unwrap();
+        assert_eq!(take(&buf), "     5\n");
+        assert!(Rc::ptr_eq(&it.files[&helper].unit, &parsed));
+        // Only a write to the file itself drops it.
+        it.file_written(&dir.0.join("helper.txt"));
+        assert!(it.files.contains_key(&helper));
+        it.file_written(&dir.0.join("sub").join("..").join("helper.m"));
+        assert!(!it.files.contains_key(&helper));
+    }
+
+    /// Cycle U3: a write drops every lookup, so a file it makes shadows a
+    /// builtin at the very next call, within one entry, and deleting the
+    /// file lets the builtin be found again.
+    #[test]
+    fn a_file_a_write_makes_shadows_a_builtin_at_the_next_call() {
+        let dir = TempDir::new("shadow");
+        let (mut it, buf) = in_dir(&dir);
+        it.run(
+            "disp(max(4))\n\
+             fid = fopen('max.m', 'w'); fprintf(fid, 'function r = max(x)\\nr = -x;\\nend\\n'); fclose(fid);\n\
+             disp(max(4))\n\
+             delete('max.m')\n\
+             disp(max(4))",
+        )
+        .unwrap();
+        assert_eq!(take(&buf), "     4\n    -4\n     4\n");
+    }
+
+    /// Cycle U3: `delete` drops the parse of the file it deletes, so the
+    /// file made again with the same length and modification time, here
+    /// by another program, is read again; and a file that is gone is named
+    /// by its folder's canonical path and its name, as it was while there.
+    #[test]
+    fn a_deleted_function_file_made_again_is_read_again() {
+        let dir = TempDir::new("remade");
+        dir.write("ff.m", "function ff\ndisp(1)\nend\n");
+        let path = dir.0.join("ff.m");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("ff").unwrap();
+        assert_eq!(take(&buf), "     1\n");
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let there = FileId::of(&path);
+        it.run("delete('ff.m')").unwrap();
+        assert!(!it.files.contains_key(&path));
+        assert_eq!(FileId::of(&path), there);
+        dir.write("ff.m", "function ff\ndisp(2)\nend\n");
+        put_back(&path, stamp);
+        it.run("ff").unwrap();
+        assert_eq!(take(&buf), "     2\n");
+    }
+
+    /// Cycle U3: `run_file` runs a file as an entry of `run` with its full
+    /// path, from its own folder wherever `cd` has gone, in the base
+    /// workspace, with the counters reset and `lasterr` set.
+    #[test]
+    fn run_file_runs_a_file_as_an_entry() {
+        let dir = TempDir::new("runfile");
+        dir.write("prog/s.m", "q = 7;\nhelper2\n");
+        dir.write("prog/helper2.m", "function helper2\ndisp(3)\nend\n");
+        dir.write("prog/fn.m", "function fn\nundefined_here\nend\n");
+        dir.write("other/x.txt", "");
+        let (mut it, buf) = in_dir(&dir);
+        it.run("cd other").unwrap();
+        it.run_file(&dir.0.join("prog").join("s.m"), "s").unwrap();
+        // `helper2` is found beside the file, not in the current folder.
+        assert_eq!(take(&buf), "     3\n");
+        assert!(matches!(it.vars().get("q"), Some(Value::Mat(_))));
+        // Back in the folder `cd` chose.
+        assert_eq!(it.cwd, dir.0.join("other"));
+        let e = it
+            .run_file(&dir.0.join("prog").join("fn.m"), "fn")
+            .unwrap_err();
+        assert_eq!(e.msg, "Unrecognized function or variable 'undefined_here'.");
+        assert_eq!(e.line, None);
+        let names: Vec<&str> = e.stack().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["fn"]);
+        assert_eq!(e.stack()[0].line, Some(2));
+        assert_eq!(it.last_err, e.msg);
+        assert_eq!(it.frames.len(), 1);
     }
 
     #[test]

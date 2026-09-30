@@ -1,0 +1,22 @@
+% covers: 5 - write_file refusals, each an answer echoing the path as sent with line null: .. is outside the file root; /etc is a malformed path; "" leaves no component and is not a file; nofolder/x.m, prog/nofolder/x.m and prog/s1.m/x.m are not in a folder of the file root (missing, or not a folder); prog is a folder; NUL.m, con, x.m. and x.m (a trailing space), in the root and in prog, are not a file; the fields are judged first, path then text, so a missing text, a text of 3, no path and a path of 3 are malformed even where the path would be refused; and none creates anything: files of prog then lists exactly its three files
+{"id":1,"op":"write_file","path":"..","text":"x"}
+{"id":2,"op":"write_file","path":"/etc","text":"x"}
+{"id":3,"op":"write_file","path":"","text":"x"}
+{"id":4,"op":"write_file","path":"nofolder/x.m","text":"x"}
+{"id":5,"op":"write_file","path":"prog/nofolder/x.m","text":"x"}
+{"id":6,"op":"write_file","path":"prog/s1.m/x.m","text":"x"}
+{"id":7,"op":"write_file","path":"prog","text":"x"}
+{"id":8,"op":"write_file","path":"NUL.m","text":"x"}
+{"id":9,"op":"write_file","path":"con","text":"x"}
+{"id":10,"op":"write_file","path":"x.m.","text":"x"}
+{"id":11,"op":"write_file","path":"x.m ","text":"x"}
+{"id":12,"op":"write_file","path":"prog/NUL.m","text":"x"}
+{"id":13,"op":"write_file","path":"prog/con","text":"x"}
+{"id":14,"op":"write_file","path":"prog/x.m.","text":"x"}
+{"id":15,"op":"write_file","path":"prog/x.m ","text":"x"}
+{"id":16,"op":"write_file","path":"prog/scratch_t.m"}
+{"id":17,"op":"write_file","path":"prog/scratch_t.m","text":3}
+{"id":18,"op":"write_file"}
+{"id":19,"op":"write_file","path":3}
+{"id":20,"op":"write_file","path":".."}
+{"id":21,"op":"files","path":"prog"}

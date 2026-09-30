@@ -1,0 +1,7 @@
+% covers: 8 - eval with "stack": true adds a stack key after line to the error object of a failed eval: run('prog/s1.m') answers out start, line 1 (the submitted code's line) and the same two frames as run_file; without the field, or with "stack": false, the answer is exactly U0's form with no stack key; "stack": 1 and "stack": "yes" are a malformed request; and a successful eval with "stack": true has no error and so no stack
+{"id":1,"op":"eval","code":"run('prog/s1.m')","stack":true}
+{"id":2,"op":"eval","code":"run('prog/s1.m')"}
+{"id":3,"op":"eval","code":"run('prog/s1.m')","stack":false}
+{"id":4,"op":"eval","code":"run('prog/s1.m')","stack":1}
+{"id":5,"op":"eval","code":"run('prog/s1.m')","stack":"yes"}
+{"id":6,"op":"eval","code":"disp(3)","stack":true}

@@ -1,0 +1,4 @@
+% covers: Scope: read_file, run_file and eval with "stack": true - the editor operations' example in docs/HANDBOOK.md, byte for byte: read_file of prog/s2.m, run_file of it with its one frame and line null, and an eval with "stack": true whose error has no frames, in one session
+{"id":1,"op":"read_file","path":"prog/s2.m"}
+{"id":2,"op":"run_file","path":"prog/s2.m"}
+{"id":3,"op":"eval","code":"y = nosuch + 1","stack":true}

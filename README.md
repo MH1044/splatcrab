@@ -105,12 +105,15 @@ arithmetic, indexing, growth on assignment, loops and formatted printing.
 graphical interface rather than something to type at: it reads one JSON
 request per line on stdin and answers each with one JSON line on stdout,
 against one session that keeps its variables between requests. The operations
-are `eval`, `complete` (is this entry finished?), `workspace` (with value
-previews on request), `completions`, `files` (one folder under the folder
-the session started in), `history` and `history_add` (the command history
-the terminal keeps); a failed evaluation or a malformed line is an answer,
-and the process exits 0 at end of input. `docs/modules/U0-ui-foundations.md`
-and `docs/modules/U2-ui-desktop.md` are the full description.
+are `eval` (with the error's stack of frames on request), `complete` (is
+this entry finished?), `workspace` (with value previews on request),
+`completions`, `files` (one folder under the folder the session started
+in), `history` and `history_add` (the command history the terminal keeps),
+and `read_file`, `write_file` and `run_file` (one file under that folder,
+read, saved or run); a failed evaluation or a malformed line is an answer,
+and the process exits 0 at end of input. `docs/modules/U0-ui-foundations.md`,
+`docs/modules/U2-ui-desktop.md` and `docs/modules/U3-ui-editor.md` are the
+full description.
 
 ```
 $ echo '{"id":1,"op":"eval","code":"x = 1 + 2"}' | splatcrab --protocol
@@ -125,9 +128,13 @@ always does, and Up and Down walk the command history. Around it are a file
 browser of the folder the server started in, a workspace listing every
 variable with a preview of its value, its size and its class, and the
 command history, shared with the terminal, where a click recalls an entry
-and a double-click runs it. The splitters between the panes move with the
-pointer or the arrow keys, and a narrow window stacks the panes. It prints
-the address it serves and opens it:
+and a double-click runs it. Above the command window is an editor:
+double-click a file in the file browser to open it in a tab, with line
+numbers, edit it, save it with Ctrl+S, run it with F5 or run a selection
+with F9; an error takes the cursor to the line that raised it, and each
+frame of its stack is a link to its file and line. The splitters between
+the panes move with the pointer or the arrow keys, and a narrow window
+stacks the panes. It prints the address it serves and opens it:
 
 ```
 $ splatcrab --ui
@@ -374,9 +381,16 @@ z
   HTTP written from the standard library with its size limits enforced
   before anything is buffered, each connection read on a thread of its own
 - the desktop's four panes: the command window, the workspace with value
-  previews, a read-only file browser confined to the folder the server
-  started in, and the command history shared with the terminal, with
-  resizable splitters and one palette for light and dark
+  previews, a file browser confined to the folder the server started in,
+  and the command history shared with the terminal, with resizable
+  splitters and one palette for light and dark
+- the desktop's editor: files in tabs with a line-number gutter, saved
+  back with their line ends kept, run whole (F5) or by selection (F9),
+  an error taking the cursor to its line and its stack's frames linked to
+  their files; unsaved changes asked about in the page; the file
+  operations confined to the file root, never through a link out of it,
+  and every API call refused unless `Sec-Fetch-Site`, when a browser
+  sends it, says the page is the server's own
 
 `docs/FEATURES.md` is the full inventory, with the test that proves each entry.
 Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.

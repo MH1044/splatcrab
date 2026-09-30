@@ -6,8 +6,9 @@
 //!
 //! Every path a function here names resolves against `Interp::cwd`,
 //! through `Interp::resolve_path`, and a function that writes or deletes a
-//! file marks the interpreter's file lookups stale, so a `.m` file a
-//! script writes is found by the next call.
+//! file tells the interpreter which (`Interp::file_written`), which drops
+//! that file's parse and every lookup, so a `.m` file a script writes is
+//! found, and run from its new text, by the next call.
 //!
 //! Identifiers `0`, `1` and `2` are standard input, output and error.
 //! `fprintf` and `fwrite` to `1` go through `Interp.out`, and to `2`
@@ -21,13 +22,14 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use super::args::{MAX_ELEMS, at_most, check_shape, mat, need, string};
 use super::printf::format_printf;
 use super::strings::parse_double;
 use super::{Registry, add, none, one, one_as};
 use crate::error;
-use crate::interp::{Interp, R, fmt_e, fmt_g, is_identifier};
+use crate::interp::{FileId, Interp, R, fmt_e, fmt_g, is_identifier};
 use crate::value::{Class, Matrix, StructArray, Value};
 
 /// One line per builtin; see the note on `core::register`.
@@ -91,8 +93,14 @@ pub struct OpenFile {
     pos: usize,
     /// Set once a read has reached the end of the file.
     eof: bool,
-    /// Whether anything was written, so closing marks file lookups stale.
+    /// Whether anything was written, so closing tells the interpreter.
     wrote: bool,
+    /// The full path it was opened at, and which file that is once the
+    /// file cache has asked, so that `fopen` for writing and `fclose` after
+    /// a write drop its parse and canonicalise it once between them (cycle
+    /// U3).
+    path: PathBuf,
+    id: Option<FileId>,
 }
 
 impl OpenFile {
@@ -372,8 +380,9 @@ fn fopen(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     };
     match opened {
         Ok(file) => {
+            let mut id = None;
             if write {
-                it.files_changed();
+                it.file_written_as(&path, &mut id);
             }
             let fid = it.open_files.insert(OpenFile {
                 name,
@@ -385,6 +394,8 @@ fn fopen(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
                 pos: 0,
                 eof: false,
                 wrote: false,
+                path,
+                id,
             });
             Ok(vec![num(fid as f64), Value::str("")])
         }
@@ -401,8 +412,8 @@ fn fclose(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     } else {
         vec![it.open_files.remove(fid_arg(args, 0, "fclose")?)?]
     };
-    if closed.iter().any(|f| f.wrote) {
-        it.files_changed();
+    for mut f in closed.into_iter().filter(|f| f.wrote) {
+        it.file_written_as(&f.path, &mut f.id);
     }
     one(num(0.0))
 }
@@ -690,7 +701,7 @@ pub(crate) fn write_file(it: &mut Interp, name: &str, bytes: &[u8]) -> R<()> {
     not_a_folder(&path)
         .and_then(|_| fs::write(&path, bytes))
         .map_err(|e| error::cannot_write_file(name, &e))?;
-    it.files_changed();
+    it.file_written(&path);
     Ok(())
 }
 
@@ -927,10 +938,12 @@ fn delete(it: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
             it.warn(Some(error::delete_not_found(&name)))?;
             continue;
         }
+        // Named while it is there, so its canonical path is its own.
+        let mut id = Some(FileId::of(&path));
         not_a_folder(&path)
             .and_then(|_| fs::remove_file(&path))
             .map_err(|e| error::cannot_delete(&name, &e))?;
-        it.files_changed();
+        it.file_written_as(&path, &mut id);
     }
     none()
 }

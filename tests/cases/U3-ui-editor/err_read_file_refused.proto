@@ -1,0 +1,8 @@
+% covers: 4 - read_file refusals, each an answer echoing the path as sent with line null and no out: .. is outside the file root (step 2), /etc is a malformed path (step 1), "" (the root itself), prog (a folder) and nope.m (cannot be canonicalised) are not a file (step 3), and path is required and a string
+{"id":1,"op":"read_file","path":".."}
+{"id":2,"op":"read_file","path":"/etc"}
+{"id":3,"op":"read_file","path":""}
+{"id":4,"op":"read_file","path":"prog"}
+{"id":5,"op":"read_file","path":"nope.m"}
+{"id":6,"op":"read_file"}
+{"id":7,"op":"read_file","path":3}

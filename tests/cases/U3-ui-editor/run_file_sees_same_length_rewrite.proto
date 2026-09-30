@@ -1,0 +1,10 @@
+% covers: 3 - the file cache forgets what the interpreter writes: scratch_f.m rewritten at once by write_file with the same length (31 bytes) runs its new text, by run_file and when called by name; and an eval of a loop that rewrites scratch_g.m with fprintf five times at the same length, each with disp(k), and calls scratch_g after each fclose prints 1 to 5, each once, never an old parse; then both files are deleted
+{"id":1,"op":"write_file","path":"scratch_f.m","text":"function scratch_f\ndisp(1)\nend\n"}
+{"id":2,"op":"run_file","path":"scratch_f.m"}
+{"id":3,"op":"eval","code":"scratch_f"}
+{"id":4,"op":"write_file","path":"scratch_f.m","text":"function scratch_f\ndisp(2)\nend\n"}
+{"id":5,"op":"run_file","path":"scratch_f.m"}
+{"id":6,"op":"eval","code":"scratch_f"}
+{"id":7,"op":"eval","code":"for k = 1:5\n  fid = fopen('scratch_g.m', 'w');\n  fprintf(fid, 'function scratch_g\\ndisp(%d)\\nend\\n', k);\n  fclose(fid);\n  scratch_g\nend"}
+{"id":8,"op":"eval","code":"delete('scratch_f.m')"}
+{"id":9,"op":"eval","code":"delete('scratch_g.m')"}

@@ -22,12 +22,14 @@
                    ├──► syntax.rs           complete: is the entry finished?
                    ├──► env.rs              completions: variables + path files + builtins;
                    │                        workspace's value previews
-                   ├──► files.rs            files: one folder under the file root
+                   ├──► files.rs            files: one folder under the file root;
+                   │                        read_file, write_file, run_file: one file there
                    └──► history.rs          history, history_add: the shared history file
 
  browser ──► server.rs ──────────────► http.rs ──► protocol::respond
- 127.0.0.1   a reader thread per       limits, Host, Origin, token, routes
- only        connection (16 at most),  │
+ 127.0.0.1   a reader thread per       limits, Host, Origin, token,
+ only        connection (16 at most),  Sec-Fetch-Site, routes
+                                       │
              a channel to the one      └──► src/ui/  index.html, app.js, app.css,
              interpreter thread                      embedded with include_str!
  stdin ────► http::serve_stdio (--http-stdio): the same http::handle, no socket
@@ -216,9 +218,12 @@ functions: `call_function` is invariant 4, `call_user` runs a function in a
 frame of its own, `run_script` runs a script file in the caller's, and
 `find_file` and `load` look files up on the path (`Interp::cwd` first, then
 the `addpath` folders) through a lookup cache and a file cache that a
-generation counter keeps honest. `run` runs a script, local functions
-allowed; `run_command` is the REPL's and the protocol's, and refuses a
-definition. It no longer knows what any individual builtin does.
+generation counter keeps honest, and from which `file_written` drops the
+parse of a file the interpreter writes, and every lookup, since cycle U3. `run` runs a script, local functions allowed; `run_command` is
+the REPL's and the protocol's, and refuses a definition; `run_file`
+(cycle U3) is the protocol's `run_file`, a file run as a command-line
+entry of `run` with its full path. It no longer knows what any individual
+builtin does.
 
 Since cycle 06 it makes and calls function handles. `named_handle` binds
 `@name` to the local function the name resolves to where the handle is made,
@@ -330,8 +335,11 @@ whole-file functions, `delete`, and `save` and `load`, which read and
 write MAT-files through `mat.rs`: pure functions over bytes, the reader
 treating the file as untrusted (see invariant 6). Every path any of them
 names goes through `Interp::resolve_path`, against `Interp::cwd`, and a
-function that writes or deletes a file calls `Interp::files_changed`, so a
-`.m` file a script writes is found by the next call. `Interp.input` is
+function that writes or deletes a file names it to `Interp::file_written`
+(`fopen` for writing and `fclose` after a write through
+`file_written_as`, sharing one `FileId` held on the open file), so a `.m`
+file a script writes is found, and run from its new text, by the next
+call. `Interp.input` is
 where `input` reads: standard input, through the one buffer the REPL
 reads, or `InputSource::Refused`, which `protocol::eval` puts in place for
 the length of every call, so under `--protocol`, `--ui` and
@@ -399,6 +407,19 @@ folders first and each group in byte order of name, at most `bound`
 entries, kept in a heap of that size so a huge folder costs a look at each
 name, and one resolution of each entry that is a link, and no more. A link
 is listed by its target only when that is inside the root. `session_root` is the root a client mode fixes as it starts.
+Since cycle U3 it holds the editor's three operations too, by the same
+rule's first two steps: `read_file(root, path, bound)` reads one regular
+file inside the root, its length judged from its metadata before a byte
+is read and the read taken no further than the bound plus one, and its
+bytes UTF-8; `write_file(root, path, text, bound)` judges the name (no
+Windows device name, no trailing `.` or space, on every platform), then
+the folder's canonical path, then whatever is at the name, a link
+included, by where it leads, then the text's length, and never creates a
+folder; `run_file(root, path)` judges a `.m` file as `read_file` does and
+names the path to run it by, on Windows the plain form of the verbatim
+root's when that names the same file. `relative(root, file)` names an
+error frame's file relative to the root, judged on its canonical path.
+The bound is `MAX_TEXT`, 4 MiB, a parameter so a unit test reaches it.
 
 **`editor.rs`** (cycle 13) is the terminal's line editor as a pure state
 machine: `Decoder` turns the characters a terminal sends, ANSI escape
@@ -448,7 +469,12 @@ interpreter is built over a sink otherwise, so nothing but responses reaches
 the writer. Since cycle 04 `eval` points `Interp.err` at the same buffer, so
 a warning lands in `out` where it was raised and nothing reaches stderr. A
 failed evaluation and a malformed request are both answers; the loop ends
-only at end of input. The message texts live in `error.rs`.
+only at end of input. The message texts live in `error.rs`. Since cycle U3
+`read_file`, `write_file` and `run_file` work on one file under the file
+root through `files.rs`, `run_file` capturing its run as `eval` does and
+`write_file` calling `Interp::file_written` with the file it wrote, and an
+error object carries its `stack`, the frames innermost first, on `eval`
+when the request's `stack` is `true` and always on `run_file`.
 
 **`http.rs`** is the UI server's HTTP, as a pure function:
 `handle(request_bytes, &mut Interp, &Config) -> Vec<u8>`, with `Config`
@@ -458,7 +484,9 @@ with case-insensitive names, CRLF or bare LF), refuses what it must with
 embedded files, and hands the body of a `POST /api` that passed every check
 to `protocol::respond`. Responses are built in one place, so the header
 order and a `Content-Length` equal to the body's length hold for all of
-them; the status texts are a table in `error.rs`. `read_request` frames one
+them; the status texts are a table in `error.rs`. Since cycle U3 a `POST
+/api` whose `Sec-Fetch-Site` is present and not `same-origin` is `403`,
+judged after the token and before the content type. `read_request` frames one
 request off any `BufRead` under the head and body caps, shared by the socket
 and by `serve_stdio`, the `--http-stdio` loop the golden cases drive.
 
@@ -484,7 +512,13 @@ with three splitters whose sizes are CSS custom properties set from script.
 Every request goes through one promise queue in `app.js`, one at a time,
 and everything a request returns reaches the page as text, never as
 markup. The palette is defined once, as custom properties of the light and
-the dark `:root` rules, which a unit test in `http.rs` enforces.
+the dark `:root` rules, which a unit test in `http.rs` enforces. Since
+cycle U3 an editor sits above the command window, behind a fourth
+splitter: tabs of open files, a line-number gutter beside a `<textarea>`
+that does not wrap, Save, Run (`run_file`) and Run Selection (an `eval`),
+its questions asked in the page and never in a browser dialog; every
+`eval` the page makes asks for the stack, whose frames the command window
+lists under an error, a frame with a file being a link that opens it.
 
 **`main.rs`** is the CLI. Since cycle 13 it answers `--help` and
 `--version` (the version is `env!("CARGO_PKG_VERSION")`, as the banner's
@@ -547,7 +581,11 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    length and lists at most 10,000 entries of a folder, keeping no more
    than that many in memory however large the folder, and a workspace
    preview displays at most 10 elements, and decodes a char row and
-   renders a handle's text only as far as its 80-character cut. Anything
+   renders a handle's text only as far as its 80-character cut; since
+   cycle U3 `read_file` judges a file's length before reading a byte and
+   reads at most 4 MiB and one byte of it, `write_file` judges the text's
+   length before writing, and neither opens anything but a regular file,
+   so no device or pipe can make one wait. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape` for the same reason; see
    the recipe below. An iteration that has no fixed trip count has a cap
@@ -800,10 +838,13 @@ statement records its own. At the top the line is therefore always a line of
 the code that was run, which is what the protocol's `line` means, and the
 trace, `MError::trace`, is one `  in <fn> (line N)` per frame, innermost
 first, which `main.rs` prints to stderr after the message, in script mode
-and at the REPL alike. The protocol does not send it. Since cycle 07 an
+and at the REPL alike. Since cycle 07 an
 entry also records the file of the function (`MError::leaving_file`, empty
 for a function local to the code that was run), and `e.stack` reads the
-entries as an Nx1 struct array of `file`, `name` and `line`.
+entries as an Nx1 struct array of `file`, `name` and `line`. The protocol
+sends the entries since cycle U3, as an error's `stack`, on `eval` when the
+request asks and always on `run_file`, each file relative to the file root
+or `null`; without the flag an `eval`'s answer is U0's, byte for byte.
 
 **Registry (cycle 01, in place).** `BuiltinFn = fn(&mut Interp, &[Value], usize) -> R<Vec<Value>>`,
 where the `usize` is `nargout`. An empty `Vec` means the builtin produced no
@@ -848,6 +889,11 @@ is the design, and every part of it is in `http.rs` except the binding:
   server's own. A refusal is `403`.
 - The head is capped at 16 KiB and the body at 8 MiB, both judged before
   buffering.
+- A `Sec-Fetch-Site` header, which a browser adds to every request a page
+  makes, must be `same-origin` when present (cycle U3): a request another
+  site makes is refused even if it somehow carried the token. A client
+  that sends none, a golden case or a script, is unaffected, and the
+  static routes are not checked, since a navigation is not same-origin.
 - A refused request never reaches the interpreter: only the last arm of
   `handle` calls `protocol::respond`, after every check has passed.
 - The page's `Content-Security-Policy: default-src 'self'; frame-ancestors
@@ -857,7 +903,12 @@ Since cycle U2 the token guards the file system and the history too:
 `files` lists folders under the root and `history` returns everything typed
 in any session. Each connection is read on a thread of its own, at most 16
 at once, and only whole requests reach the interpreter thread, so an idle
-connection can no longer hold the interpreter.
+connection can no longer hold the interpreter. Since cycle U3 it guards the
+first operation that changes the file system, `write_file`, which can
+replace any file under the root, a `.m` file the next `run` executes
+included; `eval` could already do as much through `fopen`, so
+`Sec-Fetch-Site` is one more check on top of the token, and neither may be
+relaxed.
 
 HTTP stays minimal: `Connection: close` on every response, no keep-alive, no
 chunked bodies, no `Expect: 100-continue`. The same `handle` is driven from
@@ -875,7 +926,12 @@ which catches links and junctions, judged inside the root before its kind
 so a refusal says nothing about what lies outside. The token guards it as
 it guards `eval`. The file browser following `cd` is cycle U4's, which will
 add the current folder to the answer on purpose. The Design notes of
-`docs/modules/U2-ui-desktop.md` have the details.
+`docs/modules/U2-ui-desktop.md` have the details. Since cycle U3 the
+editor's `read_file`, `write_file` and `run_file` are confined by the same
+rule, `write_file` judging the name, the folder and whatever is at the
+name before it writes, so it never follows a link out of the root, and
+`run_file` runs from the root wherever `cd` has gone; the Design notes of
+`docs/modules/U3-ui-editor.md` have the details.
 
 **The current folder (cycle 13, in place).** `Interp::cwd` is the one
 current folder: every path lookup, every file builtin, `ls`, `dir`, `run`
@@ -902,7 +958,23 @@ files shadow builtins, as in MATLAB. Files are found against `Interp::cwd`,
 never `std::env`, and cached by path; a generation counter, bumped by
 `addpath`, `rmpath` and every `run`, makes every cached lookup and file stale,
 and a stale file is reused only if its modification time and length are
-unchanged. At most 500 calls run at once (`MAX_RECURSION`), and every frame
+unchanged. Since cycle U3 a write the interpreter makes itself, a builtin
+that writes or deletes a file or the protocol's `write_file`, goes through
+`Interp::file_written`, which bumps the generation, drops every lookup, so
+a file just made is found and shadows a builtin at the next call, and
+drops the parse of the file written and of no other: a file rewritten with
+the same length inside the file system's timestamp tick had run from its
+old parse, which Save then Run meets at once, and dropping every parse
+made a loop that writes a log file and calls a large function fifty times
+slower. Each cached parse holds a `FileId`, its canonical path and its
+path normalised, taken once when the file is parsed; a write canonicalises
+the path it wrote once (a file already gone, its folder's canonical path
+joined to its name) and drops each parse whose canonical or normalised
+path matches, comparing paths already held, never asking the file system
+once per parse, and asking nothing when no parse is cached. So a file
+written through a relative path, a link or a verbatim `\\?\` path and read
+through another spelling is one file. A file another program changes that
+way is still not seen until its stamp moves. At most 500 calls run at once (`MAX_RECURSION`), and every frame
 shares the one nesting budget of `MAX_DEPTH`; the Design notes of
 `docs/modules/05-functions-and-scoping.md` have the stack measurements.
 Since cycle 06 an anonymous function's call is a frame too, with no

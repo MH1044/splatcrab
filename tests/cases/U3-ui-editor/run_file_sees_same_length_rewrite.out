@@ -1,0 +1,9 @@
+{"id":1,"ok":true,"path":"scratch_f.m","size":31}
+{"id":2,"ok":true,"out":"     1\n"}
+{"id":3,"ok":true,"out":"     1\n"}
+{"id":4,"ok":true,"path":"scratch_f.m","size":31}
+{"id":5,"ok":true,"out":"     2\n"}
+{"id":6,"ok":true,"out":"     2\n"}
+{"id":7,"ok":true,"out":"     1\n     2\n     3\n     4\n     5\n"}
+{"id":8,"ok":true,"out":""}
+{"id":9,"ok":true,"out":""}

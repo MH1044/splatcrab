@@ -1,0 +1,7 @@
+% covers: 7 - run_file and read_file resolve their path against the file root, not Interp::cwd: after an eval of cd prog (exist('s2') is then 2, so the folder did move) run_file of prog/s2.m still runs it from the root with the same answer as in item 6, and read_file of prog/s2.m still reads it; an eval of cd .. restores the folder (exist('s2') is 0 again)
+{"id":1,"op":"eval","code":"cd prog"}
+{"id":2,"op":"eval","code":"disp(exist('s2'))"}
+{"id":3,"op":"run_file","path":"prog/s2.m"}
+{"id":4,"op":"read_file","path":"prog/s2.m"}
+{"id":5,"op":"eval","code":"cd .."}
+{"id":6,"op":"eval","code":"disp(exist('s2'))"}

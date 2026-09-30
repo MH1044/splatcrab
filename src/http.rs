@@ -17,7 +17,8 @@
 //! | `/api` | `POST` | [`protocol::respond`] to the body, less its newline |
 //!
 //! Every request must name this server in `Host`, and in `Origin` when it
-//! sends one; `/api` also needs the session token in `X-SplatCrab-Token` and
+//! sends one; `/api` also needs the session token in `X-SplatCrab-Token`,
+//! since cycle U3 a `Sec-Fetch-Site` of `same-origin` when it has one, and
 //! a JSON content type. A request that fails a check is answered with an
 //! error status before the interpreter is touched: only the last line of
 //! [`handle`] reaches it.
@@ -291,6 +292,20 @@ fn token_ok(head: &Head, cfg: &Config) -> bool {
     matches!(head.single(TOKEN_HEADER), Ok(Some(t)) if same_secret(t, cfg.token.as_bytes()))
 }
 
+/// `Sec-Fetch-Site`, when present, is `same-origin` (cycle U3). A browser
+/// adds it to every request a page makes, naming whether the page is this
+/// server's own, so a request another site makes is refused even if it
+/// somehow carried the token. A client that sends none, a golden case or a
+/// script, is unaffected; two of them fail, as a repeated `Origin` does.
+/// Values are compared in any case, trimmed already.
+fn same_origin_fetch(head: &Head) -> bool {
+    match head.single("Sec-Fetch-Site") {
+        Ok(None) => true,
+        Ok(Some(site)) => trim_ows(site).eq_ignore_ascii_case(b"same-origin"),
+        Err(()) => false,
+    }
+}
+
 /// `application/json`, in any case, with or without parameters.
 fn json_body(head: &Head) -> bool {
     let Ok(Some(ct)) = head.single("Content-Type") else {
@@ -374,6 +389,10 @@ pub fn handle(request: &[u8], it: &mut Interp, cfg: &Config) -> Vec<u8> {
         b"/" | b"/app.js" | b"/app.css" => wrong_method("GET"),
         b"/api" if head.method != b"POST" => wrong_method("POST"),
         b"/api" if !token_ok(&head, cfg) => refuse(Status::Forbidden),
+        // After the token and before the content type; the static routes
+        // are not checked, since a navigation to the page is not a
+        // same-origin request.
+        b"/api" if !same_origin_fetch(&head) => refuse(Status::Forbidden),
         b"/api" if !json_body(&head) => refuse(Status::UnsupportedMediaType),
         b"/api" => {
             // Decoded leniently, as `--protocol` decodes a line: invalid
@@ -1325,6 +1344,56 @@ mod tests {
         }
     }
 
+    /// Cycle U3: the editor asks its questions in the page, never in a
+    /// dialog of the browser's; the markup has no inline handler; every
+    /// `eval` the page makes asks for the stack, and Run is `run_file`;
+    /// leaving with unsaved tabs is the browser's own warning; and user text
+    /// reaches the page as text.
+    #[test]
+    fn the_editor_keeps_to_the_page_and_its_text() {
+        for dialog in ["confirm(", "prompt(", "alert(", "showModalDialog"] {
+            assert!(!SCRIPT.contains(dialog), "{dialog}");
+        }
+        for text in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+            "new Function",
+        ] {
+            assert!(!SCRIPT.contains(text), "{text}");
+        }
+        // No inline handler: no attribute `on<letters>=` in the markup.
+        let page = PAGE.as_bytes();
+        for (k, _) in PAGE.match_indices(" on") {
+            let rest = &page[k + 3..];
+            let letters = rest.iter().take_while(|b| b.is_ascii_alphabetic()).count();
+            assert!(
+                letters == 0 || rest.get(letters) != Some(&b'='),
+                "an inline handler at byte {k}"
+            );
+        }
+        // Every eval asks for its stack.
+        let evals: Vec<usize> = SCRIPT.match_indices("op: 'eval'").map(|(k, _)| k).collect();
+        assert!(!evals.is_empty());
+        for k in evals {
+            let object = &SCRIPT[k..k + SCRIPT[k..].find('}').expect("the request's end")];
+            assert!(object.contains("stack: true"), "{object}");
+        }
+        for op in ["op: 'read_file'", "op: 'write_file'", "op: 'run_file'"] {
+            assert!(SCRIPT.contains(op), "{op}");
+        }
+        assert!(SCRIPT.contains("'beforeunload'"));
+        assert!(SCRIPT.contains("style.setProperty('--editor'"));
+        assert!(SCRIPT.contains("style.setProperty('--mark-row'"));
+        // The fourth splitter, as U2's three.
+        assert!(PAGE.contains(
+            r#"id="split-mid" class="splitter" role="separator" aria-orientation="horizontal""#
+        ));
+        assert!(PAGE.contains(r#"<textarea id="code" wrap="off""#));
+    }
+
     #[test]
     fn not_found_and_method_not_allowed() {
         assert_refused(&one(&get("/nope")), "404 Not Found");
@@ -1412,6 +1481,59 @@ mod tests {
         for origin in ["http://127.0.0.1:8123", "http://localhost:8123"] {
             let headers = format!("{GOOD}Origin: {origin}\r\n");
             assert_eq!(one(&api_with(&headers)).status, "HTTP/1.1 200 OK");
+        }
+    }
+
+    /// Cycle U3: a `Sec-Fetch-Site` other than `same-origin` is `403` and
+    /// never reaches the interpreter, judged after the token and before the
+    /// content type; none at all is fine, and the static routes are not
+    /// checked.
+    #[test]
+    fn sec_fetch_site_when_present_must_be_same_origin() {
+        let mut it = fresh();
+        for site in [
+            "cross-site",
+            "same-site",
+            "none",
+            "Cross-Site",
+            "same-origin-x",
+            "",
+        ] {
+            let headers = format!("{GOOD}Sec-Fetch-Site: {site}\r\n");
+            assert_refused(&send(&mut it, &api_with(&headers)), "403 Forbidden");
+            assert!(it.vars().is_empty(), "{site}");
+        }
+        let twice = format!("{GOOD}Sec-Fetch-Site: same-origin\r\nSec-Fetch-Site: same-origin\r\n");
+        assert_refused(&send(&mut it, &api_with(&twice)), "403 Forbidden");
+        assert!(it.vars().is_empty());
+        // Refused before the content type is looked at, and after the
+        // token, whose refusal is the same status.
+        let plain = GOOD.replace("application/json", "text/plain");
+        let headers = format!("{plain}Sec-Fetch-Site: cross-site\r\n");
+        assert_refused(&one(&api_with(&headers)), "403 Forbidden");
+        let headers = format!("{plain}Sec-Fetch-Site: same-origin\r\n");
+        assert_refused(&one(&api_with(&headers)), "415 Unsupported Media Type");
+        for site in [
+            "same-origin",
+            "Same-Origin",
+            "SAME-ORIGIN",
+            " same-origin\t",
+        ] {
+            let headers = format!("{GOOD}sec-fetch-site:{site}\r\n");
+            assert_eq!(
+                one(&api_with(&headers)).status,
+                "HTTP/1.1 200 OK",
+                "{site:?}"
+            );
+        }
+        assert_eq!(send(&mut it, &api_with(GOOD)).status, "HTTP/1.1 200 OK");
+        assert!(it.vars().contains_key("x"));
+        // A navigation to the page is not same-origin, and is served.
+        for path in ["/", "/app.js", "/app.css"] {
+            let raw = format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8123\r\nSec-Fetch-Site: none\r\n\r\n"
+            );
+            assert_eq!(one(&raw).status, "HTTP/1.1 200 OK", "{path}");
         }
     }
 

@@ -5,36 +5,47 @@
 //! before the next request is read so that a client can interleave. All of
 //! them run against one [`Interp`], so a variable assigned by one `eval` is
 //! there for the next. The operations, their fields and the order of the keys
-//! in each response are fixed by `docs/modules/U0-ui-foundations.md` and,
-//! for the desktop's three and `workspace`'s `preview`,
-//! `docs/modules/U2-ui-desktop.md`:
+//! in each response are fixed by `docs/modules/U0-ui-foundations.md`, for
+//! the desktop's three and `workspace`'s `preview` by
+//! `docs/modules/U2-ui-desktop.md`, and for the editor's three and `eval`'s
+//! `stack` by `docs/modules/U3-ui-editor.md`:
 //!
 //! | `op` | needs | answers, after `id` and `ok` |
 //! |---|---|---|
-//! | `eval` | `code` | `out`, then `error` when it failed |
+//! | `eval` | `code`; `stack`, optional | `out`, then `error` when it failed: `message`, `line`, and `stack` after `line` when `stack` is `true` |
 //! | `complete` | `code` | `complete`, [`syntax::is_complete`] |
 //! | `workspace` | `preview`, optional | `vars`, one `{name, size, class}` per variable, and `value`, [`env::preview`], after `class` when `preview` is `true` |
 //! | `completions` | `prefix` | `items`, [`env::completions`] |
 //! | `files` | `path` | `root`, `path`, `entries` (`{name, dir, size}`) and `truncated`, [`files::list`] under [`Interp::file_root`] |
 //! | `history` | | `items`, the history file's entries, [`history::load`] |
 //! | `history_add` | `entry` | `added`, whether [`history::remember`] kept it and it was appended |
+//! | `read_file` | `path` | `path` and `text`, [`files::read_file`] |
+//! | `write_file` | `path`, then `text` | `path` and `size`, [`files::write_file`], after which the file's parse and every lookup are dropped ([`Interp::file_written`]) |
+//! | `run_file` | `path` | as `eval`: `out`, then `error` when it failed, whose `line` is `null` and whose `stack` is always there; [`files::run_file`] and [`Interp::run_file`] |
+//!
+//! A stack is the error's frames, innermost first, each `{file, name,
+//! line}`: `file` relative to the root with `/` separators ([`files::relative`]),
+//! or `null` outside it or where the frame has no file; `name` as the trace
+//! writes it; `line` or `null`.
 //!
 //! A request that cannot be acted on is answered with `"ok":false` and an
 //! `error` whose `line` is `null`, and the loop goes on: a session is not a
 //! script, and neither a failed evaluation nor a malformed line ends it.
 //!
 //! Nothing here writes anywhere but the writer it is handed. The interpreter
-//! is built over two sinks, and `eval` swaps its `out` and its `err` for one
-//! buffer for the length of the call, so evaluation output and warnings reach
-//! the client only inside a response, in the order they were written.
+//! is built over two sinks, and `eval` and `run_file` swap its `out` and its
+//! `err` for one buffer for the length of the call, so evaluation output and
+//! warnings reach the client only inside a response, in the order they were
+//! written.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::rc::Rc;
 
 use crate::env;
-use crate::error::{self, MError};
+use crate::error::{self, MError, R};
 use crate::files;
 use crate::history;
 use crate::interp::{InputSource, Interp};
@@ -104,7 +115,10 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
         Err(e) => return refused(id, e),
     };
     let result = match op {
-        "eval" => field(&req, "code").map(|code| eval(it, id.clone(), code)),
+        "eval" => field(&req, "code").and_then(|code| {
+            let stack = flag(&req, "stack", error::request_stack)?;
+            Ok(eval(it, id.clone(), code, stack))
+        }),
         "complete" => field(&req, "code").map(|code| {
             Json::object([
                 ("id", id.clone()),
@@ -112,7 +126,8 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
                 ("complete", Json::Bool(syntax::is_complete(code))),
             ])
         }),
-        "workspace" => preview_flag(&req).map(|preview| workspace(it, id.clone(), preview)),
+        "workspace" => flag(&req, "preview", error::request_preview)
+            .map(|preview| workspace(it, id.clone(), preview)),
         "completions" => field(&req, "prefix").map(|prefix| {
             let items = env::completions(prefix, it.vars(), it.builtins(), &it.path_dirs());
             items_answer(id.clone(), items)
@@ -124,6 +139,12 @@ pub fn respond(it: &mut Interp, line: &str) -> Json {
         )),
         "history_add" => field(&req, "entry")
             .and_then(|entry| history_add(id.clone(), history::default_path().as_deref(), entry)),
+        "read_file" => field(&req, "path").and_then(|path| read_file(it, id.clone(), path)),
+        "write_file" => field(&req, "path").and_then(|path| {
+            let text = field(&req, "text")?;
+            write_file(it, id.clone(), path, text)
+        }),
+        "run_file" => field(&req, "path").and_then(|path| run_file(it, id.clone(), path)),
         other => Err(error::unknown_operation(other)),
     };
     result.unwrap_or_else(|e| refused(id, e))
@@ -142,25 +163,34 @@ fn items_answer(id: Json, items: Vec<String>) -> Json {
     ])
 }
 
-/// `workspace`'s optional `preview`: absent is `false`, and anything but a
-/// JSON boolean is refused, `null` included.
-fn preview_flag(req: &Json) -> Result<bool, MError> {
-    match req.get("preview") {
+/// An optional flag, `workspace`'s `preview` or `eval`'s `stack`: absent
+/// is `false`, and anything but a JSON boolean is refused, `null` included,
+/// with `refusal`.
+fn flag(req: &Json, name: &str, refusal: fn() -> MError) -> Result<bool, MError> {
+    match req.get(name) {
         None => Ok(false),
         Some(Json::Bool(b)) => Ok(*b),
-        Some(_) => Err(error::request_preview()),
+        Some(_) => Err(refusal()),
+    }
+}
+
+/// The file root, for an operation on `path`. With no root, which only an
+/// interpreter a test builds lacks, every path is outside it, the text
+/// still judged first, so a malformed path says so.
+fn root_for<'a>(it: &'a Interp, path: &str) -> Result<&'a Path, MError> {
+    match &it.file_root {
+        Some(root) => Ok(root),
+        None => {
+            files::normalise(path)?;
+            Err(error::files_outside_root(path))
+        }
     }
 }
 
 /// `files`: one folder of the file root, at most [`files::MAX_ENTRIES`]
-/// entries of it. With no root, which only an interpreter a test builds
-/// lacks, every path is outside it.
+/// entries of it.
 fn list_files(it: &Interp, id: Json, path: &str) -> Result<Json, MError> {
-    let Some(root) = &it.file_root else {
-        // The text is still judged first, so a malformed path says so.
-        files::normalise(path)?;
-        return Err(error::files_outside_root(path));
-    };
+    let root = root_for(it, path)?;
     let listing = files::list(root, path, files::MAX_ENTRIES)?;
     let entries = listing
         .entries
@@ -217,6 +247,46 @@ fn history_add(id: Json, path: Option<&Path>, entry: &str) -> Result<Json, MErro
     ]))
 }
 
+/// `read_file`: the text of one file under the root, at most
+/// [`files::MAX_TEXT`] bytes of it.
+fn read_file(it: &Interp, id: Json, path: &str) -> Result<Json, MError> {
+    let root = root_for(it, path)?;
+    let file = files::read_file(root, path, files::MAX_TEXT)?;
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("path", Json::String(file.path)),
+        ("text", Json::String(file.text)),
+    ]))
+}
+
+/// `write_file`: `text` written to one file under the root, at most
+/// [`files::MAX_TEXT`] bytes of it. The interpreter then drops its parse
+/// of the file, under whatever path it read it, and every lookup, so a
+/// function saved now runs its new text at the next call, however soon.
+fn write_file(it: &mut Interp, id: Json, path: &str, text: &str) -> Result<Json, MError> {
+    let root = root_for(it, path)?;
+    let written = files::write_file(root, path, text, files::MAX_TEXT)?;
+    it.file_written(&written.file);
+    Ok(Json::object([
+        ("id", id),
+        ("ok", Json::Bool(true)),
+        ("path", Json::String(written.path)),
+        ("size", Json::Number(written.size as f64)),
+    ]))
+}
+
+/// `run_file`: one `.m` file under the root run as `run` runs a file named
+/// by its full path, answered as `eval` is, its error's `line` `null`,
+/// since no code was submitted, and its `stack` always there. A refused
+/// path is a refusal like any other, with nothing run.
+fn run_file(it: &mut Interp, id: Json, path: &str) -> Result<Json, MError> {
+    let root = root_for(it, path)?;
+    let target = files::run_file(root, path)?;
+    let (result, out) = captured(it, |it| it.run_file(&target.path, &target.name));
+    Ok(evaluated(it, id, result, out, false, true))
+}
+
 /// A string field the operation needs.
 fn field<'a>(req: &'a Json, name: &str) -> Result<&'a str, MError> {
     match req.get(name) {
@@ -225,15 +295,56 @@ fn field<'a>(req: &'a Json, name: &str) -> Result<&'a str, MError> {
     }
 }
 
+/// A line as the protocol writes one: a number, or `null` when none is
+/// known.
+fn line_json(line: Option<u32>) -> Json {
+    match line {
+        Some(n) => Json::Number(f64::from(n)),
+        None => Json::Null,
+    }
+}
+
 /// `{"message": ..., "line": ...}`: the message exactly as the REPL prints it
 /// after `Error: `, without the `Line N: ` that script mode adds, and the
 /// line apart, one-based within the submitted code.
 fn error_object(e: &MError) -> Json {
-    let line = match e.line {
-        Some(n) => Json::Number(f64::from(n)),
-        None => Json::Null,
-    };
-    Json::object([("message", Json::String(e.msg.clone())), ("line", line)])
+    Json::object([
+        ("message", Json::String(e.msg.clone())),
+        ("line", line_json(e.line)),
+    ])
+}
+
+/// The error's frames, innermost first, as the protocol's `stack` writes
+/// them: `{file, name, line}`. Each distinct file is canonicalised once,
+/// against the root, however many frames name it; a frame with no file,
+/// a function local to the submitted code, has `null`, as has one whose
+/// file is outside the root.
+fn stack_json(it: &Interp, e: &MError) -> Json {
+    let mut seen: HashMap<&str, Json> = HashMap::new();
+    let frames = e
+        .stack()
+        .iter()
+        .map(|frame| {
+            let file = if frame.file.is_empty() {
+                Json::Null
+            } else {
+                seen.entry(frame.file.as_str())
+                    .or_insert_with(|| {
+                        it.file_root
+                            .as_deref()
+                            .and_then(|root| files::relative(root, Path::new(&frame.file)))
+                            .map_or(Json::Null, Json::String)
+                    })
+                    .clone()
+            };
+            Json::object([
+                ("file", file),
+                ("name", Json::String(frame.name.clone())),
+                ("line", line_json(frame.line)),
+            ])
+        })
+        .collect();
+    Json::Array(frames)
 }
 
 /// The answer to a request that could not be acted on.
@@ -262,7 +373,17 @@ impl Write for Capture {
 /// Runs `code` as a REPL entry is run, with its output captured. The code is
 /// run as sent, even when a block is left open: that is a parse error in the
 /// answer, not a wait for more input, and a client asks `complete` first.
-fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
+/// With `stack` the error carries its frames after its line; without it
+/// the answer is U0's, byte for byte.
+fn eval(it: &mut Interp, id: Json, code: &str, stack: bool) -> Json {
+    let (result, out) = captured(it, |it| it.run_command(code));
+    evaluated(it, id, result, out, true, stack)
+}
+
+/// Runs `run` with the interpreter's output and warnings captured, and
+/// `input` refused, for the length of the call; the result and what it
+/// wrote.
+fn captured(it: &mut Interp, run: impl FnOnce(&mut Interp) -> R<()>) -> (R<()>, Json) {
     let buf = Rc::new(RefCell::new(Vec::new()));
     // Both sinks write into the one buffer, so a warning sits in `out` where
     // it was raised, between the output before it and the output after, and
@@ -274,20 +395,39 @@ fn eval(it: &mut Interp, id: Json, code: &str) -> Json {
     // the length of the call rather than swallow the next request (cycle
     // 11).
     let saved_input = std::mem::replace(&mut it.input, InputSource::Refused);
-    let result = it.run_command(code);
+    let result = run(it);
     it.out = saved;
     it.err = saved_err;
     it.input = saved_input;
     let out = Json::String(String::from_utf8_lossy(&buf.borrow()).into_owned());
-    match result {
-        Ok(()) => Json::object([("id", id), ("ok", Json::Bool(true)), ("out", out)]),
-        Err(e) => Json::object([
-            ("id", id),
-            ("ok", Json::Bool(false)),
-            ("out", out),
-            ("error", error_object(&e)),
-        ]),
+    (result, out)
+}
+
+/// The answer to an evaluation, `eval`'s or `run_file`'s: `out`, then the
+/// `error` when it failed, whose `line` is written when `line` is set and
+/// `null` otherwise, and which has its `stack` after the line when `stack`
+/// is set.
+fn evaluated(it: &Interp, id: Json, result: R<()>, out: Json, line: bool, stack: bool) -> Json {
+    let e = match result {
+        Ok(()) => return Json::object([("id", id), ("ok", Json::Bool(true)), ("out", out)]),
+        Err(e) => e,
+    };
+    let mut error = vec![
+        ("message".to_string(), Json::String(e.msg.clone())),
+        (
+            "line".to_string(),
+            line_json(if line { e.line } else { None }),
+        ),
+    ];
+    if stack {
+        error.push(("stack".to_string(), stack_json(it, &e)));
     }
+    Json::object([
+        ("id", id),
+        ("ok", Json::Bool(false)),
+        ("out", out),
+        ("error", Json::Object(error)),
+    ])
 }
 
 /// One `{name, size, class}` per variable, sorted by name, and with
@@ -789,6 +929,316 @@ mod tests {
         assert_eq!(
             history_items(Json::Null, Some(&d.0)).to_string(),
             "{\"id\":null,\"ok\":true,\"items\":[]}"
+        );
+    }
+
+    /// An interpreter whose file root is a fresh folder `desk` holding
+    /// `prog/s1.m` and `prog/s2.m`, the spec's fixture, and `crlf.txt`.
+    fn editor_session(name: &str) -> (Dir, Interp) {
+        let d = scratch(name);
+        let root = d.0.join("desk");
+        std::fs::create_dir_all(root.join("prog")).unwrap();
+        std::fs::write(
+            root.join("prog").join("s1.m"),
+            "disp('start')\nb = 2;\nhelper(3)\nfunction helper(x)\n  y = x + 1;\n  z = nosuch(y);\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("prog").join("s2.m"),
+            "q = 1;\nw = undefined_thing + 1;\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("prog").join("crlf.txt"), b"a\r\nb\r\n").unwrap();
+        let mut it = Interp::with_sinks(Box::new(io::sink()), Box::new(io::sink()));
+        it.file_root = Some(std::fs::canonicalize(&root).unwrap());
+        it.cwd = root;
+        (d, it)
+    }
+
+    fn ask(it: &mut Interp, line: &str) -> String {
+        respond(it, line).to_string()
+    }
+
+    /// Cycle U3: `read_file` answers `path` and `text` after `id` and `ok`,
+    /// the path normalised and the text exact.
+    #[test]
+    fn read_file_answers_its_keys_in_order() {
+        let (_d, mut it) = editor_session("read-file");
+        assert_eq!(
+            ask(&mut it, r#"{"id":1,"op":"read_file","path":"prog/s2.m"}"#),
+            r#"{"id":1,"ok":true,"path":"prog/s2.m","text":"q = 1;\nw = undefined_thing + 1;\n"}"#
+        );
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":2,"op":"read_file","path":"prog/./crlf.txt"}"#
+            ),
+            r#"{"id":2,"ok":true,"path":"prog/crlf.txt","text":"a\r\nb\r\n"}"#
+        );
+        for (line, msg) in [
+            (r#""path":"..""#, "Path '..' is outside the file root."),
+            (
+                r#""path":"/etc""#,
+                "Malformed request: 'path' must be a relative path with '/' separators.",
+            ),
+            (r#""path":"""#, "Path '' is not a file."),
+            (r#""path":"prog""#, "Path 'prog' is not a file."),
+            (r#""path":"nope.m""#, "Path 'nope.m' is not a file."),
+            (r#""x":1"#, "Malformed request: no 'path' field."),
+            (
+                r#""path":[]"#,
+                "Malformed request: 'path' must be a string.",
+            ),
+        ] {
+            let got = ask(&mut it, &format!(r#"{{"id":3,"op":"read_file",{line}}}"#));
+            assert_eq!(
+                got,
+                format!(r#"{{"id":3,"ok":false,"error":{{"message":"{msg}","line":null}}}}"#),
+                "{line}"
+            );
+        }
+    }
+
+    /// Cycle U3: `write_file` answers `path` and `size` after `id` and
+    /// `ok`; its fields are judged `path` then `text`; and what it writes
+    /// is what the next call of the function runs, however soon.
+    #[test]
+    fn write_file_answers_its_keys_in_order_and_the_next_call_reads_it() {
+        let (d, mut it) = editor_session("write-file");
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":1,"op":"write_file","path":"scratch_f.m","text":"function scratch_f\ndisp(1)\nend\n"}"#
+            ),
+            r#"{"id":1,"ok":true,"path":"scratch_f.m","size":31}"#
+        );
+        assert_eq!(
+            ask(&mut it, r#"{"id":2,"op":"eval","code":"scratch_f"}"#),
+            r#"{"id":2,"ok":true,"out":"     1\n"}"#
+        );
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":3,"op":"write_file","path":"./scratch_f.m","text":"function scratch_f\ndisp(2)\nend\n"}"#
+            ),
+            r#"{"id":3,"ok":true,"path":"scratch_f.m","size":31}"#
+        );
+        assert_eq!(
+            ask(&mut it, r#"{"id":4,"op":"eval","code":"scratch_f"}"#),
+            r#"{"id":4,"ok":true,"out":"     2\n"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.0.join("desk").join("scratch_f.m")).unwrap(),
+            "function scratch_f\ndisp(2)\nend\n"
+        );
+        let refusal = |id: u32, msg: &str| {
+            format!(r#"{{"id":{id},"ok":false,"error":{{"message":"{msg}","line":null}}}}"#)
+        };
+        for (id, fields, msg) in [
+            (5, r#""text":"x""#, "Malformed request: no 'path' field."),
+            (6, "", "Malformed request: no 'path' field."),
+            (7, r#""path":"a.m""#, "Malformed request: no 'text' field."),
+            (
+                8,
+                r#""path":"a.m","text":3"#,
+                "Malformed request: 'text' must be a string.",
+            ),
+            (
+                9,
+                r#""path":3,"text":3"#,
+                "Malformed request: 'path' must be a string.",
+            ),
+            (
+                10,
+                r#""path":"..","text":"x""#,
+                "Path '..' is outside the file root.",
+            ),
+            (
+                11,
+                r#""path":"nofolder/x.m","text":"x""#,
+                "Path 'nofolder/x.m' is not in a folder of the file root.",
+            ),
+            (
+                12,
+                r#""path":"prog","text":"x""#,
+                "Path 'prog' is a folder.",
+            ),
+            (
+                13,
+                r#""path":"NUL.m","text":"x""#,
+                "Path 'NUL.m' is not a file.",
+            ),
+        ] {
+            let sep = if fields.is_empty() { "" } else { "," };
+            let got = ask(
+                &mut it,
+                &format!(r#"{{"id":{id},"op":"write_file"{sep}{fields}}}"#),
+            );
+            assert_eq!(got, refusal(id, msg), "{fields}");
+        }
+        assert!(!d.0.join("desk").join("a.m").exists());
+    }
+
+    /// Cycle U3: `run_file` answers as `eval` does, its error's `line`
+    /// `null` and its `stack` always there, each frame `file`, `name` and
+    /// `line`, the file relative to the root; and it runs from the root
+    /// wherever `cd` has gone.
+    #[test]
+    fn run_file_answers_as_eval_with_a_stack() {
+        let (_d, mut it) = editor_session("run-file");
+        let s1 = concat!(
+            r#"{"id":1,"ok":false,"out":"start\n","error":{"message":"#,
+            r#""Unrecognized function or variable 'nosuch'.","line":null,"stack":["#,
+            r#"{"file":"prog/s1.m","name":"helper","line":6},"#,
+            r#"{"file":"prog/s1.m","name":"s1","line":3}]}}"#
+        );
+        assert_eq!(
+            ask(&mut it, r#"{"id":1,"op":"run_file","path":"prog/s1.m"}"#),
+            s1
+        );
+        let s2 = concat!(
+            r#"{"id":2,"ok":false,"out":"","error":{"message":"#,
+            r#""Unrecognized function or variable 'undefined_thing'.","line":null,"stack":["#,
+            r#"{"file":"prog/s2.m","name":"s2","line":2}]}}"#
+        );
+        assert_eq!(
+            ask(&mut it, r#"{"id":2,"op":"run_file","path":"prog/s2.m"}"#),
+            s2
+        );
+        // It ran in the base workspace.
+        assert!(it.vars().contains_key("q") && it.vars().contains_key("b"));
+        ask(&mut it, r#"{"op":"eval","code":"cd prog"}"#);
+        assert_eq!(
+            ask(&mut it, r#"{"id":2,"op":"run_file","path":"prog/s2.m"}"#),
+            s2
+        );
+        assert!(it.cwd.ends_with("prog"));
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":3,"op":"run_file","path":"prog/crlf.txt"}"#
+            ),
+            r#"{"id":3,"ok":false,"error":{"message":"Path 'prog/crlf.txt' is not a .m file.","line":null}}"#
+        );
+        ask(&mut it, r#"{"op":"eval","code":"cd .."}"#);
+        // A clean run, output and a warning captured in order.
+        ask(
+            &mut it,
+            r#"{"op":"write_file","path":"ok.m","text":"disp(7)\nwarning('w')\ndisp(8)\n"}"#,
+        );
+        assert_eq!(
+            ask(&mut it, r#"{"id":4,"op":"run_file","path":"ok.m"}"#),
+            r#"{"id":4,"ok":true,"out":"     7\nWarning: w\n     8\n"}"#
+        );
+        // `input` is refused, as in an `eval`.
+        ask(
+            &mut it,
+            r#"{"op":"write_file","path":"asks.m","text":"v = input('? ');\n"}"#,
+        );
+        let got = ask(&mut it, r#"{"id":5,"op":"run_file","path":"asks.m"}"#);
+        assert!(got.starts_with(r#"{"id":5,"ok":false,"out":"#), "{got}");
+        assert!(
+            got.ends_with(r#""line":null,"stack":[{"file":"asks.m","name":"asks","line":1}]}}"#),
+            "{got}"
+        );
+    }
+
+    /// Cycle U3: `eval`'s `stack` adds the frames after `line`; without it,
+    /// or with `false`, the answer is U0's byte for byte; anything but a
+    /// boolean is refused.
+    #[test]
+    fn eval_with_stack_adds_the_frames_after_line() {
+        let (_d, mut it) = editor_session("eval-stack");
+        let frames = concat!(
+            r#""stack":[{"file":"prog/s1.m","name":"helper","line":6},"#,
+            r#"{"file":"prog/s1.m","name":"s1","line":3}]"#
+        );
+        let head = r#""ok":false,"out":"start\n","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1"#;
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":1,"op":"eval","code":"run('prog/s1.m')","stack":true}"#
+            ),
+            format!(r#"{{"id":1,{head},{frames}}}}}"#)
+        );
+        for (id, flag) in [(2, ""), (3, r#","stack":false"#)] {
+            assert_eq!(
+                ask(
+                    &mut it,
+                    &format!(r#"{{"id":{id},"op":"eval","code":"run('prog/s1.m')"{flag}}}"#)
+                ),
+                format!(r#"{{"id":{id},{head}}}}}"#)
+            );
+        }
+        for (id, value) in [(4, "1"), (5, r#""yes""#), (6, "null")] {
+            assert_eq!(
+                ask(
+                    &mut it,
+                    &format!(r#"{{"id":{id},"op":"eval","code":"disp(1)","stack":{value}}}"#)
+                ),
+                format!(
+                    r#"{{"id":{id},"ok":false,"error":{{"message":"Malformed request: 'stack' must be true or false.","line":null}}}}"#
+                )
+            );
+        }
+        // Nothing ran for a refused flag, and a success has no stack.
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":7,"op":"eval","code":"disp(1)","stack":true}"#
+            ),
+            r#"{"id":7,"ok":true,"out":"     1\n"}"#
+        );
+        // No frames, and a frame with no file.
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":8,"op":"eval","code":"x = nosuchname","stack":true}"#
+            ),
+            r#"{"id":8,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'nosuchname'.","line":1,"stack":[]}}"#
+        );
+        assert_eq!(
+            ask(
+                &mut it,
+                r#"{"id":9,"op":"eval","code":"f = @(n) nosuch(n); f(1)","stack":true}"#
+            ),
+            r#"{"id":9,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1,"stack":[{"file":null,"name":"@(n)nosuch(n)","line":null}]}}"#
+        );
+    }
+
+    /// Cycle U3: a function found on the path is recorded by the path it
+    /// was found at, which is not canonical (and on Windows the root is a
+    /// verbatim path); the stack names it relative to the root all the
+    /// same, and a file outside the root is `null`.
+    #[test]
+    fn the_stack_names_a_path_function_relative_to_the_root() {
+        let (d, mut it) = editor_session("stack-path");
+        let root = d.0.join("desk");
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(
+            root.join("lib").join("inner.m"),
+            "function inner\n\nerror('boom')\nend\n",
+        )
+        .unwrap();
+        let outside = d.0.join("elsewhere");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("outer.m"), "function outer\ninner\nend\n").unwrap();
+        // The folders as spelled, not canonical, with a `.` and a `..`.
+        it.cwd = root.join("lib").join("..").join(".");
+        let got = ask(
+            &mut it,
+            &format!(
+                r#"{{"id":1,"op":"eval","code":"addpath('lib'); addpath('{}'); outer","stack":true}}"#,
+                outside.display().to_string().replace('\\', "\\\\")
+            ),
+        );
+        assert!(
+            got.ends_with(concat!(
+                r#""message":"boom","line":1,"stack":["#,
+                r#"{"file":"lib/inner.m","name":"inner","line":3},"#,
+                r#"{"file":null,"name":"outer","line":2}]}}"#
+            )),
+            "{got}"
         );
     }
 

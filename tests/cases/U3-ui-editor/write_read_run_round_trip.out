@@ -1,0 +1,7 @@
+{"id":1,"ok":true,"path":"scratch_a.m","size":16}
+{"id":2,"ok":true,"path":"scratch_a.m","text":"disp(7)\ndisp(8)\n"}
+{"id":3,"ok":true,"out":"     7\n     8\n"}
+{"id":4,"ok":true,"out":""}
+{"id":5,"ok":true,"path":"scratch_b.txt","size":8}
+{"id":6,"ok":true,"path":"scratch_b.txt","text":"﻿a×\r\n"}
+{"id":7,"ok":true,"out":""}

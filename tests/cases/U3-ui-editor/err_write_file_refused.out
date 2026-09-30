@@ -1,0 +1,21 @@
+{"id":1,"ok":false,"error":{"message":"Path '..' is outside the file root.","line":null}}
+{"id":2,"ok":false,"error":{"message":"Malformed request: 'path' must be a relative path with '/' separators.","line":null}}
+{"id":3,"ok":false,"error":{"message":"Path '' is not a file.","line":null}}
+{"id":4,"ok":false,"error":{"message":"Path 'nofolder/x.m' is not in a folder of the file root.","line":null}}
+{"id":5,"ok":false,"error":{"message":"Path 'prog/nofolder/x.m' is not in a folder of the file root.","line":null}}
+{"id":6,"ok":false,"error":{"message":"Path 'prog/s1.m/x.m' is not in a folder of the file root.","line":null}}
+{"id":7,"ok":false,"error":{"message":"Path 'prog' is a folder.","line":null}}
+{"id":8,"ok":false,"error":{"message":"Path 'NUL.m' is not a file.","line":null}}
+{"id":9,"ok":false,"error":{"message":"Path 'con' is not a file.","line":null}}
+{"id":10,"ok":false,"error":{"message":"Path 'x.m.' is not a file.","line":null}}
+{"id":11,"ok":false,"error":{"message":"Path 'x.m ' is not a file.","line":null}}
+{"id":12,"ok":false,"error":{"message":"Path 'prog/NUL.m' is not a file.","line":null}}
+{"id":13,"ok":false,"error":{"message":"Path 'prog/con' is not a file.","line":null}}
+{"id":14,"ok":false,"error":{"message":"Path 'prog/x.m.' is not a file.","line":null}}
+{"id":15,"ok":false,"error":{"message":"Path 'prog/x.m ' is not a file.","line":null}}
+{"id":16,"ok":false,"error":{"message":"Malformed request: no 'text' field.","line":null}}
+{"id":17,"ok":false,"error":{"message":"Malformed request: 'text' must be a string.","line":null}}
+{"id":18,"ok":false,"error":{"message":"Malformed request: no 'path' field.","line":null}}
+{"id":19,"ok":false,"error":{"message":"Malformed request: 'path' must be a string.","line":null}}
+{"id":20,"ok":false,"error":{"message":"Malformed request: no 'text' field.","line":null}}
+{"id":21,"ok":true,"root":"U3-ui-editor","path":"prog","entries":[{"name":"crlf.txt","dir":false,"size":6},{"name":"s1.m","dir":false,"size":84},{"name":"s2.m","dir":false,"size":32}],"truncated":false}

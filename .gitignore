@@ -1,2 +1,3 @@
 /target
 /.claude/
+tests/cases/U3-ui-editor/**/scratch_*

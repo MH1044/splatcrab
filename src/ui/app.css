@@ -1,10 +1,11 @@
-/* SplatCrab desktop: the command window, the workspace, the command history
-   and the file browser. The palette is defined once, here, as custom
-   properties: the light set in the :root rule and the dark set in the one
-   prefers-color-scheme block's :root rule. Nothing else in this file names
-   a colour; a unit test in src/http.rs holds it to that. Pane sizes are
-   custom properties too, which app.js sets through the CSS object model:
-   the page's policy allows no style attribute and no inline style. */
+/* SplatCrab desktop: the editor, the command window, the workspace, the
+   command history and the file browser. The palette is defined once, here,
+   as custom properties: the light set in the :root rule and the dark set in
+   the one prefers-color-scheme block's :root rule. Nothing else in this
+   file names a colour; a unit test in src/http.rs holds it to that. Pane
+   sizes and the gutter's marked line are custom properties too, which
+   app.js sets through the CSS object model: the page's policy allows no
+   style attribute and no inline style. */
 
 :root {
   color-scheme: light dark;
@@ -45,6 +46,11 @@
   box-sizing: border-box;
 }
 
+/* Whatever a rule below makes a flex or a grid, hidden stays hidden. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   height: 100%;
@@ -74,15 +80,23 @@ button:focus-visible,
   outline-offset: -2px;
 }
 
-/* The four panes and three splitters. --left and --right are the side
-   columns' widths and --top the workspace's height, set by app.js; each
-   has a default here for the first layout. */
+/* The five panes and four splitters. --left and --right are the side
+   columns' widths, --top the workspace's height and --editor the editor's,
+   set by app.js; each has a default here for the first layout. */
 
 #desktop {
   display: grid;
   height: 100%;
   grid-template-columns: var(--left, 240px) 6px minmax(120px, 1fr) 6px var(--right, 360px);
   grid-template-rows: 100%;
+}
+
+#middle {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  grid-template-rows: var(--editor, minmax(120px, 1fr)) 6px minmax(120px, 1fr);
+  grid-template-columns: 100%;
 }
 
 #side {
@@ -186,6 +200,17 @@ pre {
   color: var(--err);
 }
 
+/* A frame of an error's stack whose file is under the root: a link that
+   opens the file at its line. */
+.err .link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.err .link:hover {
+  text-decoration-thickness: 2px;
+}
+
 #prompt {
   display: flex;
   align-items: flex-start;
@@ -269,6 +294,196 @@ pre {
   color: var(--muted);
 }
 
+/* The editor: a bar of tabs and tools, the in-page questions, a line
+   before any file is open, and the gutter beside the text. The gutter and
+   the text share one line height and one top padding, so line k of each
+   sits at the same height, and the gutter scrolls with the text. */
+
+#editor {
+  background: var(--bg);
+}
+
+#editor-bar {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--rule);
+  background: var(--pane);
+  font: 13px/1.4 var(--sans);
+}
+
+#tabs {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.tab {
+  display: flex;
+  flex: none;
+  align-items: center;
+  border-right: 1px solid var(--rule);
+}
+
+.tab.active {
+  background: var(--bg);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.tab-name {
+  padding: 6px 4px 6px 10px;
+  white-space: pre;
+}
+
+.tab-name .dirty {
+  color: var(--accent);
+}
+
+.tab-close {
+  padding: 6px 8px;
+  color: var(--muted);
+}
+
+.tab-close:hover {
+  color: var(--fg);
+}
+
+#editor-tools {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+}
+
+.tool {
+  padding: 2px 8px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--field);
+  font: 12px/1.4 var(--sans);
+  white-space: nowrap;
+}
+
+.tool:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.tool:disabled {
+  color: var(--muted);
+  cursor: default;
+}
+
+.ask {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--pane);
+  font: 13px/1.4 var(--sans);
+}
+
+#save-path {
+  flex: 1;
+  min-width: 120px;
+  padding: 2px 6px;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--field);
+  color: var(--fg);
+  font: 13px/1.4 var(--mono);
+}
+
+#editor-note {
+  padding: 4px 12px;
+  border-bottom: 1px solid var(--rule);
+  color: var(--err);
+  font: 13px/1.4 var(--sans);
+}
+
+#editor-note:empty {
+  display: none;
+}
+
+.hint {
+  padding: 12px;
+  color: var(--muted);
+  font-family: var(--sans);
+}
+
+#editor-body {
+  --lh: 20px;
+  --pad: 8px;
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+#gutter {
+  position: relative;
+  flex: none;
+  overflow: hidden;
+  border-right: 1px solid var(--rule);
+  background: var(--pane);
+  color: var(--muted);
+  user-select: none;
+}
+
+#gutter-lines {
+  position: relative;
+  min-width: 3ch;
+  margin: 0;
+  /* Room past the last line, so the gutter can scroll as far as the text
+     does with its horizontal bar showing. */
+  padding: var(--pad) 8px calc(var(--pad) + 64px) 12px;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: var(--lh);
+  text-align: right;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+#gutter-mark {
+  position: absolute;
+  top: calc(var(--pad) + var(--mark-row, 0) * var(--lh));
+  right: 0;
+  left: 0;
+  height: var(--lh);
+  border-left: 3px solid var(--err);
+  background: var(--err-bg);
+}
+
+#code {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: var(--pad) 12px;
+  border: 0;
+  border-radius: 0;
+  resize: none;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: var(--lh);
+  white-space: pre;
+  overflow: auto;
+  overflow-wrap: normal;
+  tab-size: 4;
+}
+
+#code:focus {
+  outline: none;
+}
+
+#code:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -2px;
+}
+
 /* The file browser and the command history: lists of one line each. */
 
 .path {
@@ -325,7 +540,8 @@ pre {
   border-top: 1px solid var(--rule);
 }
 
-/* Narrow windows: one column, the command window first, no splitters. */
+/* Narrow windows: one column, the command window first, then the editor,
+   no splitters. */
 
 @media (max-width: 719.98px) {
   #desktop {
@@ -339,6 +555,11 @@ pre {
     grid-template-rows: auto;
   }
 
+  /* The editor and the command window join the one column themselves. */
+  #middle {
+    display: contents;
+  }
+
   .splitter {
     display: none;
   }
@@ -349,12 +570,19 @@ pre {
     min-height: 240px;
   }
 
-  #side {
+  #editor {
     order: 2;
+    height: 60vh;
+    min-height: 240px;
+    border-top: 1px solid var(--rule);
+  }
+
+  #side {
+    order: 3;
   }
 
   #files {
-    order: 3;
+    order: 4;
   }
 
   #workspace,

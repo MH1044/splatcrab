@@ -1,0 +1,6 @@
+{"id":1,"ok":false,"out":"start\n","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1,"stack":[{"file":"prog/s1.m","name":"helper","line":6},{"file":"prog/s1.m","name":"s1","line":3}]}}
+{"id":2,"ok":false,"out":"start\n","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1}}
+{"id":3,"ok":false,"out":"start\n","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1}}
+{"id":4,"ok":false,"error":{"message":"Malformed request: 'stack' must be true or false.","line":null}}
+{"id":5,"ok":false,"error":{"message":"Malformed request: 'stack' must be true or false.","line":null}}
+{"id":6,"ok":true,"out":"     3\n"}

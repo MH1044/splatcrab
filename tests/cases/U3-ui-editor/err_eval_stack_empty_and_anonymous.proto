@@ -1,0 +1,4 @@
+% covers: 9 - the stack's frames: an error with no frames (x = nosuchname) has "stack":[]; an anonymous function's frame is named by its func2str text, with file null and line null (@(n)nosuch(n)); and frames come innermost first, a file under the root named relative to it and an anonymous caller null, as in g = @() run('prog/s1.m'); g()
+{"id":1,"op":"eval","code":"x = nosuchname","stack":true}
+{"id":2,"op":"eval","code":"f = @(n) nosuch(n); f(1)","stack":true}
+{"id":3,"op":"eval","code":"g = @() run('prog/s1.m'); g()","stack":true}

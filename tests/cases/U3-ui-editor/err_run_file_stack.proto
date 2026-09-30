@@ -1,0 +1,8 @@
+% covers: 6 - run_file runs a script file in the base workspace and answers as eval does, out then error, with line null (no code was submitted) and the stack always present, innermost first: prog/s1.m's local function helper at line 6 under s1 at line 3, and prog/s2.m's one frame at line 2, each file relative to the root with / separators; prog/crlf.txt is not a .m file; nope.m is not a file and ../x.m is outside the file root, judged as read_file judges them; path is required; and both scripts' assignments before their errors stay in the base workspace (b + q is 3)
+{"id":1,"op":"run_file","path":"prog/s1.m"}
+{"id":2,"op":"run_file","path":"prog/s2.m"}
+{"id":3,"op":"run_file","path":"prog/crlf.txt"}
+{"id":4,"op":"run_file","path":"nope.m"}
+{"id":5,"op":"run_file","path":"../x.m"}
+{"id":6,"op":"run_file"}
+{"id":7,"op":"eval","code":"disp(b + q)"}

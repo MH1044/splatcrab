@@ -1,0 +1,3 @@
+% covers: 1 - read_file answers the file's text exactly, with path normalised as files normalises it: prog/s2.m's two LF-ended lines, and prog/./crlf.txt answered as prog/crlf.txt with its CR LF line ends kept, each escaped by name as JSON writes it
+{"id":1,"op":"read_file","path":"prog/s2.m"}
+{"id":2,"op":"read_file","path":"prog/./crlf.txt"}

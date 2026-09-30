@@ -111,6 +111,13 @@ working directory, so helpers resolve without a path. Under `--protocol` and
 lists (cycle U2), so a `.proto` case names its fixtures relative to its own
 folder.
 
+A case that writes a file (cycle U3's `write_file`) names it `scratch_*` in
+its own folder and deletes it before it ends, with an `eval` of `delete`;
+`.gitignore` ignores `tests/cases/U3-ui-editor/**/scratch_*`, so one a failed
+run leaves behind is never committed. A fixture whose bytes are the point,
+such as U3's `prog/crlf.txt` with its CR LF line ends, is marked binary in
+`.gitattributes`, so no checkout on any platform changes it.
+
 ### The command history
 
 No case touches the user's command history (cycle U2). The harness gives
@@ -269,13 +276,31 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   links: on Unix a link inside the root pointing outside it, refused as a
   path and listed with `dir` false and `size` null, one pointing inside,
   listed as its target, and a dangling one; on Windows the same where a link
-  can be made.
+  can be made. Since cycle U3 the editor's operations: `read_file`'s text
+  exact (CR LF and a byte-order mark kept) under its normalised path, its
+  refusals, a file of exactly 4 MiB read and one byte more refused, a
+  length past the bound refused before a byte is read (a reader that
+  panics if touched) and a file that grew read to one byte past the bound
+  and no further, text that is not UTF-8; `write_file` creating and
+  replacing, its refusals in the spec's order with nothing created, every
+  device name in three cases and with extensions and every trailing `.` or
+  space refused, 4 MiB of text written and one byte more refused, and on
+  Unix a dangling link and a link out of the root refused with nothing
+  created (on Windows where a link can be made); `run_file`'s `.m` rule and
+  its plain path; `relative` on a path that is not canonical, outside the
+  root and missing.
 - `protocol.rs`: `serve` driven with an in-memory reader and writer, through
   every operation, every malformed-request text, blank lines, a `\r`, and the
   flush after each response; since cycle U2 the key order of `files`,
   `workspace` with `preview`, `history` and `history_add`, each against a
   folder or file of the test's own, never the user's history, and
-  `history_add` against a folder refused as not written.
+  `history_add` against a folder refused as not written; since cycle U3 the
+  key order of `read_file`, `write_file` and `run_file` and their refusals,
+  a function rewritten with the same length run from its new text,
+  `run_file` from the root after `cd` with its output, warnings and a
+  refused `input` captured, `eval`'s `stack` flag against U0's bytes, and
+  the stack's relative file for a function found on the path by a folder
+  that is not canonical.
 - `http.rs`: `handle` driven with byte strings, through every status, the
   header order, `Content-Length` against the body on every response, the
   static routes against the embedded files, the `Host`, `Origin` and token
@@ -285,7 +310,18 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
 - `http.rs`, since cycle U2: the palette rule over the embedded `app.css`,
   `index.html` and `app.js` (every CSS named colour listed, the system
   colours and the colour functions), and a set of deliberately bad
-  stylesheets, each refused.
+  stylesheets, each refused. Since cycle U3 `Sec-Fetch-Site`: every value
+  but `same-origin`, and two headers, refused without reaching the
+  interpreter, after the token and before the content type, the static
+  routes unchecked; and a static test that `app.js` opens no browser
+  dialog and writes no markup, the page has no inline handler, and every
+  `eval` the page makes asks for the stack.
+- `interp.rs`, since cycle U3: a write dropping the parse of the file it
+  wrote, named through its canonical path, so a function file rewritten
+  with the same length and its old modification time runs its new text,
+  and keeping every other file's parse (the same `Rc` after a loop of
+  writes); a file a write makes shadowing a builtin at the next call; a
+  deleted function file made again read again; `run_file` as an entry.
 - `server.rs`: the token's form and freshness, the URL, and since cycle U2
   the connection bound (sixteen slots, the seventeenth refused, a slot freed
   from another thread free again) and the interpreter loop answering jobs in
@@ -302,7 +338,10 @@ that a connection opened and left idle, and one that sent half a head, do
 not stop an `eval` on another connection from being answered within 3
 seconds, and runs `files` and `workspace` with `preview` against a fixture
 folder it makes under the temporary folder and starts the server in, with
-the page, the script and the stylesheet still served. Every server it
+the page, the script and the stylesheet still served. Since cycle U3 it
+runs `write_file`, `read_file` and `run_file` in a fixture folder of its
+own, a rewrite of the same length included, and a request carrying
+`Sec-Fetch-Site: cross-site` refused. Every server it
 starts has `SPLATCRAB_HISTORY` pointing at a file of its own. The child is
 killed by a guard's `Drop`, so an assertion that fails still kills it, and
 the fixture is removed the same way; the test binds nothing itself. It also

@@ -16,6 +16,37 @@
 <div class="pane-body"><ul id="files-list" class="list"></ul></div>
 </section>
 <div id="split-left" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize the file browser" aria-controls="files" tabindex="0"></div>
+<div id="middle">
+<section id="editor" class="pane" aria-label="Editor">
+<div id="editor-bar">
+<div id="tabs" role="tablist" aria-label="Open files"></div>
+<div id="editor-tools">
+<button type="button" id="new-file" class="tool" title="A new file">New</button>
+<button type="button" id="save-file" class="tool" title="Save (Ctrl+S)">Save</button>
+<button type="button" id="run-file" class="tool" title="Save and run the file (F5)">Run</button>
+<button type="button" id="run-selection" class="tool" title="Run the selection, or the line the cursor is on (F9)">Run Selection</button>
+</div>
+</div>
+<div id="save-as" class="ask" role="group" aria-labelledby="save-as-label" hidden>
+<label id="save-as-label" for="save-path">Save as</label>
+<input id="save-path" type="text" spellcheck="false" autocapitalize="off" autocomplete="off">
+<button type="button" id="save-as-ok" class="tool">Save</button>
+<button type="button" id="save-as-cancel" class="tool">Cancel</button>
+</div>
+<div id="close-ask" class="ask" role="alertdialog" aria-labelledby="close-text" hidden>
+<span id="close-text"></span>
+<button type="button" id="close-save" class="tool">Save</button>
+<button type="button" id="close-discard" class="tool">Discard</button>
+<button type="button" id="close-cancel" class="tool">Cancel</button>
+</div>
+<div id="editor-note" role="status"></div>
+<div id="editor-hint" class="hint">No file is open: double-click one in the file browser, or choose New.</div>
+<div id="editor-body" hidden>
+<div id="gutter" aria-hidden="true"><div id="gutter-mark" hidden></div><pre id="gutter-lines"></pre></div>
+<textarea id="code" wrap="off" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="The file's text"></textarea>
+</div>
+</section>
+<div id="split-mid" class="splitter" role="separator" aria-orientation="horizontal" aria-label="Resize the editor against the command window" aria-controls="editor" tabindex="0"></div>
 <section id="command" class="pane" aria-label="Command window">
 <main id="transcript" aria-live="polite" aria-label="Transcript"></main>
 <div id="prompt">
@@ -23,6 +54,7 @@
 <textarea id="input" rows="1" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Command"></textarea>
 </div>
 </section>
+</div>
 <div id="split-right" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize the workspace and the command history" aria-controls="side" tabindex="0"></div>
 <div id="side">
 <section id="workspace" class="pane" aria-labelledby="workspace-title">

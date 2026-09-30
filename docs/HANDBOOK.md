@@ -98,10 +98,11 @@ It writes nothing to stderr and exits 0 at end of input, whatever the
 requests did: a failed evaluation and a line that is not a request are both
 answers, and the session goes on.
 
-There are seven operations. `eval` runs `code` as a REPL entry, possibly
+There are ten operations. `eval` runs `code` as a REPL entry, possibly
 several lines, and answers with the output it would have printed (`out`)
 and, if it failed, an `error` holding the REPL's message and the one-based
-line within `code`. `complete` answers whether `code` is a finished entry or
+line within `code`, and with `"stack": true` the error's frames too.
+`complete` answers whether `code` is a finished entry or
 still inside an open block or bracket, the same test the REPL uses to decide
 whether to keep reading. `workspace` lists each variable's name, size and
 class, sorted by name, and with `"preview": true` a short `value` of each
@@ -109,8 +110,11 @@ too. `completions` lists every variable, function file on the path and
 builtin whose name starts with `prefix`. `files` lists one folder under the
 file root, the folder the session started in. `history` returns the command
 history the terminal's line editor keeps, and `history_add` adds an entry
-to it. Every response starts with the request's `id` (a number or a string,
-or `null` when it sent none) and `ok`.
+to it. `read_file` answers the text of one file under the file root,
+`write_file` saves a text to one, and `run_file` runs one `.m` file there
+as `run` would, answering as `eval` does. Every response starts with the
+request's `id` (a number or a string, or `null` when it sent none) and
+`ok`.
 
 This input, one request per line:
 
@@ -185,6 +189,48 @@ specified in `docs/modules/U2-ui-desktop.md`. This example is pinned by the
 golden case `tests/cases/U2-ui-desktop/handbook_desktop_example`, which
 sends these four requests from that folder and expects these four lines.
 
+**The editor's operations.** Three operations and one option serve the
+browser's editor below, each on one file under the file root and confined
+to it as `files` is. `read_file` answers a file's `text` exactly, its line
+ends and a byte-order mark included, under its `path` normalised; a folder,
+a file past 4 MiB or one that is not UTF-8 is refused. `write_file` saves
+`text` to `path`, creating or replacing the file, and answers the `size`
+it wrote in bytes; it never makes a folder, never writes through a link
+that leads out of the root, and refuses a name Windows would read as a
+device (`NUL.m`, `con`) or one ending in a dot or a space, on every
+platform. A function saved this way runs its new text at its next call,
+however soon. `run_file` runs a `.m` file as `run` runs one named by its
+full path, in the base workspace, from the file root wherever `cd` has
+gone, and answers as `eval` does, except that the error's `line` is `null`,
+since no code was submitted, and its `stack` is always there. The stack is
+the error's frames, innermost first, each the `file` relative to the root
+(or `null` for a function of the submitted code, an anonymous function or
+a file outside the root), the `name` the trace prints and the `line`;
+`eval` adds it after `line` when the request carries `"stack": true`, and
+answers exactly as before without it. Started in a folder holding
+`prog/s2.m`, the two lines `q = 1;` and `w = undefined_thing + 1;`, these
+requests:
+
+```text
+{"id":1,"op":"read_file","path":"prog/s2.m"}
+{"id":2,"op":"run_file","path":"prog/s2.m"}
+{"id":3,"op":"eval","code":"y = nosuch + 1","stack":true}
+```
+
+get exactly these answers:
+
+```text
+{"id":1,"ok":true,"path":"prog/s2.m","text":"q = 1;\nw = undefined_thing + 1;\n"}
+{"id":2,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'undefined_thing'.","line":null,"stack":[{"file":"prog/s2.m","name":"s2","line":2}]}}
+{"id":3,"ok":false,"out":"","error":{"message":"Unrecognized function or variable 'nosuch'.","line":1,"stack":[]}}
+```
+
+The first line of the script ran, so `q` is in the workspace afterwards.
+The keys, the order of the checks and every message are specified in
+`docs/modules/U3-ui-editor.md`. This example is pinned by the golden case
+`tests/cases/U3-ui-editor/handbook_editor_example`, which sends these three
+requests from that case's folder and expects these three lines.
+
 **The command window in a browser.** `splatcrab --ui` serves a command
 window on your own machine and prints the one line you need:
 
@@ -205,9 +251,33 @@ with a preview of its value, its size and its class, and below it the
 command history lists what has been run, in the page and at the terminal
 alike, oldest first: click an entry to put it in the input, double-click it
 to run it. The workspace and the file browser refresh after every entry.
+
+Above the command window is the editor. Double-click a file in the file
+browser to open it in a tab of its own, or choose New for an empty
+`untitled.m`. Each tab shows the file's name, a `•` while it has changes
+not yet saved, and a close button, and the text has its line numbers
+beside it. Tab inserts four spaces, Shift+Tab takes up to four from the
+start of each selected line, and Escape then Tab moves the focus out of
+the editor. Ctrl+S (Cmd+S on a Mac) saves, keeping the file's line ends;
+a new file asks, in the page, for the path to save it at. F5 (or Run)
+saves the file if it has changes and runs it, shown in the command window
+as `run('prog/s1.m')`, and F9 (or Run Selection) runs the selected text,
+or the line the cursor is on, as if typed. When the run fails, the cursor
+goes to the line that raised the error, in the tab of the file it is in,
+or, when that file is not open in a tab, to the line of the call that led
+there in the innermost file that is, the file that was run at the last;
+the line is marked beside its number until you next edit. In the
+command window every error lists the frames it passed through under its
+message, `in helper (line 6)`, and a frame in a file under the folder the
+server started in is a link that opens that file at that line. Closing a
+tab with unsaved changes asks whether to save, discard them or cancel,
+and leaving the page with an unsaved tab brings up the browser's own
+warning.
+
 The splitters between the panes move with the pointer or, once focused,
 with the arrow keys, and a narrow window stacks the panes in one column,
-the command window first. The server runs until you stop it with Ctrl+C.
+the command window first and the editor after it. The server runs until
+you stop it with Ctrl+C.
 
 The part after `#` is the session token, fresh on every run. The page reads
 it from the address and sends it back with every request; nothing without it
@@ -215,8 +285,11 @@ is ever run. The server listens on the loopback address `127.0.0.1` only,
 so no other machine can reach it, and because any web page you visit could
 still send requests to a local port, every request must name this server in
 its `Host` header and, when it sends an `Origin`, there too; a request to run
-code, list a folder, or read or add to the history must also carry the
-token. Anything else is refused `403 Forbidden` before the interpreter sees
+code, list a folder, read or save a file, or read or add to the history must
+also carry the token. A request a browser marks as made by another site (its
+`Sec-Fetch-Site` header is anything but `same-origin`) is refused even with
+the token; a client that sends no such header, a script, is unaffected.
+Anything else is refused `403 Forbidden` before the interpreter sees
 it. The page, its script and its stylesheet need no token: they hold nothing
 secret.
 
@@ -2617,7 +2690,10 @@ path shadows a builtin of its name, as in MATLAB:
 a relative folder is resolved against the current folder. A file is read once
 and kept; it is read again when the path changes, and, from the REPL, the
 protocol or the browser page, when it has changed on disk since the last
-entry.
+entry. Whatever the interpreter writes itself, with `fopen` and `fclose`,
+`save`, `delete` or the browser editor's Save, makes every file be read
+again at its next call, so a script that writes a function file and then
+calls it runs what it just wrote.
 
 `exist(name)` is `1` for a variable, `2` for a file on the path, `5` for a
 builtin and `0` otherwise. `feval('name', ...)` calls a function by name.

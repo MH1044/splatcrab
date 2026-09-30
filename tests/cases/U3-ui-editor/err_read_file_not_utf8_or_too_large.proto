@@ -1,0 +1,7 @@
+% covers: Scope: read_file - a file that is not valid UTF-8 (the bytes a, 0xFF, b) is not UTF-8 text, and a file of 4,194,305 bytes, one past 4 MiB, is larger than 4 MiB, each an answer echoing the path with line null; both files are written by fwrite as scratch_ files and deleted
+{"id":1,"op":"eval","code":"fid = fopen('scratch_bad.txt', 'w'); fwrite(fid, [97 255 98]); fclose(fid);"}
+{"id":2,"op":"read_file","path":"scratch_bad.txt"}
+{"id":3,"op":"eval","code":"fid = fopen('scratch_big.txt', 'w'); fwrite(fid, zeros(1, 4194305) + 97); fclose(fid);"}
+{"id":4,"op":"read_file","path":"scratch_big.txt"}
+{"id":5,"op":"eval","code":"delete('scratch_bad.txt')"}
+{"id":6,"op":"eval","code":"delete('scratch_big.txt')"}

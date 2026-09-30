@@ -1,0 +1,8 @@
+% covers: 2 - write_file creates scratch_a.m from the text sent and answers size, the bytes written (16), read_file of it answers the same text, run_file of it runs it as a script and answers out as eval does, and an eval of delete removes it; the text is written as sent, as UTF-8: scratch_b.txt with a byte-order mark, a two-byte character and CR LF is 8 bytes and reads back byte for byte, the mark included
+{"id":1,"op":"write_file","path":"scratch_a.m","text":"disp(7)\ndisp(8)\n"}
+{"id":2,"op":"read_file","path":"scratch_a.m"}
+{"id":3,"op":"run_file","path":"scratch_a.m"}
+{"id":4,"op":"eval","code":"delete('scratch_a.m')"}
+{"id":5,"op":"write_file","path":"scratch_b.txt","text":"﻿a×\r\n"}
+{"id":6,"op":"read_file","path":"scratch_b.txt"}
+{"id":7,"op":"eval","code":"delete('scratch_b.txt')"}

@@ -21,6 +21,11 @@
 //! pointing at a file of its own there, so nothing here can touch the
 //! user's history.
 //!
+//! Since cycle U3 (acceptance test 12) it runs `write_file`, `read_file` and
+//! `run_file` over the socket in a fixture folder of its own, the file root,
+//! and checks that a request carrying `Sec-Fetch-Site: cross-site` is
+//! refused before the interpreter sees it.
+//!
 //!   cargo test --test ui_server
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -399,6 +404,89 @@ fn files_and_previews_answer_over_the_socket() {
         assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{path}: {reply}");
         assert!(body(&reply).starts_with(starts), "{path}");
     }
+}
+
+/// Cycle U3's acceptance test 12: `write_file`, `read_file` and `run_file`
+/// over the socket in a fixture folder the test makes and starts the
+/// server in, so the folder is the file root, and a request with
+/// `Sec-Fetch-Site: cross-site` refused before the interpreter sees it.
+#[test]
+fn the_editor_operations_answer_over_the_socket() {
+    let top = scratch("editor");
+    let _ = std::fs::remove_dir_all(&top);
+    let root = top.join("U3-ui-editor");
+    std::fs::create_dir_all(root.join("prog")).expect("make the fixture's folder");
+    let _guard = Fixture(top);
+    let server = start_in(Some(&root));
+    let port = server.port;
+    let authorised = format!("Host: 127.0.0.1:{port}\r\nX-SplatCrab-Token: {TOKEN}\r\n");
+
+    let reply = api(
+        port,
+        &authorised,
+        r#"{"id":1,"op":"write_file","path":"prog/s.m","text":"disp(7)\ndisp(8)\n"}"#,
+    );
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert_eq!(
+        body(&reply),
+        r#"{"id":1,"ok":true,"path":"prog/s.m","size":16}"#
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prog").join("s.m")).expect("the file was written"),
+        "disp(7)\ndisp(8)\n"
+    );
+    let reply = api(
+        port,
+        &authorised,
+        r#"{"id":2,"op":"read_file","path":"prog/./s.m"}"#,
+    );
+    assert_eq!(
+        body(&reply),
+        r#"{"id":2,"ok":true,"path":"prog/s.m","text":"disp(7)\ndisp(8)\n"}"#
+    );
+    let reply = api(
+        port,
+        &authorised,
+        r#"{"id":3,"op":"run_file","path":"prog/s.m"}"#,
+    );
+    assert_eq!(
+        body(&reply),
+        r#"{"id":3,"ok":true,"out":"     7\n     8\n"}"#
+    );
+
+    // Rewritten at once with the same length: the run is of the new text.
+    api(
+        port,
+        &authorised,
+        r#"{"id":4,"op":"write_file","path":"prog/s.m","text":"disp(5)\nz = q8;\n"}"#,
+    );
+    let reply = api(
+        port,
+        &authorised,
+        r#"{"id":5,"op":"run_file","path":"prog/s.m"}"#,
+    );
+    assert_eq!(
+        body(&reply),
+        concat!(
+            r#"{"id":5,"ok":false,"out":"     5\n","error":{"message":"#,
+            r#""Unrecognized function or variable 'q8'.","line":null,"#,
+            r#""stack":[{"file":"prog/s.m","name":"s","line":2}]}}"#
+        )
+    );
+
+    // A cross-site request never reaches the interpreter, even with the
+    // token; the page's own same-origin requests do.
+    let cross = format!("{authorised}Sec-Fetch-Site: cross-site\r\n");
+    let reply = api(port, &cross, r#"{"id":6,"op":"eval","code":"crossed = 1"}"#);
+    assert!(reply.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{reply}");
+    assert_eq!(body(&reply), "403 Forbidden");
+    let same = format!("{authorised}Sec-Fetch-Site: same-origin\r\n");
+    let reply = api(
+        port,
+        &same,
+        r#"{"id":7,"op":"eval","code":"disp(exist('crossed'))"}"#,
+    );
+    assert_eq!(body(&reply), r#"{"id":7,"ok":true,"out":"     0\n"}"#);
 }
 
 /// Kills a child however the test ends; `refused` runs under one, so an
