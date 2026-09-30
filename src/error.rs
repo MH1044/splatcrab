@@ -855,9 +855,64 @@ pub fn nd_transpose() -> MError {
 /// of 1 to n exactly once, with n at least `ndims(A)` (cycle 14b):
 /// `permute(A, [1 2])` and `permute(A, [1 1 2])` of a 2x3x4.
 pub fn permute_order() -> MError {
-    MError::new(
-        "permute's dimension order must hold each of 1 to n once, with n at least ndims(A).",
-    )
+    dimension_order("permute")
+}
+
+/// The order refusal of `permute` and, since cycle 14c, of `ipermute`,
+/// which takes the same orders: `ipermute's dimension order must hold each
+/// of 1 to n once, with n at least ndims(A).`
+pub fn dimension_order(name: &str) -> MError {
+    MError::new(format!(
+        "{}'s dimension order must hold each of 1 to n once, with n at least ndims(A).",
+        name
+    ))
+}
+
+// ---- the N-D builtins of cycle 14c -----------------------------------
+//
+// SplatCrab's own wording throughout.
+
+/// A `circshift` shift that is not a nonempty real row or column of
+/// integers: `circshift(1:3, 1.5)`, `circshift(1:3, [])` and
+/// `circshift(1:3, ones(2, 2))`.
+pub fn circshift_shift() -> MError {
+    MError::new("circshift's shift must be an integer or a vector of integers.")
+}
+
+/// A `circshift` shift of more than one element beside a dimension:
+/// `circshift(1:3, [1 1], 2)`.
+pub fn circshift_shift_with_dim() -> MError {
+    MError::new("circshift's shift must be one integer when a dimension is given.")
+}
+
+/// A size argument of `sub2ind` or `ind2sub` that is not a nonempty real
+/// row or column of positive integers: `sub2ind([2 0], 1, 1)` and
+/// `ind2sub([2 -3], 1)`.
+pub fn index_size_vector(name: &str) -> MError {
+    MError::new(format!(
+        "{}'s size must be a vector of positive integers.",
+        name
+    ))
+}
+
+/// `sub2ind` subscripts of two sizes, neither of them a scalar:
+/// `sub2ind([2 3], [1 2], [1 2 3])`.
+pub fn sub2ind_subscript_sizes() -> MError {
+    MError::new("sub2ind's subscripts must have the same size, or be scalars.")
+}
+
+/// A `sub2ind` subscript that is not a positive integer within its
+/// dimension's size, or the folded size for the last: `sub2ind([2 3], 3,
+/// 1)` and `sub2ind([2 3 4], 1, 13)`.
+pub fn sub2ind_out_of_range() -> MError {
+    MError::new("sub2ind's subscripts must be positive integers within the size.")
+}
+
+/// An `ind2sub` index that is not a positive integer: `ind2sub([2 3], 0)`
+/// and `ind2sub([2 3], 1.5)`. The last dimension has no bound, so an index
+/// past the size converts.
+pub fn ind2sub_index() -> MError {
+    MError::new("ind2sub's indices must be positive integers.")
 }
 
 /// A single size argument that is a column or a matrix: `zeros([2; 3])`.

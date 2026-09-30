@@ -1,0 +1,30 @@
+% covers: 7 - circshift shifts by an integer along the first dimension whose size is not 1, by a row or column of integers each along its own dimension, an element past ndims moving nothing, or by an integer along a given dimension; positive toward the end and negative toward the beginning, wrapping modulo the size for any integer a double holds; an empty array returned as it is and the class kept
+disp(circshift(1:5, 2))
+disp(circshift(1:5, -1))
+disp(circshift(1:5, 7))
+disp(circshift((1:3)', 1))
+disp(circshift([1 2; 3 4], 1))
+disp(circshift([1 2; 3 4], 1, 2))
+disp(circshift([1 2; 3 4], [1 1]))
+A = reshape(1:24, 2, 3, 4);
+C = circshift(A, 1, 3);
+disp(size(C))
+disp(C(:, :, 1))
+disp(C(:, :, 2))
+C = circshift(A, -1, 3);
+disp(C(:, :, 1))
+C = circshift(A, [1 2]);
+disp(C(:, :, 1))
+disp(isequal(circshift(A, [1; 0; 1]), circshift(circshift(A, 1, 1), 1, 3)))
+disp(isequal(circshift(A, [0 0 4]), A))
+disp(isequal(circshift(A, 1e15, 3), A))
+disp(isequal(circshift(A, 1e300, 3), A))
+disp(isequal(circshift(A, [1 0 0 5]), circshift(A, 1)))
+disp(circshift(1:5, 2^53))
+disp(circshift(1:5, -2^53))
+disp(circshift(1:3, 2^65))
+disp(circshift('abc', 1))
+disp(class(circshift('abc', 1)))
+disp(class(circshift(A > 12, 1, 3)))
+disp(size(circshift(zeros(2, 0, 3), 1)))
+disp(size(circshift([], 1)))

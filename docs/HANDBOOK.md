@@ -2131,23 +2131,107 @@ is 1x0 and `cat(2, zeros(1, 0), zeros(0, 1))` an error.
 a 2x3x4 being 2x3x8, and `save` and `load` keep an N-D array in a MAT-file
 with every dimension, in a variable, a cell or a field.
 
+Search, sort and the statistics work along any dimension too. `sort`
+sorts each slice along the first dimension whose size is not 1, or along
+`dim`, stably, and its second output is each element's position along
+it; `find` of an N-D array is a column of linear indices, and with two
+outputs the second is the linear index over every dimension past the
+first, so `A(r, c)` is the element found; `median`, `std`, `var` and
+`mode` reduce along a dimension as `sum` does; and `diff` works along any
+dimension, its result empty along one past the array's. As their pages
+say, `find(0)` is `[]`, and past the array's dimensions `std` and `var`
+are zeros, a `NaN` included, where `median` and `mode` hand the array
+back:
+
+```matlab
+A = reshape(1:24, 2, 3, 4);
+B = sort(-A, 3);
+disp(B(:, :, 1))
+[r, c] = find(A == 14);
+disp([r c])
+k = find(A > 22)
+M = median(A, 3)
+disp(size(diff(A, 1, 3)))
+disp([var(NaN, 0, 3) size(find(0))])
+```
+
+```
+   -19   -21   -23
+   -20   -22   -24
+     2     7
+k =
+
+    23
+    24
+
+M =
+
+    10    12    14
+    11    13    15
+
+     2     3     3
+     0     0     0
+```
+
+`flip` reverses the order of the elements along the first dimension whose
+size is not 1, or along `dim`, and `fliplr` and `flipud` flip each page on
+its own; `circshift` shifts the elements circularly, a vector of shifts
+moving each dimension by its own; `ipermute` undoes `permute`; `horzcat`
+and `vertcat` are `cat` along the second and the first dimension, with
+`cat`'s rule for empties rather than the brackets'; and `sub2ind` and
+`ind2sub` convert between subscripts and linear indices as indexing does,
+the last subscript folding the dimensions after it. `arrayfun` takes
+arrays of any one size, its uniform result of that size:
+
+```matlab
+A = reshape(1:24, 2, 3, 4);
+F = flip(A, 3);
+disp(F(:, :, 1))
+disp(circshift(1:5, 2))
+C = circshift(A, 1, 3);
+disp(isequal(C(:, :, 2), A(:, :, 1)))
+P = permute(A, [3 1 2]);
+disp(isequal(ipermute(P, [3 1 2]), A))
+disp([size(horzcat(zeros(1, 0), zeros(1, 0))) size([zeros(1, 0), zeros(1, 0)])])
+i = sub2ind(size(A), 2, 1, 2)
+[r, c, p] = ind2sub(size(A), 14);
+disp([r c p])
+```
+
+```
+    19    21    23
+    20    22    24
+     4     5     1     2     3
+   1
+   1
+     1     0     0     0
+i =
+
+     8
+
+     2     1     3
+```
+
 The builtins that take an N-D array are the constructors, the shape and
 class queries, `ndims`, `reshape`, `isequal`, `disp`, `double`,
 `logical`, `char`, `fprintf`, `sprintf`, `feval`, `deal`, the reductions,
-the element-wise math, `squeeze`, `permute`, `cat` and `repmat`. Every
-other builtin, `sort`, `find`, `diff`, the statistics and the rest until a
-later cycle ([Not yet](#not-yet)), refuses one by name rather than read
-its first page alone, the matrix operators refuse one where they are not
+the element-wise math, `squeeze`, `permute`, `cat`, `repmat`, `sort`,
+`find`, `diff`, `median`, `std`, `var`, `mode`, `fliplr`, `flipud`,
+`arrayfun`, `flip`, `circshift`, `ipermute`, `horzcat`, `vertcat`,
+`sub2ind` and `ind2sub`. Every other builtin, `num2str`, `mat2str`, the
+strings, the sets, the linear algebra and the rest until a later cycle
+([Not yet](#not-yet)), refuses one by name rather than read its first
+page alone, the matrix operators refuse one where they are not
 element-wise, and so do `'`, `.'` and `save -ascii`, whose text has rows
 alone:
 
 ```matlab
 A = zeros(2, 2, 2);
-s = sort(A)
+s = num2str(A)
 ```
 
 ```
-Error: Line 2: N-D arrays are not supported by 'sort'.
+Error: Line 2: N-D arrays are not supported by 'num2str'.
 ```
 
 `A * 2`, `A / 2` and `2 \ A` are element-wise, as they are for a matrix;
@@ -3316,9 +3400,11 @@ disp(isnumeric({1}))
 
 ### Rearrangement
 
-`reshape repmat fliplr flipud squeeze permute cat`. `reshape` fills
-column-major, like MATLAB. `squeeze`, `permute` and `cat` are for [N-D
-arrays](#n-d-arrays), and `repmat` tiles along every dimension it is given.
+`reshape repmat fliplr flipud flip circshift squeeze permute ipermute cat
+horzcat vertcat`. `reshape` fills column-major, like MATLAB. `squeeze`,
+`permute`, `ipermute` and `cat` are for [N-D arrays](#n-d-arrays), and
+`repmat` tiles along every dimension it is given; `flip`, `circshift`,
+`horzcat` and `vertcat` work on matrices as on N-D arrays.
 
 ```matlab
 A = [1 2 3; 4 5 6];
@@ -3948,7 +4034,9 @@ b =
 
 ### Search and sort
 
-`find sort`. Since cycle 09 `sort` takes a matrix too.
+`find sort sub2ind ind2sub`. Since cycle 09 `sort` takes a matrix too, and
+since cycle 14c any array along any dimension ([N-D arrays](#n-d-arrays)),
+where `sub2ind` and `ind2sub` are.
 
 ```matlab
 x = [0 3 0 7 5];
@@ -4118,7 +4206,7 @@ g =
 `std` and `var` normalise by `N - 1`, or by `N` with a weight of `1`
 second. `median` of anything holding a `NaN` is `NaN`; `mode` ignores `NaN`
 and gives the smallest of a tie. All four work down the columns of a
-matrix and take a dimension. `nchoosek(v, k)` of a vector lists the
+matrix and take a dimension, any dimension of any array since cycle 14c. `nchoosek(v, k)` of a vector lists the
 combinations, one per row.
 
 ```matlab
@@ -6367,8 +6455,10 @@ Error: Line 1: NaN's cannot be converted to logicals.
   the fold that fewer subscripts index, are `Attempt to grow array along
   ambiguous dimension.`
 - The builtins not yet taught N-D arrays refuse one by name, `N-D arrays are
-  not supported by 'sort'.`, where MATLAB takes most of them; so does
-  `save -ascii`. The per-page class line of a
+  not supported by 'num2str'.`, where MATLAB takes most of them; so does
+  `save -ascii`. `horzcat` and `vertcat`, like `cat`, take arrays only, and
+  `flip`, `circshift`, `fliplr` and `flipud` refuse a cell, where MATLAB
+  takes one. The per-page class line of a
   logical or char N-D array, the `(:,:,k) =` headers of `disp` and the
   `2×0×3 empty double array` wording are SplatCrab's stated rules, not
   checked against MATLAB.
@@ -6514,7 +6604,8 @@ identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`.
 
 Empty-result shapes match MATLAB: `find([])` and `diag([])` are 0x0,
 `size('')` is `0 0`, and `disp([])` prints nothing. All four differed before
-cycle 01e.
+cycle 01e. Since cycle 14c `find(0)` is 0x0 too, by the `find` page's
+convention for a scalar zero, where it was 1x0.
 
 ```matlab
 a = size(find([]))
@@ -6625,7 +6716,7 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| The rest of the builtins on N-D arrays: `sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets and the linear algebra | later |
+| The rest of the builtins on N-D arrays: `num2str`, `mat2str`, the strings, the sets and the linear algebra | later |
 | N-D cell and struct arrays | later |
 | Compressed MAT-files, `regexpi`, backreferences | not scheduled |
 | 3-D plots, surfaces, interaction with a figure | not scheduled |
@@ -6635,9 +6726,9 @@ Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-sort(zeros(2, 3, 4))
+num2str(zeros(2, 3, 4))
 ```
 
 ```
-Error: Line 1: N-D arrays are not supported by 'sort'.
+Error: Line 1: N-D arrays are not supported by 'num2str'.
 ```

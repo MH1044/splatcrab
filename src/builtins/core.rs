@@ -916,7 +916,10 @@ fn handle(args: &[Value], i: usize, name: &str) -> R<std::rc::Rc<Func>> {
 }
 
 /// `arrayfun(f, A1, ..., An)` and its `'UniformOutput', false` form (cycle 07):
-/// see `cells::map_elements`, which `cellfun` shares.
+/// see `cells::map_elements`, which `cellfun` shares. Since cycle 14c the
+/// arrays may be N-D, of one size, and a uniform result has that size;
+/// `'UniformOutput', false` refuses an N-D array, whose cell of results
+/// would be N-D.
 fn arrayfun(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
     super::cells::map_elements(it, args, nargout, "arrayfun")
 }

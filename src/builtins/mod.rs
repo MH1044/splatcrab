@@ -81,8 +81,10 @@ pub fn registry() -> Registry {
 /// queries, which read no elements, and the functions that pass a value
 /// through whole (the struct and cell functions, `deal`, `feval`,
 /// `arrayfun`, `cellfun`), `isequal`, `double` and the plain `transpose`,
-/// and since cycle 14b `squeeze`, `permute` and `cat`, which rearrange a
-/// complex array with its imaginary parts.
+/// since cycle 14b `squeeze`, `permute` and `cat`, which rearrange a
+/// complex array with its imaginary parts, and since cycle 14c `ipermute`,
+/// `horzcat` and `vertcat`, which keep complex storage as `permute` and
+/// `cat` do.
 ///
 /// Only a matrix argument is judged here. A builtin that finds a complex
 /// value inside a cell, or gets one back from a function it calls, judges
@@ -149,6 +151,10 @@ pub const TAKES_COMPLEX: &[&str] = &[
     "squeeze",
     "permute",
     "cat",
+    // And its inverse and two forms (cycle 14c).
+    "ipermute",
+    "horzcat",
+    "vertcat",
 ];
 
 /// The refusal of a complex argument to a builtin not on
@@ -173,7 +179,11 @@ pub fn complex_gate(name: &str, args: &[Value]) -> R<()> {
 /// which reads the elements in column-major order, and `feval` and
 /// `deal`, which pass their arguments on, so the callee's own gate judges
 /// them. Cycle 14b added the reductions along any dimension, the
-/// element-wise math, `squeeze`, `permute`, `cat` and `repmat`.
+/// element-wise math, `squeeze`, `permute`, `cat` and `repmat`, and cycle
+/// 14c the search, sort and statistics functions, the flips, `arrayfun`,
+/// and `flip`, `circshift`, `ipermute`, `horzcat`, `vertcat`, `sub2ind` and
+/// `ind2sub`. `num2str`, `mat2str` and every other builtin not named stay
+/// behind the gate.
 ///
 /// Only a matrix argument is judged, as the complex gate judges one: a
 /// cell or a struct is never N-D, though an element or a field may hold
@@ -268,6 +278,26 @@ pub const ND_OK: &[&str] = &[
     "permute",
     "cat",
     "repmat",
+    // Search, sort and the statistics along any dimension (cycle 14c).
+    "sort",
+    "find",
+    "diff",
+    "median",
+    "std",
+    "var",
+    "mode",
+    // The flips, the map over elements, and the rearrangements and index
+    // conversions of cycle 14c.
+    "fliplr",
+    "flipud",
+    "arrayfun",
+    "flip",
+    "circshift",
+    "ipermute",
+    "horzcat",
+    "vertcat",
+    "sub2ind",
+    "ind2sub",
 ];
 
 /// The refusal of an N-D argument to a builtin not on [`ND_OK`]; see
@@ -340,7 +370,9 @@ mod tests {
     /// `format`, `eval`, `evalc`, `run`, `datestr`, `now`, `clock`, `pause`,
     /// `getenv`, `system`, `version`, `exit` and `quit`. Cycle 14 added
     /// `ndims`. Cycle 14b added three: `squeeze`, `permute` and `cat`.
-    const EXPECTED: usize = 254;
+    /// Cycle 14c added seven: `flip`, `circshift`, `ipermute`, `horzcat`,
+    /// `vertcat`, `sub2ind` and `ind2sub`.
+    const EXPECTED: usize = 261;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -420,8 +452,15 @@ mod tests {
             "cat",
             "fliplr",
             "flipud",
+            "flip",
+            "circshift",
+            "ipermute",
+            "horzcat",
+            "vertcat",
             "find",
             "sort",
+            "sub2ind",
+            "ind2sub",
             "disp",
             "fprintf",
             "sprintf",
@@ -587,15 +626,70 @@ mod tests {
 
     /// Cycle 14: an N-D argument reaches only the builtins on `ND_OK`;
     /// cycle 14b grew the list by the reductions, the element-wise math,
-    /// `squeeze`, `permute`, `cat` and `repmat`, and by nothing else.
+    /// `squeeze`, `permute`, `cat` and `repmat`, and cycle 14c by the
+    /// seventeen names of its Scope, and by nothing else.
     #[test]
     fn the_gate_refuses_an_nd_argument_to_every_other_builtin() {
         let nd = Value::Mat(Matrix::filled_dims(&[2, 2, 2], 0.0));
-        let e = nd_gate("sort", std::slice::from_ref(&nd)).unwrap_err().msg;
-        assert_eq!(e, "N-D arrays are not supported by 'sort'.");
+        let e = nd_gate("num2str", std::slice::from_ref(&nd))
+            .unwrap_err()
+            .msg;
+        assert_eq!(e, "N-D arrays are not supported by 'num2str'.");
         for name in [
-            "find",
+            "num2str",
+            "mat2str",
+            "cross",
+            "cellfun",
+            "inv",
+            "unique",
+            "plot",
+            "trapz",
+            "cumtrapz",
+            "filter",
+            "kron",
+            "transpose",
+            "dot",
+            "norm",
+            "polyval",
+            "interp1",
+            "histc",
+            "triu",
+        ] {
+            assert!(nd_gate(name, std::slice::from_ref(&nd)).is_err(), "{name}");
+        }
+        for name in [
+            "size",
+            "ndims",
+            "numel",
+            "reshape",
+            "disp",
+            "isequal",
+            "feval",
+            "deal",
+            "sum",
+            "prod",
+            "mean",
+            "any",
+            "all",
+            "max",
+            "min",
+            "cumsum",
+            "cumprod",
+            "abs",
+            "sqrt",
+            "round",
+            "isnan",
+            "angle",
+            "mod",
+            "hypot",
+            "power",
+            "complex",
+            "squeeze",
+            "permute",
+            "cat",
+            "repmat",
             "sort",
+            "find",
             "diff",
             "median",
             "std",
@@ -603,44 +697,38 @@ mod tests {
             "mode",
             "fliplr",
             "flipud",
-            "num2str",
-            "mat2str",
-            "cross",
             "arrayfun",
-            "cellfun",
-            "inv",
-            "unique",
-            "plot",
-            "trapz",
-            "filter",
-            "kron",
-            "transpose",
-            "dot",
-            "norm",
-        ] {
-            assert!(nd_gate(name, std::slice::from_ref(&nd)).is_err(), "{name}");
-        }
-        for name in [
-            "size", "ndims", "numel", "reshape", "disp", "isequal", "feval", "deal", "sum", "prod",
-            "mean", "any", "all", "max", "min", "cumsum", "cumprod", "abs", "sqrt", "round",
-            "isnan", "angle", "mod", "hypot", "power", "complex", "squeeze", "permute", "cat",
-            "repmat",
+            "flip",
+            "circshift",
+            "ipermute",
+            "horzcat",
+            "vertcat",
+            "sub2ind",
+            "ind2sub",
         ] {
             assert!(nd_gate(name, std::slice::from_ref(&nd)).is_ok(), "{name}");
         }
-        // Exactly the names cycle 14b added, and no more.
-        assert_eq!(ND_OK.len(), 34 + 46);
+        // Exactly the names cycles 14b and 14c added, and no more.
+        assert_eq!(ND_OK.len(), 34 + 46 + 17);
+        // Complex storage passes to the three of cycle 14c that keep it.
+        for name in ["ipermute", "horzcat", "vertcat"] {
+            assert!(TAKES_COMPLEX.contains(&name), "{name}");
+        }
+        for name in ["flip", "circshift", "sort", "sub2ind", "ind2sub"] {
+            assert!(!TAKES_COMPLEX.contains(&name), "{name}");
+        }
         // A 2-D argument, and an N-D array inside a cell, pass everywhere.
-        assert!(nd_gate("sort", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
+        assert!(nd_gate("num2str", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
         let boxed = Value::cell(crate::value::CellArray::new(1, 1, vec![nd.clone()]));
-        assert!(nd_gate("sort", &[boxed]).is_ok());
+        assert!(nd_gate("num2str", &[boxed]).is_ok());
         // Through the interpreter: the gate runs on every builtin call, a
         // call through `feval` included, and names the callee.
         let mut it = Interp::with_output(Box::new(std::io::sink()));
-        let e = it.run("feval(@find, zeros(2, 2, 2))").unwrap_err().msg;
-        assert_eq!(e, "N-D arrays are not supported by 'find'.");
+        let e = it.run("feval(@kron, zeros(2, 2, 2), 1)").unwrap_err().msg;
+        assert_eq!(e, "N-D arrays are not supported by 'kron'.");
         assert!(it.run("x = numel(zeros(2, 2, 2));").is_ok());
         assert!(it.run("x = feval(@sum, zeros(2, 2, 2), 3);").is_ok());
+        assert!(it.run("x = feval(@find, zeros(2, 2, 2));").is_ok());
     }
 
     /// Cycle 10: a complex argument reaches only the builtins that take one.

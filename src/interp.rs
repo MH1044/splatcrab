@@ -3765,6 +3765,36 @@ fn fold_dims(dims: &[usize], k: usize) -> Vec<usize> {
     (0..k).map(|p| end_value(dims, k, p)).collect()
 }
 
+/// [`fold_dims`] as asked, in `f64` (cycle 14c): the fold of the last
+/// position is the product of the sizes it spans, which saturates in
+/// `usize` when an empty array's other sizes multiply past it (`x(:, :)`
+/// of `zeros(0, 2^40, 2^40)` folds 2^80 columns), and a shape judged by
+/// `check_dims` from it names that product as asked, `0x1.20893e+24`,
+/// never the saturated `1.84467e+19`. Wherever the product fits it is
+/// exactly [`fold_dims`]'s, so nothing but the saturated case changes; a
+/// 0 among the sizes makes it 0, as it makes [`fold_dims`]'s.
+fn fold_asked(dims: &[usize], k: usize) -> Vec<f64> {
+    (0..k)
+        .map(|p| {
+            if p + 1 < k {
+                return dims.get(p).map_or(1.0, |&d| d as f64);
+            }
+            let rest = dims.get(p..).unwrap_or(&[]);
+            if rest.contains(&0) {
+                return 0.0;
+            }
+            match rest.iter().try_fold(1usize, |n, &d| n.checked_mul(d)) {
+                Some(n) => n as f64,
+                None => rest
+                    .iter()
+                    .map(|&d| d as f64)
+                    .product::<f64>()
+                    .max(usize::MAX as f64),
+            }
+        })
+        .collect()
+}
+
 /// The linear positions several subscripts select, in column-major order
 /// of the subscripts, the first moving fastest: subscript `p` spans
 /// `span[p]` positions of dimension `p` of an array laid out as `dims`.
@@ -3856,8 +3886,19 @@ fn resolve_read(dims: &[usize], sel: &[Sel]) -> R<Gather> {
     // A read of several subscripts sizes its result from the subscripts, not
     // from the array: `A(ones(1, 1e5), ones(1, 1e5))` asks for 1e10 elements
     // out of a 2x2 `A`. The bounds tests come first, so an out-of-range
-    // subscript is still reported as one.
-    let counts = sel_counts(sel, &d)?;
+    // subscript is still reported as one. A colon counts its dimension as
+    // asked, so a fold past `usize` is named as the product it is (cycle
+    // 14c, [`fold_asked`]).
+    let asked = fold_asked(dims, sel.len());
+    let counts: Vec<f64> = sel
+        .iter()
+        .zip(&asked)
+        .map(|(s, &n)| match s {
+            Sel::All => n,
+            Sel::List { idx, .. } => idx.len() as f64,
+        })
+        .collect();
+    let counts = crate::builtins::args::check_dims(&counts)?;
     if counts.contains(&0) {
         // Nothing to read, and a colon over another dimension must not
         // list its positions: `x(:, :)` of a 0x1e12 `x` (cycle 13b).
@@ -3942,13 +3983,16 @@ fn resolve_write(dims: &[usize], sel: &[Sel], rhs: &[usize]) -> R<Scatter> {
                 _ => d[p],
             })
             .collect();
+        // Each dimension as asked, the fold of the last as the product it
+        // is rather than its saturated `usize` (cycle 14c, [`fold_asked`]).
+        let fold = fold_asked(dims, k);
         let asked: Vec<f64> = sel
             .iter()
             .enumerate()
-            .map(|(p, s)| s.extent(span[p]).max(d[p] as f64))
+            .map(|(p, s)| s.extent(span[p]).max(fold[p]))
             .collect();
         let folded = k < dims.len();
-        if folded && asked.iter().zip(&d).any(|(&a, &n)| a > n as f64) {
+        if folded && asked.iter().zip(&fold).any(|(&a, &n)| a > n) {
             bail!(error::ambiguous_growth());
         }
         let new = crate::builtins::args::check_dims(&asked)?;
@@ -8471,6 +8515,47 @@ mod tests {
         assert_eq!((k.dims, k.pos.len()), (vec![0, big, 2], 0));
     }
 
+    /// Cycle 14c: a read through fewer subscripts than dimensions folds the
+    /// trailing sizes into the last, and where their product passes what a
+    /// `usize` holds the refusal names the product as asked, in `f64`,
+    /// never the saturated `usize`; wherever the product fits the fold is
+    /// exactly what it was.
+    #[test]
+    fn a_folded_size_is_named_as_asked() {
+        let big = 1usize << 40;
+        let named = "Requested 0x1.20893e+24 array exceeds the maximum array size.";
+        let e = resolve_read(&[0, big, big], &[Sel::All, Sel::All]).unwrap_err();
+        assert_eq!(e.msg, named);
+        assert_eq!(err_msg("x = zeros(0, 2^40, 2^40); y = x(:, :)"), named);
+        // A write through the same fold names it the same way.
+        let e = resolve_write(&[0, big, big], &[Sel::row(vec![]), Sel::All], &[1, 1]).unwrap_err();
+        assert_eq!(e.msg, named);
+        // `fold_asked` is `fold_dims` wherever the product fits, a 0 anywhere
+        // included, and the product itself past `usize`.
+        for (dims, k) in [
+            (vec![2, 3, 4], 2),
+            (vec![2, 3, 4], 3),
+            (vec![2, 3, 4], 5),
+            (vec![0, big, 3], 2),
+            (vec![big, big, 0], 2),
+            (vec![0, 3usize.pow(20), 3usize.pow(20)], 2),
+            (vec![1; 100], 2),
+        ] {
+            let want: Vec<f64> = fold_dims(&dims, k).iter().map(|&d| d as f64).collect();
+            assert_eq!(fold_asked(&dims, k), want, "{dims:?} {k}");
+        }
+        assert_eq!(fold_asked(&[0, big, big], 2), [0.0, 2f64.powi(80)]);
+        assert_eq!(fold_dims(&[0, big, big], 2), [0, usize::MAX]);
+        // Reads that fit are as they were: a 0x2^80 fold never lists a
+        // position, and every subscript to it is judged as before.
+        let g = resolve_read(&[0, big, 3], &[Sel::All, Sel::All]).unwrap();
+        assert_eq!((g.dims, g.pos.len()), (vec![0, 3 * big], 0));
+        assert_eq!(
+            ok_out("x = zeros(2, 3, 4); disp(size(x(:, :)))"),
+            "     2    12\n"
+        );
+    }
+
     // ---- N-D arrays (cycle 14) -----------------------------------------
 
     /// Element `(i1, i2, ..., ik)`, zero-based, sits at `i1 + d1*(i2 +
@@ -8715,9 +8800,10 @@ mod tests {
         }
         assert_eq!(size("cat(2, 1:0)"), "     1     0\n");
         assert_eq!(err_msg("cat(2, zeros(1, 0), zeros(0, 1))"), mismatch);
+        // `sort` takes an N-D array since cycle 14c; `num2str` stays gated.
         assert_eq!(
-            err_msg(&format!("{a}sort(A)")),
-            "N-D arrays are not supported by 'sort'."
+            err_msg(&format!("{a}num2str(A)")),
+            "N-D arrays are not supported by 'num2str'."
         );
     }
 

@@ -318,6 +318,165 @@ Settled at planning:
   answers because S2 and S5 state them; every other 2-D answer of the
   builtins taught here stays byte-identical.
 
+Recorded during implementation:
+
+- **Files and types changed.** `src/builtins/linalg.rs`: `sort` sees its
+  argument through `value::along_dim` and `math::default_dim`, one slice
+  of `[before, n, after]` at a time, and its index output takes every
+  dimension; `find` gives an N-D argument a column and a scalar zero `[]`;
+  `flipped`, the one reversal along a dimension, serves `fliplr`, `flipud`
+  and the new `flip`; `circshift` and `shift_amounts`, `ipermute` and
+  `inverse_order`, `horzcat` and `vertcat` over `joined` (which calls
+  `interp::concat`, `cat`'s kernel), and `sub2ind`, `ind2sub` and
+  `index_sizes` are new; `permute_order` takes the name its refusal
+  gives. `src/builtins/numerics.rs`: `extent` reads every dimension;
+  `map_slices` runs over the three-number view of any array along any
+  dimension; `diff` reaches it along any dimension, its rounds along one
+  dimension taken together; `deviation` is the rule `std` and `var` take
+  past `ndims`, while `reduce_along` keeps its rule for `median` and
+  `mode`. `src/builtins/cells.rs`: `map_elements`
+  runs over every element of `arrayfun`'s arrays, gives a uniform result
+  their dimensions, and refuses an N-D array with `'UniformOutput',
+  false`. `src/interp.rs`: `fold_asked`, the fold of trailing dimensions
+  as asked in `f64`, which `resolve_read` counts a colon by and
+  `resolve_write` judges its grown shape by. `src/error.rs`:
+  `dimension_order` (which `permute_order` is, for `permute`),
+  `circshift_shift`, `circshift_shift_with_dim`, `index_size_vector`,
+  `sub2ind_subscript_sizes`, `sub2ind_out_of_range` and `ind2sub_index`.
+  `src/builtins/mod.rs`: `ND_OK` gains the seventeen names, `TAKES_COMPLEX`
+  `ipermute`, `horzcat` and `vertcat`, and the registry holds 261
+  builtins. `src/builtins/core.rs`: `arrayfun`'s comment.
+- **Invariants preserved.** Column-major storage: every slice function
+  reads element `k` of slice `(b, a)` at `b + before * (k + n * a)`, and
+  `ind2sub`'s subscripts are the column-major remainders, so `A(I1, I2,
+  I3)` is `A(ind)`. One-based to zero-based: indexing is untouched; a
+  dimension, a shift, a size and the subscripts and indices of `sub2ind`
+  and `ind2sub` are values, not subscripts, read one-based and turned
+  into offsets where they are used, as `sum(A, d)` always was. The `end`
+  stack, name resolution and the output sink are untouched; `arrayfun`
+  still calls through `Interp::call_nested`. Invariant 6: `map_slices`
+  judges its shape by `check_dims` before allocating, and a `dim` past
+  `ndims` that would give the result more dimensions than
+  `args::MAX_NDIMS` is refused before its list of sizes is made, so
+  `diff(1:3, 1, 1e10)` is the refusal at once and `diff(X, 0, 1e300)` is
+  `X`; the statistics' shapes go through the reductions' kernel and
+  `horzcat`'s and `vertcat`'s through `cat`'s; `sort`, the flips,
+  `circshift`, `ipermute`, `sub2ind`, `ind2sub` and `arrayfun` make no
+  shape larger than an argument's. An empty argument returns at once in
+  each of them, whatever its sizes, and none walks a dimension of size 1
+  per element: `sort`, the flips and `circshift` pass over one without a
+  loop, and the view costs one product over the dimensions, so
+  `zeros([ones(1, 1e6) 2])` is sorted, flipped, shifted and found in time
+  linear in its dimensions and its two elements, never their product. `circshift` takes each shift modulo its
+  dimension's size with `rem_euclid` in `f64`, exact for any integer a
+  double holds, and rotates each block of `before * n` elements once per
+  dimension that moves; an entry of a vector shift past `ndims` sizes
+  nothing. `sub2ind` judges and weighs each scalar subscript once, and
+  `ind2sub` writes each output once, so both are linear in their inputs
+  and outputs. `diff(X, n)` takes its consecutive rounds along one
+  dimension together, each slice going through the same subtractions in
+  the same order as round by round, so the shape of an array of many
+  singleton dimensions is judged once per dimension that shrinks, not once
+  per round. No `unwrap` or `expect` was added on anything a program
+  controls, and no width reaches a formatter.
+- **Every other 2-D answer is the one it was.** A matrix along 1 is the
+  view `before = 1` and along 2 the view `after = 1`, each slice read in
+  the order the columns and the transposed rows always were, so every
+  slice function gets the same elements in the same order and no digit
+  moves. `map_slices` still judges a matrix along its rows as the
+  transpose it used to work through, `out` by `rows`, so a refusal names
+  its sizes in the order it always did (`trapz(zeros(2^29, 0), 2)` is
+  `Requested 1x536870912 array exceeds the maximum array size.`, as
+  before). In testing, 4,126 forms over a table of 39 2-D arguments
+  (`-0`, `NaN`, `Inf`, logicals, chars, empties of every orientation and
+  empties with a dimension of a million, vectors, matrices and a matrix of
+  `1e300`s) of `sort`, `find`, `diff`, `median`, `mode`, `std`, `var`,
+  `fliplr`, `flipud`, `arrayfun`, `cellfun`, `trapz`, `cumtrapz`, `filter`,
+  `permute`, `cat`, `cell2mat` and indexing, with every output, class,
+  shape, storage and error text, gave the cycle 14b build's answer but
+  for the changes Scope names: `find` of a scalar zero `0`, `-0` or
+  `false` (24 forms, now 0x0 for every output), `std` and `var` past
+  `ndims` of an argument holding a `NaN` or an `Inf` (28 forms, now
+  zeros), `diff` along a dimension past `ndims` (117 forms: 78 empty
+  results where the N-D refusal stood, and 39 a `dim` of `1e10` now
+  `Arrays have at most 1048576 dimensions.`), and the folded size (2
+  forms, below). In testing the comparison was run again over 9,840
+  forms and 12,615 lines of output, the same builtins and `max`, `min`,
+  `num2str` and `mat2str` over 40 arguments with every dimension from 1
+  to 4 and `1e10`, and differed in the same four classes alone.
+- **The folded size, for a write too.** The fold is the index pipeline's
+  one fold, which a write through fewer subscripts than dimensions judges
+  as a read does, so `resolve_write` judges its grown shape from
+  `fold_asked` as well: `x = zeros(0, 2^40, 2^40); x(1:0, :) = 5` is
+  `Requested 0x1.20893e+24 array exceeds the maximum array size.`, where
+  it named `1.84467e+19` as the read did. Wherever the product fits a
+  `usize`, `fold_asked` is exactly `fold_dims`'s, so no other read,
+  write, bound or growth decision moves. Two consequences, both clean
+  refusals: a fold whose product passes what a double holds is named
+  `Inf`, `zeros([0 repmat(2^60, 1, 18)])` read through `x(:, :)` giving
+  `Requested 0xInf array exceeds the maximum array size.`; and a write
+  whose subscript lies within the fold but past what a `usize` holds, `x(1:0,
+  2e19) = 5` of `zeros(0, 2^40, 2^40)`, is that size refusal naming the
+  fold, where it was the ambiguous-growth error.
+- **`find` of a scalar zero with a count.** S2's convention is about `X`,
+  so `find(0, n)` and `find(0, n, 'last')` are `[]` too, for every
+  output, where they were 1x0; a scalar that is not zero, `NaN`
+  included, is found as before.
+- **The order of the refusals.** `circshift` judges its shift first, then
+  its dimension, then the shift's count beside it, so
+  `circshift(1:3, 1.5, 2)` is the shift message and `circshift(1:3, [1
+  1], 0)` the dimension's. `sub2ind` judges the size vector, then the
+  subscripts' sizes, then their values, the scalars first and the arrays
+  in argument order, so a scalar subscript past its size is refused even
+  beside an empty array. `arrayfun` judges its arrays' sizes before it
+  refuses an N-D array with `'UniformOutput', false`.
+- **What the size and shift arguments take.** A char is refused as a
+  shift, a size vector and a dimension order whatever its codes, as
+  `permute` refuses one, and a cell or a struct gives the argument's own
+  refusal; a logical is read by its values, so `circshift(A, true)` shifts
+  by 1. The subscripts of `sub2ind` and the indices of `ind2sub` are read
+  by value too, a char by its codes and a logical as 0 and 1, and an
+  infinity is no integer. A complex shift, size, subscript or index, zero
+  imaginary parts included, is refused by the registry's complex gate
+  before `circshift`, `sub2ind` or `ind2sub` runs, since none of them is on
+  `TAKES_COMPLEX`, as `flip` refuses a complex array; `ipermute`, which is
+  on it to keep complex storage, refuses a complex order with its own
+  message.
+
+Settled in testing:
+
+- **`ind2sub`'s outputs are judged together.** A program can ask for as
+  many outputs as the targets it writes, or builds and evaluates: `eval`
+  of `[a, a, ..., b] = ind2sub(...)` with a hundred thousand targets asks
+  for a hundred thousand. Each output is an array the size of `ind`, so
+  before any is written the outputs are judged as one result by
+  `check_shape`, their elements `numel(ind)` by `k` and their lists of
+  sizes `ndims(ind)` by `k`, and no count of outputs makes `ind2sub` hold
+  more than one array may: a hundred thousand outputs of `1:1e5` are
+  `Requested 100000x100000 array exceeds the maximum array size.`, where
+  they would have asked for 10^10 doubles. Outputs that fit are written
+  as Scope says; an index of more than 2^27 elements asked for two
+  outputs is refused too, since the two together pass that bound.
+- **`arrayfun`'s outputs of an N-D array, likewise.** Each uniform output
+  carries the arrays' list of sizes, so for an N-D array those lists are
+  judged together, `ndims` by the outputs, before `f` is called: a
+  thousand outputs over an array of 2^20 dimensions are refused at once.
+  A matrix's two sizes are never judged, so no 2-D call moves.
+- **A subscript of 1 adds nothing to `sub2ind`'s index.** The strides are
+  products of the sizes in `f64`, and past what a double holds a stride is
+  `Inf`; `0 * Inf` would make the index `NaN`, so a subscript of 1 is
+  never weighed: `sub2ind([1e300 1e300 2], 1, 1, 1)` is 1, and a
+  subscript past 1 along such a stride gives `Inf`, the double the index
+  rounds to.
+- **Two refusals under one acceptance item.** Items 3, 8 and 11 each name
+  two inputs for one refusal, and an `err_*` case stops at its first
+  error, so the second has a case of its own: `err_diff_too_many_dims_huge`
+  (`diff(1:3, 1, 1e10)`), `err_ipermute_order_repeat` (`ipermute(A, [1 1
+  2])`) and `err_ind2sub_index_fraction` (`ind2sub([2 3], 1.5)`).
+- **Each bound on outputs has its case:** `err_ind2sub_outputs_bounded`
+  and `err_arrayfun_nd_outputs_bounded`, and `find_scalar_zero` pins the
+  count forms of `find` of a scalar zero.
+
 ## Acceptance tests
 
 Each numbered item becomes at least one golden case in
@@ -346,4 +505,4 @@ Expected output follows from this spec's rules and the existing display.
 
 ## Status
 
-Planned
+Done (2026-09-30)

@@ -31,7 +31,7 @@ functions, cell arrays and structs, linear algebra, numerics (polynomials,
 interpolation, statistics, sets, root finding, minimisation, quadrature and
 ODEs), formatted output, complex numbers with `fft`, string functions,
 regular expressions, file input and output with `save` and `load`, plotting
-to SVG and PNG, and 254 builtins. See
+to SVG and PNG, and 261 builtins. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -229,9 +229,17 @@ z
   keeping every dimension or broadcasting across them; the new `squeeze`,
   `permute` and `cat`; brackets joining N-D arrays, `[A, A]` and `[A; A]`;
   `repmat` with any number of counts; and `save` and `load` of N-D arrays
-  in MAT-files. Every builtin not yet taught N-D arrays refuses one by
-  name, `N-D arrays are not supported by 'sort'.`, rather than read its
-  first page alone
+  in MAT-files. Since cycle 14c `sort`, `find`, `diff`, `median`, `std`,
+  `var`, `mode`, `fliplr`, `flipud` and `arrayfun` of N-D arrays, along
+  any dimension, and the new `flip`, `circshift`, `ipermute`, `horzcat`,
+  `vertcat`, `sub2ind` and `ind2sub` (cases `sort_nd`, `find_nd`,
+  `diff_nd`, `statistics_nd`, `flip_lr_ud_nd`, `flip_nd`, `circshift_nd`,
+  `ipermute_nd`, `horzcat_vertcat`, `sub2ind_nd`, `ind2sub_nd`,
+  `arrayfun_nd` and `nd_pins` in `14c-more-nd-builtins/`); `find(0)` is
+  `[]` and `std` and `var` past `ndims` are zeros, as their pages say.
+  Every builtin not yet taught N-D arrays, `num2str`, `mat2str` and the
+  rest, refuses one by name, `N-D arrays are not supported by
+  'num2str'.`, rather than read its first page alone
 - Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
   `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(A)`,
   `[r, c] = size(A)` and `[r, c, v] = find(X)`. On a matrix, `c{1}`, `s.a`
@@ -316,21 +324,24 @@ z
 - Numerics: `polyfit`, `polyval`, `roots` (complex roots as complex values),
   `conv`, `deconv` and `filter`;
   `interp1` (linear, nearest, previous, next), `trapz`, `cumtrapz` and
-  `diff`; `std`, `var`, `median` and `mode`, column by column on a matrix;
+  `diff`; `std`, `var`, `median` and `mode`, column by column on a matrix
+  and along any dimension of any array since cycle 14c;
   `factorial`, `nchoosek`, `primes`, `isprime`, `gcd` and `lcm`; `logspace`,
   `meshgrid` and `histc`; and the set functions `unique`, `ismember`,
   `setdiff`, `intersect` and `union`, on arrays and on cells of character
-  vectors. `sort` sorts a matrix column by column, or along `dim`
+  vectors. `sort` sorts a matrix column by column, or along `dim`, and
+  since cycle 14c any array along any dimension
 - Solvers that call your function: `fzero` (a sign change, then Brent's
   method), `fminsearch` (Nelder-Mead), `integral` (adaptive Gauss-Kronrod,
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 254 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 261 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
-  `min`, `sort`, `size` and `find` answer with more than one value when asked
+  `min`, `sort`, `size`, `find` and `ind2sub` answer with more than one
+  value when asked
 - The argument forms MATLAB code uses: size vectors such as
   `zeros(size(A))` and `reshape(A, [], 2)`, `true(n)` and `eps(x)`,
   `sort(v, 'descend')`, `find(x, n, 'last')`, `norm(v, p)`, `diag(v, k)`,
@@ -448,9 +459,9 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-The rest of the builtins on N-D arrays (`sort`, `find`, `diff`, the
-statistics, `fliplr`, `num2str`, the strings, the sets and the linear
-algebra, each of which refuses one by name), N-D cell and struct arrays,
+The rest of the builtins on N-D arrays (`num2str`, `mat2str`, the
+strings, the sets and the linear algebra, each of which refuses one by
+name), N-D cell and struct arrays,
 integer classes, compressed MAT-files, 3-D plots and interaction with a
 figure. `docs/ROADMAP.md` has the order they arrive in, one module at a
 time.
@@ -463,7 +474,7 @@ time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 254 builtins,
+                                         builtins/    the 261 builtins,
                                                       behind a registry
                                          plot/        figures, SVG, PNG
 

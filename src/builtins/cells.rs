@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::args::{
-    CELL_UNIT, at_most, check_bytes, check_cell, check_struct, need, scalar, shape, string,
+    CELL_UNIT, at_most, check_bytes, check_cell, check_shape, check_struct, need, scalar, shape,
+    string,
 };
 use super::{Registry, add, none, one, one_as};
 use crate::bail;
@@ -357,19 +358,34 @@ pub(crate) fn map_elements(
     if inputs.iter().any(|v| v.dims() != dims) {
         bail!(error::arrayfun_size());
     }
-    // Every input is a cell, a struct array, a handle or a matrix the N-D
-    // gate has let through, so two dimensions are all there are (cycle 14).
+    // Since cycle 14c `arrayfun`'s arrays may be N-D (`cellfun`'s inputs
+    // are cells, never N-D, and the gate refuses it an N-D matrix), and a
+    // uniform result takes their shape, every dimension of it. A cell of
+    // results would be N-D, which no cell is, so `'UniformOutput', false`
+    // refuses one.
+    if dims.len() > 2 && !uniform {
+        bail!(error::nd_unsupported());
+    }
     let (rows, cols) = (dims[0], dims[1]);
+    let count = crate::value::dims_product(&dims);
     let outs = nargout.max(1);
+    // Each uniform output of an N-D array carries its list of sizes, and a
+    // program can ask for as many outputs as the targets it writes, or
+    // builds and evaluates, so those lists are judged together before `f`
+    // is called, `ndims` by the outputs, as `ind2sub` judges its own; a
+    // matrix's two sizes are never judged, so no 2-D call moves.
+    if uniform && dims.len() > 2 {
+        check_shape(dims.len() as f64, outs as f64)?;
+    }
     if !uniform {
         // Each output is a cell of the inputs' size (cycle 13b).
         check_cell(rows, cols)?;
     }
-    let mut results: Vec<Vec<Value>> = vec![Vec::with_capacity(rows * cols); outs];
+    let mut results: Vec<Vec<Value>> = vec![Vec::with_capacity(count); outs];
     // Whether `f` gives values; a statement's call finds out from the
     // first call.
     let mut gives = nargout > 0;
-    for k in 0..rows * cols {
+    for k in 0..count {
         let elems = inputs
             .iter()
             .map(|v| match v {
@@ -402,7 +418,7 @@ pub(crate) fn map_elements(
             results[o].push(v);
         }
     }
-    if !gives && rows * cols > 0 {
+    if !gives && count > 0 {
         return none();
     }
     results
@@ -428,7 +444,7 @@ pub(crate) fn map_elements(
                 im.push(z.im);
             }
             let class = class.unwrap_or_default();
-            let m = Matrix::new(rows, cols, data).with_im(Some(im));
+            let m = Matrix::from_dims(&dims, data).with_im(Some(im));
             let m = if m.is_complex() {
                 m
             } else {
@@ -685,5 +701,33 @@ mod tests {
     /// `arrayfun`'s entry, for the test above: the same map, by that name.
     fn map_elements_arrayfun(it: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
         map_elements(it, args, nargout, "arrayfun")
+    }
+
+    /// Cycle 14c: each uniform output of an N-D array carries its list of
+    /// sizes, and a program can ask for as many outputs as the targets it
+    /// builds and evaluates, so those lists are judged together before `f`
+    /// runs: a thousand outputs over an array of 2^20 dimensions are
+    /// refused at once, two are made, and a matrix's outputs are never
+    /// judged.
+    #[test]
+    fn arrayfun_judges_the_size_lists_of_its_outputs_together() {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        let t = std::time::Instant::now();
+        let src = "X = zeros([ones(1, 2^20 - 1) 2]); \
+                   eval(['[' repmat('a, ', 1, 1023) 'b] = arrayfun(@(x) deal(x), X);']);";
+        assert_eq!(
+            it.run(src).unwrap_err().msg,
+            "Requested 1048576x1024 array exceeds the maximum array size."
+        );
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        it.run(
+            "[p, q] = arrayfun(@(x) deal(x + 1, -x), X); assert(ndims(q) == 2^20 && p(2) == 1);",
+        )
+        .unwrap();
+        it.run(
+            "eval(['[' repmat('a, ', 1, 1023) 'b] = arrayfun(@(x) deal(x), [1 2]);']); \
+             assert(isequal(b, [1 2]));",
+        )
+        .unwrap();
     }
 }

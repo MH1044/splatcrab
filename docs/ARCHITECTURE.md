@@ -211,7 +211,8 @@ normalising it; see "Add a value type". Since cycle 14b `along_dim` sees
 any shape along one dimension as three numbers, `[before, n, after]`,
 element `(b, k, a)` of the view at `b + before * (k + n * a)`: the one view
 the reductions, the running scans, `cat` and the brackets, and `repmat`
-work through, whatever the array's `ndims`. Every `Matrix` carries a `class`
+work through, whatever the array's `ndims`, and since cycle 14c `sort`,
+`numerics::map_slices` (and so `diff`), the flips and `circshift`. Every `Matrix` carries a `class`
 tag, `Double`, `Logical` or `Char`, over the same `f64` storage; a char
 element is one UTF-16 code unit. Since cycle 10 a double can be complex: `im: Option<Vec<f64>>`
 holds the imaginary parts, column-major like `data`, and is `None` for real
@@ -274,7 +275,12 @@ judged by `check_dims`, `regrid` lays the old elements out in the grown
 shape (resizing in place when `keeps_layout` says the layout does not
 move), and a deletion removes positions along any one dimension. Cells and
 structs go through it with two dimensions and refuse, through `flat`, any
-result that would make one N-D.
+result that would make one N-D. Since cycle 14c a read or a write through
+fewer subscripts than dimensions judges its shape from `fold_asked`, the
+fold as asked in `f64`, which is `fold_dims`'s wherever the product fits
+a `usize` and the product itself where an empty array's sizes pass it, so
+`x(:, :)` of `zeros(0, 2^40, 2^40)` is `Requested 0x1.20893e+24 array
+exceeds the maximum array size.`, never the saturated `1.84467e+19`.
 
 `try` runs its body and, on an error, puts the nesting counters and
 `end_stack` back to what they were at the `try` (a failed `deepen` does not
@@ -314,10 +320,14 @@ the polynomials (`polyfit` over `factor::lstsq`, `roots` over
 `factor::eig_general` of the companion matrix), interpolation, the
 trapezoidal rule, differences, `filter`, the statistics, the number theory
 and the grids. Its `map_slices` is the one way a function there works
-along a dimension: it hands each column (or each row, through a
-transpose) to a closure, and judges the result's shape with `check_shape`
-first; `first_dim` is MATLAB's default dimension, since cycle 14b the
-reductions' `math::default_dim`, so the two cannot disagree. `sets.rs` holds the five
+along a dimension: it hands each slice to a closure, and judges the
+result's shape first; since cycle 14c it runs over the three-number view
+of any array along any dimension, a matrix along 1 or 2 read column by
+column or row by row in the order the columns and the transposed rows
+always were, and a result that would have more dimensions than
+`args::MAX_NDIMS` is refused before its list of sizes is made. `first_dim`
+is MATLAB's default dimension, since cycle 14b the reductions'
+`math::default_dim`, so the two cannot disagree. `sets.rs` holds the five
 set functions over a `Set`, either an array compared as numbers or a cell of
 character vectors compared as code-unit texts. `solvers.rs` holds `fzero`,
 `fminsearch`, `integral` and `ode45`, each a thin builtin around a pure
@@ -337,8 +347,11 @@ power-of-two transforms, for every other, so every length is O(n log n).
 `builtins::TAKES_COMPLEX` names the builtins that take a complex argument,
 and `complex_gate`, which `Interp::call_builtin` runs before every builtin,
 refuses one to any other; see "Add a value type". Cycle 14 added the same
-gate for N-D arrays beside it, `builtins::ND_OK` and `nd_gate`, and cycle
-14b grew `ND_OK` by the builtins it taught N-D.
+gate for N-D arrays beside it, `builtins::ND_OK` and `nd_gate`, and cycles
+14b and 14c grew `ND_OK` by the builtins they taught N-D. Cycle 14c put
+`ipermute`, `horzcat` and `vertcat` on `TAKES_COMPLEX`, since they keep
+complex storage as `permute` and `cat` do; `flip` and `circshift` stay
+off it, and refuse a complex argument as `fliplr` does.
 
 **The reductions (cycle 14b)** are one kernel, `math::each_slice`, over
 the array seen along the dimension as `[before, n, after]`: `f` of each of
@@ -361,14 +374,44 @@ by the `sum` and `mean` pages' "or when `size(A,dim)` is 1"), so
 reduce each element on its own there; and past `ndims` `any` and `all`
 give each element what they give it along a dimension of size 1, a `NaN`
 ignored by `any` and nonzero to `all`, where they converted `A` to a
-logical and refused a `NaN`. `numerics::reduce_along` keeps its own rule
-past `ndims`, each element reduced on its own, which makes `var(X, 0, 3)`
-zeros. `max` and `min` give an empty along a dimension of
+logical and refused a `NaN`. The statistics of `numerics.rs` keep their
+own rules past `ndims` (cycle 14c, by their pages): `median` and `mode`
+reduce each element on its own there (`numerics::reduce_along`), which is
+`A` itself as a double and a `mode` frequency of 1, 0 for a `NaN`, and
+`std` and `var` give "an array of zeros the same size as `A`"
+(`numerics::deviation`), a `NaN` or an `Inf` element included, where each
+element's own variance made `var(NaN, 0, 3)` a `NaN`. `max` and `min` give
+an empty along a dimension of
 size 0, their index is the same kernel over `arg_extremum`, and past
 `ndims` it is all 1s. A 2-D matrix within its two dimensions is the case
 `before = 1` (a column, contiguous) or `after = 1` (a row), with each
 slice's elements in the order they always were read, so every 2-D answer
 is the one it was.
+
+**Search, sort and the slice functions (cycle 14c)** take any array
+along any dimension through the same three-number view: `sort` sorts each
+of its slices on its own, stably, along the first dimension whose size is
+not 1 or along `dim`, handing the argument back past `ndims` with every
+index 1; `diff` goes through `numerics::map_slices`, each of its rounds
+along the first dimension that is not 1 of what the round before left,
+or every round along `dim`, the result empty along a dimension past
+`ndims`, where it was the N-D refusal; `median`, `std`, `var` and `mode`
+are the reductions' kernel within `ndims`; `fliplr`, `flipud` and `flip`
+reverse each slice along dimension 2, 1 or the one asked for, a page at a
+time; and `circshift` rotates each block of `before * n` elements by
+`s * before`, `s` the shift taken modulo the dimension's size in `f64`.
+`find` of an N-D array is a column of linear indices, and its second
+output the linear index over the dimensions past the first, which
+column-major storage makes the linear index divided by the rows; by the
+`find` page's convention a scalar zero, `find(0)` and `find(false)`, gives
+`[]` for every output, where it was 1x0. `ipermute` is `permute` by the
+inverse order, its order judged by `permute`'s rule in its own name, and
+`horzcat` and `vertcat` are `cat` along 2 and 1, through `interp::concat`,
+so their empties follow `cat`'s rule and not the brackets'. `sub2ind` and
+`ind2sub` convert by the index pipeline's own fold: the last subscript of
+`sub2ind` runs over the product of the sizes from its own on, and the
+last output of `ind2sub` is unbounded, as the `ind2sub` page's example
+shows.
 
 Cycle 11 added five files. `printf.rs` is the formatter the `printf`
 family shares, moved out of `core.rs` and finished (QA D16): `%x`, `%X`,
@@ -740,7 +783,27 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    field index, so fields in another order are never matched in quadratic
    time. `strtok`, whose delimiters may be of any size, looks each unit of
    its text up in a set of them, so a long text against a long delimiter
-   list costs time linear in both.
+   list costs time linear in both. Since cycle 14c `circshift` takes each
+   shift modulo its dimension's size, exactly in `f64`, so any integer a
+   double holds costs one pass per dimension that moves (at most log2 of
+   the element count, since only a dimension of 2 or more moves), and an
+   entry of a vector shift past `ndims` moves nothing and sizes nothing;
+   `sub2ind` judges and weighs each scalar subscript once, not once per
+   position, and `ind2sub` does no more work than the outputs it writes,
+   so both run in time linear in their inputs and outputs; since a program
+   can ask for as many outputs as the targets it builds and evaluates,
+   `ind2sub` judges its outputs together before writing any, their
+   elements `numel(ind)` by `k` and their lists of sizes `ndims(ind)` by
+   `k` through `check_shape`, so no count of outputs makes it write more
+   than one array may hold, and `arrayfun` of an N-D array judges its
+   uniform outputs' lists of sizes, `ndims` by the outputs, before it calls
+   `f`, though not their elements times the outputs, which `deal` and
+   `arrayfun` and `cellfun` of matrices do not bound either (the Known bugs
+   row on a program's memory); and nothing a
+   slice function does walks a dimension of size 1 per element: `sort`,
+   `flip` and `circshift` pass over a dimension of size 1 without a loop,
+   and the three-number view costs one product over the dimensions
+   however many singletons an array holds.
 
 ## Recipes
 
@@ -749,7 +812,8 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
 1. Write the function in the right file under `src/builtins/`: `core.rs` for
    constants, constructors, shape queries, output, the workspace and timing;
    `math.rs` for element-wise and reducing numerics; `linalg.rs` for linear
-   algebra, rearrangement, search and sort, with the numerics of a
+   algebra, rearrangement, search and sort, and since cycle 14c the index
+   conversions `sub2ind` and `ind2sub`, with the numerics of a
    factorisation in `factor.rs` and only the argument handling in
    `linalg.rs`; `numerics.rs` for polynomials, samples, statistics and
    number theory, `sets.rs` for the set functions, `solvers.rs` for a
@@ -832,7 +896,11 @@ the running scans, `fft`, `sort`, `kron`, `repmat`, `fliplr`, `flipud`,
 index resolvers (`resolve_read`, `resolve_write`, `resolve_delete`,
 `Sel::covers`), and since cycle 14b the reductions' kernel, `permute`,
 `cat` and every bracket with an N-D operand through `interp::concat`, and
-`repmat`'s tiling,
+`repmat`'s tiling, and since cycle 14c `sort`, `find`, `diff`, the
+statistics, `flip`, `fliplr`, `flipud`, `circshift`, `ipermute`,
+`horzcat`, `vertcat`, `sub2ind`, `ind2sub` and `arrayfun` along any
+dimension of any array, an empty one returned at once however large its
+other sizes (`sort(zeros(0, 1e6, 1e6), 3)`),
 loop over the elements they produce or read, never over a
 dimension of an empty operand, so `zeros(0, 1e12) + 1` returns at once and
 `x(:, :)` of it lists no positions. `for` over an array with no rows still
@@ -875,8 +943,18 @@ and never an intermediate, and every dimension a MAT-file declares.
 1048576 dimensions.`, and when `cat`'s dimension passes every argument's
 `ndims`, it is judged against the same bound before the result's list of
 sizes is made, so `cat(1e10, 1, 2)` is a clean refusal rather than a
-request for 1e10 sizes. A new operation of that kind belongs on the same
-list.
+request for 1e10 sizes. Cycle 14c's too: `map_slices`'s shape, and so
+`diff`'s, whose `dim` past `ndims` gives the result that many dimensions
+and is judged against `args::MAX_NDIMS` before any list of sizes is made
+(`diff(1:3, 1, 1e10)` is the refusal at once, and `diff(X, 0, 1e300)` is
+`X`, making no dimension), the statistics' through the reductions' kernel,
+and `horzcat`'s and `vertcat`'s through `cat`'s; and the read through
+fewer subscripts than dimensions, whose fold is judged as asked in `f64`
+(`fold_asked`). The others of cycle 14c make no shape larger than an
+argument's: `sort`, the flips and `circshift` keep their argument's shape,
+`ipermute` permutes it, `sub2ind` answers in its subscripts' shape,
+`ind2sub` in its index's and `arrayfun` in its arrays'. A new operation of
+that kind belongs on the same list.
 
 ### Add a statement
 
@@ -942,7 +1020,14 @@ the only path into a builtin. Since cycle 14b `ND_OK` holds, beside cycle
 conversions, printf family, `feval` and `deal`, the reductions (`sum`,
 `prod`, `mean`, `any`, `all`, `max`, `min`, `cumsum`, `cumprod`), the
 element-wise math and the two-argument functions that broadcast, and
-`squeeze`, `permute`, `cat` and `repmat`, and nothing else. The interpreter's own consumers, which no
+`squeeze`, `permute`, `cat` and `repmat`, and since cycle 14c `sort`,
+`find`, `diff`, `median`, `std`, `var`, `mode`, `fliplr`, `flipud`,
+`arrayfun`, `flip`, `circshift`, `ipermute`, `horzcat`, `vertcat`,
+`sub2ind` and `ind2sub`, and nothing else: `num2str`, `mat2str`, the
+strings, the sets, the linear algebra, `trapz`, `cumtrapz`, `filter`,
+`cellfun` and every other builtin not named still refuse an N-D argument.
+`arrayfun` with `'UniformOutput', false` refuses one itself, `N-D arrays
+are not supported.`, since its cell of results would be N-D. The interpreter's own consumers, which no
 gate covers, each handle every dimension or refuse: the index pipeline,
 the element-wise primitives (`map`, `try_map`, `map_c`, `zip`, `try_zip`,
 `zip_c`, `to_class`, `real_part`, `imag_part`, each carrying every
@@ -1060,7 +1145,8 @@ checker will object to `&self` and `&mut self` at once. `Stmt::Expr` asks for
 one per target, `~` included. A builtin returns as many values as it has, up
 to `nargout`; the caller, not the builtin, turns too few into "Too many output
 arguments.", so a builtin with one output needs no change to be asked for two.
-`max`, `min`, `sort`, `size` and `find` give more than one.
+`max`, `min`, `sort`, `size` and `find` give more than one, and since
+cycle 14c `ind2sub` gives as many as it is asked for.
 
 **Classes (cycle 02, in place).** `Class { Double, Logical, Char }` as a tag
 on `Matrix`. Arithmetic yields `Double`; comparisons and logical operators
@@ -1191,7 +1277,12 @@ matrix's always was, and `cat` and a bracket with an N-D operand are one
 function, `interp::concat`, so they cannot disagree there, while a bracket
 of 2-D operands alone keeps the 2-D rule of `hcat` and `vcat`, its
 empties included (`[1:0]` is 0x0, where `cat(2, 1:0)` is 1x0); see
-`docs/modules/14b-nd-functions.md`.
+`docs/modules/14b-nd-functions.md`. Cycle 14c taught the search, sort
+and statistics functions and the flips through the same view, a matrix
+along 1 or 2 read column by column or row by row as it always was, and
+added `horzcat` and `vertcat` as `cat` along 2 and 1, not as the
+brackets, so `horzcat(zeros(1, 0), zeros(1, 0))` is 1x0 where the bracket
+is 0x0; see `docs/modules/14c-more-nd-builtins.md`.
 
 **Display format (cycle 13, in place).** `format` is `Interp::format`; the
 display reads it through `value::with_format`, which sets a thread-local
@@ -1285,7 +1376,7 @@ cycle named:
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each. Cycle 10 replaced the complex refusals of `roots` with the values | by design |
 | Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where the MathWorks `mldivide` page settles MATLAB's as the nearly singular warning, `Matrix is close to singular or badly scaled. Results may be inaccurate. RCOND = ...`, issued "When `rcond` is between `0` and `eps`", which needs a condition estimate SplatCrab does not compute; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`, where the MathWorks `eig` page settles that `eig` "returns `NaN` values when the input contains nonfinite values", the one-output answer, and gives no shape for a two-output call, which stays verify first; `eig([])` is 0x1. The nearly singular warning and `eig` of nonfinite input are settled by their pages (cycle 15) and recorded for a later cycle. The Design notes of `docs/modules/08-linear-algebra.md` have each | later; the two-output `eig` of nonfinite input later (verify first) |
-| Complex numbers, cycle 10: every builtin not on `builtins::TAKES_COMPLEX` refuses a complex argument (`sort`, `max`, `min`, `floor`, `mod`, `num2str`, `reshape`, `inv`, `det`, the solvers and every other), where MATLAB takes many of them; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` refuse a complex value; indexing, concatenation and assignment drop an all-zero imaginary part as arithmetic does, and a zero imaginary part of either sign is read as `+0`, on a branch cut and in the display; the complex display, its scale factor and the phase of complex eigenvectors are SplatCrab's; `eig` and `roots` of complex input are refused. The Design notes of `docs/modules/10-complex.md` have each | by design (verify first) |
+| Complex numbers, cycle 10: every builtin not on `builtins::TAKES_COMPLEX` refuses a complex argument (`sort`, `max`, `min`, `floor`, `mod`, `num2str`, `reshape`, `inv`, `det`, the solvers, since cycle 14c `flip` and `circshift`, and every other), where MATLAB takes many of them; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` refuse a complex value; indexing, concatenation and assignment drop an all-zero imaginary part as arithmetic does, and a zero imaginary part of either sign is read as `+0`, on a branch cut and in the display; the complex display, its scale factor and the phase of complex eigenvectors are SplatCrab's; `eig` and `roots` of complex input are refused. The Design notes of `docs/modules/10-complex.md` have each | by design (verify first) |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | An `MException` is minimal: `message`, `identifier`, `stack` and `class`, with no `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`. `e.stack` (cycle 07) holds the function frames only, not the script's own, and `file` is empty for a function local to the script that was run | later |
 | Cells and structs, cycle 07: a cs-list is not spread into index subscripts (`x(c{:})`) nor accepted as a target list (`[c{:}] = deal(0)`); several message texts are recalled or SplatCrab's own. The Design notes of `docs/modules/07-cells-and-structs.md` have each. Cycle 15 removed three clauses the MathWorks pages settle: cells and structs transpose (the `transpose` and `ctranspose` pages), `isequal` compares them element by element (the `isequal` page), and `varargin` with no extra inputs is 0x0, as the `varargin` page says (`varargin_no_extra_inputs`) | later (verify first) |
@@ -1297,7 +1388,7 @@ cycle named:
 | Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; `strcmp` and `strcmpi` compare a char of several rows held in a cell by its whole shape, `strcmp({['ab'; 'cd']}, ['ab'; 'cd'])` being 1, which the MathWorks `strcmp` page neither refuses nor defines (it takes "a character array" of several rows and says "If used on unsupported data types, strcmp always returns 0"), verify first (cycle 15); several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
 | `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off` | later |
 | The environment, cycle 13: `format` has `short` and `long` only; `whos` has no heading row and its layout is SplatCrab's; `ls` and `dir` print one name per line with no `.` or `..`, and `dir` returns no `date` or `datenum`; a bare `pause` waits for Enter rather than any key; `evalc` drops the final line end of what it captured, as the spec records; `datestr` takes date numbers or one date vector and no format; `exit(n)` takes 0 to 255; `which` and `help` do not report local functions. The Design notes of `docs/modules/13-environment.md` have each | by design |
-| N-D arrays, cycles 14 and 14b: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets, the linear algebra and every other not taught N-D in cycle 14b), where MATLAB takes most of them, and so does `save -ascii`; `cat` takes arrays only, where MATLAB's joins cells too; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md` and `docs/modules/14b-nd-functions.md` have each. Cycle 15 took the display's edges, and growth and deletion through fewer subscripts than dimensions, to the MathWorks "Multidimensional Arrays" page, which does not settle them: its displays are of double pages alone, with no logical or char page, no `disp` of an N-D array and no empty N-D array, and it says nothing of growth or deletion through fewer subscripts, nor of a colon over an empty target taking the right-hand side's extent (cycle 14's rule, `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` making a 2x2x2), which stays SplatCrab's stated rule, verify first | later for the rest of the builtins; the display later (verify first) |
+| N-D arrays, cycles 14, 14b and 14c: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`num2str`, `mat2str`, the strings, the sets, the linear algebra, `trapz`, `cumtrapz`, `filter`, `interp1`, `cellfun` and every other not taught N-D in cycles 14b and 14c), where MATLAB takes most of them, and so does `save -ascii`; `cat`, and since cycle 14c `horzcat` and `vertcat`, take arrays only, where MATLAB's join cells too, and `flip`, `circshift`, `fliplr` and `flipud` refuse a cell or a struct, which their pages allow; `arrayfun` with `'UniformOutput', false` refuses an N-D argument, since SplatCrab's cells are never N-D; `median` answers a double whatever `A`'s class, where its page keeps `A`'s; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md`, `docs/modules/14b-nd-functions.md` and `docs/modules/14c-more-nd-builtins.md` have each. Cycle 15 took the display's edges, and growth and deletion through fewer subscripts than dimensions, to the MathWorks "Multidimensional Arrays" page, which does not settle them: its displays are of double pages alone, with no logical or char page, no `disp` of an N-D array and no empty N-D array, and it says nothing of growth or deletion through fewer subscripts, nor of a colon over an empty target taking the right-hand side's extent (cycle 14's rule, `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` making a 2x2x2), which stays SplatCrab's stated rule, verify first | later for the rest of the builtins; the display later (verify first) |
 | A `-0` run through `cumsum` along a dimension of size 1 within `ndims` is `+0`, verify first: `cumsum(-0, 1)` is `+0`, each element its own running sum from `+0`, as a matrix's always was, while past `ndims` it is handed back, so `1/cumsum(-0, 3)` is `-Inf`. The MathWorks `cumsum` page says it "returns `A` if `dim` is greater than `ndims(A)`" and nothing of a dimension of size 1, so it does not settle the case. Recorded in testing cycle 14b; cycle 15 narrowed the row to `cumsum`, since the `sum` and `mean` pages settle theirs ("or when `size(A,dim)` is `1`", now `-0`, `sum_mean_dim_of_size_one`); `prod`, `max`, `min` and `cumprod` keep a `-0` by their own arithmetic | later (verify first) |
 | Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
@@ -1409,7 +1500,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found in testing cycle 04. Cycle 15 took it to the MathWorks "Choose Command Syntax or Function Syntax" page, which does not settle it: MATLAB uses "the current workspace, and path" at the command line while the Code Analyzer and the Editor "operate without reference to the path or workspace", and the page says nothing of a name a script assigns implicitly | later (verify first) |
 | The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found in testing cycle U2 | later, needs a spec |
 | Name arguments read a char of several rows as one row, verify first | `isfield(struct('ab', 1), {['a'; 'b']})` is 1, reading the column as `'ab'`, its code units in column-major order; `rmfield`, `getfield`, `setfield`, `str2func`, `feval` and `cellfun` read a field or function name the same way. Cycle 15 settled the text functions whose pages take character vectors, which now refuse such a char (the `iscellstr` page's note: "Most text-processing functions and conversion functions require input cell arrays to contain only character row vectors"); these builtins were not taken to their pages, and keep the reading the removed string-functions row recorded | later (verify first) |
-| A program's memory is bounded one array at a time | Every array is judged against `MAX_ELEMS`, and every cell or struct array against `MAX_BYTES`, as it is made, but nothing bounds what a program holds in all, and storing a matrix copies it: `m = repmat('a', 2, 8e6); for k = 1:100000, C{k} = m; end` asks for 1.6 TB in 16 MB pieces, and the allocator aborts the process (exit 134). Found in testing cycle 15; the path predates it | later, needs a spec (shared matrix storage or a budget for the whole program) |
+| A program's memory is bounded one array at a time | Every array is judged against `MAX_ELEMS`, and every cell or struct array against `MAX_BYTES`, as it is made, but nothing bounds what a program holds in all, and storing a matrix copies it: `m = repmat('a', 2, 8e6); for k = 1:100000, C{k} = m; end` asks for 1.6 TB in 16 MB pieces, and the allocator aborts the process (exit 134). The same holds for the outputs a program asks for through a target list it builds and evaluates: `deal`, and `arrayfun` and `cellfun` (whose outputs are judged one at a time, and of an N-D array only by their lists of sizes, cycle 14c), make one copy per output, and `arrayfun` reserves a value per element before it calls anything; and a cell holding N-D values counts each element as one value, not the list of sizes it carries, so `repmat` of one can copy far more than the byte budget sees. Found in testing cycles 15 and 14c; the paths predate them | later, needs a spec (shared matrix storage or a budget for the whole program) |
 
 **The process-killing family.** The two panics that used to head this list,
 `num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a

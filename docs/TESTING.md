@@ -256,7 +256,10 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   dimensions within a bound, deletion along one dimension, the operators
   and `for`, the refusals, and a colon over an empty target taking the
   right-hand side's extent; since cycle 14b brackets joining N-D arrays
-  along either dimension, and a mismatch refused.
+  along either dimension, and a mismatch refused; since cycle 14c
+  `a_folded_size_is_named_as_asked`, a read and a write through a fold
+  whose product passes `usize` refused naming the product as asked, and
+  `fold_asked` equal to `fold_dims` wherever the product fits.
 - `builtins/`: the builtins themselves, called directly as functions.
   `mod.rs` checks the registry holds every name exactly once and that every
   entry is callable; `args.rs` the message text of each helper and the size
@@ -287,15 +290,43 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   order, `cat`'s agreement rule, its empty rule and its dimension past
   every argument's `ndims` judged against `MAX_NDIMS`, and `repmat` of
   every dimension, its shape
-  judged before anything is allocated. Since cycle 10 `complex.rs` checks
+  judged before anything is allocated; since cycle 14c
+  `slices_along_any_dimension_read_a_matrix_as_today` (the slices
+  `map_slices` hands out, a matrix's columns and rows in order and an N-D
+  array's by the three-number view, and `sort`, `mode`, `flip`, `median`,
+  `circshift`, `diff`, `std` and `var` of a matrix along 1 and 2 against
+  each column and row alone, and of a 2x3x4x5 array along each dimension
+  against the columns of the array permuted to bring it to the front),
+  `find_gives_the_trailing_dimensions_as_one_column_index` (and a scalar
+  zero `[]` for every output), `flip_reverses_along_one_dimension`,
+  `circshift_wraps_modulo_the_size` (a shift modulo the size, a vector
+  shift, `2^60`, `1e15` and `1e300`, and every refusal),
+  `ipermute_inverts_permute` over every order of four dimensions,
+  `horzcat_and_vertcat_are_cat` answer for answer and refusal for refusal,
+  `sub2ind_agrees_with_indexing` over every subscript of a 2x3x4 array
+  with fewer and more subscripts than dimensions, linear in its arguments,
+  and a subscript of 1 along a stride past what a double holds adding
+  nothing, and `ind2sub_folds_and_leaves_the_last_dimension_unbounded`
+  with one to five outputs, and its outputs judged together, a hundred
+  thousand of a hundred thousand indices and a thousand of an index of
+  2^20 dimensions refused at once; `cells.rs`, since cycle 14c,
+  `arrayfun_judges_the_size_lists_of_its_outputs_together`, the outputs
+  of an N-D array judged before `f` is called and a matrix's never;
+  `numerics.rs` the polynomials, samples, statistics,
+  number theory and grids, and since cycle 14c
+  `diff_along_or_past_ndims_judges_the_shape_first` (its dimension bound
+  judged at once, at and past 2^20), `the_statistics_past_ndims_follow_their_pages`
+  (`median` and `mode` returning `A` and `std` and `var` zeros, a `NaN` and
+  an `Inf` included) and `map_slices_judges_the_shape_first`. Since cycle 10 `complex.rs` checks
   the complex arithmetic, the powers and the branch cuts with tolerances,
   and `fft` against the
   direct DFT for every length from 1 to 40 and at a prime length of
   100,003; `factor.rs` checks complex eigenvalues by the residual
   `A*v - lambda*v`; `mod.rs` checks the complex gate, and since cycle 14
   the N-D gate, refusing an N-D argument to a builtin not on `ND_OK` and
-  passing one on it, through `feval` too, and since cycle 14b the names it
-  added and their count. Since cycle 11
+  passing one on it, through `feval` too, and since cycles 14b and 14c
+  the names they added and their count, and the three names cycle 14c
+  put on `TAKES_COMPLEX`. Since cycle 11
   `printf.rs` checks every conversion, flag and escape and the width and
   precision bound, `*` fields included; `strings.rs` the `num2str` layouts,
   the string functions, `regexp`'s outputs and the refusal of a result too

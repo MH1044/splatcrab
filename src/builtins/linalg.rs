@@ -1,4 +1,5 @@
-//! Linear algebra, array rearrangement, and search and sort.
+//! Linear algebra, array rearrangement, search and sort, and the index
+//! conversions `sub2ind` and `ind2sub`.
 
 use std::cmp::Ordering;
 
@@ -8,7 +9,7 @@ use super::args::{
 use super::complex::C;
 use super::core::eps_at;
 use super::factor::{self, JACOBI_SWEEPS, SVD_SWEEPS, Vectors, qr_iterations};
-use super::math::{reduce, sum0};
+use super::math::{default_dim, reduce, sum0};
 use super::{Registry, add, one, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R};
@@ -47,12 +48,21 @@ pub fn register(r: &mut Registry) {
     add(r, "squeeze", squeeze, "squeeze(A) - A with its dimensions of length 1 removed; a 2-D array is returned as it is.");
     add(r, "permute", permute, "permute(A,dimorder) - rearrange the dimensions of A: dimension i of the result is dimension dimorder(i) of A.");
     add(r, "cat", cat, "cat(dim,A1,A2,...) - concatenate arrays along dimension dim.");
+    add(r, "horzcat", horzcat, "horzcat(A1,A2,...) - concatenate arrays horizontally, as cat(2,A1,A2,...).");
+    add(r, "vertcat", vertcat, "vertcat(A1,A2,...) - concatenate arrays vertically, as cat(1,A1,A2,...).");
+    add(r, "ipermute", ipermute, "ipermute(B,dimorder) - the inverse of permute: the array A for which permute(A,dimorder) is B.");
     add(r, "fliplr", fliplr, "fliplr(A) - reverse the order of the columns.");
     add(r, "flipud", flipud, "flipud(A) - reverse the order of the rows.");
+    add(r, "flip", flip, "flip(A), flip(A,dim) - reverse the order of the elements along the first dimension whose size is not 1, or along dim.");
+    add(r, "circshift", circshift, "circshift(A,K), circshift(A,K,dim) - shift the elements circularly by K positions; a vector K shifts dimension i by K(i).");
 
     // ---- search and sort ---------------------------------------------
     add(r, "find", find, "find(A), find(A,n), find(A,n,'last'), [r,c,v] = find(...) - indices of the non-zero elements.");
     add(r, "sort", sort, "sort(A), sort(A,dim), sort(A,'descend'), [s,i] = sort(...) - sorted vectors, columns or rows, NaN at the high end.");
+
+    // ---- index conversion --------------------------------------------
+    add(r, "sub2ind", sub2ind, "ind = sub2ind(sz,I1,I2,...) - the linear indices of the subscripts I1, I2, ... into an array of size sz.");
+    add(r, "ind2sub", ind2sub, "[I1,I2,...] = ind2sub(sz,ind) - the subscripts of the linear indices ind into an array of size sz, one per output.");
 }
 
 // ---- linear algebra --------------------------------------------------
@@ -847,32 +857,56 @@ fn permute(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     need(a, 2, "permute")?;
     at_most(a, 2, "permute")?;
     let m = mat(a, 0, "permute")?;
-    let order = permute_order(&a[1], m.ndims())?;
+    let order = permute_order(&a[1], m.ndims(), "permute")?;
     one_as(permuted(&m, &order))
 }
 
-/// The zero-based order `permute` reads from `v`: a real row of positive
-/// integers holding each of 1 to n exactly once, with n at least `ndims`.
-/// A column, a char (whatever its codes), a repeat, a gap and a row too
-/// short are all the one refusal, judged before anything the order's
-/// length would size.
-fn permute_order(v: &Value, ndims: usize) -> R<Vec<usize>> {
+/// `ipermute(B, dimorder)` (cycle 14c), by the MathWorks page: the array
+/// `A` for which `permute(A, dimorder)` is `B`, "the `i`th dimension of the
+/// input array becomes the dimension `dimorder(i)` in the output array".
+/// `dimorder` is judged exactly as `permute` judges it, the refusal naming
+/// `ipermute`; the result is `permute` of `B` by the inverse order, so the
+/// class and complex storage are kept as `permute` keeps them.
+fn ipermute(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 2, "ipermute")?;
+    at_most(a, 2, "ipermute")?;
+    let m = mat(a, 0, "ipermute")?;
+    let order = permute_order(&a[1], m.ndims(), "ipermute")?;
+    one_as(permuted(&m, &inverse_order(&order)))
+}
+
+/// The inverse of a zero-based order holding each of `0..n` once: where
+/// `order[i]` is `j`, the inverse's `j` is `i`.
+fn inverse_order(order: &[usize]) -> Vec<usize> {
+    let mut inv = vec![0; order.len()];
+    for (i, &j) in order.iter().enumerate() {
+        inv[j] = i;
+    }
+    inv
+}
+
+/// The zero-based order `permute` (and `ipermute`, named by `name`) reads
+/// from `v`: a real row of positive integers holding each of 1 to n exactly
+/// once, with n at least `ndims`. A column, a char (whatever its codes), a
+/// repeat, a gap and a row too short are all the one refusal, judged before
+/// anything the order's length would size.
+fn permute_order(v: &Value, ndims: usize, name: &str) -> R<Vec<usize>> {
     let Value::Mat(o) = v else {
-        return Err(error::permute_order());
+        return Err(error::dimension_order(name));
     };
     if o.class == Class::Char || o.is_complex() || o.is_nd() || o.rows != 1 || o.cols < ndims {
-        return Err(error::permute_order());
+        return Err(error::dimension_order(name));
     }
     let n = o.cols;
     let mut seen = vec![false; n];
     let mut order = Vec::with_capacity(n);
     for &x in &o.data {
         if !(x >= 1.0 && x <= n as f64 && x.fract() == 0.0) {
-            return Err(error::permute_order());
+            return Err(error::dimension_order(name));
         }
         let k = x as usize - 1;
         if seen[k] {
-            return Err(error::permute_order());
+            return Err(error::dimension_order(name));
         }
         seen[k] = true;
         order.push(k);
@@ -948,32 +982,182 @@ fn cat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     one_as(crate::interp::concat(d, mats)?)
 }
 
-fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
-    at_most(a, 1, "fliplr")?;
-    let m = mat(a, 0, "fliplr")?;
-    let mut out = m.clone();
-    // An empty matrix is its own flip (cycle 13b).
-    let cols = if m.data.is_empty() { 0 } else { m.cols };
-    for c in 0..cols {
-        for r in 0..m.rows {
-            out.set(r, m.cols - 1 - c, m.get(r, c));
-        }
-    }
-    one_as(out)
+/// `horzcat(A1, ..., An)` (cycle 14c), which is `cat(2, A1, ..., An)`: the
+/// MathWorks page's rules, an empty array beside a nonempty one omitted and
+/// the empty the sizes give when every input is empty, are `cat`'s, so it
+/// runs `cat`'s kernel, `interp::concat`, and not the brackets' 2-D rule:
+/// `horzcat(zeros(1, 0), zeros(1, 0))` is 1x0 where `[zeros(1, 0),
+/// zeros(1, 0)]` is 0x0. With no argument it is `[]`; every argument must
+/// be an array, as `cat`'s must.
+fn horzcat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    joined(a, 2, "horzcat")
 }
 
+/// `vertcat(A1, ..., An)` (cycle 14c), which is `cat(1, A1, ..., An)`; see
+/// [`horzcat`].
+fn vertcat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    joined(a, 1, "vertcat")
+}
+
+/// Every argument joined along `d` through `cat`'s kernel.
+fn joined(a: &[Value], d: usize, name: &str) -> R<Vec<Value>> {
+    let mats = (0..a.len())
+        .map(|i| mat(a, i, name))
+        .collect::<R<Vec<Matrix>>>()?;
+    one_as(crate::interp::concat(d, mats)?)
+}
+
+/// `m` with the order of its elements reversed along dimension `d`,
+/// one-based, the class and storage kept (cycle 14c): each of the `before *
+/// after` slices of the three-number view `[before, n, after]`
+/// ([`crate::value::along_dim`]) reversed on its own, so a matrix along 2
+/// has its columns reversed and along 1 its rows, and an N-D array each
+/// page alike. Along a dimension of size 1, one past `ndims` included, and
+/// for an empty array nothing moves, and nothing is walked.
+fn flipped(mut m: Matrix, d: usize) -> Matrix {
+    let (before, n, _) = crate::value::along_dim(&m.dims(), d);
+    if n < 2 || m.data.is_empty() {
+        return m;
+    }
+    let reverse = |v: &mut [f64]| {
+        // Each block of `before * n` elements holds `before` slices, element
+        // `k` of slice `b` at `b + before * k`; swapping the `k`-th and the
+        // `(n - 1 - k)`-th runs of `before` reverses every slice at once.
+        for block in v.chunks_exact_mut(before * n) {
+            for k in 0..n / 2 {
+                let (lo, hi) = block.split_at_mut((n - 1 - k) * before);
+                lo[k * before..(k + 1) * before].swap_with_slice(&mut hi[..before]);
+            }
+        }
+    };
+    reverse(&mut m.data);
+    if let Some(im) = m.im.as_mut() {
+        reverse(im);
+    }
+    m
+}
+
+/// `fliplr(A)`: the order along dimension 2 reversed. Since cycle 14c an
+/// N-D array too, by the MathWorks page, "`fliplr` operates on the planes
+/// formed by the first and second dimensions", each page flipped on its
+/// own. The class is kept; an empty array is its own flip (cycle 13b).
+fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    at_most(a, 1, "fliplr")?;
+    one_as(flipped(mat(a, 0, "fliplr")?, 2))
+}
+
+/// `flipud(A)`: the order along dimension 1 reversed, each page on its own
+/// since cycle 14c ("The operation flips the elements on each page
+/// independently").
 fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "flipud")?;
-    let m = mat(a, 0, "flipud")?;
-    let mut out = m.clone();
-    // An empty matrix is its own flip (cycle 13b).
-    let cols = if m.data.is_empty() { 0 } else { m.cols };
-    for c in 0..cols {
-        for r in 0..m.rows {
-            out.set(m.rows - 1 - r, c, m.get(r, c));
+    one_as(flipped(mat(a, 0, "flipud")?, 1))
+}
+
+/// `flip(A)` and `flip(A, dim)` (cycle 14c), by the MathWorks page: "the
+/// order of the elements reversed" along the first dimension whose size is
+/// not 1 ([`default_dim`]), so a vector along its length and a matrix in
+/// each column, or along `dim`, a positive integer read as the reductions
+/// read one. Along a dimension past `ndims(A)` it is `A`. The class is
+/// kept; a complex argument is refused by the registry's gate, as for
+/// `fliplr`, and a cell or a struct as by every numeric builtin.
+fn flip(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 1, "flip")?;
+    at_most(a, 2, "flip")?;
+    let m = mat(a, 0, "flip")?;
+    let d = if a.len() >= 2 {
+        dim(a, 1, "flip")?
+    } else {
+        default_dim(&m.dims())
+    };
+    one_as(flipped(m, d))
+}
+
+/// `circshift(A, K)` and `circshift(A, K, dim)` (cycle 14c), by the
+/// MathWorks page: "Positive `K` shifts toward the end of the dimension and
+/// negative `K` shifts toward the beginning", wrapping around. An integer
+/// `K` shifts along the first dimension whose size is not 1, and element
+/// `i` of a vector `K` shifts dimension `i`, one past `ndims(A)` being of
+/// size 1, where nothing moves; with `dim`, `K` is one integer shifting
+/// along `dim`. `K` is judged first, a nonempty real row or column of
+/// integers, then `dim`, read as the reductions read one, and then `K`'s
+/// count beside it.
+///
+/// A shift is taken modulo its dimension's size, exactly in `f64`
+/// (`rem_euclid` of two integers), so any integer a double holds costs one
+/// pass over the array per dimension that moves, and a dimension of size 0
+/// moves nothing; an empty array is returned as it is, never walked. The
+/// class is kept; a complex argument is refused by the registry's gate and
+/// a cell or a struct as by every numeric builtin.
+fn circshift(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 2, "circshift")?;
+    at_most(a, 3, "circshift")?;
+    let mut m = mat(a, 0, "circshift")?;
+    let k = shift_amounts(&a[1])?;
+    let along = if a.len() >= 3 {
+        let d = dim(a, 2, "circshift")?;
+        if k.len() != 1 {
+            return Err(error::circshift_shift_with_dim());
+        }
+        Some(d)
+    } else {
+        None
+    };
+    if m.data.is_empty() {
+        return one_as(m);
+    }
+    let dims = m.dims();
+    // Each moving dimension, one-based, with its shift in `0..size`. A
+    // shift past `ndims` shifts a dimension of size 1, which moves nothing,
+    // so it is passed over without a list of sizes reaching it.
+    let shifts: Vec<(usize, usize)> = match along {
+        Some(d) => vec![(d, k[0])],
+        None if k.len() == 1 => vec![(default_dim(&dims), k[0])],
+        None => k.iter().enumerate().map(|(i, &s)| (i + 1, s)).collect(),
+    }
+    .into_iter()
+    .filter_map(|(d, s)| {
+        let n = *dims.get(d - 1)?;
+        if n < 2 {
+            return None;
+        }
+        let s = s.rem_euclid(n as f64) as usize;
+        (s != 0).then_some((d, s))
+    })
+    .collect();
+    for (d, s) in shifts {
+        let (before, n, _) = crate::value::along_dim(&dims, d);
+        // Each block of `before * n` elements holds `before` slices along
+        // `d`; rotating the block right by `s * before` moves every slice's
+        // element `k` to `(k + s) mod n`.
+        for block in m.data.chunks_exact_mut(before * n) {
+            block.rotate_right(s * before);
+        }
+        if let Some(im) = m.im.as_mut() {
+            for block in im.chunks_exact_mut(before * n) {
+                block.rotate_right(s * before);
+            }
         }
     }
-    one_as(out)
+    one_as(m)
+}
+
+/// The shifts of `circshift`'s `K`: a nonempty real row or column of
+/// integers, each still an `f64` so a shift past `usize` is taken modulo
+/// its dimension's size exactly. A char, a cell, a matrix, an N-D array, a
+/// `NaN`, an infinity and a fraction are all the one refusal.
+fn shift_amounts(v: &Value) -> R<Vec<f64>> {
+    let Value::Mat(k) = v else {
+        return Err(error::circshift_shift());
+    };
+    let vector = !k.is_nd() && (k.rows == 1 || k.cols == 1);
+    if k.class == Class::Char || k.data.is_empty() || !vector {
+        return Err(error::circshift_shift());
+    }
+    if k.data.iter().any(|x| !x.is_finite() || x.fract() != 0.0) {
+        return Err(error::circshift_shift());
+    }
+    Ok(k.data.clone())
 }
 
 // ---- search and sort -------------------------------------------------
@@ -990,6 +1174,15 @@ fn flipud(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 /// same elements instead of their linear indices, and asked for three, their
 /// values as well, in the argument's class. All of them take the shape the
 /// one output would have had.
+///
+/// Since cycle 14c an N-D `X` too, by the MathWorks page: `find` "returns a
+/// column vector of the linear indices", 0x1 when no element is nonzero,
+/// and with two outputs "`col` is a linear index over the `N-1` trailing
+/// dimensions of `X`", so `X(row(i), col(i))` is the `i`th nonzero element,
+/// which column-major storage gives as the linear index divided by the
+/// rows. By the page's convention "`k` is an empty matrix `[]` when `X` is
+/// ... a scalar zero", `find(0)` and `find(false)` are 0x0 for every
+/// output, where they were 1x0.
 fn find(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 3, "find")?;
     let m = mat(a, 0, "find")?;
@@ -1019,9 +1212,13 @@ fn find(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
             idx.truncate(n);
         }
     }
+    // A 2-D 0x0, and a scalar zero by the page's convention, give `[]`.
+    let blank = (m.rows == 0 && m.cols == 0 && !m.is_nd()) || (m.is_scalar() && idx.is_empty());
     let shape = |data: Vec<f64>| {
-        if m.rows == 0 && m.cols == 0 {
+        if blank {
             Matrix::empty()
+        } else if m.is_nd() {
+            Matrix::col(data)
         } else if m.rows == 1 {
             Matrix::row(data)
         } else {
@@ -1073,6 +1270,14 @@ fn sort_cmp(a: &f64, b: &f64) -> Ordering {
 /// `s(:, j) = A(i(:, j), j)`. The sort is of the positions, keyed by value,
 /// so the order the values take and the order the indices record are one
 /// and the same. Along a dimension past the second every index is `1`.
+///
+/// Since cycle 14c any array, by the MathWorks page: along the first
+/// dimension whose size is not 1 ([`default_dim`]), or along `dim`, each
+/// slice of the three-number view `[before, n, after]`
+/// ([`crate::value::along_dim`]) sorted on its own, a matrix along 1 or 2
+/// being its columns or its rows as before; "`sort` returns `A` if `dim` is
+/// greater than `ndims(A)`", with every index `1`. A dimension of size 1
+/// and an empty array are never walked.
 fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
     at_most(a, 3, "sort")?;
     let m = mat(a, 0, "sort")?;
@@ -1090,43 +1295,188 @@ fn sort(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
         Some(Some(s)) if s.eq_ignore_ascii_case("descend") => true,
         Some(_) => return Err(error::sort_direction()),
     };
-    let along = d.unwrap_or(if m.rows == 1 { 2 } else { 1 });
-    let (rows, cols) = (m.rows, m.cols);
-    // Each slice as its linear positions: a column is `rows` consecutive
-    // elements, a row is every `rows`-th.
-    let slices: Vec<Vec<usize>> = match along {
-        // An empty matrix has no slices worth sorting, however long its
-        // other dimension (cycle 13b).
-        _ if rows * cols == 0 => Vec::new(),
-        1 => (0..cols)
-            .map(|c| (c * rows..(c + 1) * rows).collect())
-            .collect(),
-        2 => (0..rows)
-            .map(|r| (0..cols).map(|c| c * rows + r).collect())
-            .collect(),
-        _ => Vec::new(),
-    };
+    let dims = m.dims();
+    let along = d.unwrap_or_else(|| default_dim(&dims));
+    // Each slice is the `n` elements `b + before * (k + n * a)`: a column of
+    // a matrix is `rows` consecutive elements (`before` 1), a row every
+    // `rows`-th (`after` 1). Past `ndims`, and along a dimension of size 1,
+    // `n` is 1 and nothing moves; an empty array has no slices worth
+    // sorting, however long its other dimensions (cycle 13b).
+    let (before, n, after) = crate::value::along_dim(&dims, along);
     let mut out = m;
     let mut index = vec![1.0; out.numel()];
-    let data = out.data.clone();
-    for pos in &slices {
-        let mut perm: Vec<usize> = (0..pos.len()).collect();
-        if descend {
-            perm.sort_by(|&x, &y| sort_cmp(&data[pos[y]], &data[pos[x]]));
-        } else {
-            perm.sort_by(|&x, &y| sort_cmp(&data[pos[x]], &data[pos[y]]));
-        }
-        for (k, &p) in perm.iter().enumerate() {
-            out.data[pos[k]] = data[pos[p]];
-            index[pos[k]] = (p + 1) as f64;
+    if n > 1 && !out.data.is_empty() {
+        let data = out.data.clone();
+        let mut pos = Vec::with_capacity(n);
+        for a in 0..after {
+            for b in 0..before {
+                pos.clear();
+                pos.extend((0..n).map(|k| b + before * (k + n * a)));
+                let mut perm: Vec<usize> = (0..n).collect();
+                if descend {
+                    perm.sort_by(|&x, &y| sort_cmp(&data[pos[y]], &data[pos[x]]));
+                } else {
+                    perm.sort_by(|&x, &y| sort_cmp(&data[pos[x]], &data[pos[y]]));
+                }
+                for (k, &p) in perm.iter().enumerate() {
+                    out.data[pos[k]] = data[pos[p]];
+                    index[pos[k]] = (p + 1) as f64;
+                }
+            }
         }
     }
-    let index = Matrix::new(rows, cols, index);
+    let index = Matrix::from_dims(&dims, index);
     // A sorted char is a char: `sort('cab')` is `'abc'`.
     if nargout < 2 {
         return one_as(out);
     }
     Ok(vec![Value::Mat(out), Value::Mat(index)])
+}
+
+// ---- index conversion (cycle 14c) ------------------------------------
+
+/// The size argument of `sub2ind` and `ind2sub`, named by `name`: a
+/// nonempty real row or column of positive integers, each kept as the
+/// `f64` it was given, so a size past `usize` is never saturated. A char, a
+/// cell, a matrix, an N-D array, a zero, a fraction, a `NaN` and an
+/// infinity are the one refusal.
+fn index_sizes(v: &Value, name: &str) -> R<Vec<f64>> {
+    let Value::Mat(sz) = v else {
+        return Err(error::index_size_vector(name));
+    };
+    let vector = !sz.is_nd() && (sz.rows == 1 || sz.cols == 1);
+    let positive = |x: f64| x >= 1.0 && x.is_finite() && x.fract() == 0.0;
+    if sz.class == Class::Char
+        || sz.data.is_empty()
+        || !vector
+        || !sz.data.iter().all(|&x| positive(x))
+    {
+        return Err(error::index_size_vector(name));
+    }
+    Ok(sz.data.clone())
+}
+
+/// `sub2ind(sz, I1, ..., In)` (cycle 14c), by the MathWorks page's
+/// relation to indexing, "`A(ind(k)) = A(I1(k),…,In(k))`": the linear index
+/// of each position in an array of size `sz`, as a double the size of the
+/// subscripts that are not scalars (1x1 when all are), which must agree.
+/// Subscript `p` runs over size `p`, a size past the end of `sz` being 1,
+/// and the last over the product of the sizes from its own on, as an index
+/// with fewer subscripts than dimensions folds them; a subscript that is
+/// not a positive integer within its size is refused.
+///
+/// The sizes and strides are `f64`, so a size past `usize` never
+/// saturates, and each scalar subscript is judged and weighed once, not
+/// once per position: the time is linear in the arguments.
+fn sub2ind(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 2, "sub2ind")?;
+    let sz = index_sizes(&a[0], "sub2ind")?;
+    let subs = (1..a.len())
+        .map(|i| mat(a, i, "sub2ind"))
+        .collect::<R<Vec<Matrix>>>()?;
+    let mut shape: Option<Vec<usize>> = None;
+    for s in subs.iter().filter(|s| !s.is_scalar()) {
+        let d = s.dims();
+        match &shape {
+            None => shape = Some(d),
+            Some(first) if *first != d => return Err(error::sub2ind_subscript_sizes()),
+            Some(_) => {}
+        }
+    }
+    let shape = shape.unwrap_or_else(|| vec![1, 1]);
+    let n = subs.len();
+    // The size subscript `p` runs over, the last the fold of the rest.
+    let size = |p: usize| -> f64 {
+        if p + 1 < n {
+            sz.get(p).copied().unwrap_or(1.0)
+        } else {
+            sz.get(p..).map_or(1.0, |rest| rest.iter().product())
+        }
+    };
+    let sizes: Vec<f64> = (0..n).map(size).collect();
+    let mut strides = Vec::with_capacity(n);
+    let mut acc = 1.0;
+    for &d in &sizes {
+        strides.push(acc);
+        acc *= d;
+    }
+    let within = |x: f64, p: usize| x >= 1.0 && x <= sizes[p] && x.fract() == 0.0;
+    // A subscript of 1 adds nothing, and is never weighed: a stride past
+    // what a double holds is `Inf`, and `0 * Inf` would make the index
+    // `NaN`, so `sub2ind([1e300 1e300 2], 1, 1, 1)` is 1.
+    let offset = |x: f64, p: usize| if x > 1.0 { (x - 1.0) * strides[p] } else { 0.0 };
+    let mut base = 1.0;
+    for (p, s) in subs.iter().enumerate().filter(|(_, s)| s.is_scalar()) {
+        let x = s.data[0];
+        if !within(x, p) {
+            return Err(error::sub2ind_out_of_range());
+        }
+        base += offset(x, p);
+    }
+    let mut out = vec![base; crate::value::dims_product(&shape)];
+    for (p, s) in subs.iter().enumerate().filter(|(_, s)| !s.is_scalar()) {
+        for (o, &x) in out.iter_mut().zip(&s.data) {
+            if !within(x, p) {
+                return Err(error::sub2ind_out_of_range());
+            }
+            *o += offset(x, p);
+        }
+    }
+    one_mat(Matrix::from_dims(&shape, out))
+}
+
+/// `[I1, ..., Ik] = ind2sub(sz, ind)` (cycle 14c), by the MathWorks page:
+/// `k` doubles each the size of `ind`, `k` the outputs asked for and 1 when
+/// none is, reading `sz` as `k` dimensions, with 1s appended up to `k` or
+/// the sizes from the `k`th on folded into one. The last of the `k`
+/// dimensions has no bound, as the page's example shows (`[row, col] =
+/// ind2sub([3 1], [9 11 13 14])` gives `col` as `3 4 5 5`), so the folded
+/// size is never needed and any positive integer converts: one output is
+/// `ind` itself. An index that is not a positive integer is refused.
+///
+/// Each subscript is the remainder of the index left so far by its size,
+/// and what is left the quotient, exactly in `f64` for any index below
+/// 2^53; the time is that of the outputs, `k` times `numel(ind)`.
+///
+/// A program can ask for as many outputs as the targets it writes, or
+/// builds and evaluates, so the `k` outputs are judged together before any
+/// is written, as one result: their elements, `numel(ind)` by `k`, and
+/// their lists of sizes, `ndims(ind)` by `k`, each held to what one array
+/// may hold. A hundred thousand outputs of a hundred thousand indices are
+/// refused at once, `Requested 100000x100000 array exceeds the maximum
+/// array size.`, rather than written.
+fn ind2sub(_: &mut Interp, a: &[Value], nargout: usize) -> R<Vec<Value>> {
+    need(a, 2, "ind2sub")?;
+    at_most(a, 2, "ind2sub")?;
+    let sz = index_sizes(&a[0], "ind2sub")?;
+    let ind = mat(a, 1, "ind2sub")?;
+    let positive = |x: f64| x >= 1.0 && x.is_finite() && x.fract() == 0.0;
+    if !ind.data.iter().all(|&x| positive(x)) {
+        return Err(error::ind2sub_index());
+    }
+    let dims = ind.dims();
+    let k = nargout.max(1);
+    check_shape(ind.numel() as f64, k as f64)?;
+    check_shape(dims.len() as f64, k as f64)?;
+    // Zero-based, what is left of each index once the subscripts before
+    // have been taken out.
+    let mut left: Vec<f64> = ind.data.iter().map(|&x| x - 1.0).collect();
+    let mut outs = Vec::with_capacity(k);
+    for p in 0..k - 1 {
+        let d = sz.get(p).copied().unwrap_or(1.0);
+        let sub: Vec<f64> = left
+            .iter_mut()
+            .map(|r| {
+                let m = *r % d;
+                *r = (*r - m) / d;
+                m + 1.0
+            })
+            .collect();
+        outs.push(Value::Mat(Matrix::from_dims(&dims, sub)));
+    }
+    let last = left.into_iter().map(|r| r + 1.0).collect();
+    outs.push(Value::Mat(Matrix::from_dims(&dims, last)));
+    Ok(outs)
 }
 
 #[cfg(test)]
@@ -2396,5 +2746,693 @@ mod tests {
         buf.borrow_mut().clear();
         inv(&mut it, &[mat(2, 2, &[2.0, 1.0, 1.0, 3.0])], 1).unwrap();
         assert!(buf.borrow().is_empty());
+    }
+
+    // ---- cycle 14c: the slice functions, the new rearrangements and the
+    // index conversions ------------------------------------------------
+
+    /// A builtin of any file, from the registry.
+    fn builtin(name: &str) -> crate::builtins::BuiltinFn {
+        crate::builtins::registry()[name].f
+    }
+
+    /// Every output of the builtin `name`, asked for `nargout`.
+    fn run(name: &str, args: &[Value], nargout: usize) -> Vec<Matrix> {
+        outputs(builtin(name), args, nargout)
+    }
+
+    /// The zero-based order that brings dimension `d` (one-based) of an
+    /// array of `nd` dimensions to the front, the others after it in turn.
+    fn to_front(nd: usize, d: usize) -> Vec<usize> {
+        let mut o = vec![d - 1];
+        o.extend((0..nd).filter(|&j| j != d - 1));
+        o
+    }
+
+    /// Each slice function along `d`, one-based, with its arguments laid
+    /// out as the builtin takes them and its outputs: `sort` and `mode`
+    /// give two.
+    fn along(name: &str, a: &Matrix, d: usize) -> Vec<Matrix> {
+        let (x, dn) = (Value::Mat(a.clone()), num(d as f64));
+        match name {
+            "sort" | "mode" => run(name, &[x, dn], 2),
+            "flip" | "median" => run(name, &[x, dn], 1),
+            "circshift" | "diff" => run(name, &[x, num(1.0), dn], 1),
+            "std" => run(name, &[x, num(0.0), dn], 1),
+            "var" => run(name, &[x, num(1.0), dn], 1),
+            _ => unreachable!("{name}"),
+        }
+    }
+
+    const SLICE_FUNCTIONS: [&str; 8] = [
+        "sort",
+        "mode",
+        "flip",
+        "median",
+        "circshift",
+        "diff",
+        "std",
+        "var",
+    ];
+
+    /// Cycle 14c, acceptance test 16: every slice function works along one
+    /// dimension through the three-number view `[before, n, after]`. A
+    /// matrix along 1 or 2 reads its columns or its rows in the order they
+    /// were always read, so each answer is the function of that column or
+    /// row alone; an N-D array along any dimension gives what the same
+    /// function gives along the columns of the array with that dimension
+    /// brought to the front, which reads each slice contiguously.
+    #[test]
+    fn slices_along_any_dimension_read_a_matrix_as_today() {
+        use std::cell::RefCell;
+        // The slices `map_slices` hands out, in the order it hands them out.
+        let seen: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
+        let record = |s: &[f64]| {
+            seen.borrow_mut().push(s.to_vec());
+            s.to_vec()
+        };
+        let slices = crate::builtins::numerics::map_slices;
+        // [1 3 5; 2 4 6]: its columns, then its rows, each in order.
+        let m = Matrix::new(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(slices(&m, 1, 2, record).unwrap(), m);
+        assert_eq!(
+            seen.take(),
+            [vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]
+        );
+        assert_eq!(slices(&m, 2, 3, record).unwrap(), m);
+        assert_eq!(seen.take(), [vec![1.0, 3.0, 5.0], vec![2.0, 4.0, 6.0]]);
+        // Past `ndims` each element is a slice of one, in storage order.
+        assert_eq!(slices(&m, 3, 1, record).unwrap(), m);
+        assert_eq!(seen.take().concat(), m.data);
+        // An N-D array: slice `(b, a)` is the elements `b + before * (k +
+        // n * a)`, `a` the outer loop.
+        let a = nd24();
+        for d in 1..=4 {
+            let (before, n, after) = crate::value::along_dim(&a.dims(), d);
+            assert_eq!(slices(&a, d, n, record).unwrap(), a, "{d}");
+            let mut want: Vec<Vec<f64>> = Vec::new();
+            for x in 0..after {
+                for b in 0..before {
+                    want.push((0..n).map(|k| a.data[b + before * (k + n * x)]).collect());
+                }
+            }
+            assert_eq!(seen.take(), want, "{d}");
+        }
+        // Every slice function on a matrix: along 1 each column of the
+        // answer is the function of that column alone, along 2 each row of
+        // that row alone. Values repeat, so `mode` and a stable `sort` have
+        // ties to settle.
+        let data: Vec<f64> = (0..12).map(|k| ((k * 7) % 5) as f64 - 1.5).collect();
+        let m = Matrix::new(3, 4, data);
+        for name in SLICE_FUNCTIONS {
+            let by_cols = along(name, &m, 1);
+            let by_rows = along(name, &m, 2);
+            for c in 0..4 {
+                let col = Matrix::col((0..3).map(|r| m.get(r, c)).collect());
+                for (o, whole) in along(name, &col, 1).iter().zip(&by_cols) {
+                    let part: Vec<f64> = (0..whole.rows).map(|r| whole.get(r, c)).collect();
+                    assert_eq!(part, o.data, "{name} column {c}");
+                }
+            }
+            for r in 0..3 {
+                let row = Matrix::row((0..4).map(|c| m.get(r, c)).collect());
+                for (o, whole) in along(name, &row, 2).iter().zip(&by_rows) {
+                    let part: Vec<f64> = (0..whole.cols).map(|c| whole.get(r, c)).collect();
+                    assert_eq!(part, o.data, "{name} row {r}");
+                }
+            }
+        }
+        // Every slice function on an N-D array along each of its
+        // dimensions, against the columns of the array permuted to bring
+        // that dimension to the front and permuted back.
+        let data: Vec<f64> = (0..120).map(|k| ((k * 7) % 9) as f64).collect();
+        let x = Matrix::from_dims(&[2, 3, 4, 5], data);
+        for name in SLICE_FUNCTIONS {
+            for d in 1..=4 {
+                let order = to_front(4, d);
+                let front = permuted(&x, &order);
+                let want: Vec<Matrix> = along(name, &front, 1)
+                    .iter()
+                    .map(|r| permuted(r, &inverse_order(&order)))
+                    .collect();
+                assert_eq!(along(name, &x, d), want, "{name} along {d}");
+            }
+        }
+    }
+
+    /// Cycle 14c: `[row, col] = find(X)` of an N-D `X` gives `col` as the
+    /// linear index over every dimension past the first, so `X(row(i),
+    /// col(i))` is the `i`th nonzero element, and every output is a column.
+    #[test]
+    fn find_gives_the_trailing_dimensions_as_one_column_index() {
+        let a = nd24();
+        let big = Value::Mat(a.map(|v| if v > 14.0 { v } else { 0.0 }));
+        let out = outputs(find, std::slice::from_ref(&big), 3);
+        assert!(out.iter().all(|m| m.dims() == [10, 1]));
+        for i in 0..10 {
+            let (r, c, v) = (out[0].data[i], out[1].data[i], out[2].data[i]);
+            // Element (r, c) of the 2x12 fold is the element found.
+            let at = (r as usize - 1) + 2 * (c as usize - 1);
+            assert_eq!((a.data[at], v), (v, 15.0 + i as f64));
+        }
+        assert_eq!(out[1].data.last(), Some(&12.0));
+        // One output is the linear indices, a column even of a 1x3x2.
+        let k = call(find, &[nd(&[1, 3, 2])]).unwrap();
+        assert_eq!(
+            (k.dims(), k.data),
+            (vec![6, 1], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        );
+        let none = call(find, &[Value::Mat(Matrix::filled_dims(&[2, 2, 2], 0.0))]).unwrap();
+        assert_eq!(none.dims(), [0, 1]);
+        let none = call(find, &[Value::Mat(Matrix::from_dims(&[0, 0, 3], vec![]))]).unwrap();
+        assert_eq!(none.dims(), [0, 1]);
+        // The count and the direction as for a matrix.
+        let x = Value::Mat(a.clone());
+        assert_eq!(
+            call(find, &[x.clone(), num(2.0), text("last")])
+                .unwrap()
+                .data,
+            [23.0, 24.0]
+        );
+        assert_eq!(call(find, &[x, num(1.0)]).unwrap().dims(), [1, 1]);
+        // A scalar zero is `[]` for every output, by the page's convention;
+        // every other 2-D answer is as it was.
+        for zero in [num(0.0), Value::Mat(Matrix::from_bool(false)), num(-0.0)] {
+            for n in 1..=3 {
+                let out = outputs(find, std::slice::from_ref(&zero), n);
+                assert!(out.iter().all(|m| m.dims() == [0, 0]), "{n}");
+            }
+            let out = outputs(find, &[zero, num(1.0)], 1);
+            assert_eq!(out[0].dims(), [0, 0]);
+        }
+        assert_eq!(call(find, &[num(5.0)]).unwrap().dims(), [1, 1]);
+        assert_eq!(call(find, &[num(f64::NAN)]).unwrap().dims(), [1, 1]);
+        assert_eq!(call(find, &[row(&[0.0, 0.0, 0.0])]).unwrap().dims(), [1, 0]);
+        assert_eq!(call(find, &[col(&[0.0, 0.0])]).unwrap().dims(), [0, 1]);
+        assert_eq!(call(find, &[mat(2, 3, &[0.0; 6])]).unwrap().dims(), [0, 1]);
+        assert_eq!(
+            call(find, &[Value::Mat(Matrix::empty())]).unwrap().dims(),
+            [0, 0]
+        );
+    }
+
+    /// Cycle 14c: `flip` along the first dimension that is not 1 or along
+    /// `dim`, `fliplr` and `flipud` page by page, each keeping the class.
+    #[test]
+    fn flip_reverses_along_one_dimension() {
+        let a = nd24();
+        let x = Value::Mat(a.clone());
+        // A(i, j, k) of the result is A(i, j, 5 - k).
+        let f = call(flip, &[x.clone(), num(3.0)]).unwrap();
+        for i in 0..2 {
+            for j in 0..3 {
+                for k in 0..4 {
+                    let at = |k: usize| i + 2 * (j + 3 * k);
+                    assert_eq!(f.data[at(k)], a.data[at(3 - k)]);
+                }
+            }
+        }
+        assert_eq!(
+            call(flip, std::slice::from_ref(&x)).unwrap(),
+            call(flipud, std::slice::from_ref(&x)).unwrap()
+        );
+        assert_eq!(
+            call(flip, &[x.clone(), num(2.0)]).unwrap(),
+            call(fliplr, std::slice::from_ref(&x)).unwrap()
+        );
+        // Page 2 of fliplr(A) is [11 9 7; 12 10 8], page 4 of flipud(A) is
+        // [20 22 24; 19 21 23].
+        let lr = call(fliplr, std::slice::from_ref(&x)).unwrap();
+        assert_eq!(lr.page(1).data, [11.0, 12.0, 9.0, 10.0, 7.0, 8.0]);
+        let ud = call(flipud, std::slice::from_ref(&x)).unwrap();
+        assert_eq!(ud.page(3).data, [20.0, 19.0, 22.0, 21.0, 24.0, 23.0]);
+        // Past `ndims`, along a dimension of size 1 and of an empty array,
+        // nothing moves.
+        assert_eq!(call(flip, &[x.clone(), num(5.0)]).unwrap(), a);
+        assert_eq!(call(flip, &[x.clone(), num(1e300)]).unwrap(), a);
+        assert_eq!(
+            call(flip, &[row(&[1.0, 2.0]), num(1.0)]).unwrap().data,
+            [1.0, 2.0]
+        );
+        let e = Matrix::from_dims(&[0, 1 << 40, 3], Vec::new());
+        assert_eq!(call(flip, &[Value::Mat(e.clone()), num(2.0)]).unwrap(), e);
+        // Vectors along their length, a matrix down its columns, the class
+        // kept.
+        assert_eq!(
+            call(flip, &[row(&[1.0, 2.0, 3.0])]).unwrap().data,
+            [3.0, 2.0, 1.0]
+        );
+        assert_eq!(
+            call(flip, &[col(&[1.0, 2.0, 3.0])]).unwrap().data,
+            [3.0, 2.0, 1.0]
+        );
+        let m = call(flip, &[mat(2, 2, &[1.0, 2.0, 3.0, 4.0])]).unwrap();
+        assert_eq!(m.data, [3.0, 1.0, 4.0, 2.0]);
+        let c = call(flip, &[text("abc")]).unwrap();
+        assert_eq!((c.class, c.data), (Class::Char, vec![99.0, 98.0, 97.0]));
+        let t =
+            Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![1.0, 0.0]).with_class(Class::Logical));
+        let t = call(flip, &[t]).unwrap();
+        assert_eq!((t.class, t.data), (Class::Logical, vec![0.0, 1.0]));
+        // The refusals: a cell as every numeric builtin, a bad dimension.
+        let cell = Value::cell(crate::value::CellArray::new(1, 1, vec![num(1.0)]));
+        assert!(call(flip, &[cell]).is_err());
+        assert!(call(flip, &[x.clone(), num(0.0)]).is_err());
+        assert!(call(flip, &[x, num(1.0), num(1.0)]).is_err());
+    }
+
+    /// Cycle 14c: `circshift` takes each shift modulo its dimension's
+    /// size, one pass whatever the shift, a vector shift moving each
+    /// dimension, one past `ndims` moving nothing.
+    #[test]
+    fn circshift_wraps_modulo_the_size() {
+        let v = row(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        let shift = |k: Value| call(circshift, &[v.clone(), k]).unwrap().data;
+        assert_eq!(shift(num(2.0)), [4.0, 5.0, 1.0, 2.0, 3.0]);
+        assert_eq!(shift(num(-1.0)), [2.0, 3.0, 4.0, 5.0, 1.0]);
+        assert_eq!(shift(num(7.0)), [4.0, 5.0, 1.0, 2.0, 3.0]);
+        assert_eq!(shift(num(-7.0)), [3.0, 4.0, 5.0, 1.0, 2.0]);
+        // A huge shift, exactly modulo the size: 2^60 is 1 more than a
+        // multiple of 5, and 1e15 a multiple of 5.
+        let t = std::time::Instant::now();
+        assert_eq!(shift(num(2f64.powi(60))), [5.0, 1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(shift(num(-(2f64.powi(60)))), [2.0, 3.0, 4.0, 5.0, 1.0]);
+        assert_eq!(shift(num(1e15)), [1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(shift(num(1e300)).len(), 5);
+        assert!(t.elapsed().as_secs() < 5);
+        // A matrix: down the columns by default, along `dim`, or a vector.
+        let m = mat(2, 2, &[1.0, 2.0, 3.0, 4.0]);
+        let c = |args: &[Value]| call(circshift, args).unwrap().data;
+        assert_eq!(c(&[m.clone(), num(1.0)]), [3.0, 1.0, 4.0, 2.0]);
+        assert_eq!(c(&[m.clone(), num(1.0), num(2.0)]), [2.0, 4.0, 1.0, 3.0]);
+        assert_eq!(c(&[m.clone(), row(&[1.0, 1.0])]), [4.0, 2.0, 3.0, 1.0]);
+        assert_eq!(c(&[m.clone(), col(&[1.0, 1.0])]), [4.0, 2.0, 3.0, 1.0]);
+        // An N-D array: element (i, j, k) moves to (i, j, k + 1 mod 4); a
+        // whole turn, a shift of a dimension past `ndims` and `dim` past it
+        // move nothing.
+        let a = nd24();
+        let x = Value::Mat(a.clone());
+        let s = call(circshift, &[x.clone(), num(1.0), num(3.0)]).unwrap();
+        for p in 0..24 {
+            let (ij, k) = (p % 6, p / 6);
+            assert_eq!(s.data[ij + 6 * ((k + 1) % 4)], a.data[p]);
+        }
+        assert_eq!(
+            call(circshift, &[x.clone(), row(&[0.0, 0.0, 4.0])]).unwrap(),
+            a
+        );
+        assert_eq!(
+            call(circshift, &[x.clone(), row(&[1.0, 0.0, 0.0, 5.0])]).unwrap(),
+            call(circshift, &[x.clone(), num(1.0)]).unwrap()
+        );
+        assert_eq!(
+            call(circshift, &[x.clone(), num(3.0), num(9.0)]).unwrap(),
+            a
+        );
+        // Shifts of 0 along both dimensions, and of 2 to 999 past them.
+        let many: Vec<f64> = (0..1000)
+            .map(|k| if k < 2 { 0.0 } else { f64::from(k) })
+            .collect();
+        assert_eq!(
+            call(circshift, &[row(&[1.0, 2.0]), row(&many)])
+                .unwrap()
+                .data,
+            [1.0, 2.0]
+        );
+        // An empty array is returned as it is, whatever the shift.
+        let e = Matrix::from_dims(&[0, 1 << 40, 3], Vec::new());
+        assert_eq!(
+            call(circshift, &[Value::Mat(e.clone()), row(&[1.0, 5.0, 7.0])]).unwrap(),
+            e
+        );
+        // The class is kept.
+        let t = call(circshift, &[text("abc"), num(1.0)]).unwrap();
+        assert_eq!((t.class, t.data), (Class::Char, vec![99.0, 97.0, 98.0]));
+        // The shift's refusals, and the dimension's.
+        let shape = "circshift's shift must be an integer or a vector of integers.";
+        for bad in [
+            num(1.5),
+            num(f64::NAN),
+            num(f64::INFINITY),
+            Value::Mat(Matrix::empty()),
+            mat(2, 2, &[1.0; 4]),
+            Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![1.0, 1.0])),
+            text("a"),
+            Value::cell(crate::value::CellArray::new(1, 1, vec![num(1.0)])),
+        ] {
+            assert_eq!(
+                call(circshift, &[v.clone(), bad.clone()]).unwrap_err().msg,
+                shape,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            call(circshift, &[v.clone(), row(&[1.0, 1.0]), num(2.0)])
+                .unwrap_err()
+                .msg,
+            "circshift's shift must be one integer when a dimension is given."
+        );
+        assert_eq!(
+            call(circshift, &[v.clone(), num(1.5), num(2.0)])
+                .unwrap_err()
+                .msg,
+            shape
+        );
+        assert!(
+            call(circshift, &[v.clone(), num(1.0), num(0.0)])
+                .unwrap_err()
+                .msg
+                .contains("Dimension")
+        );
+        assert!(call(circshift, std::slice::from_ref(&v)).is_err());
+    }
+
+    /// Cycle 14c: `ipermute(permute(A, o), o)` is `A`, and so is
+    /// `permute(ipermute(A, o), o)`, over every order of four dimensions;
+    /// the order is judged as `permute` judges it, in `ipermute`'s name.
+    #[test]
+    fn ipermute_inverts_permute() {
+        let x = Matrix::from_dims(&[2, 3, 4, 5], (0..120).map(f64::from).collect());
+        let mut orders = Vec::new();
+        for a in 0..4 {
+            for b in (0..4).filter(|&b| b != a) {
+                for c in (0..4).filter(|&c| c != a && c != b) {
+                    let d = 6 - a - b - c;
+                    orders.push([a, b, c, d]);
+                }
+            }
+        }
+        assert_eq!(orders.len(), 24);
+        for o in orders {
+            let one: Vec<f64> = o.iter().map(|&j| (j + 1) as f64).collect();
+            let p = call(permute, &[Value::Mat(x.clone()), row(&one)]).unwrap();
+            let back = call(ipermute, &[Value::Mat(p), row(&one)]).unwrap();
+            assert_eq!(back, x, "{o:?}");
+            let i = call(ipermute, &[Value::Mat(x.clone()), row(&one)]).unwrap();
+            let again = call(permute, &[Value::Mat(i.clone()), row(&one)]).unwrap();
+            assert_eq!(again, x, "{o:?}");
+            // Dimension `o(i)` of the result is dimension `i` of the argument.
+            for (k, &j) in o.iter().enumerate() {
+                assert_eq!(i.dims()[j], x.dims()[k], "{o:?}");
+            }
+        }
+        // A dimension past `ndims` is of size 1; class and complex storage
+        // are kept.
+        let s = call(
+            ipermute,
+            &[
+                Value::Mat(Matrix::filled_dims(&[4, 2, 3], 1.0)),
+                row(&[3.0, 1.0, 2.0]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(s.dims(), [2, 3, 4]);
+        let z = Matrix::complex_parts(2, 3, vec![1.0; 6], vec![0.0; 6]);
+        let t = call(ipermute, &[Value::Mat(z.clone()), row(&[2.0, 1.0])]).unwrap();
+        assert_eq!((t.dims(), t.im.is_some()), (vec![3, 2], true));
+        let c = call(ipermute, &[text("ab"), row(&[2.0, 1.0])]).unwrap();
+        assert_eq!(c.class, Class::Char);
+        // Every order `permute` refuses, refused in `ipermute`'s name.
+        let msg =
+            "ipermute's dimension order must hold each of 1 to n once, with n at least ndims(A).";
+        let a = Value::Mat(nd24());
+        for bad in [
+            row(&[1.0, 2.0]),
+            row(&[1.0, 1.0, 2.0]),
+            row(&[1.0, 2.0, 4.0]),
+            col(&[1.0, 2.0, 3.0]),
+            text("abc"),
+        ] {
+            assert_eq!(
+                call(ipermute, &[a.clone(), bad.clone()]).unwrap_err().msg,
+                msg,
+                "{bad:?}"
+            );
+        }
+        // And `permute`'s own text is as it was.
+        assert_eq!(
+            call(permute, &[a, row(&[1.0, 2.0])]).unwrap_err().msg,
+            "permute's dimension order must hold each of 1 to n once, with n at least ndims(A)."
+        );
+    }
+
+    /// Cycle 14c: `horzcat(...)` is `cat(2, ...)` and `vertcat(...)` is
+    /// `cat(1, ...)`, answer for answer and refusal for refusal, where a
+    /// bracket of 2-D operands keeps its own rule for empties.
+    #[test]
+    fn horzcat_and_vertcat_are_cat() {
+        let e10 = Value::Mat(Matrix::new(1, 0, Vec::new()));
+        let e01 = Value::Mat(Matrix::new(0, 1, Vec::new()));
+        let blank = Value::Mat(Matrix::empty());
+        let z = Value::Mat(Matrix::complex_parts(1, 1, vec![1.0], vec![2.0]));
+        let cases: Vec<Vec<Value>> = vec![
+            vec![],
+            vec![num(1.0)],
+            vec![row(&[1.0, 2.0]), num(3.0)],
+            vec![row(&[1.0, 2.0]), row(&[3.0, 4.0])],
+            vec![col(&[1.0, 2.0]), col(&[3.0, 4.0])],
+            vec![Value::Mat(nd24()), Value::Mat(nd24())],
+            vec![e10.clone(), e10.clone()],
+            vec![e01.clone(), e01.clone()],
+            vec![e10.clone(), e01.clone()],
+            vec![col(&[1.0, 2.0]), blank.clone()],
+            vec![blank.clone(), blank.clone()],
+            vec![text("ab"), text("cd")],
+            vec![text("a"), num(66.0)],
+            vec![Value::Mat(Matrix::from_bool(true)), num(2.0)],
+            vec![num(5.0), z],
+            vec![row(&[1.0, 2.0]), row(&[1.0, 2.0, 3.0])],
+            vec![Value::Mat(nd24()), mat(2, 3, &[0.0; 6])],
+        ];
+        for args in &cases {
+            for (f, d) in [(horzcat as crate::builtins::BuiltinFn, 2.0), (vertcat, 1.0)] {
+                let mut with = vec![num(d)];
+                with.extend_from_slice(args);
+                let want = call(cat, &with).map_err(|e| e.msg);
+                assert_eq!(call(f, args).map_err(|e| e.msg), want, "{d} {args:?}");
+            }
+        }
+        // The spec's pins: cat's empty rule, where the bracket's gives 0x0.
+        assert_eq!(call(horzcat, &[e10.clone(), e10]).unwrap().dims(), [1, 0]);
+        assert_eq!(
+            call(vertcat, &[col(&[1.0, 2.0]), blank]).unwrap().dims(),
+            [2, 1]
+        );
+        assert_eq!(call(horzcat, &[]).unwrap(), Matrix::empty());
+        // A cell is refused as `cat` refuses one.
+        let cell = Value::cell(crate::value::CellArray::new(1, 1, vec![num(1.0)]));
+        assert_eq!(
+            call(horzcat, &[cell.clone(), cell]).unwrap_err().msg,
+            "This operation is not supported for a value of class 'cell'."
+        );
+    }
+
+    /// Cycle 14c: `sub2ind` against the index pipeline over every subscript
+    /// of a 2x3x4 array, with as many subscripts as dimensions, fewer (the
+    /// last folding the rest) and more (each past them 1).
+    #[test]
+    fn sub2ind_agrees_with_indexing() {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        it.run("A = reshape(1:24, 2, 3, 4);").unwrap();
+        let s2i = |args: &[Value]| call(sub2ind, args);
+        let sz = row(&[2.0, 3.0, 4.0]);
+        for i in 1..=2 {
+            for j in 1..=3 {
+                for k in 1..=4 {
+                    let ind =
+                        s2i(&[sz.clone(), num(i as f64), num(j as f64), num(k as f64)]).unwrap();
+                    let src = format!("assert(A({i}, {j}, {k}) == A({}));", ind.data[0]);
+                    assert!(it.run(&src).is_ok(), "{src}");
+                    let more = s2i(&[
+                        sz.clone(),
+                        num(i as f64),
+                        num(j as f64),
+                        num(k as f64),
+                        num(1.0),
+                    ])
+                    .unwrap();
+                    assert_eq!(more.data, ind.data);
+                    assert!(
+                        s2i(&[
+                            sz.clone(),
+                            num(i as f64),
+                            num(j as f64),
+                            num(k as f64),
+                            num(2.0)
+                        ])
+                        .is_err()
+                    );
+                }
+                // Two subscripts: the second over the 12 columns of the fold.
+                for jk in 1..=12 {
+                    let ind = s2i(&[sz.clone(), num(i as f64), num(jk as f64)]).unwrap();
+                    let src = format!("assert(A({i}, {jk}) == A({}));", ind.data[0]);
+                    assert!(it.run(&src).is_ok(), "{src}");
+                }
+            }
+        }
+        // One subscript is the index itself, within the whole size.
+        for n in 1..=24 {
+            assert_eq!(s2i(&[sz.clone(), num(n as f64)]).unwrap().data, [n as f64]);
+        }
+        // Past each dimension, the fold for the last, and not an integer.
+        let range = "sub2ind's subscripts must be positive integers within the size.";
+        for bad in [
+            vec![num(3.0), num(1.0), num(1.0)],
+            vec![num(1.0), num(4.0), num(1.0)],
+            vec![num(1.0), num(1.0), num(5.0)],
+            vec![num(1.0), num(13.0)],
+            vec![num(25.0)],
+            vec![num(0.0), num(1.0)],
+            vec![num(1.5), num(1.0)],
+            vec![num(f64::NAN), num(1.0)],
+        ] {
+            let mut args = vec![sz.clone()];
+            args.extend(bad);
+            assert_eq!(s2i(&args).unwrap_err().msg, range);
+        }
+        // Arrays and scalars mix; the result has the arrays' shape.
+        let got = s2i(&[row(&[3.0, 4.0]), col(&[1.0, 2.0]), num(3.0)]).unwrap();
+        assert_eq!((got.dims(), got.data), (vec![2, 1], vec![7.0, 8.0]));
+        let pages = Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![1.0, 2.0]));
+        let got = s2i(&[sz.clone(), num(2.0), num(1.0), pages]).unwrap();
+        assert_eq!((got.dims(), got.data), (vec![1, 1, 2], vec![2.0, 8.0]));
+        assert_eq!(
+            s2i(&[sz.clone(), row(&[1.0, 2.0]), row(&[1.0, 2.0, 3.0])])
+                .unwrap_err()
+                .msg,
+            "sub2ind's subscripts must have the same size, or be scalars."
+        );
+        // The size: a real row or column of positive integers.
+        let size = "sub2ind's size must be a vector of positive integers.";
+        for bad in [
+            row(&[2.0, 0.0]),
+            row(&[2.0, 1.5]),
+            row(&[2.0, f64::INFINITY]),
+            mat(2, 2, &[1.0; 4]),
+            Value::Mat(Matrix::empty()),
+            text("ab"),
+        ] {
+            assert_eq!(
+                s2i(&[bad.clone(), num(1.0)]).unwrap_err().msg,
+                size,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            s2i(&[col(&[2.0, 3.0]), num(2.0), num(3.0)]).unwrap().data,
+            [6.0]
+        );
+        // Linear in the arguments: a hundred thousand scalar subscripts of
+        // 1 and a subscript array of a million elements, each scalar judged
+        // once rather than once per element.
+        let t = std::time::Instant::now();
+        let mut args = vec![row(&[2.0])];
+        args.extend((0..100_000).map(|_| num(1.0)));
+        args.push(row(&vec![1.0; 1_000_000]));
+        assert_eq!(s2i(&args).unwrap().numel(), 1_000_000);
+        assert!(t.elapsed().as_secs() < 10, "{:?}", t.elapsed());
+        // A stride past what a double holds is `Inf`; a subscript of 1 adds
+        // nothing to the index rather than `0 * Inf`, a scalar or an array.
+        let wide = row(&[1e300, 1e300, 2.0]);
+        let ones = [num(1.0), num(1.0), num(1.0)];
+        let mut args = vec![wide.clone()];
+        args.extend(ones.iter().cloned());
+        assert_eq!(s2i(&args).unwrap().data, [1.0]);
+        let got = s2i(&[wide, row(&[1.0, 2.0]), num(1.0), row(&[1.0, 1.0])]).unwrap();
+        assert_eq!(got.data, [1.0, 2.0]);
+        let mut args = vec![row(&vec![2.0; 2000])];
+        args.extend((0..2000).map(|p| num(if p == 1 { 2.0 } else { 1.0 })));
+        assert_eq!(s2i(&args).unwrap().data, [3.0]);
+    }
+
+    /// Cycle 14c: `ind2sub` with one output to more than the dimensions,
+    /// each set of subscripts indexing the element the index does, the
+    /// sizes from the `k`th on folded and the last dimension unbounded.
+    #[test]
+    fn ind2sub_folds_and_leaves_the_last_dimension_unbounded() {
+        let mut it = Interp::with_output(Box::new(std::io::sink()));
+        it.run("A = reshape(1:24, 2, 3, 4);").unwrap();
+        let sz = row(&[2.0, 3.0, 4.0]);
+        let every = Value::Mat(Matrix::row((1..=24).map(f64::from).collect()));
+        for k in 1..=5 {
+            let subs = run("ind2sub", &[sz.clone(), every.clone()], k);
+            assert_eq!(subs.len(), k);
+            for n in 0..24 {
+                let at: Vec<String> = subs.iter().map(|s| s.data[n].to_string()).collect();
+                let src = format!("assert(A({}) == {});", at.join(", "), n + 1);
+                assert!(it.run(&src).is_ok(), "{src}");
+            }
+        }
+        // One output is the index itself; two read [2 3 4] as 2x12.
+        let one = run("ind2sub", &[sz.clone(), every.clone()], 1);
+        assert_eq!(one[0].data, (1..=24).map(f64::from).collect::<Vec<_>>());
+        let two = run("ind2sub", &[sz.clone(), num(24.0)], 2);
+        assert_eq!((two[0].data[0], two[1].data[0]), (2.0, 12.0));
+        // The last dimension has no bound: the page's [3 1] example, and an
+        // index past the size.
+        let rc = run(
+            "ind2sub",
+            &[row(&[3.0, 1.0]), row(&[9.0, 11.0, 13.0, 14.0])],
+            2,
+        );
+        assert_eq!(
+            (rc[0].data.clone(), rc[1].data.clone()),
+            (vec![3.0, 2.0, 1.0, 2.0], vec![3.0, 4.0, 5.0, 5.0])
+        );
+        let past = run("ind2sub", &[row(&[2.0, 3.0]), num(7.0)], 3);
+        assert_eq!(
+            past.iter().map(|m| m.data[0]).collect::<Vec<_>>(),
+            [1.0, 1.0, 2.0]
+        );
+        let huge = run("ind2sub", &[row(&[2.0, 3.0]), num(2f64.powi(52))], 2);
+        assert_eq!((huge[0].data[0], huge[1].data[0]), (2.0, 2f64.powi(51)));
+        // Each output has the index's shape, an N-D one included.
+        let pages = Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![5.0, 6.0]));
+        let got = run("ind2sub", &[row(&[2.0, 3.0]), pages], 2);
+        assert!(got.iter().all(|m| m.dims() == [1, 1, 2]));
+        // The refusals.
+        let index = "ind2sub's indices must be positive integers.";
+        for bad in [0.0, -1.0, 1.5, f64::NAN, f64::INFINITY] {
+            let mut i = Interp::with_output(Box::new(std::io::sink()));
+            let e = builtin("ind2sub")(&mut i, &[sz.clone(), num(bad)], 1)
+                .unwrap_err()
+                .msg;
+            assert_eq!(e, index, "{bad}");
+        }
+        let mut i = Interp::with_output(Box::new(std::io::sink()));
+        let e = builtin("ind2sub")(&mut i, &[row(&[2.0, -3.0]), num(1.0)], 1)
+            .unwrap_err()
+            .msg;
+        assert_eq!(e, "ind2sub's size must be a vector of positive integers.");
+        // The outputs are judged together before any is written, their
+        // elements and their lists of sizes: a hundred thousand outputs of a
+        // hundred thousand indices, or a thousand of an index of 2^20
+        // dimensions, are refused at once.
+        let t = std::time::Instant::now();
+        let many = Value::Mat(Matrix::row((1..=100_000).map(f64::from).collect()));
+        let e = builtin("ind2sub")(&mut i, &[sz.clone(), many], 100_000)
+            .unwrap_err()
+            .msg;
+        assert_eq!(
+            e,
+            "Requested 100000x100000 array exceeds the maximum array size."
+        );
+        let mut dims = vec![1; (1 << 20) - 1];
+        dims.push(2);
+        let deep = Value::Mat(Matrix::from_dims(&dims, vec![1.0, 2.0]));
+        let e = builtin("ind2sub")(&mut i, &[sz.clone(), deep.clone()], 1 << 10)
+            .unwrap_err()
+            .msg;
+        assert_eq!(
+            e,
+            "Requested 1048576x1024 array exceeds the maximum array size."
+        );
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        // Within the bound every output is written, once.
+        let got = builtin("ind2sub")(&mut i, &[sz.clone(), deep], 2).unwrap();
+        assert!(got.iter().all(|v| v.mat().unwrap().ndims() == 1 << 20));
+        let got = builtin("ind2sub")(&mut i, &[sz.clone(), num(5.0)], 100_000).unwrap();
+        assert_eq!(got.len(), 100_000);
     }
 }

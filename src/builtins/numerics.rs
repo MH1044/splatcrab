@@ -13,14 +13,14 @@
 
 use std::f64::consts::PI;
 
-use super::args::{at_most, check_shape, dim, mat, need, option, scalar};
+use super::args::{MAX_NDIMS, at_most, check_dims, check_shape, dim, mat, need, option, scalar};
 use super::complex::C;
 use super::factor::{self, qr_iterations};
 use super::math::{reduce, sum0};
 use super::{Registry, add, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R};
-use crate::value::{Class, Matrix, Value};
+use crate::value::{Class, Matrix, Value, along_dim, dims_product};
 
 /// One line per builtin; see the note on `core::register`.
 #[rustfmt::skip]
@@ -99,53 +99,83 @@ pub fn first_dim(m: &Matrix) -> usize {
     super::math::default_dim(&m.dims())
 }
 
-/// How many elements `m` has along dimension `d`.
+/// How many elements `m` has along dimension `d`, 1 past `ndims` (cycle
+/// 14c: every dimension, where it read the rows and the columns alone).
 pub fn extent(m: &Matrix, d: usize) -> usize {
-    match d {
-        1 => m.rows,
-        2 => m.cols,
-        _ => 1,
-    }
+    m.dims().get(d.saturating_sub(1)).copied().unwrap_or(1)
 }
 
 /// `f` applied to every slice of `m` along dimension `d`, a slice being the
 /// elements that vary along `d`, in order. Every slice comes back as `out`
 /// values, which take the place of the extent of `d` in the result's shape,
-/// judged by `check_shape` first. Along a dimension past the second each
-/// element is a slice of one, and `out` must be `1` there: anything else is
-/// an N-D shape.
+/// judged first.
+///
+/// Since cycle 14c any dimension of any array, over the three-number view
+/// `[before, n, after]` ([`crate::value::along_dim`]): slice `(b, a)` is
+/// the `n` elements at `b + before * (k + n * a)`, and its `out` values land
+/// at `b + before * (j + out * a)`. A matrix along 1 is the view `before =
+/// 1`, each slice a contiguous column, and along 2 the view `after = 1`,
+/// each slice a row, visited in the order the columns and the rows always
+/// were, so every 2-D answer is the one it was; a matrix along its rows is
+/// still judged as the transpose it used to be worked through, `out` by
+/// `rows`, so a refusal names the sizes as it always did. Past `ndims`
+/// each element is a slice of one, and the result has `out` along `d`: the
+/// argument's own shape for `out` 1, and for any other `out` a shape of
+/// `d` dimensions, so `d` is judged against `args::MAX_NDIMS` before any
+/// list of sizes is made. An empty result returns at once, and no loop
+/// runs over a dimension of an empty argument.
 pub fn map_slices(m: &Matrix, d: usize, out: usize, f: impl Fn(&[f64]) -> Vec<f64>) -> R<Matrix> {
-    match d {
-        1 => {
-            let (r, c) = check_shape(out as f64, m.cols as f64)?;
-            if r * c == 0 {
-                // Either there are no slices or each gives nothing: a
-                // 0x1e12 argument must not visit 1e12 of them (cycle 13b).
-                return Ok(Matrix::new(r, c, Vec::new()));
-            }
-            let mut data = Vec::with_capacity(r * c);
-            for j in 0..m.cols {
-                let s = f(&m.data[j * m.rows..(j + 1) * m.rows]);
-                debug_assert_eq!(s.len(), out);
-                data.extend(s);
-            }
-            Ok(Matrix::new(r, c, data))
+    let dims = m.dims();
+    let k = d.saturating_sub(1);
+    let mut asked: Vec<f64> = dims.iter().map(|&x| x as f64).collect();
+    if k < dims.len() {
+        asked[k] = out as f64;
+    } else if out != 1 {
+        if d > MAX_NDIMS {
+            return Err(error::too_many_dims(MAX_NDIMS));
         }
-        2 => Ok(map_slices(&m.transpose(), 1, out, f)?.transpose()),
-        _ if out == 1 => Ok(Matrix::new(
-            m.rows,
-            m.cols,
-            m.data.iter().map(|&x| f(&[x])[0]).collect(),
-        )),
-        _ => Err(error::nd_unsupported()),
+        asked.resize(k, 1.0);
+        asked.push(out as f64);
     }
+    let shape = if d == 2 && !m.is_nd() {
+        let (o, r) = check_shape(out as f64, m.rows as f64)?;
+        vec![r, o]
+    } else {
+        check_dims(&asked)?
+    };
+    let total = dims_product(&shape);
+    if total == 0 {
+        // Either there are no slices or each gives nothing: a 0x1e12
+        // argument must not visit 1e12 of them (cycle 13b).
+        return Ok(Matrix::from_dims(&shape, Vec::new()));
+    }
+    let (before, n, after) = along_dim(&dims, d);
+    let mut data = vec![0.0; total];
+    let mut buf = Vec::with_capacity(n);
+    for a in 0..after {
+        for b in 0..before {
+            buf.clear();
+            buf.extend((0..n).map(|k| m.data[b + before * (k + n * a)]));
+            let s = f(&buf);
+            debug_assert_eq!(s.len(), out);
+            for (j, v) in s.into_iter().enumerate().take(out) {
+                data[b + before * (j + out * a)] = v;
+            }
+        }
+    }
+    Ok(Matrix::from_dims(&shape, data))
 }
 
 /// A reduction along `d`, or along the default dimension when `d` is
-/// `None`. Unlike `math::reduce`, a dimension past `ndims` reduces each
-/// element on its own rather than handing the argument back, which is what
-/// makes `var(X, 0, 3)` zeros; a dimension within `ndims` is
-/// `math::reduce`'s, whose rule for a dimension of size 1 is the same.
+/// `None`, for `median` and `mode`. Unlike `math::reduce`, a dimension past
+/// `ndims` reduces each element on its own rather than handing the
+/// argument back, which gives each element as a double, `A` itself by the
+/// `median` and `mode` pages ("returns `A` when `dim` is greater than
+/// `ndims(A)`"), a `mode` frequency of 1, and 0 for a `NaN`; a dimension
+/// within `ndims` is `math::reduce`'s, whose rule for a dimension of size 1
+/// is the same, and whose kernel runs over the three-number view of any
+/// array (cycle 14c). `std` and `var` take their own rule past `ndims`;
+/// see [`deviation`].
 fn reduce_along(m: &Matrix, d: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
     match d {
         Some(d) if d > m.ndims() => Ok(m.map(|x| f(&[x]))),
@@ -645,6 +675,14 @@ pub fn differences(s: &[f64], n: usize) -> Vec<f64> {
 /// round before left, so `diff([1 2; 4 8], 2)` differences the column
 /// differences along the row they form. With `dim`, all `n` rounds work
 /// along it, and the result has `max(size(X, dim) - n, 0)` elements there.
+///
+/// Since cycle 14c any array and any dimension, through [`map_slices`]:
+/// `diff(A)` of a 2x3x4 is 1x3x4, and along a dimension past `ndims(X)`,
+/// of size 1, the result is empty there, `size(diff(ones(2, 3), 1, 3))`
+/// being `2 3 0`, where it was `N-D arrays are not supported.`; with `n` 0
+/// it is `X`, whatever `dim`. A `dim` that would give the result more than
+/// `args::MAX_NDIMS` dimensions is refused before any list of sizes is
+/// made, so `diff(1:3, 1, 1e10)` costs nothing.
 fn diff(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 3, "diff")?;
     need(a, 1, "diff")?;
@@ -659,13 +697,19 @@ fn diff(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
         let out = extent(&m, d).saturating_sub(n);
         return one_mat(map_slices(&m, d, out, |s| differences(s, n))?);
     }
-    for _ in 0..n {
-        if m.is_empty() {
-            break;
-        }
+    // Consecutive rounds along one dimension are taken together, since each
+    // leaves that dimension the first whose size is not 1 until it is 1:
+    // every slice goes through the same subtractions in the same order as
+    // round by round, and the shape is judged once per dimension rather
+    // than once per round, which an array of many singleton dimensions
+    // would pay for in every round (cycle 14c).
+    let mut left = n;
+    while left > 0 && !m.is_empty() {
         let d = first_dim(&m);
-        let out = extent(&m, d) - 1;
-        m = map_slices(&m, d, out, |s| differences(s, 1))?;
+        let size = extent(&m, d);
+        let rounds = if size > 1 { left.min(size - 1) } else { 1 };
+        m = map_slices(&m, d, size - rounds.min(size), |s| differences(s, rounds))?;
+        left -= rounds;
     }
     one_mat(m)
 }
@@ -716,12 +760,24 @@ fn weighted(a: &[Value], name: &str) -> R<(Matrix, bool, Option<usize>)> {
 
 fn var(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     let (m, by_n, d) = weighted(a, "var")?;
-    one_mat(reduce_along(&m, d, |xs| variance(xs, by_n))?)
+    one_mat(deviation(&m, d, |xs| variance(xs, by_n))?)
 }
 
 fn std(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     let (m, by_n, d) = weighted(a, "std")?;
-    one_mat(reduce_along(&m, d, |xs| variance(xs, by_n).sqrt())?)
+    one_mat(deviation(&m, d, |xs| variance(xs, by_n).sqrt())?)
+}
+
+/// The reduction of `std` and `var`: `math::reduce` within `ndims`, over
+/// any array (cycle 14c), and past `ndims`, by the MathWorks `std` and
+/// `var` pages, "an array of zeros the same size as `A`", a `NaN` or an
+/// `Inf` element included (cycle 14c; each element's own variance before,
+/// which made `var(NaN, 0, 3)` a `NaN`).
+fn deviation(m: &Matrix, d: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
+    match d {
+        Some(d) if d > m.ndims() => Ok(Matrix::filled_dims(&m.dims(), 0.0)),
+        _ => reduce(m, d, f),
+    }
 }
 
 /// The middle value of `xs`, the mean of the two middle ones for an even
@@ -1507,6 +1563,105 @@ mod tests {
         assert_eq!(differences(&[1.0, 2.0], 3), Vec::<f64>::new());
     }
 
+    /// `A(i, j, k)` of `reshape(1:24, 2, 3, 4)` is `i + 2*(j-1) + 6*(k-1)`,
+    /// the running example of the cycle 14 specs.
+    fn nd24() -> Value {
+        Value::Mat(Matrix::from_dims(
+            &[2, 3, 4],
+            (1..=24).map(f64::from).collect(),
+        ))
+    }
+
+    /// Cycle 14c: `diff` along any dimension of any array, the result
+    /// `max(size(X, dim) - n, 0)` long there, a dimension past `ndims` of
+    /// size 1 and so empty there, and a dimension that would give the
+    /// result more than 2^20 dimensions refused before any list of sizes is
+    /// made.
+    #[test]
+    fn diff_along_or_past_ndims_judges_the_shape_first() {
+        let a = nd24();
+        let d = call(diff, &[a.clone(), num(1.0), num(3.0)]).unwrap();
+        assert_eq!(d.dims(), [2, 3, 3]);
+        assert!(d.data.iter().all(|&x| x == 6.0));
+        let d = call(diff, std::slice::from_ref(&a)).unwrap();
+        assert_eq!(d.dims(), [1, 3, 4]);
+        assert!(d.data.iter().all(|&x| x == 1.0));
+        // Each round along the first dimension that is not 1 of what the
+        // round before left: 2x3x4, then 1x3x4, then 1x2x4.
+        assert_eq!(
+            call(diff, &[a.clone(), num(2.0)]).unwrap().dims(),
+            [1, 2, 4]
+        );
+        let d = call(diff, &[a.clone(), num(3.0), num(3.0)]).unwrap();
+        assert_eq!((d.dims(), d.data), (vec![2, 3], vec![0.0; 6]));
+        assert_eq!(
+            call(diff, &[a.clone(), num(5.0), num(3.0)]).unwrap().dims(),
+            [2, 3, 0]
+        );
+        // Past `ndims`: empty there, and `X` itself for no rounds.
+        let m = rows(2, 3, &[1.0; 6]);
+        assert_eq!(
+            call(diff, &[m.clone(), num(1.0), num(3.0)]).unwrap().dims(),
+            [2, 3, 0]
+        );
+        assert_eq!(
+            call(diff, &[m.clone(), num(1.0), num(5.0)]).unwrap().dims(),
+            [2, 3, 1, 1, 0]
+        );
+        assert_eq!(
+            call(diff, &[a.clone(), num(0.0), num(7.0)]).unwrap(),
+            a.mat().unwrap().clone()
+        );
+        assert_eq!(
+            call(diff, &[m.clone(), num(0.0), num(1e300)]).unwrap(),
+            m.mat().unwrap().clone()
+        );
+        // The bound on dimensions, judged before a shape is built: at the
+        // bound the list is made, past it the refusal comes at once.
+        let cap = "Arrays have at most 1048576 dimensions.";
+        let t = std::time::Instant::now();
+        for d in [2f64.powi(20) + 1.0, 2f64.powi(21), 1e10, 1e300] {
+            let e = err(diff, &[row(&[1.0, 2.0, 3.0]), num(1.0), num(d)]);
+            assert_eq!(e, cap, "{d}");
+        }
+        assert!(t.elapsed().as_secs() < 2, "{:?}", t.elapsed());
+        let at = call(diff, &[row(&[1.0, 2.0, 3.0]), num(1.0), num(2f64.powi(20))]).unwrap();
+        assert_eq!((at.ndims(), at.numel()), (1 << 20, 0));
+        // A matrix's answers are the ones they were, a double of a char.
+        let c = call(diff, &[text("ace")]).unwrap();
+        assert_eq!((c.class, c.data), (Class::Double, vec![2.0, 2.0]));
+        let d = call(
+            diff,
+            &[rows(2, 2, &[1.0, 2.0, 4.0, 8.0]), num(1.0), num(2.0)],
+        )
+        .unwrap();
+        assert_eq!(d.data, [1.0, 4.0]);
+        // An empty argument costs nothing, whatever its sizes.
+        let e = Value::Mat(Matrix::from_dims(&[0, 1_000_000, 1_000_000], Vec::new()));
+        assert_eq!(
+            call(diff, &[e.clone(), num(1.0), num(2.0)]).unwrap().dims(),
+            [0, 999_999, 1_000_000]
+        );
+        assert_eq!(
+            call(diff, &[e, num(3.0)]).unwrap().dims(),
+            [0, 1_000_000, 1_000_000]
+        );
+        // Rounds along one dimension are judged together, so a hundred
+        // thousand singleton dimensions are paid for once, not per round,
+        // and the answer is the rounds' own.
+        let mut dims = vec![1; 100_000];
+        dims.push(300);
+        let ramp: Vec<f64> = (0..300).map(|k| f64::from(k * k)).collect();
+        let x = Value::Mat(Matrix::from_dims(&dims, ramp.clone()));
+        let t = std::time::Instant::now();
+        let d = call(diff, &[x, num(2.0)]).unwrap();
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+        assert_eq!((d.ndims(), d.numel()), (100_001, 298));
+        assert!(d.data.iter().all(|&v| v == 2.0));
+        let r = call(diff, &[row(&ramp), num(299.0)]).unwrap();
+        assert_eq!(r.data, [0.0]);
+    }
+
     // ---- statistics --------------------------------------------------
 
     #[test]
@@ -1561,6 +1716,96 @@ mod tests {
         assert_eq!((out[0].data[0], out[1].data[0]), (1.0, 2.0));
         assert_eq!(mode_of(&[]).1, 0);
         assert!(mode_of(&[f64::NAN]).0.is_nan());
+    }
+
+    /// Cycle 14c: past `ndims`, by their pages, `median` and `mode` return
+    /// `A` (a frequency of 1 for each element and 0 for a `NaN`), and `std`
+    /// and `var` "an array of zeros the same size as `A`", a `NaN` or an
+    /// `Inf` included; within `ndims`, the reduction of each slice, a
+    /// dimension of size 1 included, is as it was.
+    #[test]
+    fn the_statistics_past_ndims_follow_their_pages() {
+        let bits = |m: &Matrix| m.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        let x = Matrix::from_dims(
+            &[1, 2, 3],
+            vec![-0.0, 1.0, f64::NAN, f64::INFINITY, -2.5, 7.0],
+        );
+        let a = Value::Mat(x.clone());
+        for d in [4.0, 5.0, 1e10, 1e300] {
+            let m = call(median, &[a.clone(), num(d)]).unwrap();
+            assert_eq!((m.dims(), bits(&m)), (x.dims(), bits(&x)), "{d}");
+            let out = outputs(mode, &[a.clone(), num(d)], 2).unwrap();
+            assert_eq!(bits(&out[0]), bits(&x), "{d}");
+            assert_eq!(out[1].data, [1.0, 1.0, 0.0, 1.0, 1.0, 1.0], "{d}");
+            for (f, w) in [
+                (std as crate::builtins::BuiltinFn, 0.0),
+                (var, 0.0),
+                (std, 1.0),
+                (var, 1.0),
+            ] {
+                let z = call(f, &[a.clone(), num(w), num(d)]).unwrap();
+                assert_eq!((z.dims(), bits(&z)), (x.dims(), vec![0u64; 6]), "{d}");
+            }
+        }
+        // A matrix past its two dimensions, which the spec changes for
+        // `std` and `var` alone.
+        let nan = [num(f64::NAN), num(0.0), num(3.0)];
+        assert_eq!(call(var, &nan).unwrap().data, [0.0]);
+        assert_eq!(
+            call(std, &[row(&[f64::NAN, f64::INFINITY]), num(0.0), num(3.0)])
+                .unwrap()
+                .data,
+            [0.0, 0.0]
+        );
+        assert!(call(median, &[num(f64::NAN), num(3.0)]).unwrap().data[0].is_nan());
+        let m = call(mode, &[row(&[1.0, f64::NAN]), num(3.0)]).unwrap();
+        assert_eq!(m.data[0], 1.0);
+        assert!(m.data[1].is_nan());
+        // Within `ndims`, a dimension of size 1 reduces each element as it
+        // always did: the variance of a `NaN` alone is `NaN`.
+        assert!(
+            call(var, &[num(f64::NAN), num(0.0), num(1.0)])
+                .unwrap()
+                .data[0]
+                .is_nan()
+        );
+        assert!(
+            call(var, &[num(f64::NAN), num(0.0), num(2.0)])
+                .unwrap()
+                .data[0]
+                .is_nan()
+        );
+        assert_eq!(
+            call(var, &[num(5.0), num(0.0), num(2.0)]).unwrap().data,
+            [0.0]
+        );
+        // Within `ndims`, each slice along any dimension.
+        let y = nd24();
+        assert_eq!(
+            call(median, &[y.clone(), num(3.0)]).unwrap().data,
+            [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+        );
+        assert_eq!(
+            call(var, &[y.clone(), num(1.0), num(3.0)]).unwrap().data,
+            [45.0; 6]
+        );
+        assert_eq!(
+            call(var, &[y.clone(), num(0.0), num(3.0)]).unwrap().data,
+            [60.0; 6]
+        );
+        let s = call(std, &[y.clone(), num(0.0), num(3.0)]).unwrap();
+        assert!(s.data.iter().all(|v| (v - 60f64.sqrt()).abs() < 1e-12));
+        let m = call(median, std::slice::from_ref(&y)).unwrap();
+        assert_eq!(m.dims(), [1, 3, 4]);
+        // A slice with no elements is `NaN`, with a frequency of 0; the 0x0
+        // keeps its answers.
+        let e = Value::Mat(Matrix::from_dims(&[2, 0, 3], Vec::new()));
+        let m = call(median, &[e.clone(), num(2.0)]).unwrap();
+        assert!(m.dims() == [2, 1, 3] && m.data.iter().all(|v| v.is_nan()));
+        let out = outputs(mode, &[e.clone(), num(2.0)], 2).unwrap();
+        assert!(out[0].data.iter().all(|v| v.is_nan()) && out[1].data == [0.0; 6]);
+        assert_eq!(call(mode, &[e]).unwrap().dims(), [1, 0, 3]);
+        assert!(call(median, &[Value::Mat(Matrix::empty())]).unwrap().data[0].is_nan());
     }
 
     // ---- number theory -----------------------------------------------
@@ -1680,13 +1925,27 @@ mod tests {
     }
 
     #[test]
-    fn map_slices_judges_the_shape_and_refuses_nd() {
+    fn map_slices_judges_the_shape_first() {
         let m = Matrix::new(2, 3, (1..=6).map(f64::from).collect());
         let s = map_slices(&m, 1, 1, |s| vec![s.iter().sum()]).unwrap();
         assert_eq!(s.data, [3.0, 7.0, 11.0]);
         let s = map_slices(&m, 2, 1, |s| vec![s.iter().sum()]).unwrap();
         assert_eq!((s.rows, s.cols, s.data.clone()), (2, 1, vec![9.0, 12.0]));
-        assert!(map_slices(&m, 3, 0, |_| vec![]).is_err());
+        // Past `ndims` each element is a slice of one, and a result with no
+        // elements there has that many dimensions (cycle 14c; an N-D
+        // refusal before it), the dimension judged against the cap first.
+        assert_eq!(map_slices(&m, 3, 0, |_| vec![]).unwrap().dims(), [2, 3, 0]);
+        assert_eq!(
+            map_slices(&m, 1 << 21, 0, |_| vec![]).unwrap_err().msg,
+            "Arrays have at most 1048576 dimensions."
+        );
+        // A matrix along its rows is judged as it always was, `out` by
+        // `rows`, so the refusal names the sizes in that order.
+        let tall = Matrix::new(1 << 29, 0, Vec::new());
+        assert_eq!(
+            map_slices(&tall, 2, 1, |_| vec![0.0]).unwrap_err().msg,
+            "Requested 1x536870912 array exceeds the maximum array size."
+        );
         assert_eq!(first_dim(&Matrix::scalar(1.0)), 1);
         assert_eq!(first_dim(&Matrix::row(vec![1.0, 2.0])), 2);
         assert_eq!(first_dim(&Matrix::empty()), 1);
