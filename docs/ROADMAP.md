@@ -48,6 +48,7 @@ and the table names the cycle that owns it.
 | 14c | [more-nd-builtins](modules/14c-more-nd-builtins.md) | The rest of the everyday library taught N-D: `sort`, `find`, `diff`, `median`, `std`, `var`, `mode`, `fliplr`, `flipud` and `arrayfun`, and new `flip`, `circshift`, `ipermute`, `horzcat`, `vertcat`, `sub2ind` and `ind2sub` | Done (2026-09-30) |
 | 15 | [verify-first](modules/15-verify-first.md) | The rows marked verify first, taken to their MathWorks pages: `isequal` of handles, cells and structs, transposed cells and structs, `sum` and `mean` along a dimension of size 1, `any` and `all` past `ndims`, text functions refusing a char matrix; the rest pinned or cited as unsettled | Done (2026-09-30) |
 | 16 | [hex-binary-literals](modules/16-hex-binary-literals.md) | `0x2A` and `0b101010` literals with the eight integer-type suffixes and two's complement, each stored as the double its value is | Done (2026-09-30) |
+| 17 | [history-bound](modules/17-history-bound.md) | The history file bounded in bytes: an entry of at most 64 KiB is kept, and at most the last 4 MiB of the file is read, and the file compacted to it | Planned |
 
 ## The U series: the interface
 
