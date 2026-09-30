@@ -190,7 +190,7 @@ Settled at planning:
   Dropping only the written file's parse costs nothing for the files the
   write did not touch.
 
-Settled at review, before the code that follows it:
+Settled in testing, before the code that follows it:
 
 - **The cache drops one parse, not all.** The first build dropped every
   parse on every write, as this spec then said; the review timed a loop of
