@@ -2075,9 +2075,10 @@ The reductions work along any dimension. With no dimension, `sum`,
 `prod`, `mean`, `any`, `all`, `max`, `min`, `cumsum` and `cumprod` run
 along the first dimension whose size is not 1, so `sum(ones(1, 1, 3))` is
 3; along a dimension that dimension becomes 1 and every other stays;
-along a dimension of size 1 each element is its own reduction; and along
-one past the array's the array is handed back as it is, as it is for a
-matrix, so `sum(A, 5)` is `A`. `max(A, [], 3)` gives the index along the
+along one past the array's the array is handed back as it is, as it is for
+a matrix, so `sum(A, 5)` is `A`, and `sum` and `mean` hand it back along a
+dimension of size 1 too, where every other reduction reduces each element
+on its own. `max(A, [], 3)` gives the index along the
 third dimension as its second output, and `max(A, B, 3)` of two arrays is
 refused, since a dimension goes with one array. The element-wise math,
 `abs`, `sqrt`, `floor`, `round`, `isnan` and the rest, keeps every
@@ -2225,6 +2226,36 @@ c + 1
 Error: Line 2: Operator '+' is not supported for operands of type 'cell'.
 ```
 
+`c'`, `c.'` and `transpose(c)` interchange the row and column of every
+element, each element itself unchanged. `isequal` compares two cells
+element by element, by the rules it compares arrays by: the same size,
+every pair of elements equal, the class not compared and a `NaN` equal to
+nothing, however deeply the cells nest:
+
+```matlab
+c = {1, 'ab'; [3 4], 2};
+d = c';
+disp(size(d))
+disp(d{1, 2})
+disp(d{2, 1})
+disp(isequal(c', c.'))
+disp(isequal({1, 'a'}, {1, 'a'}))
+disp(isequal({'a'}, {97}))
+disp(isequal({1, 2}, {1; 2}))
+disp(isequal({NaN}, {NaN}))
+```
+
+```
+     2     2
+     3     4
+ab
+   1
+   1
+   1
+   0
+   0
+```
+
 ### Structs
 
 Assigning a field makes a struct, and a field of a field a struct inside
@@ -2285,20 +2316,42 @@ s * 2
 Error: Line 2: Operator '*' is not supported for operands of type 'struct'.
 ```
 
+`isequal` of two structs needs the same fields, in any order, and every
+field equal; a struct never equals a cell or an array:
+
+```matlab
+s.a = 1;
+s.b = 'x';
+t.b = 'x';
+t.a = 1;
+disp(isequal(s, t))
+t.b = 'y';
+disp(isequal(s, t))
+disp(isequal(s, {1}))
+```
+
+```
+   1
+   0
+   0
+```
+
 ### Struct arrays and cs-lists
 
 `p(2).name = 'B'` grows a struct array, every element having every field.
 `p.name` of a struct array and `c{:}` of a cell are comma-separated lists:
 in a call's arguments, a bracket or a brace they become one value per
 element, `[a, b] = c{:}` assigns them in order, and anywhere one value is
-needed a list of any other length is MATLAB's error. `struct` with cell
-values makes a struct array of the cells' size:
+needed a list of any other length is MATLAB's error. A struct array
+transposes as a cell does, `p'` of a 1x2 being 2x1 with the same fields.
+`struct` with cell values makes a struct array of the cells' size:
 
 ```matlab
 p(1).name = 'A';
 p(2).name = 'B';
 p
 disp([p.name])
+disp(size(p'))
 q = struct('v', {10, 20, 30});
 disp(size(q))
 disp(sum([q.v]))
@@ -2317,11 +2370,12 @@ p =
     name
 
 AB
+     2     1
      1     3
     60
      1     2     3
      3
-Error: Line 12: Expected one output from a curly brace or dot indexing expression, but there were 3 results.
+Error: Line 13: Expected one output from a curly brace or dot indexing expression, but there were 3 results.
 ```
 
 ### Functions on cells
@@ -2949,8 +3003,37 @@ one function and not an array, so `[f g]` is refused, and so is
 `[@(x) x+1]` in the source. `str2func` of an `'@(...)'` text captures
 nothing, since it cannot see the workspace it is called from.
 
-For the same reason a binary operator refuses a handle, in MATLAB's
-sentence; call the handle first, `f(0) + 1`:
+`isequal` compares handles as the MathWorks page describes: two handles to
+the same named function are equal, `str2func('sin')` and `@sin` included,
+and so are two handles to one local function; an anonymous function is
+equal only to its copies, since two made separately may hold different
+captured values, whatever their text; and a handle equals nothing but a
+handle:
+
+```matlab
+fun1 = @sin;
+fun2 = @sin;
+disp(isequal(fun1, fun2))
+disp(isequal(str2func('sin'), @sin))
+A = 5;
+h1 = @(x) A * x.^2;
+h2 = @(x) A * x.^2;
+disp(isequal(h1, h2))
+h2 = h1;
+disp(isequal(h1, h2))
+disp(isequal(@sin, @(x) sin(x)))
+```
+
+```
+   1
+   1
+   0
+   1
+   0
+```
+
+A handle is one function and not an array, and a binary operator refuses
+it, `==` included, in MATLAB's sentence; call the handle first, `f(0) + 1`:
 
 ```matlab
 f = @sin;
@@ -3341,10 +3424,13 @@ j =
 
 A dimension past the array's hands the input back with its values as they
 were, a `-0` included, as a double (`sum('ab', 3)` is `97 98`), or as a
-logical for `any` and `all` and for `max` and `min` of a logical; along a
-dimension of size 1 each element is reduced on its own; `0` is an error. A
-char is never read as a dimension. `any` ignores `NaN`, so `any(NaN)` is `0`
-and `all(NaN)` is `1`, matching the MATLAB page.
+logical for `max` and `min` of a logical. `sum` and `mean` do the same along
+a dimension of size 1, as the MathWorks pages say ("or when size(A,dim) is
+1"), so `sum(-0)` is `-0`; every other reduction reduces each element on its
+own there. `0` is an error. A char is never read as a dimension. `any`
+ignores `NaN`, so `any(NaN)` is `0` and `all(NaN)` is `1`, matching the
+MATLAB page, and past the array's dimensions each element gets that same
+answer, a logical of the array's shape, so `any([0 NaN 2], 3)` is `0 0 1`.
 
 ```matlab
 A = [1 2 3; 4 5 6];
@@ -3507,7 +3593,9 @@ argument.
 and the class tests `islogical ischar isnumeric isa`. Every one returns a
 logical. `isequal(A, B, ...)` is true when every argument has the first
 one's size and values; the class is not compared, so `isequal('a', 97)` is
-true.
+true. Cells and structs compare element by element and function handles by
+what they name; see [cell arrays](#cell-arrays), [structs](#structs) and
+[function handles](#function-handles).
 
 ```matlab
 a = isnan([1 NaN Inf])
@@ -4545,6 +4633,35 @@ d =
   1×2 cell array
 
     {'xx'}    {'bx'}
+```
+
+Where a function takes a character vector, a char of at most one row, a
+char of several rows is refused, as an argument or as an element of a
+cell, in the words that place refuses any value that is not text, as the
+MathWorks `iscellstr` page says most text functions do: `upper({['ab';
+'cd']})` is `Every element of a cell argument to 'upper' must be a
+character vector.` A bare char array of any shape still goes to `upper`,
+`lower` and `strcat`, which keep its rows, and `strtrim` trims an element
+of several rows as it trims that array on its own:
+
+```matlab
+x = upper(['ab'; 'cd'])
+r = strtrim({[' ab'; ' cd']});
+disp(r{1})
+strrep(['ab'; 'cd'], 'a', 'z')
+```
+
+```
+x =
+
+  2×2 char array
+
+    'AB'
+    'CD'
+
+ab
+cd
+Error: Line 4: Argument 1 to 'strrep' must be a character vector.
 ```
 
 ### Regular expressions
@@ -6257,7 +6374,7 @@ Error: Line 1: NaN's cannot be converted to logicals.
   checked against MATLAB.
 - A cs-list is not spread into index subscripts, so `x(c{:})` of a
   two-element `c` is the cs-list error, and `[c{:}] = deal(0)` is not a
-  target list; MATLAB accepts both. A cell cannot be transposed, `c'`.
+  target list; MATLAB accepts both.
 - `A(:, :) = []` leaves an empty with no rows and the original columns;
   that has not been checked against MATLAB.
 - `[m, i] = max(a, b)`, the two-array form, is `Too many output arguments.`
@@ -6390,7 +6507,7 @@ is MATLAB's `whos`.
 A caught error is a minimal `MException`: `e.message`, `e.identifier`,
 `e.stack` and `class(e)`, with no `cause`, and a one-line display of
 SplatCrab's own. `e.stack` lists the function frames only, not the script's
-own. `isequal` of two cells or two structs is false whatever they hold. An error the interpreter raises itself has an empty
+own. An error the interpreter raises itself has an empty
 identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`.
 `warning('off')` and `lastwarn` do not exist: `warning('off')` prints
 `Warning: off`.

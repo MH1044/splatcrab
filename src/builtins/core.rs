@@ -1,6 +1,8 @@
 //! Constants, constructors, shape queries, output, the workspace and timing.
 
+use std::collections::HashSet;
 use std::f64::consts::PI;
+use std::rc::Rc;
 
 use super::args::{
     at_most, check_dims, check_shape, dim, mat, need, scalar, shape, shape_dims, string,
@@ -9,7 +11,7 @@ pub use super::printf::{MAX_FIELD, format_printf};
 use super::{Registry, add, none, one, one_as, one_mat};
 use crate::error;
 use crate::interp::{Callee, Interp, R};
-use crate::value::{Class, Func, Matrix, Value};
+use crate::value::{Class, Func, Matrix, StructArray, Value};
 
 /// The registration table is one line per builtin on purpose: it is the index
 /// of the library, and rustfmt would otherwise spread each entry over five
@@ -545,34 +547,146 @@ fn assert(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     }
 }
 
-/// `isequal(A, B, ...)`: true when every argument has the same size and the
-/// same values as the first. The class is not compared, so `isequal('a',
-/// 97)` is true; a `NaN` is equal to nothing, itself included.
+/// `isequal(A, B, ...)`: true when every argument is equal to the first by
+/// [`values_equal`]. The class is not compared, so `isequal('a', 97)` is
+/// true; a `NaN` is equal to nothing, itself included.
 fn isequal(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 2, "isequal")?;
     let same = args[1..].iter().all(|b| values_equal(&args[0], b));
     one_as(Matrix::from_bool(same))
 }
 
-/// One pair for [`isequal`]. Two `MException`s are equal when their message
-/// and identifier are; an `MException` equals no array.
+/// One pair for [`isequal`], by the MathWorks `isequal` page's rules.
 ///
-/// Two arrays compare every dimension before any element (cycle 14), so
-/// arrays of different shapes are unequal and no comparison reads past
-/// either array: `isequal(zeros(2, 2, 2), zeros(2, 2))` is false where the
-/// rows and columns alone agree.
+/// Two arrays are equal when they have the same size and the same values:
+/// every dimension is compared before any element (cycle 14), so arrays of
+/// different shapes are unequal and no comparison reads past either array,
+/// and `isequal(zeros(2, 2, 2), zeros(2, 2))` is false where the rows and
+/// columns alone agree. Two `MException`s are equal when their message and
+/// identifier are. Since cycle 15 two function handles compare by
+/// [`handles_equal`]; two cell arrays are equal when they have the same
+/// size and every pair of elements in the same place is equal by these
+/// rules, and two struct arrays when they have the same size, the same
+/// field names in any order ("Fields need not be in the same order as long
+/// as the contents are equal") and every field of every element is equal.
+/// Values of two different kinds are never equal: a cell never equals a
+/// struct or an array, and a handle equals nothing but a handle.
+///
+/// Nested cells and structs are walked with a worklist of pairs, never by
+/// recursion, so a nesting of any depth compares in time proportional to
+/// its elements and never overflows the stack (invariant 6). A pair of
+/// containers is compared once however many paths reach it, which only a
+/// container held in more than one place allows: `c = {c, c}` repeated
+/// builds a nest with exponentially many paths through a few containers.
 pub fn values_equal(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        // Complex values compare both parts, as `==` does (cycle 10), so
-        // `complex(1, 0)` equals `1`: the storage is not the value.
-        (Value::Mat(a), Value::Mat(b)) => {
-            a.dims() == b.dims()
-                && a.numel() == b.numel()
-                && (0..a.numel()).all(|k| a.c(k) == b.c(k))
+    let mut todo: Vec<(&Value, &Value)> = vec![(a, b)];
+    let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    while let Some(pair) = todo.pop() {
+        match pair {
+            // Complex values compare both parts, as `==` does (cycle 10), so
+            // `complex(1, 0)` equals `1`: the storage is not the value.
+            (Value::Mat(a), Value::Mat(b)) => {
+                let same = a.dims() == b.dims()
+                    && a.numel() == b.numel()
+                    && (0..a.numel()).all(|k| a.c(k) == b.c(k));
+                if !same {
+                    return false;
+                }
+            }
+            (Value::Exception(a), Value::Exception(b)) => {
+                if a.msg != b.msg || a.identifier() != b.identifier() {
+                    return false;
+                }
+            }
+            (Value::Func(a), Value::Func(b)) => {
+                if !handles_equal(a, b) {
+                    return false;
+                }
+            }
+            // A pair of containers met before was judged then, and what
+            // it holds is already on the list or compared.
+            (Value::Cell(a), Value::Cell(b)) => {
+                if !first_visit(&mut seen, a, b) {
+                    continue;
+                }
+                if (a.rows, a.cols) != (b.rows, b.cols) {
+                    return false;
+                }
+                todo.extend(a.data.iter().zip(&b.data));
+            }
+            (Value::Struct(a), Value::Struct(b)) => {
+                if !first_visit(&mut seen, a, b) {
+                    continue;
+                }
+                if (a.rows, a.cols) != (b.rows, b.cols) {
+                    return false;
+                }
+                let Some(places) = field_places(a, b) else {
+                    return false;
+                };
+                for (x, y) in a.elems.iter().zip(&b.elems) {
+                    todo.extend(x.iter().zip(places.iter().map(|&g| &y[g])));
+                }
+            }
+            _ => return false,
         }
-        (Value::Exception(a), Value::Exception(b)) => {
-            a.msg == b.msg && a.identifier() == b.identifier()
+    }
+    true
+}
+
+/// True the first time the pair of containers `a` and `b` is met by
+/// [`values_equal`]'s walk. Only a container held in more than one place
+/// can be reached along two paths, so a pair of containers each held once
+/// is not recorded, and a nesting built as `c = {c}` costs nothing here.
+fn first_visit<T>(seen: &mut HashSet<(usize, usize)>, a: &Rc<T>, b: &Rc<T>) -> bool {
+    if Rc::strong_count(a) == 1 && Rc::strong_count(b) == 1 {
+        return true;
+    }
+    seen.insert((Rc::as_ptr(a) as usize, Rc::as_ptr(b) as usize))
+}
+
+/// Where each field of `a` is among the fields of `b`, when the two have
+/// the same field names in any order, and `None` otherwise. Each name is
+/// looked up through the struct's own field index, a hash map past a few
+/// fields, so matching 100,000 fields written in the reverse order costs
+/// time in proportion to the fields and is never quadratic.
+fn field_places(a: &StructArray, b: &StructArray) -> Option<Vec<usize>> {
+    if a.fields.len() != b.fields.len() {
+        return None;
+    }
+    let mut taken = vec![false; b.fields.len()];
+    let mut places = Vec::with_capacity(a.fields.len());
+    for f in &a.fields {
+        let g = b.field_index(f)?;
+        if std::mem::replace(&mut taken[g], true) {
+            return None;
         }
+        places.push(g);
+    }
+    Some(places)
+}
+
+/// Two function handles by the MathWorks "Compare Function Handles" page
+/// (cycle 15). Two named handles are equal when they name the same
+/// function: the same name, bound where each was made to the same local
+/// function of the same file, or to no local function for either, so
+/// `isequal(@sin, str2func('sin'))` is true. An anonymous function is equal
+/// only to its copies, the same handle passed on by assignment, as an
+/// argument or through a cell or a field, since two made separately are
+/// "unequal because MATLAB cannot guarantee that the frozen values of
+/// nonargument variables are the same", whatever their text. A named
+/// handle never equals an anonymous one.
+fn handles_equal(a: &Rc<Func>, b: &Rc<Func>) -> bool {
+    match (&**a, &**b) {
+        (Func::Named { name: m, local: p }, Func::Named { name: n, local: q }) => {
+            m == n
+                && match (p, q) {
+                    (None, None) => true,
+                    (Some((ua, fa)), Some((ub, fb))) => Rc::ptr_eq(ua, ub) && Rc::ptr_eq(fa, fb),
+                    _ => false,
+                }
+        }
+        (Func::Anon { .. }, Func::Anon { .. }) => Rc::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -1605,6 +1719,272 @@ mod tests {
         assert!(!values_equal(&nd(&[2, 2]), &a));
         assert!(!values_equal(&a, &nd(&[2, 2, 1, 2])));
         assert!(!values_equal(&nd(&[2, 1, 2]), &nd(&[2, 2, 1])));
+    }
+
+    fn named(
+        name: &str,
+        local: Option<(Rc<crate::interp::Unit>, Rc<crate::parser::Function>)>,
+    ) -> Value {
+        Value::Func(Rc::new(Func::Named {
+            name: name.into(),
+            local,
+        }))
+    }
+
+    fn function(name: &str) -> Rc<crate::parser::Function> {
+        Rc::new(crate::parser::Function {
+            name: name.into(),
+            outputs: Vec::new(),
+            params: Vec::new(),
+            body: Vec::new(),
+            line: 1,
+        })
+    }
+
+    /// A handle made from `def`, as each evaluation of `@(x) ...` makes one.
+    fn anon_of(def: &Rc<crate::parser::AnonFn>) -> Value {
+        Value::Func(Rc::new(Func::Anon {
+            def: def.clone(),
+            captured: vec![("A".into(), num(5.0))],
+            unit: Rc::new(crate::interp::Unit::default()),
+        }))
+    }
+
+    /// `@(x) name(x)`, made afresh.
+    fn anon(name: &str) -> Value {
+        use crate::parser::{Access, AnonFn, Expr};
+        let body = Expr::Access(
+            name.into(),
+            vec![Access::Paren(vec![Expr::Ident("x".into())])],
+        );
+        anon_of(&Rc::new(AnonFn::new(vec!["x".into()], body)))
+    }
+
+    /// Cycle 15: two named handles are equal when they name the same
+    /// function, the same name bound to the same local function of the same
+    /// file where each was made, or to none for either (S4's `@sin` twice).
+    #[test]
+    fn named_handles_are_equal_when_they_bind_the_same_function() {
+        assert!(values_equal(&named("sin", None), &named("sin", None)));
+        assert!(!values_equal(&named("sin", None), &named("cos", None)));
+        let unit = Rc::new(crate::interp::Unit::default());
+        let loc = function("loc");
+        let bound = || named("loc", Some((unit.clone(), loc.clone())));
+        assert!(values_equal(&bound(), &bound()));
+        // A local function of the name is not the name resolved when
+        // called, and another file's function of the name is another.
+        assert!(!values_equal(&bound(), &named("loc", None)));
+        assert!(!values_equal(&named("loc", None), &bound()));
+        let other = named(
+            "loc",
+            Some((Rc::new(crate::interp::Unit::default()), loc.clone())),
+        );
+        assert!(!values_equal(&bound(), &other));
+        let again = named("loc", Some((unit.clone(), function("loc"))));
+        assert!(!values_equal(&bound(), &again));
+        // A handle equals nothing but a handle.
+        assert!(!values_equal(&named("sin", None), &num(1.0)));
+        assert!(!values_equal(&num(1.0), &named("sin", None)));
+        assert!(!values_equal(&named("sin", None), &Value::str("sin")));
+        let yes = |args: &[Value]| mat_of(isequal, args).data[0] == 1.0;
+        assert!(yes(&[
+            named("sin", None),
+            named("sin", None),
+            named("sin", None)
+        ]));
+        assert!(!yes(&[
+            named("sin", None),
+            named("sin", None),
+            named("cos", None)
+        ]));
+    }
+
+    /// Cycle 15: an anonymous function is equal only to its copies, the
+    /// same handle passed on; two made from the same text are unequal, and
+    /// a named handle never equals an anonymous one (S4).
+    #[test]
+    fn anonymous_handles_are_equal_only_to_their_copies() {
+        // Two evaluations of one `@(x) A * x.^2`: one text, one capture.
+        let def = Rc::new(crate::parser::AnonFn::new(
+            vec!["x".into()],
+            crate::parser::Expr::Ident("x".into()),
+        ));
+        let (h1, h2) = (anon_of(&def), anon_of(&def));
+        assert!(!values_equal(&h1, &h2));
+        assert!(!values_equal(&anon("sin"), &anon("sin")));
+        let copy = h1.clone();
+        assert!(values_equal(&h1, &copy));
+        assert!(values_equal(&h1, &h1));
+        let held = Value::cell(crate::value::CellArray::new(1, 1, vec![h1.clone()]));
+        let Value::Cell(c) = &held else {
+            unreachable!()
+        };
+        assert!(values_equal(&c.data[0], &h1));
+        assert!(!values_equal(&named("sin", None), &anon("@(x) sin(x)")));
+        assert!(!values_equal(&anon("@(x) sin(x)"), &named("sin", None)));
+    }
+
+    fn cell_of(rows: usize, cols: usize, data: Vec<Value>) -> Value {
+        Value::cell(crate::value::CellArray::new(rows, cols, data))
+    }
+
+    fn struct_of(fields: &[&str], values: Vec<Value>) -> Value {
+        Value::strukt(StructArray::scalar(
+            fields.iter().map(|f| f.to_string()).collect(),
+            values,
+        ))
+    }
+
+    /// Cycle 15: cells and structs compare element by element, by the rules
+    /// arrays compare by, and never equal a value of another kind (S3).
+    #[test]
+    fn cells_and_structs_compare_every_element() {
+        let pair = |a: Value, b: Value| cell_of(1, 2, vec![a, b]);
+        assert!(values_equal(
+            &pair(num(1.0), Value::str("a")),
+            &pair(num(1.0), Value::str("a"))
+        ));
+        assert!(!values_equal(
+            &pair(num(1.0), Value::str("a")),
+            &pair(num(1.0), Value::str("b"))
+        ));
+        // The same elements in another shape are another cell.
+        let col = cell_of(2, 1, vec![num(1.0), num(2.0)]);
+        assert!(!values_equal(&pair(num(1.0), num(2.0)), &col));
+        // The class is not compared, and a NaN equals nothing.
+        assert!(values_equal(
+            &cell_of(1, 1, vec![Value::str("a")]),
+            &cell_of(1, 1, vec![num(97.0)])
+        ));
+        let nan = || cell_of(1, 1, vec![num(f64::NAN)]);
+        assert!(!values_equal(&nan(), &nan()));
+        let shared = nan();
+        assert!(!values_equal(&shared, &shared));
+        assert!(values_equal(&cell_of(0, 0, vec![]), &cell_of(0, 0, vec![])));
+        // Nested cells, and handles inside them.
+        let nest = || cell_of(1, 1, vec![pair(num(1.0), cell_of(1, 1, vec![num(2.0)]))]);
+        assert!(values_equal(&nest(), &nest()));
+        let sin = || cell_of(1, 1, vec![named("sin", None)]);
+        assert!(values_equal(&sin(), &sin()));
+        // A cell never equals an array or a struct, nor a struct an array.
+        let one = cell_of(1, 1, vec![num(1.0)]);
+        assert!(!values_equal(&one, &num(1.0)));
+        assert!(!values_equal(&num(1.0), &one));
+        let s = struct_of(&["a"], vec![num(1.0)]);
+        assert!(!values_equal(&s, &one));
+        assert!(!values_equal(&one, &s));
+        assert!(!values_equal(&s, &num(1.0)));
+        // A struct array: the same size and every field of every element.
+        let arr = |second: f64| {
+            Value::strukt(StructArray::new(
+                1,
+                2,
+                vec!["a".into()],
+                vec![vec![num(1.0)], vec![num(second)]],
+            ))
+        };
+        assert!(values_equal(&arr(2.0), &arr(2.0)));
+        assert!(!values_equal(&arr(2.0), &arr(3.0)));
+        assert!(!values_equal(&arr(2.0), &s));
+        let nested = |v: f64| {
+            struct_of(
+                &["c"],
+                vec![cell_of(1, 1, vec![struct_of(&["d"], vec![num(v)])])],
+            )
+        };
+        assert!(values_equal(&nested(1.0), &nested(1.0)));
+        assert!(!values_equal(&nested(1.0), &nested(2.0)));
+        // An MException inside a cell compares as it does alone.
+        let caught = |m: &str| cell_of(1, 1, vec![Value::Exception(crate::error::MError::new(m))]);
+        assert!(values_equal(&caught("x"), &caught("x")));
+        assert!(!values_equal(&caught("x"), &caught("y")));
+        let yes = |args: &[Value]| mat_of(isequal, args).data[0] == 1.0;
+        let three = || pair(num(1.0), num(2.0));
+        assert!(yes(&[three(), three(), three()]));
+        assert!(!yes(&[three(), three(), col.clone()]));
+    }
+
+    /// Cycle 15: "Fields need not be in the same order as long as the
+    /// contents are equal" (S3), and the fields are matched through the
+    /// struct's field index, so 100,000 fields in the reverse order are
+    /// matched in time proportional to their count.
+    #[test]
+    fn struct_fields_compare_in_any_order() {
+        let s = struct_of(&["a", "b"], vec![num(1.0), Value::str("x")]);
+        let t = struct_of(&["b", "a"], vec![Value::str("x"), num(1.0)]);
+        assert!(values_equal(&s, &t));
+        let t2 = struct_of(&["b", "a"], vec![Value::str("y"), num(1.0)]);
+        assert!(!values_equal(&s, &t2));
+        // Missing, extra or other fields are unequal.
+        assert!(!values_equal(&s, &struct_of(&["a"], vec![num(1.0)])));
+        assert!(!values_equal(&struct_of(&["a"], vec![num(1.0)]), &s));
+        assert!(!values_equal(
+            &s,
+            &struct_of(&["a", "c"], vec![num(1.0), Value::str("x")])
+        ));
+        // A name repeated in one struct matches no struct of distinct names.
+        let twice = struct_of(&["a", "a"], vec![num(1.0), num(1.0)]);
+        assert!(!values_equal(
+            &twice,
+            &struct_of(&["a", "b"], vec![num(1.0), num(1.0)])
+        ));
+        let n = 100_000;
+        let names: Vec<String> = (0..n).map(|k| format!("f{k}")).collect();
+        let forward = StructArray::scalar(names.clone(), (0..n).map(|k| num(k as f64)).collect());
+        let reverse = StructArray::scalar(
+            names.iter().rev().cloned().collect(),
+            (0..n).rev().map(|k| num(k as f64)).collect(),
+        );
+        let started = std::time::Instant::now();
+        assert!(values_equal(
+            &Value::strukt(forward.clone()),
+            &Value::strukt(reverse.clone())
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let mut changed = reverse;
+        changed.elems[0][0] = num(-1.0);
+        assert!(!values_equal(
+            &Value::strukt(forward),
+            &Value::strukt(changed)
+        ));
+    }
+
+    /// Cycle 15: two nestings 100,000 deep, and deeper, are compared by the
+    /// worklist without recursion, so neither overflows the stack; a nest
+    /// with exponentially many paths through few containers is compared
+    /// once per pair of containers.
+    #[test]
+    fn a_deep_nesting_compares_without_recursion() {
+        let depth = 200_000;
+        let cells = |inner: f64| {
+            let mut v = num(inner);
+            for _ in 0..depth {
+                v = cell_of(1, 1, vec![v]);
+            }
+            v
+        };
+        let (a, b, c) = (cells(1.0), cells(1.0), cells(2.0));
+        assert!(values_equal(&a, &b));
+        assert!(!values_equal(&a, &c));
+        let structs = |inner: f64| {
+            let mut v = num(inner);
+            for _ in 0..depth {
+                v = struct_of(&["f"], vec![v]);
+            }
+            v
+        };
+        let (s, t, u) = (structs(1.0), structs(1.0), structs(2.0));
+        assert!(values_equal(&s, &t));
+        assert!(!values_equal(&s, &u));
+        // `e = {e, e}` sixty times: 2^60 paths, 61 containers.
+        let mut e = num(1.0);
+        let mut f = num(1.0);
+        for _ in 0..60 {
+            e = cell_of(1, 2, vec![e.clone(), e]);
+            f = cell_of(1, 2, vec![f.clone(), f]);
+        }
+        assert!(values_equal(&e, &f));
+        assert!(values_equal(&e, &e));
     }
 
     #[test]

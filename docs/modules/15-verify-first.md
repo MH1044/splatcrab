@@ -308,6 +308,117 @@ Settled at planning:
   `size(A,dim)` is `1`"; that line becomes `-Inf` and the case's covers
   line says so, since S6 now settles it.
 
+Recorded during implementation:
+
+- **Files and types.** `src/builtins/core.rs`: `values_equal` became a
+  worklist walk over pairs of values, with `handles_equal` (S3, S4),
+  `field_places` and `first_visit` beside it; the `isequal` builtin is
+  unchanged. `src/value.rs`: `transposed_items`, `transpose_cell` and
+  `transpose_struct`, which lay a cell's or a struct array's items out as
+  its transpose, moving them when the array has no other owner and copying
+  them otherwise. `src/interp.rs`: `Expr::Transpose` and
+  `Expr::DotTranspose` evaluate their operand as a value and go through
+  `transpose_value`, which hands a cell or a struct to the functions above
+  and a matrix to `flat_operand` and the transposes as before.
+  `src/builtins/linalg.rs`: the `transpose` builtin takes a cell and a
+  struct the same way. `src/builtins/math.rs`: `returns_argument` and
+  `reduce_or_return` give `sum` and `mean`, real and complex, the
+  past-`ndims` answer along a dimension of size 1; `reduction` gives `any`
+  and `all` each element's own answer past `ndims`; `logical_if` is the
+  logical-or-double tail both paths share. `reduce`, `reduce_c`, `scan`
+  and `each_slice` are unchanged, so `prod`, `max`, `min`, `cumsum`,
+  `cumprod`, `'all'` and `numerics::reduce_along` keep their answers.
+  `src/builtins/strings.rs`: `vector_units` is the character-vector test
+  (`Matrix::is_char_row`), read by `text_arg`, `map_cell`, `delimiters`
+  and the cell loops of `strcat`, `strjoin` and `regexp`; `units_arg`
+  keeps `strtok`'s delimiters of any size; `strtrim` walks its cell itself,
+  through `trim_char`. No type changed, no message was added to
+  `src/error.rs`, and no builtin joined or left the registry or its gates.
+- **Invariants preserved.** Column-major storage: the transposed layout
+  moves item `(r, c)` to `(c, r)` of the `cols x rows` result by index
+  arithmetic on the column-major order, and a row or a column keeps its
+  order unchanged. The one-based boundary is untouched: nothing here
+  indexes from user input. The `end` stack and name resolution are
+  untouched; a named handle's `local` binding, made by `named_handle` at
+  the handle's creation, is what equality compares, by pointer, so
+  equality never resolves a name. All output still goes through the sink;
+  nothing here writes. Invariant 6: `values_equal` holds its pending pairs
+  in a `Vec`, never on the stack, so a million-deep `c = {c}` compares with
+  no recursion; each pair is taken once, and a pair of containers is
+  recorded in a set only when one side is held in more than one place,
+  the one way a pair can be reached twice, so a nest of shared containers
+  with exponentially many paths compares in time proportional to the
+  pairs of containers it compares, never to its paths, and a chain of
+  containers held once costs no set entry;
+  struct fields are matched through `StructArray::field_index`, a hash
+  index past 32 fields, so a struct of 100,000 fields against its twin in
+  the reverse order is matched in linear time. A transposition allocates
+  exactly the operand's element count and judges nothing new. The text
+  functions' check is constant time per value.
+- **`isequal` of two structs with a repeated field name.** A struct is
+  never built with a name twice, but `field_places` still requires the
+  match to be one to one, so two structs are equal only when each name of
+  one is a different name of the other.
+- **`strtrim` of an empty element of several rows** is that element as it
+  is, as `strtrim` of the same array alone gives it, so
+  `strtrim({char(zeros(2, 0))})` holds a 2x0 char, and an element of
+  several blank rows trims to the 1x0 `strtrim` gives that array alone.
+  A character-vector element keeps its old path exactly, `''` included
+  becoming a 1x0.
+- **No deviation from Scope was accepted.** Every acceptance example was
+  checked against the built binary during implementation and gives the
+  answer the spec states.
+
+Settled in testing:
+
+- **An `MException` is refused in its own class's name.** Scope keeps
+  today's refusal for a function handle and an `MException` and quotes the
+  handle's form; the refusal names the value's class, so `x'` of a caught
+  exception is `This operation is not supported for a value of class
+  'MException'.`, as before this cycle (`transpose_refusals_kept`).
+- **S1's own example is `[1 2 3]:2:10`**, a start that is not a scalar;
+  `1:size(ones(3, 4))` is the end form Scope sets beside it. Both are
+  pinned, by `err_colon_nonscalar_start` and `err_colon_nonscalar_end`.
+- **`strtok`'s delimiters of any size are looked up in a set** (`unit_key`,
+  `-0` and `+0` one key, a `NaN` matching nothing, as `==` judges them), so a
+  text of a million units against two million delimiters is matched in time
+  linear in both, where scanning the delimiters for each unit of the text
+  took their product and did not finish (invariant 6,
+  `strtok_takes_delimiters_of_any_size_in_linear_time`). No answer changes.
+- **`strcat` judges the size of its cell result from character vectors
+  alone**, so a cell element of several rows is refused as any element that
+  is not text is, whatever its size, rather than first measured as one row
+  and refused by the array size limit
+  (`strcat_refuses_a_large_char_matrix_element_as_no_character_vector`).
+- **An option name reads a char as before.** Scope's "each text argument"
+  of `regexp` and `regexprep` is the text, the expression and the
+  replacement S9 quotes; their option names, and `strsplit`'s, are not
+  among S9's inputs and keep today's reading, so `regexp('abc', 'b', ['m';
+  'a'; 't'; 'c'; 'h'])` still reads the column as `'match'`.
+- **Two rows recorded beside the ones Scope names.** The removed Known
+  bugs row on the string functions also covered builtins no page was taken
+  to, which read a field or function name from a char of several rows as
+  one row (`isfield`, `rmfield`, `getfield`, `setfield`, `str2func`,
+  `feval`, `cellfun`); that remainder is a row of its own, verify first.
+  And a program's memory is judged one array at a time: storing a 16 MB
+  matrix into 100,000 cell elements copies it each time and ends in an
+  allocator abort, a path older than this cycle, recorded as a Known bugs
+  row for a later spec. `strcmp` of a cell holding a char of several rows,
+  and a colon over an empty target, which Scope lists as unsettled, are
+  clauses of the cycle 11 and N-D Known deviations rows.
+- **Every answer Scope does not name is unchanged**, compared line by line
+  with the build before this cycle: 4,968 reduction lines (`sum`, `mean`,
+  `prod`, `max` and `min` with their index, `cumsum`, `cumprod`, `any` and
+  `all` over 66 inputs, 2-D and N-D, real, complex, logical, char and empty,
+  along no dimension, dimensions 1 to 5 and `'all'`) differ only in a `-0`
+  that `sum` and `mean` keep along a dimension of size 1 and in `any` and
+  `all` past `ndims` of an array holding a `NaN`; 2,986 lines of `isequal`
+  over arrays and `MException`s and 222 lines of `'`, `.'` and `transpose`
+  over matrices are identical; and 20,033 text-function lines differ only
+  in a char of several rows refused at a place Scope lists, in the order
+  a value that is not text is refused there, and in `strtrim` of a cell
+  element of several rows.
+
 ## Acceptance tests
 
 Each numbered item becomes at least one golden case in
@@ -323,22 +434,23 @@ double `-Inf` `  -Inf`.
    @sin)` → `   1`; `isequal(@sin, @(x) sin(x))` → `   0`; `isequal(@sin,
    1)` → `   0`; `c = {h1}; isequal(c{1}, h1)` → `   1`; `isequal(h1, h1,
    h1)` → `   1`; two handles to one local function of the script,
-   `isequal(@loc, @loc)` → `   1`.
+   `isequal(@loc, @loc)` → `   1`. Cases: `isequal_handles.m`.
 2. `isequal` of cells: `isequal({1, 'a'}, {1, 'a'})` → `   1`; `{1, 'a'}`
    against `{1, 'b'}` → `   0`; `{1, 2}` against `{1; 2}` → `   0`;
    `{'a'}` against `{97}` → `   1`; `{NaN}` against `{NaN}` → `   0`;
    `isequal({}, {})` → `   1`; `{{1, {2}}}` against `{{1, {2}}}` →
    `   1`; `isequal({1}, 1)` → `   0`; `isequal({@sin}, {@sin})` → `   1`;
-   `isequal({1, 2}, {1, 2}, {1, 2})` → `   1`.
+   `isequal({1, 2}, {1, 2}, {1, 2})` → `   1`. Cases: `isequal_cells.m`.
 3. `isequal` of structs: `s.a = 1; s.b = 'x'; t.b = 'x'; t.a = 1;
    isequal(s, t)` → `   1`; then `t.b = 'y'` → `   0`; `u.a = 1;
    isequal(s, u)` → `   0`; `p(1).a = 1; p(2).a = 2; q = p;
    isequal(p, q)` → `   1`; then `q(2).a = 3` → `   0`; `isequal(s,
-   {1})` → `   0`.
+   {1})` → `   0`. Cases: `isequal_structs.m`.
 4. Deep nesting: two cells each nested 100,000 deep around `1`,
    `c = 1; d = 1; for k = 1:100000, c = {c}; d = {d}; end`, are equal,
    `   1`; around `1` and `2` unequal, `   0`; a struct nested 100,000 deep
-   through a field alike, `   1` and `   0`; exit 0 in each case.
+   through a field alike, `   1` and `   0`; exit 0 in each case. Cases:
+   `isequal_deep_nesting.m`.
 5. Transposition: `c = {1, 'ab', [3 4]}; d = c'; disp(size(d)); disp(d{2});
    disp(d{3})` → `     3     1`, `ab`, `     3     4`; `isequal(c', c.')`
    → `   1`; `disp(size(transpose(c)))` → `     3     1`; `g = {1, 2, 3;
@@ -347,19 +459,22 @@ double `-Inf` `  -Inf`.
    `s(1).a = 1; s(2).a = 2; t = s'; disp(size(t)); disp(t(2).a)` →
    `     2     1`, `     2`, and `s.'` alike. `err_*`: `f = @sin; f'` →
    `This operation is not supported for a value of class
-   'function_handle'.`, exit 1.
+   'function_handle'.`, exit 1. Cases: `transpose_cells_structs.m`,
+   `err_transpose_handle.m`.
 6. `sum` and `mean` along a dimension of size 1: `disp(1/sum(-0))`,
    `disp(1/sum(-0, 1))`, `disp(1/mean(-0))`, `disp(1/mean(-0, 1))` →
    `  -Inf` each; `disp(1 ./ sum([-0 -0], 1))` → `  -Inf  -Inf`;
    `disp(1 ./ mean([-0; -0], 2))` → `  -Inf` twice; `x = 1 ./ sum(-0 *
    ones(1, 1, 2), 1); disp(x(:)')` → `  -Inf  -Inf`; unchanged:
    `disp(1/sum(-0, 3))` → `  -Inf`, `disp(1/cumsum(-0, 1))` → `   Inf`,
-   `disp(class(sum(true, 1)))` → `double`.
+   `disp(class(sum(true, 1)))` → `double`. Cases:
+   `sum_mean_dim_of_size_one.m`.
 7. `any` and `all`: `disp(any(NaN, 3))` → `   0`; `disp(all(NaN, 3))` →
    `   1`; `disp(any([0 NaN 2], 3))` → `   0   0   1`; `disp(all([0 NaN
    2], 3))` → `   0   1   1`; `disp(class(any(NaN, 3)))` → `logical`;
    `disp(size(all(NaN(2, 3), 5)))` → `     2     3`; unchanged:
-   `disp(any(NaN, 1))` → `   0`, `disp(all(NaN, 1))` → `   1`.
+   `disp(any(NaN, 1))` → `   0`, `disp(all(NaN, 1))` → `   1`. Cases:
+   `any_all_past_ndims.m`.
 8. Text functions refuse a char array of several rows, each message
    printed through `try` and `catch`: `upper({['ab'; 'cd']})` and
    `lower({'ab'.'})` → `Every element of a cell argument to 'upper' must
@@ -380,28 +495,33 @@ double `-Inf` `  -Inf`.
    `upper({cat(3, 'a', 'b')})` → `Every element of a cell argument to
    'upper' ...`; `strtrim({cat(3, 'a', 'b')})` → `N-D arrays are not
    supported by 'strtrim'.` Beside it, `err_*` cases for `upper` of a cell
-   and `strrep` of a char matrix, each exit 1.
+   and `strrep` of a char matrix, each exit 1. Cases:
+   `text_functions_refuse_char_matrix.m`, `err_upper_cell_char_matrix.m`,
+   `err_strrep_char_matrix.m`.
 9. Text functions keep what they took: `x = upper(['ab'; 'cd']); disp(x)`
    → `AB` and `CD`; `r = strtrim({[' ab'; ' cd']}); disp(size(r{1}));
    disp(r{1})` → `     2     2`, `ab`, `cd`; `r = strtrim({['ab '; ' cd']});
    disp(size(r{1}))` → `     2     3`; `disp(strcat(['a'; 'b'], ['x';
    'y']))` → `ax` and `by`; `disp(numel(upper({char(zeros(0, 3))})))` →
    `     1`; `x = upper({'ab', ''}); disp(x{1}); disp(isempty(x{2}))` →
-   `AB` and `   1`.
+   `AB` and `   1`. Cases: `text_functions_keep_what_they_took.m`.
 10. The colon: through `try` and `catch`, `[1 3]:4` and `[1 2 3]:2:10` →
     `range start must be a scalar.`; `1:[1 2]:5` → `range step must be a
     scalar.`; `1:[3 4]`, `1:[]` and `1:size(ones(3, 4))` → `range end must
     be a scalar.`; `for k = 1:[], disp(k), end` → `range end must be a
     scalar.`; and `err_*` cases for a start, a step and an end operand,
-    each exit 1.
+    each exit 1. Cases: `colon_nonscalar_operand.m`,
+    `err_colon_nonscalar_start.m`, `err_colon_nonscalar_step.m`,
+    `err_colon_nonscalar_end.m`.
 11. `varargin`: the S10 function `definedAndVariableNumInputs(X, Y,
     varargin)`, printing `fprintf('Size of varargin cell array: %dx%d\n',
     size(varargin))`, called with two inputs and with five → `Size of
     varargin cell array: 0x0` and `Size of varargin cell array: 1x3`.
+    Cases: `varargin_no_extra_inputs.m`.
 12. `func2str`: `disp(func2str(@(x) x.^2+7))` → `@(x)x.^2+7`; `fh =
     @(x,y)sqrt(x.^2+y.^2); disp(['Anonymous function: ' func2str(fh)])` →
     `Anonymous function: @(x,y)sqrt(x.^2+y.^2)`; `disp(func2str(@cos))` →
-    `cos`.
+    `cos`. Cases: `func2str_spacing.m`.
 13. Unit tests: handle equality by name and binding and by identity;
     cells and structs compared element by element, fields in any order,
     and a deep nesting compared without recursion; the transposition of a
@@ -424,4 +544,4 @@ double `-Inf` `  -Inf`.
 
 ## Status
 
-Planned
+Done (2026-09-30)

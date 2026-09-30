@@ -19,7 +19,7 @@ use crate::parser::{
 };
 use crate::value::{
     CellArray, Class, Format, Func, Matrix, StructArray, Value, along_dim, blank, dims_product,
-    nonfinite, normalize_dims, with_format,
+    nonfinite, normalize_dims, transpose_cell, transpose_struct, with_format,
 };
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -1269,9 +1269,17 @@ impl Interp {
                 ))
             }
             // `'` conjugates as it transposes and `.'` does not (cycle 10).
-            // Neither is defined for an N-D array (cycle 14).
-            Expr::Transpose(a) => Ok(Value::Mat(flat_operand(self.eval_mat(a)?)?.ctranspose())),
-            Expr::DotTranspose(a) => Ok(Value::Mat(flat_operand(self.eval_mat(a)?)?.transpose())),
+            // Neither is defined for an N-D array (cycle 14). A cell or a
+            // struct array transposes by either, its elements unchanged
+            // (cycle 15).
+            Expr::Transpose(a) => {
+                let v = self.eval(a)?;
+                transpose_value(v, true)
+            }
+            Expr::DotTranspose(a) => {
+                let v = self.eval(a)?;
+                transpose_value(v, false)
+            }
             // A range between two chars is a char (cycle 11): `'a':'e'` is
             // `'abcde'`, as in MATLAB. Any other range is a double.
             Expr::Range(a, step, b) => {
@@ -3216,6 +3224,26 @@ fn flat_operand(m: Matrix) -> R<Matrix> {
         bail!(error::nd_transpose());
     }
     Ok(m)
+}
+
+/// `v'` when `conjugate`, and `v.'` otherwise. A matrix is transposed as
+/// it always was; a cell or a struct array has the row and column of every
+/// element interchanged by either operator, each element unchanged (cycle
+/// 15, the MathWorks `transpose` and `ctranspose` pages); a function handle
+/// and an `MException` keep the refusal of a value that is not an array.
+fn transpose_value(v: Value, conjugate: bool) -> R<Value> {
+    Ok(match v {
+        Value::Cell(c) => Value::cell(transpose_cell(c)),
+        Value::Struct(s) => Value::strukt(transpose_struct(s)),
+        v => {
+            let m = flat_operand(v.into_mat()?)?;
+            Value::Mat(if conjugate {
+                m.ctranspose()
+            } else {
+                m.transpose()
+            })
+        }
+    })
 }
 
 /// True when column-major storage laid out as `old` is already the start

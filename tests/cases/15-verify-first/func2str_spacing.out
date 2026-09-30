@@ -1,0 +1,3 @@
+@(x)x.^2+7
+Anonymous function: @(x,y)sqrt(x.^2+y.^2)
+cos

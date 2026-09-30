@@ -304,6 +304,50 @@ impl StructArray {
     }
 }
 
+/// The items of a `rows x cols` array, column-major, laid out as its
+/// transpose, `cols x rows`: item `(r, c)` moves to `(c, r)`, and each item
+/// itself is moved, never changed. A row or a column keeps its order.
+fn transposed_items<T>(rows: usize, cols: usize, items: Vec<T>) -> Vec<T> {
+    if rows <= 1 || cols <= 1 {
+        return items;
+    }
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    // Item `k` of the result, `(i, j)` of the `cols x rows` transpose, is
+    // `(j, i)` of the original, at `j + i * rows`. That is a permutation,
+    // so every slot is taken exactly once.
+    (0..rows * cols)
+        .filter_map(|k| slots[k / cols + (k % cols) * rows].take())
+        .collect()
+}
+
+/// A cell array's transpose (cycle 15), what `c'`, `c.'` and
+/// `transpose(c)` give: the row and column index of every element
+/// interchanged, "For logical or non-numeric inputs, ctranspose and
+/// transpose produce the same result" (the MathWorks `ctranspose` page), and
+/// each element itself unchanged, never transposed or conjugated. The
+/// elements are moved when this is the cell's last owner and copied
+/// otherwise, as any copy on write copies them.
+pub fn transpose_cell(c: Rc<CellArray>) -> CellArray {
+    let (rows, cols) = (c.rows, c.cols);
+    let data = match Rc::try_unwrap(c) {
+        Ok(mut c) => std::mem::take(&mut c.data),
+        Err(c) => c.data.clone(),
+    };
+    CellArray::new(cols, rows, transposed_items(rows, cols, data))
+}
+
+/// A struct array's transpose (cycle 15), as [`transpose_cell`]: every
+/// element moves from `(r, c)` to `(c, r)` and keeps its values, and the
+/// fields and their order are kept.
+pub fn transpose_struct(s: Rc<StructArray>) -> StructArray {
+    let (rows, cols) = (s.rows, s.cols);
+    let (fields, elems) = match Rc::try_unwrap(s) {
+        Ok(mut s) => (std::mem::take(&mut s.fields), std::mem::take(&mut s.elems)),
+        Err(s) => (s.fields.clone(), s.elems.clone()),
+    };
+    StructArray::new(cols, rows, fields, transposed_items(rows, cols, elems))
+}
+
 /// True for a value that holds other values, and so could start a chain
 /// that must be freed without recursion.
 fn holds_values(v: &Value) -> bool {
@@ -2215,6 +2259,59 @@ mod tests {
         z.set(1, 0, 7.0);
         z.set(0, 1, 9.0);
         assert_eq!(z.data, [0.0, 7.0, 9.0, 0.0]);
+    }
+
+    /// Cycle 15: a cell's and a struct array's transpose interchange the
+    /// row and column of every element, each element itself unchanged, a
+    /// struct's fields and their order kept, whether the array is shared
+    /// or moved.
+    #[test]
+    fn a_cell_and_a_struct_array_transpose() {
+        let n = |v: f64| Value::Mat(Matrix::scalar(v));
+        // {1, 2, 3; 4, 5, 6}, column-major.
+        let c = Rc::new(CellArray::new(
+            2,
+            3,
+            (1..=6)
+                .map(|k| n([1.0, 4.0, 2.0, 5.0, 3.0, 6.0][k - 1]))
+                .collect(),
+        ));
+        let scalar = |v: &Value| v.mat().unwrap().data[0];
+        let shared = c.clone();
+        let t = transpose_cell(c);
+        assert_eq!((t.rows, t.cols), (3, 2));
+        let got: Vec<f64> = t.data.iter().map(scalar).collect();
+        assert_eq!(got, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        // The shared original is untouched, and a moved one gives the same.
+        assert_eq!((shared.rows, shared.cols), (2, 3));
+        let moved = transpose_cell(shared);
+        assert_eq!(moved.data.iter().map(scalar).collect::<Vec<_>>(), got);
+        // An element is not transposed or conjugated.
+        let z = Matrix::complex_parts(1, 2, vec![1.0, 3.0], vec![2.0, 4.0]);
+        let r = transpose_cell(Rc::new(CellArray::row(vec![Value::Mat(z.clone()), n(7.0)])));
+        assert_eq!((r.rows, r.cols), (2, 1));
+        let Value::Mat(e) = &r.data[0] else {
+            panic!("a matrix")
+        };
+        assert_eq!((e.rows, e.cols, &e.data, &e.im), (1, 2, &z.data, &z.im));
+        // A row and a column keep their order; an empty keeps its sizes.
+        let back = transpose_cell(Rc::new(r));
+        assert_eq!((back.rows, back.cols), (1, 2));
+        let e = transpose_cell(Rc::new(CellArray::new(0, 3, Vec::new())));
+        assert_eq!((e.rows, e.cols), (3, 0));
+        // A 2x2 struct array with two fields.
+        let elems: Vec<Vec<Value>> = (0..4).map(|k| vec![n(k as f64), Value::str("x")]).collect();
+        let s = StructArray::new(2, 2, vec!["a".into(), "b".into()], elems);
+        let t = transpose_struct(Rc::new(s));
+        assert_eq!((t.rows, t.cols), (2, 2));
+        assert_eq!(t.fields, ["a", "b"]);
+        let a: Vec<f64> = t.elems.iter().map(|e| scalar(&e[0])).collect();
+        assert_eq!(a, [0.0, 2.0, 1.0, 3.0]);
+        assert_eq!(t.field_index("b"), Some(1));
+        let row = StructArray::new(1, 2, vec!["a".into()], vec![vec![n(1.0)], vec![n(2.0)]]);
+        let col = transpose_struct(Rc::new(row));
+        assert_eq!((col.rows, col.cols), (2, 1));
+        assert_eq!(scalar(&col.elems[1][0]), 2.0);
     }
 
     #[test]

@@ -274,6 +274,26 @@ z
   `isa` and the other class and shape queries answer for a handle, an
   `MException`, a cell and a struct, and a binary operator on one of them is
   MATLAB's `Operator '+' is not supported for operands of type 'cell'.`
+- Behaviour the MathWorks pages settle (cycle 15): `isequal` compares
+  function handles by what they name, an anonymous function equal only to
+  its copies (`isequal_handles`), and cells and structs element by
+  element, struct fields in any order, walking any depth of nesting without
+  recursion (`isequal_cells`, `isequal_structs`, `isequal_deep_nesting`);
+  `c'`, `c.'` and `transpose(c)` of a cell or a struct array interchange
+  its rows and columns, a handle still refused (`transpose_cells_structs`,
+  `err_transpose_handle`); `sum` and `mean` along a dimension of size 1
+  return their argument, so `sum(-0)` is `-0` (`sum_mean_dim_of_size_one`),
+  and `any` and `all` past `ndims` ignore a `NaN` as `any` does, so
+  `any(NaN, 3)` is false (`any_all_past_ndims`); the text functions refuse
+  a char array of several rows where they take a character vector, rather
+  than read it as one row (`text_functions_refuse_char_matrix`,
+  `err_upper_cell_char_matrix`, `err_strrep_char_matrix`,
+  `text_functions_keep_what_they_took`); and a colon operand that is not a
+  scalar stays an error, `varargin` with no extra inputs stays 0x0 and
+  `func2str` drops the space after the parameter list, as the pages show
+  (`colon_nonscalar_operand`, `err_colon_nonscalar_start`,
+  `err_colon_nonscalar_step`, `err_colon_nonscalar_end`,
+  `varargin_no_extra_inputs`, `func2str_spacing`)
 - Nesting is bounded rather than unbounded: 10,000 levels of parentheses,
   brackets, calls, indexes, blocks or chained operators, past which the parser
   and the evaluator both give a clean error. Nothing a user can type aborts

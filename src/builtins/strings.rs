@@ -13,6 +13,19 @@
 //! over the elements; `regexp` of a cell answers a cell of per-element
 //! outputs. `strsplit`, `strtok`, `blanks`, `mat2str`, `int2str`,
 //! `num2str` and `str2num` take a single array.
+//!
+//! Since cycle 15 a place that takes a character vector, a char of at most
+//! one row and two dimensions, refuses a char of several rows with the
+//! message it gives any value that is not text, where it read one as its
+//! code units in column-major order: an argument of `strrep`, `strfind`,
+//! `regexp`, `regexprep`, `strsplit` and `strtok`, the delimiter of
+//! `strjoin` and `strsplit`, and an element of a cell given to any of them
+//! or to `upper`, `lower` and `strcat`. A bare char argument of `upper`,
+//! `lower` and `strcat` and `strtok`'s delimiters take any size, as
+//! before, and `strtrim` trims an element of several rows as it trims
+//! that array on its own.
+
+use std::collections::HashSet;
 
 use super::args::{MAX_ELEMS, at_most, check_cell, check_shape, check_struct, mat, need};
 use super::printf::{escapes, format_printf};
@@ -77,8 +90,32 @@ fn units_of(v: &Value) -> Option<&[f64]> {
     }
 }
 
-/// Argument `i` as the code units of a char, refused otherwise.
+/// The code units of a character vector, a char of at most one row and two
+/// dimensions ([`Matrix::is_char_row`]): `''`, a char with no rows and a
+/// char row. `None` for any other value, a char of several rows or of more
+/// than two dimensions included (cycle 15): "a cell array containing a
+/// character array with more than one row result[s] in an error" (the
+/// MathWorks `iscellstr` page), and each place that takes a character
+/// vector refuses one in the words it refuses any value that is not text.
+fn vector_units(v: &Value) -> Option<&[f64]> {
+    match v {
+        Value::Mat(m) if m.is_char_row() => Some(&m.data),
+        _ => None,
+    }
+}
+
+/// Argument `i` as the code units of a character vector, refused otherwise,
+/// a char of several rows included (cycle 15).
 fn text_arg<'a>(args: &'a [Value], i: usize, name: &str) -> R<&'a [f64]> {
+    match args.get(i) {
+        Some(v) => vector_units(v).ok_or_else(|| error::arg_not_a_string(i + 1, name)),
+        None => Err(error::not_enough_args(name)),
+    }
+}
+
+/// Argument `i` as the code units of a char of any size, refused when it is
+/// not a char: `strtok`'s delimiters, which "can be any size".
+fn units_arg<'a>(args: &'a [Value], i: usize, name: &str) -> R<&'a [f64]> {
     match args.get(i) {
         Some(v) => units_of(v).ok_or_else(|| error::arg_not_a_string(i + 1, name)),
         None => Err(error::not_enough_args(name)),
@@ -131,12 +168,13 @@ pub(crate) fn upper_unit(u: f64) -> f64 {
     f64::from(super::regex::upper(u as u32))
 }
 
-/// Each element of a cell of texts through `f`, the result a cell of the
-/// same shape. An element that is not text is refused in `name`'s words.
+/// Each element of a cell of character vectors through `f`, the result a
+/// cell of the same shape. An element that is not a character vector, a
+/// char of several rows included (cycle 15), is refused in `name`'s words.
 fn map_cell(c: &CellArray, name: &str, mut f: impl FnMut(&[f64]) -> R<Value>) -> R<Value> {
     let mut out = Vec::with_capacity(c.data.len());
     for v in &c.data {
-        let u = units_of(v).ok_or_else(|| error::cell_not_text(name))?;
+        let u = vector_units(v).ok_or_else(|| error::cell_not_text(name))?;
         out.push(f(u)?);
     }
     Ok(Value::cell(CellArray::new(c.rows, c.cols, out)))
@@ -166,16 +204,19 @@ fn strcat(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         {
             return Err(error::strcat_cells());
         }
+        // An element that is no character vector counts nothing here, a
+        // char of several rows as any other, so the loop below refuses it
+        // rather than this sum judging its size.
         let mut total: usize = 0;
         for a in args {
             total = total.saturating_add(match a {
-                Value::Cell(c) if c.data.len() == 1 => units_of(&c.data[0])
+                Value::Cell(c) if c.data.len() == 1 => vector_units(&c.data[0])
                     .map_or(0, <[f64]>::len)
                     .saturating_mul(n),
                 Value::Cell(c) => c
                     .data
                     .iter()
-                    .map(|v| units_of(v).map_or(0, <[f64]>::len))
+                    .map(|v| vector_units(v).map_or(0, <[f64]>::len))
                     .sum(),
                 other => other.mat()?.data.len().saturating_mul(n),
             });
@@ -191,7 +232,7 @@ fn strcat(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
                         } else {
                             &c.data[k]
                         };
-                        units_of(v).ok_or_else(|| error::cell_not_text("strcat"))?
+                        vector_units(v).ok_or_else(|| error::cell_not_text("strcat"))?
                     }
                     other => &other.mat()?.data,
                 };
@@ -240,23 +281,25 @@ fn strcat(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     }
 }
 
-/// The delimiters of `strsplit` or `strtok`: a char or a cell of chars,
-/// escapes processed as `sprintf` processes them.
+/// The delimiters of `strsplit` or `strjoin`: a character vector or a cell
+/// of character vectors, escapes processed as `sprintf` processes them. A
+/// char of several rows is refused as any value that is not text is
+/// (cycle 15).
 fn delimiters(v: &Value, name: &str) -> R<Vec<Vec<f64>>> {
     let one_text = |v: &Value| -> R<Vec<f64>> {
-        let t = v.text().ok_or_else(|| error::arg_not_a_string(2, name))?;
+        let t = match v {
+            Value::Mat(m) if m.is_char_row() => m.text(),
+            _ => return Err(error::arg_not_a_string(2, name)),
+        };
         Ok(units(&escapes(&t)))
     };
     match v {
         Value::Cell(c) => c
             .data
             .iter()
-            .map(|d| {
-                if d.is_char() {
-                    one_text(d)
-                } else {
-                    Err(error::cell_not_text(name))
-                }
+            .map(|d| match d {
+                Value::Mat(m) if m.is_char_row() => one_text(d),
+                _ => Err(error::cell_not_text(name)),
             })
             .collect(),
         other => Ok(vec![one_text(other)?]),
@@ -375,7 +418,7 @@ fn strjoin(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     let texts = c
         .data
         .iter()
-        .map(|v| units_of(v).ok_or_else(|| error::cell_not_text("strjoin")))
+        .map(|v| vector_units(v).ok_or_else(|| error::cell_not_text("strjoin")))
         .collect::<R<Vec<_>>>()?;
     let total = texts
         .iter()
@@ -494,21 +537,45 @@ fn trim_matrix(m: &Matrix) -> Matrix {
     char_rows(&rows)
 }
 
+/// `strtrim(s)`: a char array less the columns at either end that are
+/// whitespace in every row, and a cell element by element. The page takes
+/// "a cell array of character arrays", so since cycle 15 an element of
+/// several rows is trimmed as `strtrim` trims that array on its own, its
+/// shape kept, where it was read as one row of its code units; an element
+/// of more than two dimensions is refused as the registry refuses such an
+/// argument. A character vector element is trimmed as it always was.
 fn strtrim(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 1, "strtrim")?;
     at_most(args, 1, "strtrim")?;
     match &args[0] {
-        Value::Cell(c) => one(map_cell(c, "strtrim", |s| {
-            Ok(Value::Mat(trim_matrix(&Matrix::row(s.to_vec()))))
-        })?),
-        Value::Mat(m) if m.class == Class::Char => {
-            if m.is_empty() {
-                return one(args[0].clone());
+        Value::Cell(c) => {
+            let mut out = Vec::with_capacity(c.data.len());
+            for v in &c.data {
+                out.push(match v {
+                    Value::Mat(m) if m.is_char_row() => {
+                        Value::Mat(trim_matrix(&Matrix::row(m.data.clone())))
+                    }
+                    Value::Mat(m) if m.class == Class::Char && m.is_nd() => {
+                        return Err(error::nd_argument("strtrim"));
+                    }
+                    Value::Mat(m) if m.class == Class::Char => Value::Mat(trim_char(m)),
+                    _ => return Err(error::cell_not_text("strtrim")),
+                });
             }
-            one_as(trim_matrix(m))
+            one(Value::cell(CellArray::new(c.rows, c.cols, out)))
         }
+        Value::Mat(m) if m.class == Class::Char => one_as(trim_char(m)),
         _ => Err(error::arg_not_a_string(1, "strtrim")),
     }
+}
+
+/// `strtrim` of a 2-D char array on its own: an empty one as it is, and
+/// any other through [`trim_matrix`].
+fn trim_char(m: &Matrix) -> Matrix {
+    if m.is_empty() {
+        return m.clone();
+    }
+    trim_matrix(m)
 }
 
 /// `upper` and `lower`: a char mapped unit by unit, a cell element by
@@ -666,16 +733,24 @@ fn strtok(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
     need(args, 1, "strtok")?;
     at_most(args, 2, "strtok")?;
     let s = text_arg(args, 0, "strtok")?;
-    let delims: Vec<f64> = match args.get(1) {
-        Some(_) => text_arg(args, 1, "strtok")?.to_vec(),
-        None => Vec::new(),
+    // The delimiters "can be any size" (the MathWorks `strtok` page): every
+    // code unit of a char of any shape is one. They are looked up in a set,
+    // so a text and a delimiter list of any lengths cost time linear in
+    // both (invariant 6), where a scan of the list for each unit of the
+    // text took their product.
+    let delims: Option<HashSet<u64>> = match args.get(1) {
+        Some(_) => Some(
+            units_arg(args, 1, "strtok")?
+                .iter()
+                .map(|u| unit_key(*u))
+                .collect(),
+        ),
+        None => None,
     };
-    let is_delim = |u: f64| {
-        if args.len() > 1 {
-            delims.contains(&u)
-        } else {
-            is_white(u) || u == 0.0
-        }
+    let is_delim = |u: f64| match &delims {
+        // A `NaN` equals nothing, as `==` would judge it.
+        Some(d) => !u.is_nan() && d.contains(&unit_key(u)),
+        None => is_white(u) || u == 0.0,
     };
     let start = s.iter().position(|u| !is_delim(*u)).unwrap_or(s.len());
     let end = s[start..]
@@ -686,6 +761,12 @@ fn strtok(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
         chars(s[start..end].to_vec()),
         chars(s[end..].to_vec()),
     ])
+}
+
+/// A code unit as a set key, `-0` and `+0` alike, since `==` makes them
+/// the same unit.
+fn unit_key(u: f64) -> u64 {
+    (u + 0.0).to_bits()
 }
 
 fn isspace(_: &mut Interp, args: &[Value], _: usize) -> R<Vec<Value>> {
@@ -1323,7 +1404,7 @@ fn regexp(_: &mut Interp, args: &[Value], nargout: usize) -> R<Vec<Value>> {
             };
             let mut per: Vec<Vec<Value>> = vec![Vec::with_capacity(c.data.len()); count];
             for v in &c.data {
-                let s = units_of(v).ok_or_else(|| error::cell_not_text("regexp"))?;
+                let s = vector_units(v).ok_or_else(|| error::cell_not_text("regexp"))?;
                 for (k, out) in regexp_one(&re, s, &o)?.into_iter().take(count).enumerate() {
                     per[k].push(out);
                 }
@@ -2018,5 +2099,223 @@ mod tests {
         );
         assert_eq!(out, want);
         assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    }
+
+    /// A char of these rows, each the same length.
+    fn char_matrix(rows: &[&str]) -> Value {
+        let units: Vec<Vec<f64>> = rows.iter().map(|r| super::units(r)).collect();
+        Value::Mat(char_rows(&units))
+    }
+
+    fn cell1(v: Value) -> Value {
+        Value::cell(CellArray::new(1, 1, vec![v]))
+    }
+
+    fn message(f: super::super::BuiltinFn, args: &[Value]) -> String {
+        call(f, args, 1).unwrap_err().msg
+    }
+
+    /// Cycle 15: a character vector is a char of at most one row and two
+    /// dimensions, and at every place that takes one a char of several
+    /// rows, or of three dimensions in a cell, is refused as a value that
+    /// is not text is refused there, with that place's own message.
+    #[test]
+    fn a_char_of_several_rows_is_no_character_vector() {
+        let m = || char_matrix(&["ab", "cd"]);
+        let col = || char_matrix(&["a", "b"]);
+        let nd =
+            || Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![97.0, 98.0]).with_class(Class::Char));
+        // What is and is not a character vector.
+        assert!(vector_units(&s("ab")).is_some());
+        assert!(vector_units(&s("")).is_some());
+        let no_rows = Value::Mat(Matrix::new(0, 3, Vec::new()).with_class(Class::Char));
+        assert!(vector_units(&no_rows).is_some());
+        assert!(vector_units(&m()).is_none());
+        assert!(vector_units(&col()).is_none());
+        assert!(vector_units(&nd()).is_none());
+        assert!(vector_units(&num(97.0)).is_none());
+        let arg = |n: usize, f: &str| format!("Argument {n} to '{f}' must be a character vector.");
+        let elem = |f: &str| {
+            format!("Every element of a cell argument to '{f}' must be a character vector.")
+        };
+        for (f, name) in [
+            (upper as super::super::BuiltinFn, "upper"),
+            (lower, "lower"),
+        ] {
+            assert_eq!(message(f, &[cell1(m())]), elem(name));
+            assert_eq!(message(f, &[cell1(col())]), elem(name));
+            assert_eq!(message(f, &[cell1(nd())]), elem(name));
+        }
+        assert_eq!(message(strrep, &[m(), s("a"), s("z")]), arg(1, "strrep"));
+        assert_eq!(
+            message(strrep, &[s("abc"), col(), s("z")]),
+            arg(2, "strrep")
+        );
+        assert_eq!(
+            message(strrep, &[s("abc"), s("a"), col()]),
+            arg(3, "strrep")
+        );
+        assert_eq!(
+            message(strrep, &[cell1(m()), s("a"), s("z")]),
+            elem("strrep")
+        );
+        assert_eq!(message(strfind, &[m(), s("a")]), arg(1, "strfind"));
+        assert_eq!(message(strfind, &[s("ab"), col()]), arg(2, "strfind"));
+        assert_eq!(message(strfind, &[cell1(m()), s("a")]), elem("strfind"));
+        assert_eq!(
+            message(regexp, &[m(), s("a"), s("match")]),
+            arg(1, "regexp")
+        );
+        assert_eq!(message(regexp, &[s("ab"), col()]), arg(2, "regexp"));
+        assert_eq!(message(regexp, &[cell1(m()), s("a")]), elem("regexp"));
+        assert_eq!(
+            message(regexprep, &[m(), s("a"), s("z")]),
+            arg(1, "regexprep")
+        );
+        assert_eq!(
+            message(regexprep, &[s("abc"), col(), s("z")]),
+            arg(2, "regexprep")
+        );
+        assert_eq!(
+            message(regexprep, &[s("abc"), s("a"), col()]),
+            arg(3, "regexprep")
+        );
+        assert_eq!(
+            message(regexprep, &[cell1(m()), s("a"), s("z")]),
+            elem("regexprep")
+        );
+        let ab = |second: Value| Value::cell(CellArray::row(vec![s("a"), second]));
+        assert_eq!(message(strjoin, &[ab(col())]), elem("strjoin"));
+        assert_eq!(message(strjoin, &[ab(s("b")), col()]), arg(2, "strjoin"));
+        assert_eq!(
+            message(strjoin, &[ab(s("b")), cell1(col())]),
+            elem("strjoin")
+        );
+        assert_eq!(message(strcat, &[cell1(m()), s("z")]), elem("strcat"));
+        assert_eq!(
+            message(strsplit, &[char_matrix(&["a b", "c d"])]),
+            arg(1, "strsplit")
+        );
+        assert_eq!(message(strsplit, &[s("a b"), col()]), arg(2, "strsplit"));
+        assert_eq!(
+            message(strsplit, &[s("a b"), cell1(col())]),
+            elem("strsplit")
+        );
+        assert_eq!(
+            message(strtok, &[char_matrix(&["a b", "c d"])]),
+            arg(1, "strtok")
+        );
+        // What keeps taking a char of any shape: a bare argument of `upper`
+        // and `strcat`, and `strtok`'s delimiters.
+        assert_eq!(rows(&call(upper, &[m()], 1).unwrap()[0]), ["AB", "CD"]);
+        let joined = call(strcat, &[col(), char_matrix(&["x", "y"])], 1).unwrap();
+        assert_eq!(rows(&joined[0]), ["ax", "by"]);
+        let out = call(strtok, &[s("a b"), char_matrix(&[" ", "x"])], 2).unwrap();
+        assert_eq!(
+            (out[0].text().unwrap(), out[1].text().unwrap()),
+            ("a".into(), " b".into())
+        );
+        // A character vector gives what it always gave, and a char with no
+        // rows is one.
+        let v = call(
+            upper,
+            &[Value::cell(CellArray::row(vec![s("ab"), s("")]))],
+            1,
+        )
+        .unwrap();
+        let Value::Cell(c) = &v[0] else {
+            panic!("a cell")
+        };
+        assert_eq!(c.data[0].text().unwrap(), "AB");
+        assert!(c.data[1].text().unwrap().is_empty());
+        assert!(call(upper, &[cell1(no_rows)], 1).is_ok());
+        assert_eq!(text(strrep, &[s("abc"), s("b"), s("x")]), "axc");
+        // `strcmp` compares a char of several rows, as it always did.
+        let same = call(strcmp, &[cell1(m()), m()], 1).unwrap();
+        assert_eq!(same[0].mat().unwrap().data, [1.0]);
+    }
+
+    /// Cycle 15: `strtrim` takes "a cell array of character arrays", so an
+    /// element of several rows is trimmed as `strtrim` trims that array on
+    /// its own, its shape kept; one of three dimensions is refused as the
+    /// registry refuses such an argument.
+    #[test]
+    fn strtrim_trims_a_char_matrix_in_a_cell_as_on_its_own() {
+        let first = |v: Vec<Value>| -> Value {
+            let Value::Cell(c) = &v[0] else {
+                panic!("a cell")
+            };
+            c.data[0].clone()
+        };
+        let m = char_matrix(&[" ab", " cd"]);
+        let alone = call(strtrim, std::slice::from_ref(&m), 1)
+            .unwrap()
+            .remove(0);
+        let held = first(call(strtrim, &[cell1(m)], 1).unwrap());
+        assert_eq!(held.dims(), [2, 2]);
+        assert_eq!(rows(&held), ["ab", "cd"]);
+        assert_eq!(rows(&alone), rows(&held));
+        let kept = first(call(strtrim, &[cell1(char_matrix(&["ab ", " cd"]))], 1).unwrap());
+        assert_eq!(kept.dims(), [2, 3]);
+        let blank = first(call(strtrim, &[cell1(char_matrix(&["  ", "  "]))], 1).unwrap());
+        assert_eq!(blank.dims(), [1, 0]);
+        let empty = Value::Mat(Matrix::new(2, 0, Vec::new()).with_class(Class::Char));
+        assert_eq!(
+            first(call(strtrim, &[cell1(empty)], 1).unwrap()).dims(),
+            [2, 0]
+        );
+        // A character vector is trimmed as it always was, `''` to a 1x0.
+        let row = first(call(strtrim, &[cell1(s("  x "))], 1).unwrap());
+        assert_eq!(row.text().unwrap(), "x");
+        assert_eq!(
+            first(call(strtrim, &[cell1(s(""))], 1).unwrap()).dims(),
+            [1, 0]
+        );
+        let nd =
+            Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![97.0, 98.0]).with_class(Class::Char));
+        assert_eq!(
+            message(strtrim, &[cell1(nd)]),
+            "N-D arrays are not supported by 'strtrim'."
+        );
+        assert_eq!(
+            message(strtrim, &[cell1(num(1.0))]),
+            "Every element of a cell argument to 'strtrim' must be a character vector."
+        );
+    }
+
+    /// `strtok`'s delimiters "can be any size", so a text of a million units
+    /// against a char of two million delimiters is matched in time linear
+    /// in both, never their product (invariant 6).
+    #[test]
+    fn strtok_takes_delimiters_of_any_size_in_linear_time() {
+        let start = std::time::Instant::now();
+        let text = format!("{}a{}", "xy".repeat(500_000), "z".repeat(10));
+        let row = "ab".repeat(500_000);
+        let delims = char_matrix(&[&row, &row]);
+        let out = call(strtok, &[s(&text), delims], 2).unwrap();
+        assert_eq!(out[0].text().unwrap(), "xy".repeat(500_000));
+        assert_eq!(out[1].text().unwrap(), format!("a{}", "z".repeat(10)));
+        // A delimiter row as long, and the default whitespace, alike.
+        let long = format!("{}q", "xy".repeat(500_000));
+        let out = call(strtok, &[s(&format!("qq{text}")), s(&long)], 2).unwrap();
+        assert_eq!(out[0].text().unwrap(), format!("a{}", "z".repeat(10)));
+        assert!(out[1].text().unwrap().is_empty());
+        let out = call(strtok, &[s("  a b")], 2).unwrap();
+        assert_eq!(out[0].text().unwrap(), "a");
+        assert!(start.elapsed().as_secs() < 10, "{:?}", start.elapsed());
+    }
+
+    /// A cell element of several rows is refused by `strcat` as any element
+    /// that is no character vector, whatever its size: the size the result
+    /// would take is judged from the character vectors alone.
+    #[test]
+    fn strcat_refuses_a_large_char_matrix_element_as_no_character_vector() {
+        let row = "ab".repeat(1 << 19);
+        let big = cell1(char_matrix(&[&row, &row]));
+        let many = Value::cell(CellArray::row((0..200).map(|_| s("x")).collect()));
+        assert_eq!(
+            message(strcat, &[big, many]),
+            "Every element of a cell argument to 'strcat' must be a character vector."
+        );
     }
 }

@@ -9,10 +9,10 @@ use super::complex::C;
 use super::core::eps_at;
 use super::factor::{self, JACOBI_SWEEPS, SVD_SWEEPS, Vectors, qr_iterations};
 use super::math::{reduce, sum0};
-use super::{Registry, add, one_as, one_mat};
+use super::{Registry, add, one, one_as, one_mat};
 use crate::error;
 use crate::interp::{Interp, R};
-use crate::value::{Class, Matrix, Value};
+use crate::value::{Class, Matrix, Value, transpose_cell, transpose_struct};
 
 /// One line per builtin; see the note on `core::register`.
 #[rustfmt::skip]
@@ -57,9 +57,17 @@ pub fn register(r: &mut Registry) {
 
 // ---- linear algebra --------------------------------------------------
 
+/// `transpose(A)`, "an alternate way to execute `A.'`" (the MathWorks
+/// `transpose` page): a matrix's plain transpose, and since cycle 15 a cell
+/// or a struct array with the row and column of every element
+/// interchanged, each element unchanged.
 fn transpose(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     at_most(a, 1, "transpose")?;
-    one_as(mat(a, 0, "transpose")?.transpose())
+    match a.first() {
+        Some(Value::Cell(c)) => one(Value::cell(transpose_cell(c.clone()))),
+        Some(Value::Struct(s)) => one(Value::strukt(transpose_struct(s.clone()))),
+        _ => one_as(mat(a, 0, "transpose")?.transpose()),
+    }
 }
 
 /// `inv(A)`, with the singular warning and an `Inf` result for a singular

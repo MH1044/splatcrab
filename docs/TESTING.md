@@ -242,7 +242,9 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   dimension, a page's own scale factor and the empty N-D wording, the
   display handed out a page at a time, two thousand pages under headers
   naming three thousand dimensions of 1 within a bound, and a field name
-  past any format width aligned by hand.
+  past any format width aligned by hand. Since cycle 15 a cell and a
+  struct array transposed, each element moved to the interchanged
+  position and never itself changed.
 - `interp.rs`: behaviour, through a capture helper that swaps `Interp.out` for
   an in-memory buffer, plus the pure helpers `fmt_e`, `fmt_g`, `range` and
   `matrix_power`. The builtin tests here cover the wiring only: name
@@ -263,15 +265,21 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   past `MAX_NDIMS` dimensions;
   `core.rs` the constructors, and since cycle 14 their N-D sizes, the shape
   queries by the `size` page's rules and `values_equal` of arrays of
-  different shapes and `whos` padding a column past any format width;
+  different shapes and `whos` padding a column past any format width, and
+  since cycle 15 `isequal` of handles by name and binding or by identity,
+  of cells and structs element by element with fields in any order, a
+  struct of 100,000 fields against its reverse within a bound, and a
+  nesting 200,000 deep compared without recursion;
   since cycle 14 `sets.rs` and `strings.rs` a cell
   holding an N-D char, which is no character vector, and `strings.rs`
   `strcmp` and `strcmpi` comparing one by every dimension;
   `math.rs` the reduction and scan dimension rules, and since cycle 14b
   the default dimension, the three-number view of every reduction checked
   slice by slice against a direct sum, a dimension of size 1, past `ndims`
-  (the argument handed back, a `-0` and a complex storage kept, `any` and
-  `all` refusing a `NaN` there) and of size 0, `max` and `min` with their
+  (the argument handed back, a `-0` and a complex storage kept, and since
+  cycle 15 `any` and `all` giving each element its own answer there, a
+  `NaN` ignored by `any`), since cycle 15 `sum` and `mean` along a
+  dimension of size 1 keeping a `-0`, and of size 0, `max` and `min` with their
   index along any dimension and broadcasting, and refusing two arrays and
   a dimension, and the element-wise math keeping every dimension;
   `linalg.rs` sorting and rearrangement, and since cycle 14b `squeeze`,
@@ -291,7 +299,10 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   `printf.rs` checks every conversion, flag and escape and the width and
   precision bound, `*` fields included; `strings.rs` the `num2str` layouts,
   the string functions, `regexp`'s outputs and the refusal of a result too
-  large to build; `regex.rs` the syntax, leftmost-first answers, the
+  large to build, and since cycle 15 the character-vector test at every
+  place that takes one, `strtrim` of a char matrix in a cell trimmed as on
+  its own, `strtok`'s delimiters of any size in linear time, and `strcat`
+  refusing a large char-matrix element as no character vector; `regex.rs` the syntax, leftmost-first answers, the
   refusals and the bounds, and a pathological pattern on a 100,000-unit
   subject finishing at once; `mat.rs` a round trip of every value kind and
   every cut of a good file, a header claiming 1e12 elements and nesting

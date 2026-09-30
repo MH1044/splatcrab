@@ -178,32 +178,78 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
         Red::Any => |xs| xs.iter().any(|v| *v != 0.0 && !v.is_nan()) as u8 as f64,
         Red::All => |xs| xs.iter().all(|v| *v != 0.0) as u8 as f64,
     };
-    let out = match along {
-        None => reduce(&m, None, f)?,
-        Some(Along::Dim(d)) => reduce(&m, Some(d), f)?,
-        Some(Along::All) => reduce_all(&m, f),
+    let dim = match along {
+        None => None,
+        Some(Along::Dim(d)) => Some(d),
+        Some(Along::All) => return logical_if(kind, reduce_all(&m, f)),
     };
-    // `any` and `all` answer with a logical, as MATLAB's do. Along a
-    // dimension of size 1 within `ndims` each element is reduced on its
-    // own, a `NaN` ignored (cycle 14b); past `ndims` the argument itself
-    // is converted, as it always was: `any([2 0], 3)` is the logical `1 0`,
-    // and `any(NaN, 3)` refuses the `NaN`.
+    let out = match kind {
+        Red::Sum | Red::Mean => reduce_or_return(&m, dim, f)?,
+        // Past `ndims` each element gets what it gets along a dimension of
+        // size 1 within `ndims` (cycle 15), a `NaN` ignored by `any` and
+        // nonzero to `all`, so `any(NaN, 3)` is false where converting the
+        // argument refused the `NaN`.
+        Red::Any | Red::All => match dim {
+            Some(d) if past_ndims(&m, d) => m.map(|x| f(&[x])),
+            _ => reduce(&m, dim, f)?,
+        },
+        Red::Prod => reduce(&m, dim, f)?,
+    };
+    logical_if(kind, out)
+}
+
+/// `any` and `all` answer with a logical, as MATLAB's do, every element
+/// already `0` or `1`; the others with a double.
+fn logical_if(kind: Red, out: Matrix) -> R<Vec<Value>> {
     match kind {
         Red::Any | Red::All => one_as(out.to_class(Class::Logical)?),
         _ => one_mat(out),
     }
 }
 
+/// True when `sum` and `mean` hand `m` back as it is (cycle 15): "sum
+/// returns A when dim is greater than ndims(A) or when size(A,dim) is 1"
+/// (the MathWorks `sum` page, and the `mean` page alike). With no
+/// dimension the default is judged the same way, so `sum(-0)` is `-0`;
+/// the 2-D 0x0 keeps its special case, `sum([])` being `0`.
+fn returns_argument(m: &Matrix, dim: Option<usize>) -> bool {
+    let dims = m.dims();
+    let d = match dim {
+        Some(d) => d,
+        None if is_zero_by_zero(m) => return false,
+        None => default_dim(&dims),
+    };
+    past_ndims(m, d) || dims[d - 1] == 1
+}
+
+/// [`reduce`] for `sum` and `mean`: along a dimension of size 1 within
+/// `ndims` the argument is handed back as it is past `ndims`
+/// ([`returns_argument`]), values and storage alike, so a `-0` stays `-0`;
+/// along any other dimension it is [`reduce`] itself.
+fn reduce_or_return(m: &Matrix, dim: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
+    if returns_argument(m, dim) {
+        return Ok(m.clone());
+    }
+    reduce(m, dim, f)
+}
+
 /// `sum`, `prod` and `mean` of a complex array (cycle 10). A sum and a mean
-/// are linear, so each is the real reduction of the two parts; a product
-/// multiplies complex scalars. `any` and `all` refuse one, as the
-/// registry's gate already does before they run.
+/// are linear, so each is the real reduction of the two parts, handed back
+/// along a dimension of size 1 as the real one is (cycle 15,
+/// [`reduce_or_return`]); a product multiplies complex scalars. `any` and
+/// `all` refuse one, as the registry's gate already does before they run.
 fn complex_reduction(m: &Matrix, along: Option<Along>, kind: Red, name: &str) -> R<Matrix> {
     let parts = |f: fn(&[f64]) -> f64| -> R<Matrix> {
         let (re, im) = (m.real_part(), m.imag_part());
         let (re, im) = match along {
-            None => (reduce(&re, None, f)?, reduce(&im, None, f)?),
-            Some(Along::Dim(d)) => (reduce(&re, Some(d), f)?, reduce(&im, Some(d), f)?),
+            None => (
+                reduce_or_return(&re, None, f)?,
+                reduce_or_return(&im, None, f)?,
+            ),
+            Some(Along::Dim(d)) => (
+                reduce_or_return(&re, Some(d), f)?,
+                reduce_or_return(&im, Some(d), f)?,
+            ),
             Some(Along::All) => (reduce_all(&re, f), reduce_all(&im, f)),
         };
         Ok(re.with_im(Some(im.data)))
@@ -507,8 +553,9 @@ fn is_zero_by_zero(m: &Matrix) -> bool {
 /// `m` back as it is, values and storage alike (cycle 14b): the path a
 /// matrix and a dimension past 2 always took, so `1/sum(-0, 3)` is `-Inf`
 /// and `prod(complex(1, 0), 3)` keeps its complex storage, and an N-D
-/// array past its own `ndims` takes the same path. `any` and `all` then
-/// convert `m` to a logical, as they always did there, which refuses a
+/// array past its own `ndims` takes the same path. Since cycle 15 `any` and
+/// `all` there give each element its own answer instead, as along a
+/// dimension of size 1, where they converted `m` to a logical and refused a
 /// `NaN`.
 fn past_ndims(m: &Matrix, d: usize) -> bool {
     d > m.ndims()
@@ -587,7 +634,9 @@ fn each_slice<T: Copy, U>(
 ///
 /// Since cycle 14b any dimension of any array: `sum(A, 3)` of a 2x3x4 is
 /// 2x3, a dimension of size 1 within `ndims` gives each element's own
-/// reduction (`sum(-0, 1)` is `+0`, as it always was), and one of size 0
+/// reduction (`prod(-0, 1)` is `-0`, and a sum here starts from `+0`;
+/// the `sum` and `mean` builtins hand the argument back there instead since
+/// cycle 15, through [`reduce_or_return`]), and one of size 0
 /// gives `f` of nothing in every element. A dimension past `ndims` hands
 /// the argument back, "sum returns A when dim is greater than ndims(A)"
 /// (the MathWorks `sum` page), as a matrix and a dimension past 2 always
@@ -1305,8 +1354,9 @@ mod tests {
         assert_eq!(c, a);
         // Past `ndims` the argument is handed back, values and storage
         // alike, as a matrix and a dimension past 2 always were: a `-0`
-        // stays `-0`, where along a dimension of size 1 within `ndims` it
-        // is reduced on its own to `+0`.
+        // stays `-0`. Along a dimension of size 1 within `ndims`, `sum` and
+        // `mean` hand it back too since cycle 15, while `cumsum` still
+        // reduces each element on its own to `+0`.
         let neg = Matrix::scalar(-0.0);
         let sign = |m: &Matrix| m.data[0].is_sign_negative();
         for (kind, name) in [(Red::Sum, "sum"), (Red::Mean, "mean"), (Red::Prod, "prod")] {
@@ -1315,7 +1365,7 @@ mod tests {
         }
         assert!(sign(&scan(&neg, Some(3), true)));
         let within = call(&[val(neg.clone()), dim_arg(1.0)], "sum", Red::Sum).unwrap();
-        assert!(!sign(&within));
+        assert!(sign(&within));
         assert!(!sign(&scan(&neg, Some(1), true)));
         let pages = Matrix::from_dims(&[1, 1, 2], vec![-0.0, -0.0]);
         let signs = |m: Matrix| {
@@ -1335,17 +1385,17 @@ mod tests {
         let s = call(&[z, dim_arg(3.0)], "sum", Red::Sum).unwrap();
         assert!(!s.is_complex());
         // `any` and `all` along a dimension of size 1 reduce each element,
-        // a `NaN` ignored; past `ndims` they convert the argument, which
-        // refuses a `NaN`, as they always did.
+        // a `NaN` ignored; since cycle 15 past `ndims` alike, where they
+        // converted the argument and refused a `NaN`.
         let nan = val(Matrix::from_dims(&[1, 1, 2], vec![f64::NAN, 0.0]));
         let y = call(&[nan.clone(), dim_arg(1.0)], "any", Red::Any).unwrap();
         assert_eq!((y.dims(), y.data), (vec![1, 1, 2], vec![0.0, 0.0]));
         let y = call(&[nan.clone(), dim_arg(2.0)], "all", Red::All).unwrap();
         assert_eq!(y.data, [1.0, 0.0]);
-        for (kind, name) in [(Red::Any, "any"), (Red::All, "all")] {
-            let e = call(&[nan.clone(), dim_arg(4.0)], name, kind).unwrap_err();
-            assert_eq!(e.msg, "NaN's cannot be converted to logicals.", "{name}");
-        }
+        let y = call(&[nan.clone(), dim_arg(4.0)], "any", Red::Any).unwrap();
+        assert_eq!((y.dims(), y.data), (vec![1, 1, 2], vec![0.0, 0.0]));
+        let y = call(&[nan.clone(), dim_arg(4.0)], "all", Red::All).unwrap();
+        assert_eq!((y.class, y.data), (Class::Logical, vec![1.0, 0.0]));
         // The index of `max` past `ndims` is all 1s, an empty's empty.
         let e = val(Matrix::new(0, 3, Vec::new()));
         let (m, i) = two(&[e, val(Matrix::empty()), dim_arg(3.0)], true);
@@ -1377,6 +1427,135 @@ mod tests {
             e,
             "Requested 1x1048576x1048576 array exceeds the maximum array size."
         );
+    }
+
+    /// Cycle 15: "sum returns A when dim is greater than ndims(A) or when
+    /// size(A,dim) is 1", and the `mean` page alike, so along a dimension of
+    /// size 1 within `ndims` both hand the argument back, a `-0` kept, and
+    /// with no dimension the default is judged the same way. `prod`,
+    /// `cumsum`, `'all'` and a dimension of any other size are unchanged.
+    #[test]
+    fn sum_and_mean_along_a_dimension_of_size_one_return_the_argument() {
+        let negs = |v: R<Matrix>| -> Vec<bool> {
+            v.unwrap()
+                .data
+                .iter()
+                .map(|x| *x == 0.0 && x.is_sign_negative())
+                .collect()
+        };
+        let z = || val(Matrix::scalar(-0.0));
+        for (kind, name) in [(Red::Sum, "sum"), (Red::Mean, "mean")] {
+            assert_eq!(negs(call(&[z()], name, kind)), [true], "{name}");
+            assert_eq!(
+                negs(call(&[z(), dim_arg(1.0)], name, kind)),
+                [true],
+                "{name}"
+            );
+            assert_eq!(
+                negs(call(&[z(), dim_arg(2.0)], name, kind)),
+                [true],
+                "{name}"
+            );
+            assert_eq!(
+                negs(call(&[z(), dim_arg(3.0)], name, kind)),
+                [true],
+                "{name}"
+            );
+            let row = val(Matrix::row(vec![-0.0, -0.0]));
+            assert_eq!(
+                negs(call(&[row.clone(), dim_arg(1.0)], name, kind)),
+                [true, true]
+            );
+            // Along the row's own length it is reduced, from `+0`.
+            assert_eq!(negs(call(&[row, dim_arg(2.0)], name, kind)), [false]);
+            let col = val(Matrix::col(vec![-0.0, -0.0]));
+            assert_eq!(negs(call(&[col, dim_arg(2.0)], name, kind)), [true, true]);
+            let pages = val(Matrix::from_dims(&[1, 1, 2], vec![-0.0, -0.0]));
+            let s = call(&[pages.clone(), dim_arg(1.0)], name, kind).unwrap();
+            assert_eq!(s.dims(), [1, 1, 2]);
+            assert_eq!(negs(Ok(s)), [true, true]);
+            // With no dimension a 1x1x2 reduces along its third.
+            assert_eq!(negs(call(&[pages], name, kind)), [false]);
+            // `'all'` still reduces every element, from `+0`.
+            assert_eq!(negs(call(&[z(), text("all")], name, kind)), [false]);
+            // Complex storage: each part handed back, stored by the flag rule.
+            let c = val(Matrix::complex_parts(1, 1, vec![-0.0], vec![2.0]));
+            let s = call(&[c, dim_arg(1.0)], name, kind).unwrap();
+            assert!(s.data[0].is_sign_negative());
+            assert_eq!(s.im.as_deref(), Some(&[2.0][..]));
+        }
+        // The class is a double's, as it always was.
+        let t = call(
+            &[val(Matrix::from_bool(true)), dim_arg(1.0)],
+            "sum",
+            Red::Sum,
+        )
+        .unwrap();
+        assert_eq!((t.class, t.data), (Class::Double, vec![1.0]));
+        let a = call(&[text("ab"), dim_arg(1.0)], "mean", Red::Mean).unwrap();
+        assert_eq!((a.class, a.data), (Class::Double, vec![97.0, 98.0]));
+        // A 1x0 along its dimension of size 1 is the 1x0 it was.
+        let e = call(
+            &[val(Matrix::new(1, 0, Vec::new())), dim_arg(1.0)],
+            "sum",
+            Red::Sum,
+        )
+        .unwrap();
+        assert_eq!(e.dims(), [1, 0]);
+        // `prod` and `cumsum` are unchanged: `prod` keeps a `-0` by its own
+        // arithmetic, and `cumsum` along a dimension of size 1 starts from
+        // `+0`.
+        assert_eq!(negs(call(&[z(), dim_arg(1.0)], "prod", Red::Prod)), [true]);
+        assert!(!scan(&Matrix::scalar(-0.0), Some(1), true).data[0].is_sign_negative());
+        // `sum([])` keeps its special case.
+        assert_eq!(
+            negs(call(&[val(Matrix::empty())], "sum", Red::Sum)),
+            [false]
+        );
+    }
+
+    /// Cycle 15: past `ndims`, `any` and `all` give each element what they
+    /// give it along a dimension of size 1, a `NaN` ignored by `any` and
+    /// nonzero to `all`, a logical of the argument's shape.
+    #[test]
+    fn any_and_all_past_ndims_take_a_nan() {
+        let row = || val(Matrix::row(vec![0.0, f64::NAN, 2.0]));
+        let y = call(&[row(), dim_arg(3.0)], "any", Red::Any).unwrap();
+        assert_eq!(
+            (y.class, y.dims(), y.data),
+            (Class::Logical, vec![1, 3], vec![0.0, 0.0, 1.0])
+        );
+        let y = call(&[row(), dim_arg(3.0)], "all", Red::All).unwrap();
+        assert_eq!((y.class, y.data), (Class::Logical, vec![0.0, 1.0, 1.0]));
+        let nan = || val(Matrix::scalar(f64::NAN));
+        assert_eq!(
+            call(&[nan(), dim_arg(3.0)], "any", Red::Any).unwrap().data,
+            [0.0]
+        );
+        assert_eq!(
+            call(&[nan(), dim_arg(3.0)], "all", Red::All).unwrap().data,
+            [1.0]
+        );
+        // The same answers along a dimension of size 1 within `ndims`.
+        assert_eq!(
+            call(&[nan(), dim_arg(1.0)], "any", Red::Any).unwrap().data,
+            [0.0]
+        );
+        assert_eq!(
+            call(&[nan(), dim_arg(1.0)], "all", Red::All).unwrap().data,
+            [1.0]
+        );
+        let grid = val(Matrix::filled(2, 3, f64::NAN));
+        let y = call(&[grid, dim_arg(5.0)], "all", Red::All).unwrap();
+        assert_eq!((y.dims(), y.data), (vec![2, 3], vec![1.0; 6]));
+        // Within `ndims`, along a dimension of any other size, nothing changes.
+        let y = call(&[row(), dim_arg(2.0)], "any", Red::Any).unwrap();
+        assert_eq!(y.data, [1.0]);
+        let y = call(&[row(), dim_arg(2.0)], "all", Red::All).unwrap();
+        assert_eq!(y.data, [0.0]);
+        // A complex argument keeps its refusal.
+        let c = val(Matrix::complex_parts(1, 1, vec![1.0], vec![1.0]));
+        assert!(call(&[c, dim_arg(3.0)], "any", Red::Any).is_err());
     }
 
     #[test]

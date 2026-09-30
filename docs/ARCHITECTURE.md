@@ -353,10 +353,17 @@ one element, and along one of size 0 each is empty. Past `ndims` no
 kernel runs: `reduce`, `reduce_c` and `scan` hand the argument back
 (`math::past_ndims`), the path a matrix and a dimension past 2 always
 took, values and storage alike, so `sum` returns `A`, a `-0` stays `-0`,
-`prod(complex(1, 0), 3)` keeps its complex storage, and `any` and `all`
-convert `A` to a logical as they always did; `numerics::reduce_along`
-keeps its own rule there, each element reduced on its own, which makes
-`var(X, 0, 3)` zeros. `max` and `min` give an empty along a dimension of
+and `prod(complex(1, 0), 3)` keeps its complex storage. Since cycle 15
+`sum` and `mean` take that path along a dimension of size 1 within `ndims`
+too, the default dimension judged the same way (`math::reduce_or_return`,
+by the `sum` and `mean` pages' "or when `size(A,dim)` is 1"), so
+`sum(-0)` is `-0`, while `prod`, `max`, `min`, `cumsum` and `cumprod`
+reduce each element on its own there; and past `ndims` `any` and `all`
+give each element what they give it along a dimension of size 1, a `NaN`
+ignored by `any` and nonzero to `all`, where they converted `A` to a
+logical and refused a `NaN`. `numerics::reduce_along` keeps its own rule
+past `ndims`, each element reduced on its own, which makes `var(X, 0, 3)`
+zeros. `max` and `min` give an empty along a dimension of
 size 0, their index is the same kernel over `arg_extremum`, and past
 `ndims` it is all 1s. A 2-D matrix within its two dimensions is the case
 `before = 1` (a column, contiguous) or `after = 1` (a row), with each
@@ -370,7 +377,20 @@ that an invalid conversion ends the output. Every width and precision,
 written or given by `*`, is still judged against `printf::MAX_FIELD`
 before it reaches Rust's formatter, whose panics it prevents.
 `strings.rs` holds the string functions, `num2str` among them (one row
-per matrix row since QA D13), and `regexp` and `regexprep` over
+per matrix row since QA D13); since cycle 15 the places whose pages take
+a character vector read it through `vector_units` (`Matrix::is_char_row`)
+and refuse a char of several rows with the message they give any value
+that is not text, where each read one as a single row of its code units:
+the three arguments of `strrep`, the two of `strfind`, the text, the
+expression and the replacement of `regexp` and `regexprep`, the text and
+the delimiter of `strjoin` and `strsplit`, the text of `strtok`, and the
+elements of a cell given to any of these or to `upper`, `lower` and
+`strcat`. Everywhere else a char is read as before: `upper`, `lower` and
+`strcat` of a bare char array, `strtok`'s delimiters, the option names of
+`regexp`, `regexprep` and `strsplit`, the `strcmp` family, `str2double`
+and the number conversions; and `strtrim` trims a cell's element of
+several rows as it trims that array alone. It holds `regexp` and
+`regexprep` over
 `regex.rs`, a Pike VM: a pattern is parsed into a tree, compiled into a
 program of at most `regex::MAX_PROGRAM` instructions, and run by
 simulating every thread at once, one thread per program counter per
@@ -710,7 +730,17 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    and a struct's field lines pad their columns by hand
    (`value::push_left`, `push_right`), since a size text or a name has no
    length limit; and the display of an N-D array is written a page at a
-   time, so its memory is one page's whatever the page count.
+   time, so its memory is one page's whatever the page count. Since cycle
+   15 `isequal` walks nested cells and structs with a worklist of pairs,
+   never by recursion, so a `c = {c}` chain a million deep compares
+   without touching the stack; a pair of containers that more than one
+   path reaches is compared once, so a nest of few shared containers and
+   exponentially many paths compares in time proportional to the pairs of
+   containers it compares, never to its paths; and struct fields are matched through the struct's own
+   field index, so fields in another order are never matched in quadratic
+   time. `strtok`, whose delimiters may be of any size, looks each unit of
+   its text up in a set of them, so a long text against a long delimiter
+   list costs time linear in both.
 
 ## Recipes
 
@@ -936,8 +966,10 @@ never one. The gate judges a matrix argument only, so a builtin that reads
 a cell judges an N-D element itself: `cell2mat` through the bracket rule,
 `save` in its writer, the set functions and `str2double`, for which an
 N-D char is no character vector however few its rows
-(`Matrix::is_char_row`), and `strcmp` and `strcmpi`, which compare one by
-every dimension, not by its rows and columns alone.
+(`Matrix::is_char_row`), `strcmp` and `strcmpi`, which compare one by
+every dimension, not by its rows and columns alone, and since cycle 15 the
+text functions that take a cell of character vectors, which refuse one as
+no character vector.
 
 A container is a different kind of value, not a class of array. Cells and
 structs (cycle 07) become new `Value` variants beside `Mat`, as the
@@ -959,8 +991,12 @@ workspace should not be copied each time. It answers `class_name`
 (`function_handle`), `dims` (1x1), `display_body` (`  function_handle with
 value:`, a blank line, `    @(x)x+1`) and `disp_text` (`@(x)x+1`, `@sin`)
 itself. The operations that accept it: a call through a variable or a chain,
-`feval`, `arrayfun`, `func2str`, `class` and `isa`; `hcat` refuses it with
-the concatenation message rather than the generic one.
+`feval`, `arrayfun`, `func2str`, `class` and `isa`, and since cycle 15
+`isequal`, by the MathWorks "Compare Function Handles" page: two named
+handles are equal when they have the same name and the same `local`
+binding, compared by pointer, and an anonymous one only to its copies, the
+same `Rc<Func>`; `hcat` refuses it with the concatenation message rather
+than the generic one, and `'` and `.'` keep the generic refusal.
 
 Cycle 07 added the fourth and fifth, the containers `Value::Cell(Rc<CellArray>)`
 and `Value::Struct(Rc<StructArray>)`. Each answers `class_name` (`cell`,
@@ -973,7 +1009,14 @@ are 1x1. A binary operator on any value that is not a matrix is MATLAB
 R2020a's `Operator '+' is not supported for operands of type 'cell'.`, from
 `Interp::binary`, which evaluates both operands and names the first that is
 not an array; every other operation still reaches a matrix through
-`Value::mat` and keeps the generic refusal.
+`Value::mat` and keeps the generic refusal, apart from two that cycle 15
+taught the containers. `'`, `.'` and `transpose` of a cell or a struct
+array (`value::transpose_cell` and `transpose_struct`) interchange the row
+and column of every element, each element unchanged. `isequal` compares
+two cells, or two struct arrays with their fields matched by name in any
+order through the struct's own field index, element by element with a
+worklist of pairs rather than by recursion, so a nesting of any depth is
+compared in time proportional to its elements (`core::values_equal`).
 
 A value kind that holds other values must go on the drop worklist in
 `value.rs`: `holds_values` names the kinds that nest, and `free` opens each
@@ -1238,25 +1281,24 @@ cycle named:
 
 | Deviation | Fixed in |
 |---|---|
-| `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives | later (verify first) |
+| `det([1 2; 3 4])` prints `    -2`, where the spec records MATLAB's `   -2.0000`. Cycle 02 fixed the display half: a value a rounding error from an integer now prints with decimals. The value half remains: this interpreter's pivoted elimination lands exactly on `-2`, because the last product `3 * 0.66666666666666674` is a rounding tie that goes to the even `2`, so there is nothing for the display to show. MATLAB's `-2.0000` implies LAPACK returns `-2.0000000000000004`, an operation order not reproduced here. Cycle 08 replaced `det` with the shared LU and kept the old elimination order on purpose, since no source at hand settles LAPACK's; its spec forbids choosing an order for the digits it gives. Cycle 15 found no MathWorks page that states the digits | later (verify first) |
 | An error text says more than MATLAB's and keeps its own wording: the dimension mismatch names the operator and both shapes, where MATLAB says only `Arrays have incompatible sizes for this operation.` | by design; see the message-text policy in `docs/modules/01e-display-and-parser.md` |
 | Numerics, cycle 09: a solver that fails (`fzero` with no sign change, `fminsearch` at its cap, a divergent `integral`, `ode45` below its smallest step) is a clean error, where MATLAB warns and returns a value or `NaN`; `polyfit` with too few points warns with `\`'s rank-deficient text; `ode45` with one output gives a struct of `solver`, `x` and `y` only; several message texts are SplatCrab's own. The Design notes of `docs/modules/09-numerics.md` have each. Cycle 10 replaced the complex refusals of `roots` with the values | by design |
-| Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where MATLAB is understood to say "close to singular or badly scaled" with an `RCOND`; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`; `eig([])` is 0x1. The Design notes of `docs/modules/08-linear-algebra.md` have each | later (verify first) |
+| Linear algebra, cycle 08: a system singular only to working precision warns with MATLAB's exactly-singular text, where the MathWorks `mldivide` page settles MATLAB's as the nearly singular warning, `Matrix is close to singular or badly scaled. Results may be inaccurate. RCOND = ...`, issued "When `rcond` is between `0` and `eps`", which needs a condition estimate SplatCrab does not compute; a rank-deficient least-squares system warns with SplatCrab's own `Matrix is rank deficient to working precision (rank r).`; `det` is exactly `0` wherever `\` warns, where MATLAB's is the product of the pivots; `eig`, `svd`, `rank`, `pinv`, `null`, `orth` and `cond` refuse a `NaN` or `Inf`, where the MathWorks `eig` page settles that `eig` "returns `NaN` values when the input contains nonfinite values", the one-output answer, and gives no shape for a two-output call, which stays verify first; `eig([])` is 0x1. The nearly singular warning and `eig` of nonfinite input are settled by their pages (cycle 15) and recorded for a later cycle. The Design notes of `docs/modules/08-linear-algebra.md` have each | later; the two-output `eig` of nonfinite input later (verify first) |
 | Complex numbers, cycle 10: every builtin not on `builtins::TAKES_COMPLEX` refuses a complex argument (`sort`, `max`, `min`, `floor`, `mod`, `num2str`, `reshape`, `inv`, `det`, the solvers and every other), where MATLAB takes many of them; `if`, `while`, `&`, `\|`, `~`, `&&` and `\|\|` refuse a complex value; indexing, concatenation and assignment drop an all-zero imaginary part as arithmetic does, and a zero imaginary part of either sign is read as `+0`, on a branch cut and in the display; the complex display, its scale factor and the phase of complex eigenvectors are SplatCrab's; `eig` and `roots` of complex input are refused. The Design notes of `docs/modules/10-complex.md` have each | by design (verify first) |
 | Chained indexing `x(2:3)(2)` is read successively, as Octave does; MATLAB refuses it. `x()` is "Only 1-D and 2-D indexing is supported." where MATLAB returns `x`. Both recorded in cycle 03's Design notes | later |
 | An `MException` is minimal: `message`, `identifier`, `stack` and `class`, with no `cause` or `Correction`, and its display is SplatCrab's one line `  MException (id): msg` rather than MATLAB's property listing. An error the interpreter raises itself has an empty identifier, where MATLAB's carry one such as `MATLAB:UndefinedFunction`. `e.stack` (cycle 07) holds the function frames only, not the script's own, and `file` is empty for a function local to the script that was run | later |
-| Cells and structs, cycle 07: a cs-list is not spread into index subscripts (`x(c{:})`) nor accepted as a target list (`[c{:}] = deal(0)`); a cell or a struct cannot be transposed; `isequal` of cells or structs is false; `varargin` with no extra arguments is 0x0; several message texts are recalled or SplatCrab's own. The Design notes of `docs/modules/07-cells-and-structs.md` have each | later (verify first) |
+| Cells and structs, cycle 07: a cs-list is not spread into index subscripts (`x(c{:})`) nor accepted as a target list (`[c{:}] = deal(0)`); several message texts are recalled or SplatCrab's own. The Design notes of `docs/modules/07-cells-and-structs.md` have each. Cycle 15 removed three clauses the MathWorks pages settle: cells and structs transpose (the `transpose` and `ctranspose` pages), `isequal` compares them element by element (the `isequal` page), and `varargin` with no extra inputs is 0x0, as the `varargin` page says (`varargin_no_extra_inputs`) | later (verify first) |
 | `exist` gives `5` for every builtin, where MATLAB gives `2` for the builtins it ships as `.m` files (`linspace`, for instance): every SplatCrab builtin is built in. What `exist` gives for a function local to the running script is not settled by the MathWorks page; SplatCrab gives `0`, and no case asserts it | by design; the local-function value later (verify first) |
 | The trace names a function alone, `  in g3 (line 8)`, where MATLAB writes `Error in script>g3 (line 8)`; the spec fixes SplatCrab's form | by design |
 | Functions are more permissive than MATLAB's in three ways, none of which changes what a file MATLAB accepts means: a function in a file on the path can call a local function of the script being run (invariant 4 reads the script's local functions after the running file's, where MATLAB keeps local functions private to their file); a file may mix functions that end with `end` and functions that do not; and a script's local functions may go without `end`. Calling a script with arguments or for a value is `Too many input arguments.` or `Too many output arguments.`, where MATLAB names the script | later |
 | Command syntax judges "is a variable" when the source is lexed, from the workspace and the names assigned earlier in the source, so `x = 1; clear x; x -1` stays the expression; MATLAB judges a file the same way, the command line from the live workspace | by design; see cycle 04's Design notes |
-| Function handles, cycle 06: `func2str` renders an anonymous function from its parse tree, so `@(x) (x)` reads back `@(x)x` where MATLAB keeps the text as written; the trace names an anonymous function `  in @(n)g(n)` with no line; an anonymous call counts against the recursion limit of 500; `str2func` of a text that is not a name makes a handle that fails only when called. The Design notes of `docs/modules/06-function-handles.md` have each | by design (verify first) |
-| Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
+| Function handles, cycle 06: `func2str` renders an anonymous function from its parse tree, so `@(x) (x)` reads back `@(x)x`, dropping parentheses the tree does not need, which the MathWorks `func2str` page's examples do not show either way; the space after the parameter list is dropped as the page's `@(x)x.^2+7` drops it (cycle 15, `func2str_spacing`); the trace names an anonymous function `  in @(n)g(n)` with no line; an anonymous call counts against the recursion limit of 500; `str2func` of a text that is not a name makes a handle that fails only when called. The Design notes of `docs/modules/06-function-handles.md` have each | by design (verify first) |
+| Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; `strcmp` and `strcmpi` compare a char of several rows held in a cell by its whole shape, `strcmp({['ab'; 'cd']}, ['ab'; 'cd'])` being 1, which the MathWorks `strcmp` page neither refuses nor defines (it takes "a character array" of several rows and says "If used on unsupported data types, strcmp always returns 0"), verify first (cycle 15); several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
 | `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off` | later |
 | The environment, cycle 13: `format` has `short` and `long` only; `whos` has no heading row and its layout is SplatCrab's; `ls` and `dir` print one name per line with no `.` or `..`, and `dir` returns no `date` or `datenum`; a bare `pause` waits for Enter rather than any key; `evalc` drops the final line end of what it captured, as the spec records; `datestr` takes date numbers or one date vector and no format; `exit(n)` takes 0 to 255; `which` and `help` do not report local functions. The Design notes of `docs/modules/13-environment.md` have each | by design |
-| N-D arrays, cycles 14 and 14b: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets, the linear algebra and every other not taught N-D in cycle 14b), where MATLAB takes most of them, and so does `save -ascii`; `cat` takes arrays only, where MATLAB's joins cells too; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md` and `docs/modules/14b-nd-functions.md` have each | later for the rest of the builtins; the display later (verify first) |
-| A `-0` reduced along a dimension of size 1 within `ndims` is `+0`, verify first: `sum(-0, 1)`, `mean(-0, 1)` and `cumsum(-0, 1)`, and `sum(-0)`, whose default dimension is the first, are `+0`, each element reduced on its own by a sum that starts from `+0`, as a matrix's always was, where the MathWorks `sum` page says `sum` returns `A` "or when size(A,dim) is 1", which would keep the `-0`; an N-D array alike, `sum(-0 * ones(1, 1, 2), 1)`. `prod`, `max`, `min` and `cumprod` keep it, and past `ndims` every reduction hands the argument back, so `1/sum(-0, 3)` is `-Inf` (`reduce_2d_past_ndims_unchanged`). Recorded in testing cycle 14b and kept, since it is a 2-D answer; the Design notes of `docs/modules/14b-nd-functions.md` have it | later (verify first) |
-| `any` and `all` along a dimension of size 1 ignore a `NaN`, verify first: along a dimension of size 1 within `ndims` each element is what `any` or `all` gives a one-element vector of it, so `any(NaN, 1)` and `any(NaN(1, 1, 2), 1)` are false, as the MathWorks `any` page's "any ignores elements of A that are NaN" makes the vector's answer, where the spec's earlier gloss of that case, `A ~= 0`, would make them true; `all` of a `NaN` is true either way. Past `ndims` `any` and `all` convert the argument to a logical, as they always did, which refuses a `NaN`: `any(NaN, 3)` is `NaN's cannot be converted to logicals.` Recorded in testing cycle 14b; the Design notes of `docs/modules/14b-nd-functions.md` have it | later (verify first) |
+| N-D arrays, cycles 14 and 14b: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets, the linear algebra and every other not taught N-D in cycle 14b), where MATLAB takes most of them, and so does `save -ascii`; `cat` takes arrays only, where MATLAB's joins cells too; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md` and `docs/modules/14b-nd-functions.md` have each. Cycle 15 took the display's edges, and growth and deletion through fewer subscripts than dimensions, to the MathWorks "Multidimensional Arrays" page, which does not settle them: its displays are of double pages alone, with no logical or char page, no `disp` of an N-D array and no empty N-D array, and it says nothing of growth or deletion through fewer subscripts, nor of a colon over an empty target taking the right-hand side's extent (cycle 14's rule, `x = []; x(:, :, :) = reshape(1:8, 2, 2, 2)` making a 2x2x2), which stays SplatCrab's stated rule, verify first | later for the rest of the builtins; the display later (verify first) |
+| A `-0` run through `cumsum` along a dimension of size 1 within `ndims` is `+0`, verify first: `cumsum(-0, 1)` is `+0`, each element its own running sum from `+0`, as a matrix's always was, while past `ndims` it is handed back, so `1/cumsum(-0, 3)` is `-Inf`. The MathWorks `cumsum` page says it "returns `A` if `dim` is greater than `ndims(A)`" and nothing of a dimension of size 1, so it does not settle the case. Recorded in testing cycle 14b; cycle 15 narrowed the row to `cumsum`, since the `sum` and `mean` pages settle theirs ("or when `size(A,dim)` is `1`", now `-0`, `sum_mean_dim_of_size_one`); `prod`, `max`, `min` and `cumprod` keep a `-0` by their own arithmetic | later (verify first) |
 | Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
@@ -1338,6 +1380,18 @@ Cycle 14 narrowed "Constructors take two sizes only" to `repmat` and
 `cell`, and removed the Known deviations row for indexing into or growing a
 second page, both by building N-D arrays. Cycle 14b narrowed the row to
 `cell`, by teaching `repmat` N-D.
+Cycle 15 took the verify-first rows to their MathWorks pages and removed
+three: the colon operand that is not a scalar, pinned as the error it was;
+the string functions that read a char matrix held in a cell as one row of
+its code units, which now refuse one as they refuse any value that is not
+text; and `isequal` of handles, which now compares them. It removed the
+Known deviations row on `any` and `all`, narrowed the `-0` row to `cumsum`
+and the rows of cycles 06 and 07 to what no page settles, and the rows no
+page settles now cite their pages. It re-recorded the remainder of the
+string-functions row, the builtins that read a name from a char of
+several rows, which no page was taken to, as a row of its own, and
+recorded a bound found in testing: a program's memory is judged one array
+at a time.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -1348,15 +1402,14 @@ spec also lists, it removes the row from that spec in the same commit.
 
 | Bug | Symptom | Fixed in |
 |---|---|---|
-| `1:NaN` is an empty, verify first | `1:NaN` is 1x0; Octave 8.4 gives the 1x1 `NaN` and MATLAB is unverified, so cycle 01d deliberately left it as it found it while refusing the infinite end points beside it. No golden case asserts either way | later (verify first) |
-| `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
-| A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
+| `1:NaN` is an empty, verify first | `1:NaN` is 1x0; Octave 8.4 gives the 1x1 `NaN` and MATLAB is unverified, so cycle 01d deliberately left it as it found it while refusing the infinite end points beside it. No golden case asserts either way. Cycle 15 took it to the MathWorks `colon` page, which does not settle it: its operands are each "a real numeric scalar" and its empty results are listed, but it names no rule for a `NaN` operand | later (verify first) |
+| `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it. Cycle 15 took it to the MathWorks `for` page, which does not settle it: its "numel(valArray(1,:))" indexes a row a 0-by-n array does not have, and "a maximum of `n` times" allows fewer than `n` | later (verify first) |
 | `cell` takes two sizes only | `cell(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds the 2-by-3-by-4 cell. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `cell(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Cycle 14 built N-D arrays and taught the other constructors (`zeros`, `ones`, `rand`, `NaN`, `Inf`, `true`, `false`) and `reshape` to make them, which narrowed this row from "Constructors take two sizes only" to `repmat` and `cell`, and cycle 14b taught `repmat`, which narrowed it to `cell`. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D cells |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
-| String functions flatten a char matrix held in a cell, verify first | `upper({['ab'; 'cd']})` gives the 1x4 `'ACBD'`, the element's code units in column-major order, where MATLAB is understood to keep the 2x2 shape; `lower`, `strtrim`, `strrep` and the other functions that read a cell's text by its code units do the same, and an N-D char element alike. Found in testing cycle 14; a 2-D behaviour, so left for a later cycle | later (verify first) |
-| `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |
-| Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found by cycle 04's review | later (verify first) |
-| The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found by cycle U2's review | later, needs a spec |
+| Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found in testing cycle 04. Cycle 15 took it to the MathWorks "Choose Command Syntax or Function Syntax" page, which does not settle it: MATLAB uses "the current workspace, and path" at the command line while the Code Analyzer and the Editor "operate without reference to the path or workspace", and the page says nothing of a name a script assigns implicitly | later (verify first) |
+| The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found in testing cycle U2 | later, needs a spec |
+| Name arguments read a char of several rows as one row, verify first | `isfield(struct('ab', 1), {['a'; 'b']})` is 1, reading the column as `'ab'`, its code units in column-major order; `rmfield`, `getfield`, `setfield`, `str2func`, `feval` and `cellfun` read a field or function name the same way. Cycle 15 settled the text functions whose pages take character vectors, which now refuse such a char (the `iscellstr` page's note: "Most text-processing functions and conversion functions require input cell arrays to contain only character row vectors"); these builtins were not taken to their pages, and keep the reading the removed string-functions row recorded | later (verify first) |
+| A program's memory is bounded one array at a time | Every array is judged against `MAX_ELEMS`, and every cell or struct array against `MAX_BYTES`, as it is made, but nothing bounds what a program holds in all, and storing a matrix copies it: `m = repmat('a', 2, 8e6); for k = 1:100000, C{k} = m; end` asks for 1.6 TB in 16 MB pieces, and the allocator aborts the process (exit 134). Found in testing cycle 15; the path predates it | later, needs a spec (shared matrix storage or a budget for the whole program) |
 
 **The process-killing family.** The two panics that used to head this list,
 `num2str(Inf)` and `zeros(1e10)`, were the first thing cycle 01 fixed, before a
@@ -1410,12 +1463,17 @@ would be exhausted well before 10,000 levels. Nothing observed has ever taken
 that branch.
 
 Three entries are marked "verify first": `for` over a matrix with no rows,
-`1:NaN`, and the colon operand that is not a scalar, which cycle 01e added
-when it taught the parser to read `1:2:3:4`. All three were found by reasoning
-about MATLAB rather than by running it, and neither the MATLAB pages nor
-Octave settles them. Confirm the real behaviour before writing a test that
+`1:NaN`, and command syntax with an implicit `ans` in a script. All three
+were found by reasoning about MATLAB rather than by running it. Cycle 15
+took each to its MathWorks page, the `for` page, the `colon` page and the
+"Choose Command Syntax or Function Syntax" page, and none of them settles
+it; nor does Octave. Confirm the real behaviour before writing a test that
 asserts either way: an expected-output file that encodes a guess is worse than
-no test.
+no test. A fourth, the colon operand that is not a scalar, which cycle 01e
+added when it taught the parser to read `1:2:3:4`, was settled by the
+`colon` page as the error it already was ("`colon` now returns an error
+when creating vectors if one or more operands are not scalar", R2025a):
+cycle 15 pinned it (`colon_nonscalar_operand`) and removed its row.
 
 Two former "verify first" rows are gone. The loop variable after a
 zero-iteration `for` was settled as a real bug and cycle 01d fixed it. `mod`

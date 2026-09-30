@@ -1,0 +1,14 @@
+Argument 3 to 'strrep' must be a character vector.
+Argument 2 to 'strfind' must be a character vector.
+Every element of a cell argument to 'strfind' must be a character vector.
+Argument 2 to 'regexp' must be a character vector.
+Every element of a cell argument to 'regexp' must be a character vector.
+Argument 1 to 'regexprep' must be a character vector.
+Argument 3 to 'regexprep' must be a character vector.
+Every element of a cell argument to 'strjoin' must be a character vector.
+Argument 2 to 'strsplit' must be a character vector.
+Every element of a cell argument to 'strsplit' must be a character vector.
+Every element of a cell argument to 'lower' must be a character vector.
+Every element of a cell argument to 'strrep' must be a character vector.
+N-D arrays are not supported by 'upper'.
+N-D arrays are not supported by 'strrep'.

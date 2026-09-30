@@ -1743,7 +1743,8 @@ pub fn write_unsupported(class: &str, name: &str) -> MError {
 }
 
 /// `strjoin({1, 'a'})`, `strcat({'a'}, {2})` and the other string
-/// functions given a cell that holds something other than text.
+/// functions given a cell that holds something other than text, and since
+/// cycle 15 one that holds a char of several rows, `upper({['ab'; 'cd']})`.
 pub fn cell_not_text(name: &str) -> MError {
     MError::new(format!(
         "Every element of a cell argument to '{}' must be a character vector.",
