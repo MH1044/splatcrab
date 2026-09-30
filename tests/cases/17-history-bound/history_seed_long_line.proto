@@ -1,0 +1,2 @@
+% covers: 3 - a line of the history file whose entry is longer than 65,536 bytes, as another program may have written it, is left out when the file is read: a seed holding a, a line of 70,000 characters and b answers history with a and b alone, oldest first
+{"id":1,"op":"history"}

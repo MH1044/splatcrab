@@ -406,6 +406,28 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   judges a folder, refusal for refusal, and named in its plain form, and
   `folder_relative` at the root, below it, outside it and on a folder
   gone.
+- `history.rs` (cycle 13): an entry round-tripping through its line, the
+  file round-tripping and appended to, blank lines and CR LF endings, the
+  newest 1000 kept and a file past twice that compacted, and `remember`'s
+  rules. Since cycle 17 the two byte bounds, reached with small numbers
+  through `load_within` and `remember_within`, each in a temporary folder
+  of its own: `load_reads_at_most_the_tail_of_a_long_file` (a read
+  starting inside a line, exactly at a line's first byte, at an LF, at
+  either byte of a two-byte character and at the CR or the LF of CR LF
+  lines, only the partial line lost and no replacement character made,
+  and the newest 1000 of the lines read kept),
+  `a_long_file_is_compacted_to_what_was_kept` (a file one byte past the
+  bound rewritten to the entries kept, escapes and all, and read whole
+  after; a file within the bound, blank lines and CR LF included, left
+  byte for byte; a tail with no whole line leaving an empty file; a
+  rewrite to a read-only file ignored, the entries answered all the same;
+  a folder no history), `an_entry_past_the_bound_is_not_remembered` (at
+  and past a bound of four bytes, bytes and not characters, and at and
+  past 65,536) and `a_long_line_in_the_file_is_left_out` (judged after
+  decoding, escapes shrinking and a byte that is not UTF-8 counting as
+  the three bytes of U+FFFD, taking no place among the newest 1000, the
+  file left as it is, and a line of 70,000 characters under the real
+  bounds).
 - `protocol.rs`: `serve` driven with an in-memory reader and writer, through
   every operation, every malformed-request text, blank lines, a `\r`, and the
   flush after each response; since cycle U2 the key order of `files`,

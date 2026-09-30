@@ -66,9 +66,12 @@ leaves with exit code `n`. At a terminal the prompt is a line editor: the
 arrows move and recall history, Home and End jump, Tab completes names
 (variables, files on the path, builtins), Ctrl-C clears the line and Ctrl-D
 on an empty line leaves. The history is kept in `~/.splatcrab_history`, or
-wherever `SPLATCRAB_HISTORY` points, and the browser desktop shares it.
-Piped input is read as plain lines. `splatcrab --help` lists the options and
-`splatcrab --version` prints the version.
+wherever `SPLATCRAB_HISTORY` points, and the browser desktop shares it. It
+keeps the newest 1000 entries; an entry of more than 64 KiB still runs but
+is not kept, and only the last 4 MiB of the file is read, a longer file
+being cut back to the entries kept. Piped input is read as plain lines.
+`splatcrab --help` lists the options and `splatcrab --version` prints the
+version.
 
 ```
 SplatCrab 0.1.0  (type 'exit' to quit)
@@ -164,8 +167,10 @@ stays there whatever `cd` does: `path` is relative to the root and `""` is
 the root itself, folders come first, each file has its size in bytes, and a
 path that would leave the root, by a `..`, a link or an absolute name, is
 refused. `history` returns the entries of the history file the terminal's
-line editor keeps, oldest first, and `history_add` adds one by the
-terminal's rule (not a blank one, not a repeat of the newest), so an entry
+line editor keeps, oldest first, at most 1000 of them read from at most
+the file's last 4 MiB, and `history_add` adds one by the terminal's rule
+(not a blank one, not a repeat of the newest, not one of more than 64 KiB,
+65,536 bytes of UTF-8, which answers `"added":false`), so an entry
 typed in either place can be recalled in the other after a reload of the
 page or a restart of the terminal, since each loads the history once, as
 it starts. Started in a folder

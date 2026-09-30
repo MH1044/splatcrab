@@ -62,9 +62,10 @@ impl LineReader {
     }
 
     /// Reads one line after `prompt`. `complete` lists the names starting
-    /// with a prefix, for Tab. A submitted line that is not blank or a
-    /// repeat goes into the history and onto the end of its file; a
-    /// failure to write the file is ignored.
+    /// with a prefix, for Tab. A submitted line that is not blank, a
+    /// repeat or longer than [`history::MAX_ENTRY_BYTES`] goes into the
+    /// history and onto the end of its file; a failure to write the file
+    /// is ignored.
     pub fn read_line(
         &mut self,
         prompt: &str,

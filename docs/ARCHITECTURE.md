@@ -586,7 +586,16 @@ one line; appended to one entry at a time and compacted on load past twice
 its 1000 entries, at `SPLATCRAB_HISTORY` or `~/.splatcrab_history`. Since
 cycle U2 the protocol's `history` and `history_add` read and extend the same
 file through the same functions, so the browser's history pane and the
-terminal share one history. **`src/term.rs`**, a module of the
+terminal share one history. Since cycle 17 it is bounded in bytes twice:
+`remember` refuses an entry of more than `MAX_ENTRY_BYTES` (64 KiB) of
+UTF-8, so neither the line editor nor `history_add` keeps or appends one;
+and `load` judges the file's length from its metadata and reads at most
+its last `MAX_FILE_BYTES` (4 MiB), seeking there and dropping the partial
+line the read starts in, leaves out an entry past `MAX_ENTRY_BYTES` that
+another program wrote, and compacts a longer file to the entries it kept,
+as it compacts one past twice its entries. Both bounds are parameters of
+`load_within` and `remember_within`, so a unit test reaches them with
+small numbers. **`src/term.rs`**, a module of the
 binary alone, is the raw-mode shell around the editor: `LineReader`
 enters raw mode for one line at a time through raw declarations
 (`GetConsoleMode`, `SetConsoleMode` and `ReadConsoleW` with virtual-terminal
@@ -761,7 +770,15 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    length before writing, and neither opens anything but a regular file,
    so no device or pipe can make one wait; since cycle U4 `figure` answers
    at most 32 MiB of SVG text, a figure's render being bounded by the
-   point budget below, and `cwd` judges its path as `files` does. Anything
+   point budget below, and `cwd` judges its path as `files` does; since
+   cycle 17 the history file is bounded in bytes: an entry of more than
+   `history::MAX_ENTRY_BYTES` (64 KiB) is neither kept nor appended, and
+   `history::load`, which `history` and `history_add` call and the line
+   editor calls as it starts, judges the file's length from its metadata
+   and reads at most its last `history::MAX_FILE_BYTES` (4 MiB) and the
+   byte before them, never the rest, so a `history` answer carries at most
+   1000 entries decoded from 4 MiB of the file, however large the file
+   has grown, and a longer file is compacted to them. Anything
    that computes a result shape from its
    operands' shapes goes through `args::check_shape`, or `args::check_dims`
    for any number of dimensions (cycle 14), for the same reason; see the
@@ -1224,15 +1241,16 @@ is the design, and every part of it is in `http.rs` except the binding:
   `/app.js` alone, so the SVG text is never markup and nothing in it runs.
 
 Since cycle U2 the token guards the file system and the history too:
-`files` lists folders under the root and `history` returns everything typed
-in any session. Each connection is read on a thread of its own, at most 16
-at once, and only whole requests reach the interpreter thread, so an idle
-connection can no longer hold the interpreter. Since cycle U3 it guards the
-first operation that changes the file system, `write_file`, which can
-replace any file under the root, a `.m` file the next `run` executes
-included; `eval` could already do as much through `fopen`, so
-`Sec-Fetch-Site` is one more check on top of the token, and neither may be
-relaxed.
+`files` lists folders under the root and `history` returns what was typed
+in any session, its newest 1000 entries (since cycle 17 those in the
+file's last 4 MiB, each at most 64 KiB). Each connection is read on a
+thread of its own, at most 16 at once, and only whole requests reach the
+interpreter thread, so an idle connection can no longer hold the
+interpreter. Since cycle U3 it guards the first operation that changes
+the file system, `write_file`, which can replace any file under the root,
+a `.m` file the next `run` executes included; `eval` could already do as
+much through `fopen`, so `Sec-Fetch-Site` is one more check on top of the
+token, and neither may be relaxed.
 
 HTTP stays minimal: `Connection: close` on every response, no keep-alive, no
 chunked bodies, no `Expect: 100-continue`. The same `handle` is driven from
@@ -1515,6 +1533,9 @@ recorded a bound found in testing: a program's memory is judged one array
 at a time.
 Cycle 16 fixed the hex and binary literals row (QA D30): `0x1F` and
 `0b101` are numbers, stored as doubles, which Known deviations records.
+Cycle 17 fixed the row on the history file read whole with no byte bound:
+an entry is at most 64 KiB and `history::load` reads at most the file's
+last 4 MiB, compacting a longer file to what it kept.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -1529,7 +1550,6 @@ spec also lists, it removes the row from that spec in the same commit.
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it. Cycle 15 took it to the MathWorks `for` page, which does not settle it: its "numel(valArray(1,:))" indexes a row a 0-by-n array does not have, and "a maximum of `n` times" allows fewer than `n` | later (verify first) |
 | `cell` takes two sizes only | `cell(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds the 2-by-3-by-4 cell. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `cell(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Cycle 14 built N-D arrays and taught the other constructors (`zeros`, `ones`, `rand`, `NaN`, `Inf`, `true`, `false`) and `reshape` to make them, which narrowed this row from "Constructors take two sizes only" to `repmat` and `cell`, and cycle 14b taught `repmat`, which narrowed it to `cell`. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D cells |
 | Command syntax does not see an implicit `ans` in a script, verify first | Whether a name is a variable is judged when the source is lexed, from the names the script has assigned so far, and `3;` assigns `ans` only at run time. So `3;` then `ans -1` is the command `ans('-1')`, an index error, where the REPL and `--protocol`, which see the live workspace, read an expression. What MATLAB does is not settled by its documentation. Found in testing cycle 04. Cycle 15 took it to the MathWorks "Choose Command Syntax or Function Syntax" page, which does not settle it: MATLAB uses "the current workspace, and path" at the command line while the Code Analyzer and the Editor "operate without reference to the path or workspace", and the page says nothing of a name a script assigns implicitly | later (verify first) |
-| The history file is read whole, with no byte bound | `history::load` (cycle 13) reads the whole file into memory before it keeps the newest 1000 entries, and bounds neither the file nor an entry in bytes. U2's `history` and `history_add` call it on every page load and every entry run, so a token holder, or a pasted multi-megabyte entry, can grow the `history` answer, and the time each call takes, without bound. Found in testing cycle U2 | later, needs a spec |
 | Name arguments read a char of several rows as one row, verify first | `isfield(struct('ab', 1), {['a'; 'b']})` is 1, reading the column as `'ab'`, its code units in column-major order; `rmfield`, `getfield`, `setfield`, `str2func`, `feval` and `cellfun` read a field or function name the same way. Cycle 15 settled the text functions whose pages take character vectors, which now refuse such a char (the `iscellstr` page's note: "Most text-processing functions and conversion functions require input cell arrays to contain only character row vectors"); these builtins were not taken to their pages, and keep the reading the removed string-functions row recorded | later (verify first) |
 | A program's memory is bounded one array at a time | Every array is judged against `MAX_ELEMS`, and every cell or struct array against `MAX_BYTES`, as it is made, but nothing bounds what a program holds in all, and storing a matrix copies it: `m = repmat('a', 2, 8e6); for k = 1:100000, C{k} = m; end` asks for 1.6 TB in 16 MB pieces, and the allocator aborts the process (exit 134). The same holds for the outputs a program asks for through a target list it builds and evaluates: `deal`, and `arrayfun` and `cellfun` (whose outputs are judged one at a time, and of an N-D array only by their lists of sizes, cycle 14c), make one copy per output, and `arrayfun` reserves a value per element before it calls anything; and a cell holding N-D values counts each element as one value, not the list of sizes it carries, so `repmat` of one can copy far more than the byte budget sees. Found in testing cycles 15 and 14c; the paths predate them | later, needs a spec (shared matrix storage or a budget for the whole program) |
 

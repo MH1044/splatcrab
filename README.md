@@ -72,7 +72,9 @@ or `exit(n)` to leave with exit code `n`. At a terminal the prompt is a line
 editor: the arrow keys move and recall history, Home and End jump, Tab
 completes variable, function and file names, and Ctrl-C clears the line. The
 history is kept in `~/.splatcrab_history` (or wherever `SPLATCRAB_HISTORY`
-points), one entry per line.
+points), one entry per line: the newest 1000 entries, each at most 64 KiB,
+read from at most the file's last 4 MiB, so the history stays small and
+quick to load however long the file has grown.
 
 ```
 $ splatcrab
@@ -437,6 +439,12 @@ z
   `datestr`, `now`, `clock`, `pause`, `getenv`, `system` and `version`;
   `exit`, `quit` and `exit(n)` as statements anywhere in a script or at the
   prompt; `clc`, which clears only a real terminal
+- The command history bounded in bytes (cycle 17): an entry of more than
+  64 KiB still runs but is not kept, and at most the last 4 MiB of the
+  history file is read, a longer file cut back to the entries kept, so the
+  terminal and the desktop load it quickly however it grew (cases
+  `history_entry_too_long`, `history_entry_at_bound` and
+  `history_seed_long_line` in `17-history-bound/`)
 - `splatcrab --protocol`, a JSON Lines request loop over one session, with
   `eval`, `complete`, `workspace` and `completions`: the groundwork for the
   interface, with its JSON hand-written rather than taken from a crate
