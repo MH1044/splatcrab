@@ -1469,40 +1469,55 @@ mod tests {
         assert!(!d.0.join("none.mat").exists());
     }
 
-    /// Cycle 14: an N-D variable, or one held in a cell, is refused with
-    /// the gate's text before a byte is written, in both formats, and an
-    /// existing file is left as it was.
+    /// Cycle 14b: a MAT-file holds an N-D array, as a variable or in a
+    /// cell, and `load` gives it back with every dimension; `-ascii`,
+    /// whose text has rows alone, keeps cycle 14's refusal and writes
+    /// nothing, and `-append` of one leaves an existing text file as it
+    /// was.
     #[test]
-    fn save_refuses_an_nd_array_and_writes_nothing() {
+    fn save_writes_an_nd_array_and_ascii_refuses_one() {
         let d = Dir::new("save-nd");
         let mut it = interp_in(&d);
-        let nd = Value::Mat(Matrix::filled_dims(&[2, 2, 2], 1.0));
+        let nd = Value::Mat(Matrix::from_dims(
+            &[2, 2, 2],
+            (1..=8).map(f64::from).collect(),
+        ));
         it.vars_mut().insert("A".into(), nd.clone());
         it.vars_mut().insert(
             "c".into(),
-            Value::cell(crate::value::CellArray::new(1, 1, vec![nd])),
+            Value::cell(crate::value::CellArray::new(1, 1, vec![nd.clone()])),
         );
+        call(&mut it, save, &[s("n.mat"), s("A"), s("c")], 0).unwrap();
+        it.vars_mut().clear();
+        call(&mut it, load, &[s("n.mat")], 0).unwrap();
+        assert_eq!(it.vars()["A"].dims(), [2, 2, 2]);
+        assert_eq!(it.vars()["A"].mat().unwrap().data, nd.mat().unwrap().data);
+        let Value::Cell(c) = &it.vars()["c"] else {
+            panic!("not a cell")
+        };
+        assert_eq!(c.data[0].dims(), [2, 2, 2]);
+        // A dimension a MAT-file's `int32` cannot hold is refused before a
+        // byte is written, and no file is made.
+        let wide = Matrix::from_dims(&[0, 1, 5_000_000_000], Vec::new());
+        it.vars_mut().insert("C".into(), Value::Mat(wide));
+        let e = call(&mut it, save, &[s("big.mat"), s("C")], 0).unwrap_err();
+        assert_eq!(
+            msg(e),
+            "Unable to save variable 'C': a dimension past 2147483647 cannot be written in a MAT-file of version 5."
+        );
+        assert!(!d.0.join("big.mat").exists());
         let refusal = "N-D arrays are not supported by 'save'.";
-        for (file, var, ascii) in [
-            ("n.mat", "A", false),
-            ("m.mat", "c", false),
-            ("n.txt", "A", true),
-        ] {
-            let mut args = vec![s(file), s(var)];
-            if ascii {
-                args.push(s("-ascii"));
-            }
-            let e = call(&mut it, save, &args, 0).unwrap_err();
-            assert_eq!(msg(e), refusal);
-            assert!(!d.0.join(file).exists(), "{file}");
-        }
+        let e = call(&mut it, save, &[s("n.txt"), s("A"), s("-ascii")], 0).unwrap_err();
+        assert_eq!(msg(e), refusal);
+        assert!(!d.0.join("n.txt").exists());
         it.vars_mut()
             .insert("x".into(), Value::Mat(Matrix::scalar(1.0)));
-        call(&mut it, save, &[s("k.mat"), s("x")], 0).unwrap();
-        let before = fs::read(d.0.join("k.mat")).unwrap();
-        let e = call(&mut it, save, &[s("k.mat"), s("A"), s("-append")], 0).unwrap_err();
+        call(&mut it, save, &[s("k.txt"), s("x"), s("-ascii")], 0).unwrap();
+        let before = fs::read(d.0.join("k.txt")).unwrap();
+        let args = [s("k.txt"), s("A"), s("-ascii"), s("-append")];
+        let e = call(&mut it, save, &args, 0).unwrap_err();
         assert_eq!(msg(e), refusal);
-        assert_eq!(fs::read(d.0.join("k.mat")).unwrap(), before);
+        assert_eq!(fs::read(d.0.join("k.txt")).unwrap(), before);
     }
 
     #[test]

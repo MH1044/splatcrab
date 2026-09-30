@@ -804,10 +804,27 @@ pub fn size_overflow(dims: &[String]) -> MError {
     ))
 }
 
+/// A shape of more than `limit` (`args::MAX_NDIMS`, 2^20) dimensions
+/// (cycle 14b), judged before its sizes: `cat(2^21, 1, 2)`, or a list of
+/// more than a million sizes. SplatCrab's own text.
+pub fn too_many_dims(limit: usize) -> MError {
+    MError::new(format!("Arrays have at most {} dimensions.", limit))
+}
+
+/// `max(A, B, dim)` and `min(A, B, dim)` with a second array that is not
+/// `[]` (cycle 14b), which used to be dropped in silence. SplatCrab's own
+/// text.
+pub fn extremum_two_arrays_and_dim(name: &str) -> MError {
+    MError::new(format!(
+        "{} takes two arrays or one array and a dimension, not both.",
+        name
+    ))
+}
+
 /// A third or later size other than `1` where no N-D array can be made:
-/// `cell(2, 3, 4)` and `repmat(1, [2 2 2])`, a cell or struct array read
-/// or grown into an N-D shape, and the builtins of `numerics.rs` that
-/// refuse a third dimension of their own (`meshgrid` of three inputs).
+/// `cell(2, 3, 4)` and `eye([2 3 4])`, a cell or struct array read or
+/// grown into an N-D shape, and the builtins of `numerics.rs` that refuse
+/// a third dimension of their own (`meshgrid` of three inputs).
 pub fn nd_unsupported() -> MError {
     MError::new("N-D arrays are not supported.")
 }
@@ -834,9 +851,13 @@ pub fn nd_transpose() -> MError {
     MError::new("Transpose is not defined for N-D arrays.")
 }
 
-/// A bracket concatenation holding an N-D array: `[zeros(2, 2, 2), 1]`.
-pub fn nd_concatenation() -> MError {
-    MError::new("Concatenation of N-D arrays is not supported.")
+/// A `permute` order that is not a row of positive integers holding each
+/// of 1 to n exactly once, with n at least `ndims(A)` (cycle 14b):
+/// `permute(A, [1 2])` and `permute(A, [1 1 2])` of a 2x3x4.
+pub fn permute_order() -> MError {
+    MError::new(
+        "permute's dimension order must hold each of 1 to n once, with n at least ndims(A).",
+    )
 }
 
 /// A single size argument that is a column or a matrix: `zeros([2; 3])`.
@@ -1648,6 +1669,17 @@ pub fn save_unsupported(var: &str, class: &str) -> MError {
 pub fn save_too_large(var: &str) -> MError {
     MError::new(format!(
         "Unable to save variable '{}': it is larger than the 4 GiB a MAT-file of version 5 can hold in one element.",
+        var
+    ))
+}
+
+/// `save` of an array with a dimension past 2147483647 (cycle 14b), which
+/// the `int32` dimensions array of a MAT-file of version 5 cannot hold:
+/// `zeros(0, 1, 5e9)`, which the writer used to write wrapped. Nothing is
+/// written. SplatCrab's own text.
+pub fn save_dim_too_large(var: &str) -> MError {
+    MError::new(format!(
+        "Unable to save variable '{}': a dimension past 2147483647 cannot be written in a MAT-file of version 5.",
         var
     ))
 }

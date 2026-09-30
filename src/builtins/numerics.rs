@@ -93,15 +93,10 @@ fn is_count(v: f64) -> bool {
 }
 
 /// MATLAB's default working dimension: the first that is not a singleton,
-/// and `1` when every dimension is one.
+/// and `1` when every dimension is one. It is the reductions' rule,
+/// `math::default_dim`, since cycle 14b, so the two cannot disagree.
 pub fn first_dim(m: &Matrix) -> usize {
-    if m.rows != 1 {
-        1
-    } else if m.cols != 1 {
-        2
-    } else {
-        1
-    }
+    super::math::default_dim(&m.dims())
 }
 
 /// How many elements `m` has along dimension `d`.
@@ -147,12 +142,13 @@ pub fn map_slices(m: &Matrix, d: usize, out: usize, f: impl Fn(&[f64]) -> Vec<f6
 }
 
 /// A reduction along `d`, or along the default dimension when `d` is
-/// `None`. Unlike `math::reduce`, a dimension past the second reduces each
+/// `None`. Unlike `math::reduce`, a dimension past `ndims` reduces each
 /// element on its own rather than handing the argument back, which is what
-/// makes `var(X, 0, 3)` zeros.
+/// makes `var(X, 0, 3)` zeros; a dimension within `ndims` is
+/// `math::reduce`'s, whose rule for a dimension of size 1 is the same.
 fn reduce_along(m: &Matrix, d: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
     match d {
-        Some(d) if d >= 3 => Ok(m.map(|x| f(&[x]))),
+        Some(d) if d > m.ndims() => Ok(m.map(|x| f(&[x]))),
         _ => reduce(m, d, f),
     }
 }

@@ -4,7 +4,7 @@
 //!
 //! **The reader treats the file as untrusted input.** Every length it reads
 //! is checked against the bytes that are actually there before anything is
-//! sliced, every array's dimensions go through `args::check_shape` before
+//! sliced, every array's dimensions go through `args::check_dims` before
 //! anything is allocated, a container never reserves room for more
 //! elements than the bytes left could hold, and nesting is bounded by
 //! [`MAX_DEPTH`], so a truncated, corrupt or hostile file is a clean error:
@@ -16,15 +16,19 @@
 //! data stored under any of the numeric data types MATLAB uses to save
 //! space. What is refused: compressed data (MATLAB's default since v7;
 //! save with `-v6` there), sparse arrays, objects, function handles and
-//! arrays of more than two dimensions. What is written: doubles (complex
-//! included), logicals, chars, cells and structs, little-endian, each
-//! numeric array as `miDOUBLE`.
+//! cell and struct arrays of more than two dimensions. What is written:
+//! doubles (complex included), logicals, chars, cells and structs,
+//! little-endian, each numeric array as `miDOUBLE`. Since cycle 14b a
+//! numeric, logical or char array of any number of dimensions is written
+//! and read with its whole dimensions array, one `int32` per dimension; a
+//! dimension past 2147483647, which an `int32` cannot hold, is refused
+//! before anything is written.
 
 use std::collections::{HashMap, HashSet};
 
-use super::args::{check_cell, check_shape, check_struct};
+use super::args::{check_cell, check_dims, check_struct};
 use crate::error::{self, MError, MatFault, R};
-use crate::value::{CellArray, Class, Matrix, StructArray, Value};
+use crate::value::{CellArray, Class, Matrix, StructArray, Value, dims_product};
 
 /// How deeply cells and structs may nest in a file that is read or
 /// written. Both directions recurse once per level.
@@ -128,24 +132,28 @@ fn matrix(out: &mut Vec<u8>, name: &str, v: &Value, var: &str, depth: usize) -> 
     if depth > MAX_DEPTH {
         return Err(error::save_too_deep(var));
     }
-    // An N-D array would be written as its first page with the rest of
-    // its storage after it, a file no reader could trust, so it is refused
-    // with the N-D gate's text, before a byte is written, wherever it sits:
-    // a variable, a cell element or a field (cycle 14).
-    if matches!(v, Value::Mat(m) if m.is_nd()) {
-        return Err(error::nd_argument("save"));
+    // Every dimension, one `int32` each, so an N-D array is written whole
+    // wherever it sits, a variable, a cell element or a field (cycle 14b).
+    // A dimension an `int32` cannot hold, which an empty array can have
+    // (`zeros(0, 1, 5e9)`), would be written wrapped, so it is refused
+    // here, before a byte of this array is laid out; the whole file is
+    // built in memory before any of it is written, so nothing is.
+    let dims = v.dims();
+    if dims.iter().any(|&k| i32::try_from(k).is_err()) {
+        return Err(error::save_dim_too_large(var));
     }
     let start = out.len();
     out.extend_from_slice(&MI_MATRIX.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
-    let dims = v.dims();
     let (rows, cols) = (dims[0], dims[1]);
     let flags = |out: &mut Vec<u8>, class: u32, bits: u32| -> R<()> {
         let mut d = (class | (bits << 8)).to_le_bytes().to_vec();
         d.extend_from_slice(&0u32.to_le_bytes());
         element(out, MI_UINT32, &d, var)?;
-        let mut d = (rows as i32).to_le_bytes().to_vec();
-        d.extend_from_slice(&(cols as i32).to_le_bytes());
+        let d: Vec<u8> = dims
+            .iter()
+            .flat_map(|&k| (k as i32).to_le_bytes())
+            .collect();
         element(out, MI_INT32, &d, var)?;
         element(out, MI_INT8, name.as_bytes(), var)
     };
@@ -414,15 +422,24 @@ impl<'a> Reader<'a> {
         if d.len() < 8 || d.len() % 4 != 0 {
             return Err(self.bad(MatFault::Corrupt));
         }
+        // The dimensions array holds one word per dimension, each read
+        // from the bytes that are there, so its length is bounded by the
+        // file's.
         let dims = self.words(d);
         if dims.iter().any(|&k| k < 0) {
             return Err(self.bad(MatFault::Corrupt));
         }
-        if dims[2..].iter().any(|&k| k != 1) {
+        // A numeric, logical or char array of any number of dimensions is
+        // read whole (cycle 14b); a cell or struct array, which SplatCrab
+        // keeps 2-D, and anything else, is refused past two as before.
+        if dims[2..].iter().any(|&k| k != 1) && !matches!(class, MX_CHAR | 6..=15) {
             return Err(self.bad(MatFault::NDims));
         }
-        let (rows, cols) = check_shape(dims[0] as f64, dims[1] as f64)?;
-        let numel = rows * cols;
+        // The whole shape, judged before anything is allocated for it.
+        let asked: Vec<f64> = dims.iter().map(|&k| k as f64).collect();
+        let shape = check_dims(&asked)?;
+        let (rows, cols) = (shape[0], shape[1]);
+        let numel = dims_product(&shape);
         let (_, n) = self.expect(&[MI_INT8, MI_UINT8, MI_UTF8])?;
         let name = String::from_utf8_lossy(n)
             .trim_end_matches('\0')
@@ -464,7 +481,7 @@ impl<'a> Reader<'a> {
                     MI_UINT8 | MI_INT8 => return Err(self.bad(MatFault::Corrupt)),
                     _ => self.numbers(MI_UINT16, data, numel)?,
                 };
-                Value::Mat(Matrix::new(rows, cols, units).with_class(Class::Char))
+                Value::Mat(Matrix::from_dims(&shape, units).with_class(Class::Char))
             }
             6..=15 => {
                 let re = self.numeric(numel)?;
@@ -473,14 +490,14 @@ impl<'a> Reader<'a> {
                 } else {
                     None
                 };
-                let m = Matrix::new(rows, cols, re);
+                let m = Matrix::from_dims(&shape, re);
                 if bits & FLAG_LOGICAL != 0 {
                     let data = m
                         .data
                         .iter()
                         .map(|x| f64::from(u8::from(*x != 0.0)))
                         .collect();
-                    Value::Mat(Matrix::new(rows, cols, data).with_class(Class::Logical))
+                    Value::Mat(Matrix::from_dims(&shape, data).with_class(Class::Logical))
                 } else {
                     Value::Mat(m.with_im(im))
                 }
@@ -793,21 +810,132 @@ mod tests {
         assert_eq!(round_trip(vec![("s".into(), s)])[0].1.dims(), [2, 3]);
     }
 
-    /// Cycle 14: an N-D array would be written as its first page, so the
-    /// writer refuses one, as a variable, a cell element or a field.
+    /// One `miMATRIX` variable named `x` of `class`, with the dimensions
+    /// array `dims` and the data elements `data`, built by hand.
+    fn array_file(class: u32, dims: &[i32], data: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        put(&mut body, MI_UINT32, &[class as u8, 0, 0, 0, 0, 0, 0, 0]);
+        let d: Vec<u8> = dims.iter().flat_map(|k| k.to_le_bytes()).collect();
+        put(&mut body, MI_INT32, &d);
+        put(&mut body, MI_INT8, b"x");
+        for (ty, bytes) in data {
+            put(&mut body, *ty, bytes);
+        }
+        let mut f = header();
+        f.extend_from_slice(&MI_MATRIX.to_le_bytes());
+        f.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        f.extend_from_slice(&body);
+        f
+    }
+
+    /// Cycle 14b: an N-D numeric, logical or char array is written with its
+    /// whole dimensions array, one `int32` per dimension, as a variable, a
+    /// cell element or a field, and read back with every dimension.
     #[test]
-    fn an_nd_array_is_refused_wherever_it_sits() {
-        let nd = Value::Mat(Matrix::filled_dims(&[2, 1, 3], 0.0));
-        let refusal = "N-D arrays are not supported by 'save'.";
-        assert_eq!(write(&[("a".into(), nd.clone())]).unwrap_err().msg, refusal);
-        let c = Value::cell(CellArray::new(
-            1,
-            2,
-            vec![Value::Mat(Matrix::scalar(1.0)), nd.clone()],
-        ));
-        assert_eq!(write(&[("c".into(), c)]).unwrap_err().msg, refusal);
-        let s = Value::strukt(StructArray::scalar(vec!["f".into()], vec![nd]));
-        assert_eq!(write(&[("s".into(), s)]).unwrap_err().msg, refusal);
+    fn an_nd_array_is_written_and_read_with_every_dimension() {
+        let nd = Matrix::from_dims(&[2, 1, 3], (1..=6).map(f64::from).collect());
+        let bytes = write(&[("a".into(), Value::Mat(nd.clone()))]).unwrap();
+        // The dimensions array follows the flags element: its tag, then
+        // one word per dimension.
+        let at = HEADER + 8 + 16;
+        assert_eq!(bytes[at..at + 8], [MI_INT32 as u8, 0, 0, 0, 12, 0, 0, 0]);
+        let words: Vec<i32> = bytes[at + 8..at + 20]
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words, [2, 1, 3]);
+        let mut z = nd.clone();
+        z.im = Some(vec![1.0; 6]);
+        let t = Matrix::from_dims(&[1, 1, 1, 2], vec![1.0, 0.0]).with_class(Class::Logical);
+        let c =
+            Matrix::from_dims(&[1, 2, 2], vec![97.0, 98.0, 99.0, 100.0]).with_class(Class::Char);
+        let cell = Value::cell(CellArray::new(1, 2, vec![num(1.0), Value::Mat(nd.clone())]));
+        let field = Value::strukt(StructArray::scalar(vec!["f".into()], vec![Value::Mat(nd)]));
+        let empty = Matrix::from_dims(&[2, 0, 3], Vec::new());
+        let vars = vec![
+            ("z".to_string(), Value::Mat(z)),
+            ("t".to_string(), Value::Mat(t)),
+            ("c".to_string(), Value::Mat(c)),
+            ("cell".to_string(), cell),
+            ("field".to_string(), field),
+            ("empty".to_string(), Value::Mat(empty)),
+        ];
+        let back = round_trip(vars.clone());
+        for ((n1, v1), (_, v2)) in vars.iter().zip(&back) {
+            assert_eq!(format!("{v1:?}"), format!("{v2:?}"), "{n1}");
+        }
+        assert_eq!(back[0].1.dims(), [2, 1, 3]);
+        assert_eq!(back[1].1.dims(), [1, 1, 1, 2]);
+        // A dimensions array with trailing ones is the shape without them.
+        let f = array_file(MX_DOUBLE, &[2, 1, 1, 1], &[(MI_DOUBLE, &[0; 16])]);
+        assert_eq!(read(&f, "t.mat").unwrap()[0].1.dims(), [2, 1]);
+    }
+
+    /// Cycle 14b: a dimension an `int32` cannot hold, which only an empty
+    /// array can have, is refused naming its variable, wherever it sits,
+    /// where the writer wrapped it; 2147483647 itself is written and read.
+    #[test]
+    fn a_dimension_past_int32_is_refused() {
+        let refusal = |var: &str| {
+            format!(
+                "Unable to save variable '{var}': a dimension past 2147483647 cannot be written in a MAT-file of version 5."
+            )
+        };
+        let wide = Value::Mat(Matrix::from_dims(&[0, 1, 5_000_000_000], Vec::new()));
+        assert_eq!(
+            write(&[("C".into(), wide.clone())]).unwrap_err().msg,
+            refusal("C")
+        );
+        let tall = Value::Mat(Matrix::new(1 << 31, 0, Vec::new()));
+        assert_eq!(write(&[("t".into(), tall)]).unwrap_err().msg, refusal("t"));
+        let c = Value::cell(CellArray::new(1, 2, vec![num(1.0), wide.clone()]));
+        assert_eq!(write(&[("c".into(), c)]).unwrap_err().msg, refusal("c"));
+        let s = Value::strukt(StructArray::scalar(vec!["f".into()], vec![wide]));
+        assert_eq!(write(&[("s".into(), s)]).unwrap_err().msg, refusal("s"));
+        let most = Matrix::from_dims(&[0, 1, i32::MAX as usize], Vec::new());
+        let back = round_trip(vec![("m".into(), Value::Mat(most))]);
+        assert_eq!(back[0].1.dims(), [0, 1, i32::MAX as usize]);
+    }
+
+    /// Cycle 14b: the reader's bounds apply to every dimension. The whole
+    /// shape is judged before anything is allocated, and the data must
+    /// hold exactly its elements, so no dimensions array can make the
+    /// reader reserve more than the bytes there; a cell or struct array of
+    /// more than two dimensions keeps its refusal.
+    #[test]
+    fn a_hostile_dimensions_array_is_a_clean_error() {
+        let t = std::time::Instant::now();
+        let huge = array_file(
+            MX_DOUBLE,
+            &[1 << 20, 1 << 20, 1 << 20],
+            &[(MI_DOUBLE, &[0; 8])],
+        );
+        assert_eq!(
+            err(&huge),
+            "Requested 1048576x1048576x1048576 array exceeds the maximum array size."
+        );
+        // Within the cap, but claiming more than the data holds.
+        let short = array_file(MX_DOUBLE, &[1024, 1024, 64], &[(MI_DOUBLE, &[0; 8])]);
+        assert!(err(&short).contains("corrupt"), "{}", err(&short));
+        let chars = array_file(MX_CHAR, &[2, 2, 2], &[(MI_UINT16, &[0; 4])]);
+        assert!(err(&chars).contains("corrupt"), "{}", err(&chars));
+        // A negative dimension is corrupt, as before.
+        let neg = array_file(MX_DOUBLE, &[1, 1, -2], &[(MI_DOUBLE, &[0; 8])]);
+        assert!(err(&neg).contains("corrupt"), "{}", err(&neg));
+        // Many dimensions of 1 cost the words the file holds and no more.
+        let mut many = vec![1i32; 100_000];
+        many.push(2);
+        let wide = array_file(MX_DOUBLE, &many, &[(MI_DOUBLE, &[0; 16])]);
+        let v = read(&wide, "t.mat").unwrap();
+        assert_eq!(v[0].1.dims().len(), 100_001);
+        // An empty whose sizes multiply past any memory is still empty.
+        let e = array_file(MX_DOUBLE, &[0, i32::MAX, i32::MAX], &[(MI_DOUBLE, &[])]);
+        assert_eq!(read(&e, "t.mat").unwrap()[0].1.numel(), 0);
+        // A cell or struct array stays 2-D, with the reader's own text.
+        let nd = "Unable to read MAT-file 't.mat': an array in it has more than two dimensions.";
+        assert_eq!(err(&array_file(MX_CELL, &[1, 1, 2], &[])), nd);
+        assert_eq!(err(&array_file(MX_STRUCT, &[1, 1, 2], &[])), nd);
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
     }
 
     /// A tag holds a length in 32 bits, so a variable past 4 GiB would be

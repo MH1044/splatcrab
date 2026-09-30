@@ -17,6 +17,13 @@ use crate::value::{Matrix, Value};
 /// same idea under a different name ("maximum array size preference").
 pub const MAX_ELEMS: usize = 1 << 28;
 
+/// The most dimensions any array has, 2^20 (cycle 14b). [`check_dims`]
+/// refuses a longer shape before judging its sizes, and `cat` judges its
+/// dimension against the same bound before it builds a shape, so no small
+/// argument can make a list of dimensions that costs gigabytes:
+/// `cat(2^28, 1, 2)` would have asked for 2^28 of them.
+pub const MAX_NDIMS: usize = 1 << 20;
+
 /// Lower bound on the argument count: "Not enough input arguments."
 pub fn need(args: &[Value], n: usize, name: &str) -> R<()> {
     if args.len() < n {
@@ -173,9 +180,8 @@ pub fn size_list(args: &[Value], from: usize, name: &str, auto: bool) -> R<Vec<O
 
 /// Two dimensions out of a list of sizes. Trailing sizes of `1` are dropped,
 /// as MATLAB drops them; any other third or later size, `0` included, would
-/// need an N-D array, which the callers that come here (`eye`, `cell` and
-/// `repmat`, through [`shape`]) cannot make yet. `dims` has at least two
-/// entries.
+/// need an N-D array, which the callers that come here (`eye` and `cell`,
+/// through [`shape`]) cannot make. `dims` has at least two entries.
 pub fn trailing_ones(dims: &[f64]) -> R<(f64, f64)> {
     if dims[2..].iter().any(|&d| d != 1.0) {
         return Err(error::nd_unsupported());
@@ -184,8 +190,8 @@ pub fn trailing_ones(dims: &[f64]) -> R<(f64, f64)> {
 }
 
 /// The requested `(rows, cols)` of a builtin that makes a 2-D array only,
-/// `eye`, `cell` and `repmat` since cycle 14 gave the other constructors
-/// [`shape_dims`]: no size is 1x1, and otherwise [`size_list`] then
+/// `eye` and `cell`, since cycle 14 gave the other constructors and cycle
+/// 14b `repmat` [`shape_dims`]: no size is 1x1, and otherwise [`size_list`] then
 /// [`trailing_ones`]. More than `max_dims` sizes is the N-D error even when
 /// they are ones, which is how `eye` keeps its two-size limit for a size
 /// vector.
@@ -202,7 +208,8 @@ pub fn shape(args: &[Value], from: usize, name: &str, max_dims: usize) -> R<(f64
 }
 
 /// The sizes of a constructor that takes any number of dimensions (cycle
-/// 14): no size is 1x1, and otherwise [`size_list`], with every trailing
+/// 14), and of `repmat`'s counts (cycle 14b): no size is 1x1, and
+/// otherwise [`size_list`], with every trailing
 /// size of `1` past the second dropped, as MATLAB drops it, so
 /// `zeros(2, 3, 1)` asks for 2x3 and `zeros(2, 3, 1, 4)` for 2x3x1x4. The
 /// sizes stay `f64` for [`check_dims`] to judge and name.
@@ -224,8 +231,14 @@ pub fn shape_dims(args: &[Value], from: usize, name: &str) -> R<Vec<f64>> {
 /// refusal is [`check_shape`]'s, naming every size as it was asked for:
 /// `Requested 100000x100000x100000 array exceeds the maximum array size.`
 /// Every N-D shape the interpreter computes, a constructor's, a reshape's,
-/// a broadcast's, a read's and a growth's, comes here.
+/// a broadcast's, a read's and a growth's, comes here. A shape of more
+/// than [`MAX_NDIMS`] dimensions is refused first, `Arrays have at most
+/// 1048576 dimensions.` (cycle 14b), so the size message never names
+/// millions of sizes.
 pub fn check_dims(dims: &[f64]) -> R<Vec<usize>> {
+    if dims.len() > MAX_NDIMS {
+        return Err(error::too_many_dims(MAX_NDIMS));
+    }
     // `usize::MAX as f64` rounds up to 2^64, so anything below it fits.
     let limit = usize::MAX as f64;
     if dims.iter().all(|&d| d < limit) {
@@ -469,9 +482,10 @@ mod tests {
 
     #[test]
     fn the_size_parser_drops_trailing_ones_and_nothing_else() {
-        // `shape` is the two-size parser `eye`, `cell` and `repmat` keep
-        // (cycle 14): a third size other than 1 is still its refusal. The
-        // constructors that make N-D arrays read `shape_dims` instead.
+        // `shape` is the two-size parser `eye` and `cell` keep (cycle
+        // 14): a third size other than 1 is still its refusal. The
+        // constructors that make N-D arrays, and `repmat` since cycle 14b,
+        // read `shape_dims` instead.
         let nd = "N-D arrays are not supported.";
         assert_eq!(sizes(&[num(2.0), num(3.0), num(1.0)]).unwrap(), (2.0, 3.0));
         assert_eq!(
@@ -633,6 +647,24 @@ mod tests {
         assert!(check_dims(&[huge, huge, 1.0]).is_err());
         // check_shape is check_dims of two sizes.
         assert_eq!(check_shape(2.0, 3.0).unwrap(), (2, 3));
+    }
+
+    /// Cycle 14b: at most 2^20 dimensions, judged before the sizes, so a
+    /// longer shape is refused by its length whatever its sizes are, and
+    /// the size message never names millions of sizes.
+    #[test]
+    fn check_dims_refuses_more_than_a_million_dimensions() {
+        assert_eq!(MAX_NDIMS, 1_048_576);
+        let mut at = vec![1.0; MAX_NDIMS];
+        at[0] = 2.0;
+        assert_eq!(check_dims(&at).unwrap().len(), MAX_NDIMS);
+        let cap = "Arrays have at most 1048576 dimensions.";
+        let past = vec![1.0; MAX_NDIMS + 1];
+        assert_eq!(check_dims(&past).unwrap_err().msg, cap);
+        let mut big = vec![2.0; MAX_NDIMS + 1];
+        assert_eq!(check_dims(&big).unwrap_err().msg, cap);
+        big[0] = 0.0;
+        assert_eq!(check_dims(&big).unwrap_err().msg, cap);
     }
 
     #[test]

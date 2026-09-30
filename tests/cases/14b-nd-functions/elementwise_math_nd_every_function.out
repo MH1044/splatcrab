@@ -1,0 +1,49 @@
+abs 1 1 1 1
+sqrt 1 1 1 0
+exp 1 1 1 1
+log 1 1 1 0
+log2 1 1 1 0
+log10 1 1 1 0
+sin 1 1 1 1
+cos 1 1 1 1
+tan 1 1 1 1
+asin 1 1 1 0
+acos 1 1 1 0
+atan 1 1 1 1
+sinh 1 1 1 1
+cosh 1 1 1 1
+tanh 1 1 1 1
+floor 1 1 1 1
+ceil 1 1 1 1
+round 1 1 1 1
+fix 1 1 1 1
+sign 1 1 1 1
+isnan 1 1 1 1
+isinf 1 1 1 1
+isfinite 1 1 1 1
+real 1 1 1 1
+imag 1 1 1 1
+conj 1 1 1 1
+angle 1 1 1 1
+     2     3     4
+   1
+mod 1 1 1
+rem 1 1 1
+atan2 1 1 1
+hypot 1 1 1
+power 1 1 1
+complex 1 1 0
+abs 1 1 1
+sqrt 1 1 0
+exp 1 1 0
+log 1 1 0
+log2 1 1 0
+log10 1 1 0
+sin 1 1 0
+cos 1 1 0
+asin 1 1 0
+acos 1 1 0
+real 1 1 1
+imag 1 1 1
+conj 1 1 0
+angle 1 1 1

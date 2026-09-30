@@ -207,7 +207,11 @@ is exactly what it was before cycle 14, and every 2-D kernel keeps
 compiling and stays correct. `Matrix::dims` answers every dimension,
 `ndims` is 2 plus the stored count, and `from_dims`, `filled_dims` and
 `set_dims` are the only ways to make or change an N-D shape, each
-normalising it; see "Add a value type". Every `Matrix` carries a `class`
+normalising it; see "Add a value type". Since cycle 14b `along_dim` sees
+any shape along one dimension as three numbers, `[before, n, after]`,
+element `(b, k, a)` of the view at `b + before * (k + n * a)`: the one view
+the reductions, the running scans, `cat` and the brackets, and `repmat`
+work through, whatever the array's `ndims`. Every `Matrix` carries a `class`
 tag, `Double`, `Logical` or `Char`, over the same `f64` storage; a char
 element is one UTF-16 code unit. Since cycle 10 a double can be complex: `im: Option<Vec<f64>>`
 holds the imaginary parts, column-major like `data`, and is `None` for real
@@ -312,7 +316,8 @@ trapezoidal rule, differences, `filter`, the statistics, the number theory
 and the grids. Its `map_slices` is the one way a function there works
 along a dimension: it hands each column (or each row, through a
 transpose) to a closure, and judges the result's shape with `check_shape`
-first; `first_dim` is MATLAB's default dimension. `sets.rs` holds the five
+first; `first_dim` is MATLAB's default dimension, since cycle 14b the
+reductions' `math::default_dim`, so the two cannot disagree. `sets.rs` holds the five
 set functions over a `Set`, either an array compared as numbers or a cell of
 character vectors compared as code-unit texts. `solvers.rs` holds `fzero`,
 `fminsearch`, `integral` and `ode45`, each a thin builtin around a pure
@@ -332,7 +337,31 @@ power-of-two transforms, for every other, so every length is O(n log n).
 `builtins::TAKES_COMPLEX` names the builtins that take a complex argument,
 and `complex_gate`, which `Interp::call_builtin` runs before every builtin,
 refuses one to any other; see "Add a value type". Cycle 14 added the same
-gate for N-D arrays beside it, `builtins::ND_OK` and `nd_gate`.
+gate for N-D arrays beside it, `builtins::ND_OK` and `nd_gate`, and cycle
+14b grew `ND_OK` by the builtins it taught N-D.
+
+**The reductions (cycle 14b)** are one kernel, `math::each_slice`, over
+the array seen along the dimension as `[before, n, after]`: `f` of each of
+the `before * after` slices, in the result's column-major order. The
+`sum` page's three sentences are its rule for every reduction, `sum`,
+`prod`, `mean`, `any`, `all`, `max`, `min`, and the scans `cumsum` and
+`cumprod`: with no dimension the first whose size is not 1
+(`math::default_dim`), the 2-D 0x0 keeping its special cases; along `dim`
+that dimension becomes 1 and every other stays, the shape judged by
+`check_dims`; along a dimension of size 1 within `ndims` each slice is
+one element, and along one of size 0 each is empty. Past `ndims` no
+kernel runs: `reduce`, `reduce_c` and `scan` hand the argument back
+(`math::past_ndims`), the path a matrix and a dimension past 2 always
+took, values and storage alike, so `sum` returns `A`, a `-0` stays `-0`,
+`prod(complex(1, 0), 3)` keeps its complex storage, and `any` and `all`
+convert `A` to a logical as they always did; `numerics::reduce_along`
+keeps its own rule there, each element reduced on its own, which makes
+`var(X, 0, 3)` zeros. `max` and `min` give an empty along a dimension of
+size 0, their index is the same kernel over `arg_extremum`, and past
+`ndims` it is all 1s. A 2-D matrix within its two dimensions is the case
+`before = 1` (a column, contiguous) or `after = 1` (a row), with each
+slice's elements in the order they always were read, so every 2-D answer
+is the one it was.
 
 Cycle 11 added five files. `printf.rs` is the formatter the `printf`
 family shares, moved out of `core.rs` and finished (QA D16): `%x`, `%X`,
@@ -658,7 +687,9 @@ These hold everywhere. Breaking one is a bug even if the tests pass.
    whatever the pattern, and bounds the pattern's nesting and compiled
    size, each class built once into ranges that count toward that size;
    the MAT reader checks every length against the bytes there and
-   every array's dimensions through `check_shape` before it allocates,
+   every array's dimensions through `check_shape` before it allocates
+   (since cycle 14b `check_dims`, every dimension of the array's
+   dimensions array, which is itself read from the bytes there),
    never reserves more elements than the bytes left could hold, bounds a
    struct array with no fields, which no bytes pay for, by
    `mat::MAX_FIELDLESS`, and bounds cells and structs nested in a file by
@@ -739,7 +770,8 @@ it is judged, so that an oversized request is named as asked. `shape_dims`
 reads a constructor's sizes (cycle 14): none (1x1), a scalar `n` (n x n), a
 row size vector, or two or more scalars, with trailing sizes of `1` dropped
 and every other size kept, so `zeros(2, 3, 4)` asks for 2x3x4. `shape` is
-the two-size form that `eye`, `cell` and `repmat` keep, any other third
+the two-size form that `eye` and `cell` keep (`repmat` reads
+`shape_dims` since cycle 14b), any other third
 size its N-D error. `size_list` and `trailing_ones` are their lower layers,
 for a builtin such as `reshape` that takes a `[]` placeholder or has no
 n-by-n rule. `size_arg` and `size_value` read one size as an `f64`, where a
@@ -768,7 +800,10 @@ element-wise kernel, real and complex (`try_zip`, `zip_c`, `transpose`),
 the running scans, `fft`, `sort`, `kron`, `repmat`, `fliplr`, `flipud`,
 `triu`, `tril`, `numerics::map_slices`, vertical concatenation, and the
 index resolvers (`resolve_read`, `resolve_write`, `resolve_delete`,
-`Sel::covers`) loop over the elements they produce or read, never over a
+`Sel::covers`), and since cycle 14b the reductions' kernel, `permute`,
+`cat` and every bracket with an N-D operand through `interp::concat`, and
+`repmat`'s tiling,
+loop over the elements they produce or read, never over a
 dimension of an empty operand, so `zeros(0, 1e12) + 1` returns at once and
 `x(:, :)` of it lists no positions. `for` over an array with no rows still
 iterates its columns, which is the open question of its own Known bugs row.
@@ -801,8 +836,17 @@ elements from 2e5 — so "the operands fit, therefore the result fits" is never
 true. Cycle 14's go through `check_dims`: the N-D constructors and
 `reshape`, broadcasting across every dimension, a read's shape of one
 dimension per subscript, and a growth's shape and its count of positions,
-which repeated subscripts can make far larger than the array. A new
-operation of that kind belongs on the same list.
+which repeated subscripts can make far larger than the array. Cycle
+14b's too: a reduction's shape, a concatenation's (`cat`'s and every
+bracket's with an N-D operand), `repmat`'s whole shape, named as asked
+and never an intermediate, and every dimension a MAT-file declares.
+`check_dims` also refuses a shape of more than 2^20 dimensions
+(`args::MAX_NDIMS`) before it judges the sizes, `Arrays have at most
+1048576 dimensions.`, and when `cat`'s dimension passes every argument's
+`ndims`, it is judged against the same bound before the result's list of
+sizes is made, so `cat(1e10, 1, 2)` is a clean refusal rather than a
+request for 1e10 sizes. A new operation of that kind belongs on the same
+list.
 
 ### Add a statement
 
@@ -863,18 +907,28 @@ reading `rows x cols` of an N-D array would read its first page alone in
 silence, so the registry refuses an N-D argument to every builtin not on
 `builtins::ND_OK` with `N-D arrays are not supported by '<name>'.`, through
 `nd_gate`, which `Interp::call_builtin` runs beside `complex_gate`; that is
-the only path into a builtin. The interpreter's own consumers, which no
+the only path into a builtin. Since cycle 14b `ND_OK` holds, beside cycle
+14's constructors, shape and class queries, `isequal`, `reshape`, `disp`,
+conversions, printf family, `feval` and `deal`, the reductions (`sum`,
+`prod`, `mean`, `any`, `all`, `max`, `min`, `cumsum`, `cumprod`), the
+element-wise math and the two-argument functions that broadcast, and
+`squeeze`, `permute`, `cat` and `repmat`, and nothing else. The interpreter's own consumers, which no
 gate covers, each handle every dimension or refuse: the index pipeline,
 the element-wise primitives (`map`, `try_map`, `map_c`, `zip`, `try_zip`,
 `zip_c`, `to_class`, `real_part`, `imag_part`, each carrying every
 dimension, the zips broadcasting across them), the operators, which refuse
 an N-D operand where they are not element-wise (`Matrix operations are not
 defined for N-D arrays.`), `'` and `.'` (`Transpose is not defined for N-D
-arrays.`), a bracket joining one to anything (`Concatenation of N-D arrays
-is not supported.`), `for` over the 2-D fold, the display, `whos`, the
-protocol's `workspace`, the preview, the cell and struct summaries,
-`values_equal`, which compares every dimension before any element, and
-`save`, whose MAT-file writer refuses one wherever it sits. `Value::dims`
+arrays.`), the brackets, which join one along any dimension through the
+kernel `cat` uses (cycle 14b), `for` over the 2-D fold, the display,
+`whos`, the protocol's `workspace`, the preview, the cell and struct
+summaries, `values_equal`, which compares every dimension before any
+element, and `save`, whose MAT-file writer writes one's whole dimensions
+array wherever it sits (cycle 14b; cycle 14 refused one), refusing a
+dimension past 2147483647, which its `int32` words cannot hold, before
+anything is written (`Unable to save variable 'C': a dimension past
+2147483647 cannot be written in a MAT-file of version 5.`), and whose
+`-ascii` text, which has rows alone, refuses one. `Value::dims`
 answers every dimension and `Value::numel` their product, and
 `Matrix::is_vector` is false for an N-D array. Cells and structs stay 2-D:
 an element or a field may hold an N-D array, but a cell or struct array is
@@ -1086,7 +1140,15 @@ interpreter writes them a page at a time (`write_pages`, through
 `Interp::emit_display` and `emit_disp`), each header in time linear in its
 length, so a display holds one page's text however many pages there are.
 The Design notes of
-`docs/modules/14-nd-arrays.md` have the details.
+`docs/modules/14-nd-arrays.md` have the details. Cycle 14b taught the
+builtins through two kernels: every reduction is `math::each_slice` over
+the array seen along its dimension as `[before, n, after]`, by the `sum`
+page's rule, a dimension past `ndims` handing the argument back as a
+matrix's always was, and `cat` and a bracket with an N-D operand are one
+function, `interp::concat`, so they cannot disagree there, while a bracket
+of 2-D operands alone keeps the 2-D rule of `hcat` and `vcat`, its
+empties included (`[1:0]` is 0x0, where `cat(2, 1:0)` is 1x0); see
+`docs/modules/14b-nd-functions.md`.
 
 **Display format (cycle 13, in place).** `format` is `Interp::format`; the
 display reads it through `value::with_format`, which sets a thread-local
@@ -1192,7 +1254,9 @@ cycle named:
 | Strings and files, cycle 11: `delete` refuses a wildcard rather than expand it; the regular-expression engine refuses backreferences, lookaround, atomic groups, possessive quantifiers, conditionals and inline flags, since it runs in linear time; `str2num` reads literals and operators only, where MATLAB hands its text to `eval`; `input` of text that is not an expression is an error, where MATLAB asks again; `feof` is set by a read that ends at the end of the file; a compressed MAT-file is refused, and the integer and `single` classes load as doubles; a struct array with no fields past 1,048,576 elements is refused by `load` and `save`, since no bytes of the file bound it; `save` in an empty workspace is an error rather than a file of a header alone, which `load` would refuse; `fopen` takes no machine format or encoding, and text is UTF-8 both ways; several message texts are SplatCrab's own. The Design notes of `docs/modules/11-strings-and-io.md` have each | by design (verify first) |
 | `warning('off')`, `warning('on')` and `lastwarn` do not exist: `warning('off')` prints `Warning: off` | later |
 | The environment, cycle 13: `format` has `short` and `long` only; `whos` has no heading row and its layout is SplatCrab's; `ls` and `dir` print one name per line with no `.` or `..`, and `dir` returns no `date` or `datenum`; a bare `pause` waits for Enter rather than any key; `evalc` drops the final line end of what it captured, as the spec records; `datestr` takes date numbers or one date vector and no format; `exit(n)` takes 0 to 255; `which` and `help` do not report local functions. The Design notes of `docs/modules/13-environment.md` have each | by design |
-| N-D arrays, cycle 14: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (the reductions, the element-wise math, `squeeze`, `permute`, `cat`, `repmat`, `find`, `sort` and every other), where MATLAB takes most of them, and so do bracket concatenation and `save`; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md` have each | 14b for the builtins; the display later (verify first) |
+| N-D arrays, cycles 14 and 14b: every builtin not on `builtins::ND_OK` refuses an N-D argument with `N-D arrays are not supported by '<name>'.` (`sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets, the linear algebra and every other not taught N-D in cycle 14b), where MATLAB takes most of them, and so does `save -ascii`; `cat` takes arrays only, where MATLAB's joins cells too; an N-D array grows only through as many subscripts as it has dimensions or more, a linear subscript past its end and a subscript past the end of the fold fewer subscripts index being the ambiguous-growth error. The display's edges are the spec's stated rules, verify first: the per-page class line of a logical or char page, the `(:,:,k) =` headers of `disp`, and the `2×0×3 empty double array` wording of an empty N-D array; the page layout itself is the MathWorks page's. The Design notes of `docs/modules/14-nd-arrays.md` and `docs/modules/14b-nd-functions.md` have each | later for the rest of the builtins; the display later (verify first) |
+| A `-0` reduced along a dimension of size 1 within `ndims` is `+0`, verify first: `sum(-0, 1)`, `mean(-0, 1)` and `cumsum(-0, 1)`, and `sum(-0)`, whose default dimension is the first, are `+0`, each element reduced on its own by a sum that starts from `+0`, as a matrix's always was, where the MathWorks `sum` page says `sum` returns `A` "or when size(A,dim) is 1", which would keep the `-0`; an N-D array alike, `sum(-0 * ones(1, 1, 2), 1)`. `prod`, `max`, `min` and `cumprod` keep it, and past `ndims` every reduction hands the argument back, so `1/sum(-0, 3)` is `-Inf` (`reduce_2d_past_ndims_unchanged`). Recorded in testing cycle 14b and kept, since it is a 2-D answer; the Design notes of `docs/modules/14b-nd-functions.md` have it | later (verify first) |
+| `any` and `all` along a dimension of size 1 ignore a `NaN`, verify first: along a dimension of size 1 within `ndims` each element is what `any` or `all` gives a one-element vector of it, so `any(NaN, 1)` and `any(NaN(1, 1, 2), 1)` are false, as the MathWorks `any` page's "any ignores elements of A that are NaN" makes the vector's answer, where the spec's earlier gloss of that case, `A ~= 0`, would make them true; `all` of a `NaN` is true either way. Past `ndims` `any` and `all` convert the argument to a logical, as they always did, which refuses a `NaN`: `any(NaN, 3)` is `NaN's cannot be converted to logicals.` Recorded in testing cycle 14b; the Design notes of `docs/modules/14b-nd-functions.md` have it | later (verify first) |
 | Plotting, cycle 12: `gcf` and `figure` return the figure's number as a double, as MATLAB did before R2014b, where MATLAB now returns a Figure object whose `disp` lists its properties; there are no graphics objects or handles; a complex argument is refused, where MATLAB plots the real part against the imaginary; labels are plain text, with no TeX; `plot` takes no name-value options; `histogram` with no bin count uses Sturges' rule; the tick rule, the layout, the fonts and the SVG and PNG bytes are SplatCrab's; a line with a `NaN` gap is one `<polyline>` a run. The Design notes of `docs/modules/12-plotting.md` have each | by design |
 
 A row that read "Char arrays display with quotes; MATLAB shows them bare" was
@@ -1272,7 +1336,8 @@ UTF-16, the only half left; other encodings stay out of scope, a leniently
 decoded file being read rather than refused.
 Cycle 14 narrowed "Constructors take two sizes only" to `repmat` and
 `cell`, and removed the Known deviations row for indexing into or growing a
-second page, both by building N-D arrays.
+second page, both by building N-D arrays. Cycle 14b narrowed the row to
+`cell`, by teaching `repmat` N-D.
 Fixed rows are removed from the table rather than marked done, but an
 instruction a removed row carried is re-recorded, never dropped with it.
 
@@ -1286,7 +1351,7 @@ spec also lists, it removes the row from that spec in the same commit.
 | `1:NaN` is an empty, verify first | `1:NaN` is 1x0; Octave 8.4 gives the 1x1 `NaN` and MATLAB is unverified, so cycle 01d deliberately left it as it found it while refusing the infinite end points beside it. No golden case asserts either way | later (verify first) |
 | `for` over a matrix with no rows iterates (QA D35), verify first | `for q = zeros(0, 3), disp(size(q)), end` iterates three times with `q` 0x1; Octave 8.4 iterates zero times. The MATLAB `for` page's "numel(valArray(1,:))" is ambiguous for a 0-row array. Do not encode either behaviour without a source that settles it. Cycle 01d left it as it found it | later (verify first) |
 | A colon operand that is not a scalar is an error | `[1 3]:4` is `range start must be a scalar.`, and so therefore is `1:2:3:4`, which cycle 01e taught the parser to read as `(1:2:3):4`. MATLAB is understood to take the first element of a non-scalar colon operand, which would make it `1:4`; that was not verified against a real MATLAB run, so 01e fixed the parse and left the evaluation as it found it. Verify before changing it | later (verify first) |
-| `repmat` and `cell` take two sizes only | `repmat(1, [2 2 2])` and `cell(2, 3, 4)` are "N-D arrays are not supported."; MATLAB builds the 2-by-2-by-2 array and the 2-by-3-by-4 cell. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `repmat(1, 2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Cycle 14 built N-D arrays and taught the other constructors (`zeros`, `ones`, `rand`, `NaN`, `Inf`, `true`, `false`) and `reshape` to make them, which narrowed this row from "Constructors take two sizes only" to these two. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | 14b for `repmat`; `cell` later, needs N-D cells |
+| `cell` takes two sizes only | `cell(2, 3, 4)` is "N-D arrays are not supported."; MATLAB builds the 2-by-3-by-4 cell. Since cycle 01c a trailing size of `1` is dropped, as MATLAB drops it, so `cell(2, 3, 1)` is 2x3, and any other third or later size, `0` included, is that clean error. Cycle 14 built N-D arrays and taught the other constructors (`zeros`, `ones`, `rand`, `NaN`, `Inf`, `true`, `false`) and `reshape` to make them, which narrowed this row from "Constructors take two sizes only" to `repmat` and `cell`, and cycle 14b taught `repmat`, which narrowed it to `cell`. `eye` is unaffected: MATLAB rejects `eye(r, c, p)` too | later, needs N-D cells |
 | Hex and binary literals are unsupported (QA D30) | `x = 0x1F` is `unexpected 'x1F'`; MATLAB R2019b+ and Octave give `31` | later, low impact |
 | String functions flatten a char matrix held in a cell, verify first | `upper({['ab'; 'cd']})` gives the 1x4 `'ACBD'`, the element's code units in column-major order, where MATLAB is understood to keep the 2x2 shape; `lower`, `strtrim`, `strrep` and the other functions that read a cell's text by its code units do the same, and an N-D char element alike. Found in testing cycle 14; a 2-D behaviour, so left for a later cycle | later (verify first) |
 | `isequal` of handles answers false | `isequal(f, f)` is false for any handle, where MATLAB compares them. Cycle 07 made the shape and class queries answer for every value and left this half of the row, which its spec keeps out of scope until a source settles MATLAB's rule | later (verify first) |

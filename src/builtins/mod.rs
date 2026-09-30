@@ -80,7 +80,9 @@ pub fn registry() -> Registry {
 /// the real parts, as MathWorks' `sprintf` page says), the shape and class
 /// queries, which read no elements, and the functions that pass a value
 /// through whole (the struct and cell functions, `deal`, `feval`,
-/// `arrayfun`, `cellfun`), `isequal`, `double` and the plain `transpose`.
+/// `arrayfun`, `cellfun`), `isequal`, `double` and the plain `transpose`,
+/// and since cycle 14b `squeeze`, `permute` and `cat`, which rearrange a
+/// complex array with its imaginary parts.
 ///
 /// Only a matrix argument is judged here. A builtin that finds a complex
 /// value inside a cell, or gets one back from a function it calls, judges
@@ -143,6 +145,10 @@ pub const TAKES_COMPLEX: &[&str] = &[
     "isequal",
     "double",
     "transpose",
+    // Rearrangement that keeps complex storage (cycle 14b).
+    "squeeze",
+    "permute",
+    "cat",
 ];
 
 /// The refusal of a complex argument to a builtin not on
@@ -161,12 +167,13 @@ pub fn complex_gate(name: &str, args: &[Value]) -> R<()> {
 /// was written for two dimensions and would read only the first page of
 /// an N-D array, so the registry refuses one to it before it runs, with
 /// `error::nd_argument`, as [`complex_gate`] refuses a complex argument:
-/// `sum(zeros(2, 2, 2))` is that refusal. On this list are the
+/// `sort(zeros(2, 2, 2))` is that refusal. On this list are the
 /// constructors, which make N-D arrays, the shape and class queries,
 /// `isequal`, `reshape`, `disp`, the class conversions, the printf family,
 /// which reads the elements in column-major order, and `feval` and
 /// `deal`, which pass their arguments on, so the callee's own gate judges
-/// them. Cycle 14b grows the list.
+/// them. Cycle 14b added the reductions along any dimension, the
+/// element-wise math, `squeeze`, `permute`, `cat` and `repmat`.
 ///
 /// Only a matrix argument is judged, as the complex gate judges one: a
 /// cell or a struct is never N-D, though an element or a field may hold
@@ -211,6 +218,56 @@ pub const ND_OK: &[&str] = &[
     // Values passed on whole.
     "feval",
     "deal",
+    // The reductions along any dimension (cycle 14b).
+    "sum",
+    "prod",
+    "mean",
+    "any",
+    "all",
+    "max",
+    "min",
+    "cumsum",
+    "cumprod",
+    // The element-wise math, which keeps every dimension, and the
+    // two-argument functions, which broadcast across every one.
+    "abs",
+    "sqrt",
+    "exp",
+    "log",
+    "log2",
+    "log10",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "sinh",
+    "cosh",
+    "tanh",
+    "floor",
+    "ceil",
+    "round",
+    "fix",
+    "sign",
+    "isnan",
+    "isinf",
+    "isfinite",
+    "real",
+    "imag",
+    "conj",
+    "angle",
+    "mod",
+    "rem",
+    "atan2",
+    "hypot",
+    "power",
+    "complex",
+    // Rearrangement.
+    "squeeze",
+    "permute",
+    "cat",
+    "repmat",
 ];
 
 /// The refusal of an N-D argument to a builtin not on [`ND_OK`]; see
@@ -282,8 +339,8 @@ mod tests {
     /// nineteen of `environ.rs`: `cd`, `pwd`, `ls`, `dir`, `help`, `which`,
     /// `format`, `eval`, `evalc`, `run`, `datestr`, `now`, `clock`, `pause`,
     /// `getenv`, `system`, `version`, `exit` and `quit`. Cycle 14 added
-    /// `ndims`.
-    const EXPECTED: usize = 251;
+    /// `ndims`. Cycle 14b added three: `squeeze`, `permute` and `cat`.
+    const EXPECTED: usize = 254;
 
     #[test]
     fn the_registry_holds_every_name_exactly_once() {
@@ -358,6 +415,9 @@ mod tests {
             "dot",
             "reshape",
             "repmat",
+            "squeeze",
+            "permute",
+            "cat",
             "fliplr",
             "flipud",
             "find",
@@ -525,32 +585,62 @@ mod tests {
         }
     }
 
-    /// Cycle 14: an N-D argument reaches only the builtins on `ND_OK`.
+    /// Cycle 14: an N-D argument reaches only the builtins on `ND_OK`;
+    /// cycle 14b grew the list by the reductions, the element-wise math,
+    /// `squeeze`, `permute`, `cat` and `repmat`, and by nothing else.
     #[test]
     fn the_gate_refuses_an_nd_argument_to_every_other_builtin() {
         let nd = Value::Mat(Matrix::filled_dims(&[2, 2, 2], 0.0));
-        let e = nd_gate("sum", std::slice::from_ref(&nd)).unwrap_err().msg;
-        assert_eq!(e, "N-D arrays are not supported by 'sum'.");
+        let e = nd_gate("sort", std::slice::from_ref(&nd)).unwrap_err().msg;
+        assert_eq!(e, "N-D arrays are not supported by 'sort'.");
         for name in [
-            "abs", "max", "squeeze", "permute", "cat", "repmat", "find", "sort", "num2str",
+            "find",
+            "sort",
+            "diff",
+            "median",
+            "std",
+            "var",
+            "mode",
+            "fliplr",
+            "flipud",
+            "num2str",
+            "mat2str",
+            "cross",
+            "arrayfun",
+            "cellfun",
+            "inv",
+            "unique",
+            "plot",
+            "trapz",
+            "filter",
+            "kron",
+            "transpose",
+            "dot",
+            "norm",
         ] {
             assert!(nd_gate(name, std::slice::from_ref(&nd)).is_err(), "{name}");
         }
         for name in [
-            "size", "ndims", "numel", "reshape", "disp", "isequal", "feval", "deal",
+            "size", "ndims", "numel", "reshape", "disp", "isequal", "feval", "deal", "sum", "prod",
+            "mean", "any", "all", "max", "min", "cumsum", "cumprod", "abs", "sqrt", "round",
+            "isnan", "angle", "mod", "hypot", "power", "complex", "squeeze", "permute", "cat",
+            "repmat",
         ] {
             assert!(nd_gate(name, std::slice::from_ref(&nd)).is_ok(), "{name}");
         }
+        // Exactly the names cycle 14b added, and no more.
+        assert_eq!(ND_OK.len(), 34 + 46);
         // A 2-D argument, and an N-D array inside a cell, pass everywhere.
-        assert!(nd_gate("sum", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
+        assert!(nd_gate("sort", &[Value::Mat(Matrix::scalar(1.0))]).is_ok());
         let boxed = Value::cell(crate::value::CellArray::new(1, 1, vec![nd.clone()]));
-        assert!(nd_gate("sum", &[boxed]).is_ok());
+        assert!(nd_gate("sort", &[boxed]).is_ok());
         // Through the interpreter: the gate runs on every builtin call, a
         // call through `feval` included, and names the callee.
         let mut it = Interp::with_output(Box::new(std::io::sink()));
-        let e = it.run("feval(@abs, zeros(2, 2, 2))").unwrap_err().msg;
-        assert_eq!(e, "N-D arrays are not supported by 'abs'.");
+        let e = it.run("feval(@find, zeros(2, 2, 2))").unwrap_err().msg;
+        assert_eq!(e, "N-D arrays are not supported by 'find'.");
         assert!(it.run("x = numel(zeros(2, 2, 2));").is_ok());
+        assert!(it.run("x = feval(@sum, zeros(2, 2, 2), 3);").is_ok());
     }
 
     /// Cycle 10: a complex argument reaches only the builtins that take one.

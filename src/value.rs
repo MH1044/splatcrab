@@ -890,6 +890,28 @@ pub fn dims_product(dims: &[usize]) -> usize {
     dims.iter().fold(1usize, |n, &d| n.saturating_mul(d))
 }
 
+/// An array of shape `dims` seen along dimension `d`, one-based, as three
+/// numbers (cycle 14b): `before`, the product of the dimensions below `d`,
+/// `n`, the size of `d` itself, and `after`, the product of those above
+/// it. Element `(b, k, a)` of that view sits at `b + before * (k + n * a)`
+/// in column-major storage, whatever the array's `ndims`, so a kernel that
+/// works along one dimension needs these three numbers and nothing more:
+/// the reductions, the running scans, `cat` and brackets, and `repmat`. A
+/// dimension past `dims` is of size 1, with every dimension below it. Each
+/// product saturates, as [`dims_product`] does, for an empty array whose
+/// sizes multiply past `usize`.
+pub fn along_dim(dims: &[usize], d: usize) -> (usize, usize, usize) {
+    let k = d.saturating_sub(1);
+    if k >= dims.len() {
+        return (dims_product(dims), 1, 1);
+    }
+    (
+        dims_product(&dims[..k]),
+        dims[k],
+        dims_product(&dims[k + 1..]),
+    )
+}
+
 /// `dims` as a matrix stores them: at least two, every trailing 1 past the
 /// second dropped. No dimensions is 1x1 and one is a column.
 pub fn normalize_dims(dims: &[usize]) -> Vec<usize> {

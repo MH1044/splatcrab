@@ -31,7 +31,7 @@ functions, cell arrays and structs, linear algebra, numerics (polynomials,
 interpolation, statistics, sets, root finding, minimisation, quadrature and
 ODEs), formatted output, complex numbers with `fft`, string functions,
 regular expressions, file input and output with `save` and `load`, plotting
-to SVG and PNG, and 251 builtins. See
+to SVG and PNG, and 254 builtins. See
 [What works today](#what-works-today), [Not yet](#not-yet) and
 `docs/ROADMAP.md`.
 
@@ -222,9 +222,16 @@ z
   into the last, growth into new pages and deletion along any one
   dimension; the element-wise operators with broadcasting across every
   dimension; `for` over the columns of the 2-D fold; and a page-by-page
-  display, `A(:,:,1) =`, `A(:,:,2) =`. Every builtin not yet taught N-D
-  arrays refuses one by name, `N-D arrays are not supported by 'sum'.`,
-  rather than read its first page alone
+  display, `A(:,:,1) =`, `A(:,:,2) =`. Since cycle 14b the builtins that
+  work on them: `sum`, `prod`, `mean`, `any`, `all`, `max`, `min`,
+  `cumsum` and `cumprod` along any dimension, `sum(A, 3)` included; the
+  element-wise math, `abs`, `sqrt`, `floor`, `mod`, `atan2` and the rest,
+  keeping every dimension or broadcasting across them; the new `squeeze`,
+  `permute` and `cat`; brackets joining N-D arrays, `[A, A]` and `[A; A]`;
+  `repmat` with any number of counts; and `save` and `load` of N-D arrays
+  in MAT-files. Every builtin not yet taught N-D arrays refuses one by
+  name, `N-D arrays are not supported by 'sort'.`, rather than read its
+  first page alone
 - Multiple assignment `[a, b] = f(...)`, with `~` to discard an output:
   `[m, i] = max(v)`, `[m, i] = min(v)`, `[s, i] = sort(A)`,
   `[r, c] = size(A)` and `[r, c, v] = find(X)`. On a matrix, `c{1}`, `s.a`
@@ -299,7 +306,7 @@ z
   infinite limits allowed) and `ode45` (Dormand-Prince, with `odeset`).
   Each call is counted against the nesting limit, so a solver can call a
   solver, and each has a cap, so no function can make one hang
-- 251 builtins in a registry, from `zeros` and `linspace` through `sum` and
+- 254 builtins in a registry, from `zeros` and `linspace` through `sum` and
   `cumsum` to `fprintf`, `sprintf`, `class`, `feval`, `arrayfun`, `cellfun`,
   `struct` and `tic`/`toc`. Each is an ordinary
   function with `nargout` in its signature, in `src/builtins/`, and `max`,
@@ -310,8 +317,9 @@ z
   `num2str(x, n)`, `round(x, n)` and `round(x, n, 'significant')`,
   `sum(A, 'all')` and `max(A, [], 'all')`, and `dot` of two matrices. A char
   option is never read as a dimension, and a third size other than `1` makes
-  an N-D array, except for `cell` and `repmat`, where it is the clear error
-  "N-D arrays are not supported.", and `eye`, which takes two sizes
+  an N-D array, `repmat` included since cycle 14b, except for `cell`, where
+  it is the clear error "N-D arrays are not supported.", and `eye`, which
+  takes two sizes
 - `fprintf` and `sprintf` with a bounded width and precision, so no format
   specifier can panic or build a pad it cannot afford; `%d` prints an integer
   past `2^63` in full, and `%.Ns` truncates a string before padding it.
@@ -420,11 +428,12 @@ Known differences from MATLAB are listed in `docs/ARCHITECTURE.md`.
 
 ## Not yet
 
-The builtins on N-D arrays (reductions along any dimension, the
-element-wise math, `squeeze`, `permute`, `cat`, N-D concatenation, `repmat`
-and N-D MAT-files), integer classes, compressed MAT-files, 3-D plots and
-interaction with a figure. `docs/ROADMAP.md` has the order they arrive in,
-one module at a time.
+The rest of the builtins on N-D arrays (`sort`, `find`, `diff`, the
+statistics, `fliplr`, `num2str`, the strings, the sets and the linear
+algebra, each of which refuses one by name), N-D cell and struct arrays,
+integer classes, compressed MAT-files, 3-D plots and interaction with a
+figure. `docs/ROADMAP.md` has the order they arrive in, one module at a
+time.
 
 ## How it is built
 
@@ -434,7 +443,7 @@ one module at a time.
               + lines      + lines       evaluator      f64 matrices
                                                             + a class tag
                                               │
-                                         builtins/    the 251 builtins,
+                                         builtins/    the 254 builtins,
                                                       behind a registry
                                          plot/        figures, SVG, PNG
 

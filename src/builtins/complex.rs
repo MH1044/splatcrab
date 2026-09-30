@@ -309,7 +309,8 @@ fn part(args: &[Value], name: &str, re: bool) -> R<Vec<Value>> {
     } else {
         m.im.clone().unwrap_or_else(|| vec![0.0; m.numel()])
     };
-    one_mat(Matrix::new(m.rows, m.cols, data))
+    // Every dimension kept (cycle 14b).
+    one_mat(Matrix::from_dims(&m.dims(), data))
 }
 
 fn conj(args: &[Value]) -> R<Vec<Value>> {
@@ -323,7 +324,7 @@ fn angle(args: &[Value]) -> R<Vec<Value>> {
     at_most(args, 1, "angle")?;
     let m = mat(args, 0, "angle")?;
     let data = (0..m.numel()).map(|k| m.c(k).arg()).collect();
-    one_mat(Matrix::new(m.rows, m.cols, data))
+    one_mat(Matrix::from_dims(&m.dims(), data))
 }
 
 /// `isreal(A)`: false exactly when `A` has complex storage, so
@@ -341,7 +342,8 @@ fn isreal(args: &[Value]) -> R<Vec<Value>> {
 
 /// `complex(a)` and `complex(a, b)`: `a + b*i` with complex storage kept
 /// even where every `b` is zero, which is what makes it the one way to
-/// hold a complex zero. `a` and `b` broadcast as an operator's operands do.
+/// hold a complex zero. `a` and `b` broadcast as an operator's operands do,
+/// across every dimension since cycle 14b.
 /// Both must be real: `complex` is not among the builtins that take a
 /// complex argument, so the registry's gate refuses one before this runs.
 fn complex(args: &[Value]) -> R<Vec<Value>> {
@@ -350,11 +352,15 @@ fn complex(args: &[Value]) -> R<Vec<Value>> {
     let a = mat(args, 0, "complex")?;
     let b = match args.get(1) {
         Some(_) => mat(args, 1, "complex")?,
-        None => Matrix::filled(a.rows, a.cols, 0.0),
+        None => a.map(|_| 0.0),
     };
     let re = a.zip(&b, "complex", |x, _| x)?;
     let im = a.zip(&b, "complex", |_, y| y)?;
-    one_mat(Matrix::complex_parts(re.rows, re.cols, re.data, im.data))
+    // Built as the 2-D fold and given every dimension back.
+    let dims = re.dims();
+    let mut z = Matrix::complex_parts(re.rows, re.fold_cols(), re.data, im.data);
+    z.set_dims(&dims);
+    one_mat(z)
 }
 
 /// `fft(X)` and `ifft(X)`: the transform of a row, or of each column of

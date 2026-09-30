@@ -2071,28 +2071,91 @@ end
      5     6
 ```
 
-The builtins that take an N-D array so far, until the rest arrive with
-cycle 14b ([Not yet](#not-yet)), are those constructors, the shape and class
-queries, `ndims`, `reshape`, `isequal`, `disp`, `double`, `logical`,
-`char`, `fprintf`, `sprintf`, `feval` and `deal`. Every other builtin
-refuses one by name rather than read its first page alone, the matrix
-operators refuse one where they are not element-wise, and so do `'`, `.'`,
-a bracket that joins one to anything, and `save`:
+The reductions work along any dimension. With no dimension, `sum`,
+`prod`, `mean`, `any`, `all`, `max`, `min`, `cumsum` and `cumprod` run
+along the first dimension whose size is not 1, so `sum(ones(1, 1, 3))` is
+3; along a dimension that dimension becomes 1 and every other stays;
+along a dimension of size 1 each element is its own reduction; and along
+one past the array's the array is handed back as it is, as it is for a
+matrix, so `sum(A, 5)` is `A`. `max(A, [], 3)` gives the index along the
+third dimension as its second output, and `max(A, B, 3)` of two arrays is
+refused, since a dimension goes with one array. The element-wise math,
+`abs`, `sqrt`, `floor`, `round`, `isnan` and the rest, keeps every
+dimension, and `mod`, `rem`, `atan2`, `hypot`, `power` and `complex`
+broadcast across them. `permute` rearranges the dimensions, dimension `i`
+of the result being dimension `dimorder(i)` of the argument, `squeeze`
+removes the dimensions of length 1, and `cat` joins arrays along any
+dimension, by the rule a bracket with an N-D operand follows too, so
+`[A, A]` joins along the second:
+
+```matlab
+A = reshape(1:24, 2, 3, 4);
+S = sum(A, 3)
+P = permute(A, [3 1 2]);
+disp(size(P))
+disp(P(:, 1, 1)')
+C = cat(3, [1 2; 3 4], [5 6; 7 8])
+disp(size([A, A]))
+```
+
+```
+S =
+
+    40    48    56
+    44    52    60
+
+     4     2     3
+     1     7    13    19
+C(:,:,1) =
+
+     1     2
+     3     4
+
+
+C(:,:,2) =
+
+     5     6
+     7     8
+
+     2     6     4
+```
+
+Every other dimension of a concatenation must agree, a dimension past an
+array's last being 1, or it is `Dimensions of arrays being concatenated
+are not consistent.`; an empty array beside a nonempty one is left out.
+A bracket of matrices alone keeps the rule it always had, so `[1:0]` and
+`[zeros(1, 0), zeros(0, 1)]` are still the 0x0 `[]`, where `cat(2, 1:0)`
+is 1x0 and `cat(2, zeros(1, 0), zeros(0, 1))` an error.
+`repmat` tiles along every dimension it is given, `repmat(A, 1, 1, 2)` of
+a 2x3x4 being 2x3x8, and `save` and `load` keep an N-D array in a MAT-file
+with every dimension, in a variable, a cell or a field.
+
+The builtins that take an N-D array are the constructors, the shape and
+class queries, `ndims`, `reshape`, `isequal`, `disp`, `double`,
+`logical`, `char`, `fprintf`, `sprintf`, `feval`, `deal`, the reductions,
+the element-wise math, `squeeze`, `permute`, `cat` and `repmat`. Every
+other builtin, `sort`, `find`, `diff`, the statistics and the rest until a
+later cycle ([Not yet](#not-yet)), refuses one by name rather than read
+its first page alone, the matrix operators refuse one where they are not
+element-wise, and so do `'`, `.'` and `save -ascii`, whose text has rows
+alone:
 
 ```matlab
 A = zeros(2, 2, 2);
-s = sum(A)
+s = sort(A)
 ```
 
 ```
-Error: Line 2: N-D arrays are not supported by 'sum'.
+Error: Line 2: N-D arrays are not supported by 'sort'.
 ```
 
 `A * 2`, `A / 2` and `2 \ A` are element-wise, as they are for a matrix;
 `A * B` of two arrays is `Matrix operations are not defined for N-D
-arrays.`, `A'` is `Transpose is not defined for N-D arrays.` and `[A, 1]`
-is `Concatenation of N-D arrays is not supported.` Cells and structs stay
-2-D, though an element or a field may hold an N-D array, which a cell's
+arrays.` and `A'` is `Transpose is not defined for N-D arrays.`, for which
+`permute(A, [2 1 3])` is the page-by-page `.'`, the transpose without the
+conjugate, so of a complex array it is not the page-by-page `'`. Cells
+and structs
+stay 2-D, though an element or a field may hold an N-D array, which a cell's
 display summarises as `{2×3×4 double}` and a struct's as `[2×3×4 double]`.
 A builtin that reads a cell's elements judges an N-D one itself: `unique`
 and the other set functions refuse it, `str2double` reads it as `NaN`, and
@@ -3170,7 +3233,9 @@ disp(isnumeric({1}))
 
 ### Rearrangement
 
-`reshape repmat fliplr flipud`. `reshape` fills column-major, like MATLAB.
+`reshape repmat fliplr flipud squeeze permute cat`. `reshape` fills
+column-major, like MATLAB. `squeeze`, `permute` and `cat` are for [N-D
+arrays](#n-d-arrays), and `repmat` tiles along every dimension it is given.
 
 ```matlab
 A = [1 2 3; 4 5 6];
@@ -3274,7 +3339,10 @@ j =
 
 ```
 
-A dimension past the array's leaves the input unchanged; `0` is an error. A
+A dimension past the array's hands the input back with its values as they
+were, a `-0` included, as a double (`sum('ab', 3)` is `97 98`), or as a
+logical for `any` and `all` and for `max` and `min` of a logical; along a
+dimension of size 1 each element is reduced on its own; `0` is an error. A
 char is never read as a dimension. `any` ignores `NaN`, so `any(NaN)` is `0`
 and `all(NaN)` is `1`, matching the MATLAB page.
 
@@ -5142,9 +5210,10 @@ E =
 `pi(2)` stays an error, as in MATLAB. A trailing size of `1` is dropped, so
 `zeros(2, 3, 1)` is 2x3, while any other third size makes an [N-D
 array](#n-d-arrays), `zeros(2, 3, 0)` an empty 2x3x0. `eye` keeps two
-sizes, and `cell` and `repmat` keep the clean error `N-D arrays are not
-supported.` for a third size other than `1`. A size past what `usize`
-holds is named as you asked for it, not as the clamp:
+sizes, and `cell` keeps the clean error `N-D arrays are not supported.`
+for a third size other than `1`, while `repmat(1, 2, 2, 2)` tiles a
+2x2x2. A size past what `usize` holds is named as you asked for it, not
+as the clamp:
 
 ```matlab
 x = zeros(1e300);
@@ -6181,8 +6250,8 @@ Error: Line 1: NaN's cannot be converted to logicals.
   the fold that fewer subscripts index, are `Attempt to grow array along
   ambiguous dimension.`
 - The builtins not yet taught N-D arrays refuse one by name, `N-D arrays are
-  not supported by 'sum'.`, where MATLAB takes most of them; so does `save`,
-  and a bracket joining one to anything. The per-page class line of a
+  not supported by 'sort'.`, where MATLAB takes most of them; so does
+  `save -ascii`. The per-page class line of a
   logical or char N-D array, the `(:,:,k) =` headers of `disp` and the
   `2×0×3 empty double array` wording are SplatCrab's stated rules, not
   checked against MATLAB.
@@ -6439,7 +6508,8 @@ None of the following exist. `docs/ROADMAP.md` gives the order.
 | Missing | Arrives in |
 |---|---|
 | `global`, `persistent`, nested functions | later |
-| N-D reductions, element-wise math, `squeeze`, `permute`, `cat`, N-D concatenation, `repmat` and MAT-files | 14b |
+| The rest of the builtins on N-D arrays: `sort`, `find`, `diff`, the statistics, `fliplr`, `num2str`, the strings, the sets and the linear algebra | later |
+| N-D cell and struct arrays | later |
 | Compressed MAT-files, `regexpi`, backreferences | not scheduled |
 | 3-D plots, surfaces, interaction with a figure | not scheduled |
 | Integer classes and `single` | not scheduled |
@@ -6448,9 +6518,9 @@ Hitting one of these gives a parse error or another clean error, never a
 wrong answer:
 
 ```matlab
-sum(zeros(2, 3, 4))
+sort(zeros(2, 3, 4))
 ```
 
 ```
-Error: Line 1: N-D arrays are not supported by 'sum'.
+Error: Line 1: N-D arrays are not supported by 'sort'.
 ```

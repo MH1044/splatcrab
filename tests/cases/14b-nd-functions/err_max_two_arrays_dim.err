@@ -1,0 +1,1 @@
+max takes two arrays or one array and a dimension, not both.

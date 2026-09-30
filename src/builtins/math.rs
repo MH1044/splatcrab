@@ -1,11 +1,11 @@
 //! Reductions, element-wise math and the two-argument numeric functions.
 
-use super::args::{Along, at_most, check_shape, dim, dim_or_all, mat, need, option};
+use super::args::{Along, at_most, check_dims, dim, dim_or_all, mat, need, option};
 use super::{Registry, add, one_as, one_mat};
 use crate::builtins::complex::C;
 use crate::error;
 use crate::interp::R;
-use crate::value::{Class, Matrix, Value};
+use crate::value::{Class, Matrix, Value, along_dim, normalize_dims};
 
 /// One line per builtin; see the note on `core::register`.
 #[rustfmt::skip]
@@ -76,7 +76,8 @@ fn abs(args: &[Value]) -> R<Vec<Value>> {
         return one_mat(m.map(f64::abs));
     }
     let data = (0..m.numel()).map(|k| m.c(k).abs()).collect();
-    one_mat(Matrix::new(m.rows, m.cols, data))
+    // Every dimension kept (cycle 14b), as the real path's `map` keeps it.
+    one_mat(Matrix::from_dims(&m.dims(), data))
 }
 
 /// A one-argument element-wise function of complex scalars (cycle 10),
@@ -182,9 +183,11 @@ fn reduction(args: &[Value], name: &str, kind: Red) -> R<Vec<Value>> {
         Some(Along::Dim(d)) => reduce(&m, Some(d), f)?,
         Some(Along::All) => reduce_all(&m, f),
     };
-    // `any` and `all` answer with a logical, as MATLAB's do. A dimension
-    // past the array's hands back the argument itself, which is converted
-    // then: `any([2 0], 3)` is the logical `1 0`.
+    // `any` and `all` answer with a logical, as MATLAB's do. Along a
+    // dimension of size 1 within `ndims` each element is reduced on its
+    // own, a `NaN` ignored (cycle 14b); past `ndims` the argument itself
+    // is converted, as it always was: `any([2 0], 3)` is the logical `1 0`,
+    // and `any(NaN, 3)` refuses the `NaN`.
     match kind {
         Red::Any | Red::All => one_as(out.to_class(Class::Logical)?),
         _ => one_mat(out),
@@ -223,36 +226,27 @@ fn complex_reduction(m: &Matrix, along: Option<Along>, kind: Red, name: &str) ->
     }
 }
 
-/// [`reduce`] over complex scalars, with the same shapes and the same size
-/// checks, stored by the flag rule.
+/// [`reduce`] over complex scalars, with the same dimension rule, the same
+/// shapes and the same size check, stored by the flag rule. Past `ndims`
+/// the argument is handed back with its storage, as [`reduce`] hands it
+/// back: `prod(complex(1, 0), 3)` stays complex.
 fn reduce_c(m: &Matrix, dim: Option<usize>, f: impl Fn(&[C]) -> C) -> R<Matrix> {
+    let dims = m.dims();
     let d = match dim {
         Some(d) => d,
-        None if m.rows == 0 && m.cols == 0 => return Ok(Matrix::from_c(1, 1, vec![f(&[])])),
-        None if m.rows == 1 => 2,
-        None => 1,
+        None if is_zero_by_zero(m) => return Ok(Matrix::from_c(1, 1, vec![f(&[])])),
+        None => default_dim(&dims),
     };
-    if d >= 3 {
+    if past_ndims(m, d) {
         return Ok(m.clone());
     }
-    let (rows, cols) = if d == 1 { (1, m.cols) } else { (m.rows, 1) };
-    check_shape(rows as f64, cols as f64)?;
-    let out = if d == 1 {
-        (0..m.cols)
-            .map(|c| {
-                let z: Vec<C> = (0..m.rows).map(|r| m.c(c * m.rows + r)).collect();
-                f(&z)
-            })
-            .collect()
-    } else {
-        (0..m.rows)
-            .map(|r| {
-                let z: Vec<C> = (0..m.cols).map(|c| m.c(c * m.rows + r)).collect();
-                f(&z)
-            })
-            .collect()
-    };
-    Ok(Matrix::from_c(rows, cols, out))
+    let out = judged(&reduced_dims(&dims, d))?;
+    let z: Vec<C> = (0..m.numel()).map(|k| m.c(k)).collect();
+    let (re, im): (Vec<f64>, Vec<f64>) = each_slice(&z, &dims, d, f)
+        .into_iter()
+        .map(|z| (z.re, z.im))
+        .unzip();
+    Ok(Matrix::from_dims(&out, re).with_im(Some(im)))
 }
 
 /// The reduction over `A(:)`, which is what `'all'` means: one 1x1 answer
@@ -297,13 +291,14 @@ fn extremum(args: &[Value], name: &str, is_max: bool, nargout: usize) -> R<Vec<V
     Ok(vec![Value::Mat(value), Value::Mat(index)])
 }
 
-/// Where `max` or `min` reduces a one- or three-argument call.
+/// Where `max` or `min` reduces a one- or three-argument call: the
+/// dimension asked for, or the first whose size is not 1, which for a 0x0
+/// is the first.
 fn extremum_along_arg(args: &[Value], m: &Matrix, name: &str) -> R<Along> {
     Ok(if args.len() >= 3 {
         dim_or_all(args, 2, name)?
     } else {
-        // The first non-singleton dimension, which for a 0x0 is the first.
-        Along::Dim(if m.rows == 1 { 2 } else { 1 })
+        Along::Dim(default_dim(&m.dims()))
     })
 }
 
@@ -333,28 +328,27 @@ fn extremum_index(args: &[Value], name: &str, is_max: bool) -> R<Matrix> {
     Ok(match extremum_along_arg(args, &m, name)? {
         Along::All if m.is_empty() => Matrix::empty(),
         Along::All => Matrix::scalar(f(&m.data)),
-        Along::Dim(d) => {
-            let len = match d {
-                1 => m.rows,
-                2 => m.cols,
-                _ => 1,
-            };
-            if len == 0 {
-                // The empty the first output is, with no elements to index.
-                Matrix::new(m.rows, m.cols, Vec::new())
-            } else if d >= 3 {
-                // Every slice is one element, the first of its slice.
-                Matrix::filled(m.rows, m.cols, 1.0)
-            } else {
-                reduce(&m, Some(d), f)?
-            }
-        }
+        // Past `ndims` the first output is the argument itself, and every
+        // slice one element, the first of its slice.
+        Along::Dim(d) if past_ndims(&m, d) => Matrix::filled_dims(&m.dims(), 1.0),
+        // The empty the first output is, with no elements to index.
+        Along::Dim(d) if along_dim(&m.dims(), d).1 == 0 => Matrix::from_dims(&m.dims(), Vec::new()),
+        // Along a dimension of size 1 every slice is one element, so every
+        // index is 1.
+        Along::Dim(d) => reduce(&m, Some(d), f)?,
     })
 }
 
 fn extremum_value(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
     at_most(args, 3, name)?;
     let m = mat(args, 0, name)?;
+    // `max(A, B, dim)` read the dimension and dropped `B` in silence, a
+    // wrong answer, so a second array with elements beside a dimension is
+    // refused (cycle 14b); the placeholder `[]` of `max(A, [], dim)` has
+    // none.
+    if args.len() == 3 && args[1].numel() > 0 {
+        return Err(error::extremum_two_arrays_and_dim(name));
+    }
     if args.len() == 2 {
         // The two-array form: element-wise, ignoring NaN.
         let b = mat(args, 1, name)?;
@@ -397,16 +391,12 @@ fn extremum_value(args: &[Value], name: &str, is_max: bool) -> R<Vec<Value>> {
 
 /// `max` or `min` along `d`, with MATLAB's rule for an empty: "If
 /// size(A,dim) is 0, then max(A,dim) returns an empty array with the same
-/// size as A." Otherwise the reduced dimension becomes 1, even when the other
+/// size as A." Otherwise the reduced dimension becomes 1, even when another
 /// one is 0, so `max(zeros(3, 0))` is 1x0 and `max(zeros(0, 3), [], 2)` is
 /// 0x1. `max` has no identity element, which is why this is not `sum`'s rule.
+/// Any dimension of an N-D array alike (cycle 14b).
 fn extremum_along(m: &Matrix, d: usize, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
-    let len = match d {
-        1 => m.rows,
-        2 => m.cols,
-        _ => 1,
-    };
-    if len == 0 {
+    if along_dim(&m.dims(), d).1 == 0 {
         return Ok(m.clone());
     }
     reduce(m, Some(d), f)
@@ -498,49 +488,127 @@ pub fn round_significant(x: f64, n: f64) -> f64 {
     round_decimals(x, n - x.abs().log10().floor() - 1.0)
 }
 
-/// Reduce along a dimension. Without one, MATLAB picks the first dimension
-/// that is not a singleton, which for our two-dimensional arrays means rows
-/// unless the input is a row vector.
+/// MATLAB's default dimension for a reduction, a scan and `max` and `min`,
+/// by the `sum` page's rule (cycle 14b): "the first array dimension whose
+/// size does not equal 1", and dimension 1 when every size is 1. For a 2-D
+/// matrix it is the rows unless the matrix is a row, as it always was, and
+/// for a 1x1x3 it is the third.
+pub fn default_dim(dims: &[usize]) -> usize {
+    dims.iter().position(|&d| d != 1).map_or(1, |k| k + 1)
+}
+
+/// The 2-D 0x0 empty, whose reduction with no dimension is today's special
+/// case: `sum([])` is `0` and `prod([])` is `1`.
+fn is_zero_by_zero(m: &Matrix) -> bool {
+    m.rows == 0 && m.cols == 0 && !m.is_nd()
+}
+
+/// True when `d` is past `ndims(m)`, where every reduction and scan hands
+/// `m` back as it is, values and storage alike (cycle 14b): the path a
+/// matrix and a dimension past 2 always took, so `1/sum(-0, 3)` is `-Inf`
+/// and `prod(complex(1, 0), 3)` keeps its complex storage, and an N-D
+/// array past its own `ndims` takes the same path. `any` and `all` then
+/// convert `m` to a logical, as they always did there, which refuses a
+/// `NaN`.
+fn past_ndims(m: &Matrix, d: usize) -> bool {
+    d > m.ndims()
+}
+
+/// The shape of a reduction of an array of shape `dims` along `d`, by the
+/// `sum` page's rule: "the size of S in this dimension becomes 1 while the
+/// sizes of all other dimensions remain the same as in A", trailing sizes
+/// of 1 dropped. Along a dimension past `ndims` it is the array's own.
+fn reduced_dims(dims: &[usize], d: usize) -> Vec<usize> {
+    let mut out = dims.to_vec();
+    if let Some(size) = out.get_mut(d.saturating_sub(1)) {
+        *size = 1;
+    }
+    normalize_dims(&out)
+}
+
+/// A shape computed from an operand's, judged by `check_dims` before
+/// anything is allocated for it.
+fn judged(dims: &[usize]) -> R<Vec<usize>> {
+    let asked: Vec<f64> = dims.iter().map(|&d| d as f64).collect();
+    check_dims(&asked)
+}
+
+/// `f` of every slice of an array of shape `dims` along dimension `d`, in
+/// the column-major order of the result: the one kernel every reduction
+/// runs (cycle 14b), over the array seen as `[before, n, after]`
+/// ([`along_dim`]), so slice `(b, a)` is the `n` elements at `b + before *
+/// (k + n * a)` and its answer lands at `b + before * a`. Along a
+/// dimension of size 1 each slice is one element (past `ndims` the callers
+/// hand the argument back before coming here, [`past_ndims`]); along a
+/// dimension of size 0 each is empty, and `f` answers for nothing. There
+/// are `before * after` slices, the result's elements, which the caller
+/// has judged; no loop runs over a dimension of an empty array, since an
+/// empty result has no slices and an empty slice no elements.
+fn each_slice<T: Copy, U>(
+    src: &[T],
+    dims: &[usize],
+    d: usize,
+    mut f: impl FnMut(&[T]) -> U,
+) -> Vec<U> {
+    let (before, n, after) = along_dim(dims, d);
+    let count = before.saturating_mul(after);
+    let mut out = Vec::with_capacity(count);
+    if count == 0 {
+        return out;
+    }
+    if n == 0 {
+        for _ in 0..count {
+            out.push(f(&[]));
+        }
+    } else if before == 1 {
+        // Each slice is contiguous: a column of a matrix, or the elements
+        // along the first dimension that is not 1.
+        for s in src.chunks_exact(n) {
+            out.push(f(s));
+        }
+    } else {
+        // At most `src.len()`, since every slice here has elements.
+        let mut buf = Vec::with_capacity(n);
+        for a in 0..after {
+            for b in 0..before {
+                buf.clear();
+                buf.extend((0..n).map(|k| src[b + before * (k + n * a)]));
+                out.push(f(&buf));
+            }
+        }
+    }
+    out
+}
+
+/// Reduce along a dimension: `f` of each slice along `d` (see
+/// [`each_slice`]), with the result's shape by [`reduced_dims`]. Without a
+/// dimension it is [`default_dim`]'s, and a 2-D 0x0 collapses to `f` of
+/// nothing: `sum([])` is 0, but `sum([], 1)` keeps MATLAB's 1x0 empty.
 ///
-/// A dimension beyond the array's is a singleton, so the answer is the input
-/// unchanged; `0` never reaches here, because `args::dim` rejects it.
+/// Since cycle 14b any dimension of any array: `sum(A, 3)` of a 2x3x4 is
+/// 2x3, a dimension of size 1 within `ndims` gives each element's own
+/// reduction (`sum(-0, 1)` is `+0`, as it always was), and one of size 0
+/// gives `f` of nothing in every element. A dimension past `ndims` hands
+/// the argument back, "sum returns A when dim is greater than ndims(A)"
+/// (the MathWorks `sum` page), as a matrix and a dimension past 2 always
+/// did, so a `-0` stays `-0` there: [`past_ndims`]. `0` never reaches
+/// here, because `args::dim` rejects it.
 /// The result shape comes from the operand, and one dimension of an operand
 /// can be enormous while the operand itself is empty: `sum(zeros(0, 1e15))`
 /// is a 1x1e15 row built from no elements at all, and used to abort in the
-/// allocator. Both shapes therefore go through `args::check_shape` first.
+/// allocator. The shape therefore goes through `args::check_dims` first.
 pub fn reduce(m: &Matrix, dim: Option<usize>, f: impl Fn(&[f64]) -> f64) -> R<Matrix> {
+    let dims = m.dims();
     let d = match dim {
         Some(d) => d,
-        None => {
-            // Only the no-dimension form of a 0x0 collapses to the identity:
-            // sum([]) is 0, but sum([], 1) keeps MATLAB's 1x0 empty.
-            if m.rows == 0 && m.cols == 0 {
-                return Ok(Matrix::scalar(f(&[])));
-            }
-            if m.rows == 1 { 2 } else { 1 }
-        }
+        None if is_zero_by_zero(m) => return Ok(Matrix::scalar(f(&[]))),
+        None => default_dim(&dims),
     };
-    if d >= 3 {
+    if past_ndims(m, d) {
         return Ok(m.clone());
     }
-    if d == 1 {
-        check_shape(1.0, m.cols as f64)?;
-        Ok(Matrix::row(
-            (0..m.cols)
-                .map(|c| f(&m.data[c * m.rows..(c + 1) * m.rows]))
-                .collect(),
-        ))
-    } else {
-        check_shape(m.rows as f64, 1.0)?;
-        Ok(Matrix::col(
-            (0..m.rows)
-                .map(|r| {
-                    let xs: Vec<f64> = (0..m.cols).map(|c| m.get(r, c)).collect();
-                    f(&xs)
-                })
-                .collect(),
-        ))
-    }
+    let out = judged(&reduced_dims(&dims, d))?;
+    Ok(Matrix::from_dims(&out, each_slice(&m.data, &dims, d, f)))
 }
 
 fn cumulative(args: &[Value], name: &str, is_sum: bool) -> R<Vec<Value>> {
@@ -563,34 +631,37 @@ fn cumulative(args: &[Value], name: &str, is_sum: bool) -> R<Vec<Value>> {
 
 /// Running sum or product along a dimension. The dimension argument used to
 /// be read and then ignored, which always gave the down-the-columns answer.
+///
+/// Since cycle 14b along any dimension of any array, by the reductions'
+/// rule: the default is [`default_dim`]'s, every size is kept, and the
+/// array is seen as `[before, n, after]` ([`along_dim`]), each of its
+/// `before * after` slices accumulated in order. Along a dimension of size
+/// 1 within `ndims`, each element is its own running value; past `ndims`
+/// the argument is handed back as it is, as [`reduce`] hands it back, so
+/// `1/cumsum(-0, 3)` is `-Inf`.
 pub fn scan(m: &Matrix, dim: Option<usize>, is_sum: bool) -> Matrix {
-    let d = dim.unwrap_or(if m.rows == 1 { 2 } else { 1 });
-    // An empty matrix has nothing to scan, and its other dimension alone
+    let dims = m.dims();
+    let d = dim.unwrap_or_else(|| default_dim(&dims));
+    // An empty array has nothing to scan, and one of its dimensions alone
     // can be enormous (cycle 13b).
-    if d >= 3 || m.numel() == 0 {
+    if past_ndims(m, d) || m.numel() == 0 {
         return m.clone();
     }
     let step = |acc: f64, v: f64| if is_sum { acc + v } else { acc * v };
     let seed = if is_sum { 0.0 } else { 1.0 };
-    let mut out = m.clone();
-    if d == 1 {
-        for c in 0..m.cols {
+    let (before, n, after) = along_dim(&dims, d);
+    let mut out = m.data.clone();
+    for a in 0..after {
+        for b in 0..before {
             let mut acc = seed;
-            for r in 0..m.rows {
-                acc = step(acc, m.get(r, c));
-                out.set(r, c, acc);
-            }
-        }
-    } else {
-        for r in 0..m.rows {
-            let mut acc = seed;
-            for c in 0..m.cols {
-                acc = step(acc, m.get(r, c));
-                out.set(r, c, acc);
+            for k in 0..n {
+                let at = b + before * (k + n * a);
+                acc = step(acc, m.data[at]);
+                out[at] = acc;
             }
         }
     }
-    out
+    Matrix::from_dims(&dims, out)
 }
 
 #[cfg(test)]
@@ -832,7 +903,18 @@ mod tests {
         assert_eq!(round(&four).unwrap_err().msg, "Too many input arguments.");
         assert!(binary(&one, "mod", f64::atan2).is_err());
         assert!(binary(&two, "mod", f64::atan2).is_ok());
-        assert!(extremum(&three, "max", true, 1).is_ok());
+        let placeholder = [one[0].clone(), Value::Mat(Matrix::empty()), one[0].clone()];
+        assert!(extremum(&placeholder, "max", true, 1).is_ok());
+        // Three arguments are within the arity; two arrays beside a
+        // dimension are refused for what they are (cycle 14b).
+        assert_eq!(
+            extremum(&three, "max", true, 1).unwrap_err().msg,
+            "max takes two arrays or one array and a dimension, not both."
+        );
+        assert_eq!(
+            extremum(&four, "max", true, 1).unwrap_err().msg,
+            "Too many input arguments."
+        );
     }
 
     fn call(args: &[Value], name: &str, kind: Red) -> R<Matrix> {
@@ -1097,6 +1179,312 @@ mod tests {
         assert!(e.contains("positive integer"), "{e}");
         let e = cumulative(&args, "cumsum", true).unwrap_err().msg;
         assert!(e.contains("positive integer"), "{e}");
+    }
+
+    // ---- N-D reductions (cycle 14b) -----------------------------------
+
+    /// `reshape(1:24, 2, 3, 4)`, whose element `(i, j, k)` is `i + 2*(j-1)
+    /// + 6*(k-1)`: the spec's running example.
+    fn nd24() -> Matrix {
+        Matrix::from_dims(&[2, 3, 4], (1..=24).map(f64::from).collect())
+    }
+
+    fn dim_arg(d: f64) -> Value {
+        val(Matrix::scalar(d))
+    }
+
+    #[test]
+    fn the_default_dimension_is_the_first_whose_size_is_not_one() {
+        assert_eq!(default_dim(&[2, 3]), 1);
+        assert_eq!(default_dim(&[1, 3]), 2);
+        assert_eq!(default_dim(&[1, 1]), 1);
+        assert_eq!(default_dim(&[0, 0]), 1);
+        assert_eq!(default_dim(&[1, 0]), 2);
+        assert_eq!(default_dim(&[1, 1, 3]), 3);
+        assert_eq!(default_dim(&[1, 1, 1, 4]), 4);
+        assert_eq!(default_dim(&[2, 3, 4]), 1);
+        // Through the builtins: `sum(ones(1, 1, 3))` is 3.
+        let v = val(Matrix::filled_dims(&[1, 1, 3], 1.0));
+        assert_eq!(
+            call(std::slice::from_ref(&v), "sum", Red::Sum).unwrap(),
+            Matrix::scalar(3.0)
+        );
+        let c = out(cumulative(&[v], "cumsum", true));
+        assert_eq!((c.dims(), c.data), (vec![1, 1, 3], vec![1.0, 2.0, 3.0]));
+    }
+
+    /// The one kernel sees any array along `d` as three numbers, and every
+    /// slice lands where the `sum` page's shape rule puts it.
+    #[test]
+    fn a_reduction_runs_over_the_three_number_view() {
+        assert_eq!(along_dim(&[2, 3, 4], 1), (1, 2, 12));
+        assert_eq!(along_dim(&[2, 3, 4], 2), (2, 3, 4));
+        assert_eq!(along_dim(&[2, 3, 4], 3), (6, 4, 1));
+        assert_eq!(along_dim(&[2, 3, 4], 5), (24, 1, 1));
+        assert_eq!(along_dim(&[2, 3], 1), (1, 2, 3));
+        assert_eq!(along_dim(&[2, 3], 2), (2, 3, 1));
+        let a = nd24();
+        let s3 = sum_of(&a, Some(3));
+        assert_eq!(s3.dims(), [2, 3]);
+        assert_eq!(s3.data, [40.0, 44.0, 48.0, 52.0, 56.0, 60.0]);
+        let s1 = sum_of(&a, None);
+        assert_eq!(s1.dims(), [1, 3, 4]);
+        assert_eq!(s1.data[..4], [3.0, 7.0, 11.0, 15.0]);
+        let s2 = sum_of(&a, Some(2));
+        assert_eq!(s2.dims(), [2, 1, 4]);
+        // Row 1 of page 1 is 1 + 3 + 5; row 2 of page 4 is 20 + 22 + 24.
+        assert_eq!((s2.data[0], s2.data[7]), (9.0, 66.0));
+        // Every slice against a direct sum of its elements.
+        for d in 1..=3 {
+            let s = sum_of(&a, Some(d));
+            let dims = [2, 3, 4];
+            for i in 0..2 {
+                for j in 0..3 {
+                    for k in 0..4 {
+                        let at = [i, j, k];
+                        let mut want = 0.0;
+                        let mut sub = at;
+                        for t in 0..dims[d - 1] {
+                            sub[d - 1] = t;
+                            want += a.data[sub[0] + 2 * (sub[1] + 3 * sub[2])];
+                        }
+                        let mut r = at;
+                        r[d - 1] = 0;
+                        let rd = reduced_dims(&dims, d);
+                        let rd: Vec<usize> =
+                            (0..3).map(|q| rd.get(q).copied().unwrap_or(1)).collect();
+                        assert_eq!(s.data[r[0] + rd[0] * (r[1] + rd[1] * r[2])], want);
+                    }
+                }
+            }
+        }
+        // mean, prod, any and all through the same kernel.
+        let m = call(&[val(a.clone()), dim_arg(3.0)], "mean", Red::Mean).unwrap();
+        assert_eq!(m.data, [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]);
+        let p = call(
+            &[val(Matrix::filled_dims(&[2, 2, 2], 2.0)), dim_arg(3.0)],
+            "prod",
+            Red::Prod,
+        )
+        .unwrap();
+        assert_eq!((p.dims(), p.data), (vec![2, 2], vec![4.0; 4]));
+        let big = a.map(|x| (x > 22.0) as u8 as f64);
+        let y = call(&[val(big), dim_arg(3.0)], "any", Red::Any).unwrap();
+        assert_eq!(
+            (y.class, y.data),
+            (Class::Logical, vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+        );
+    }
+
+    /// Along a dimension of size 1 each element is its own reduction, and
+    /// past `ndims` the argument is handed back, each element as it was;
+    /// along one of size 0 each reduces nothing.
+    #[test]
+    fn a_dimension_of_size_one_or_past_ndims_reduces_each_element() {
+        let a = nd24();
+        for d in [5.0, 9.0] {
+            let s = call(&[val(a.clone()), dim_arg(d)], "sum", Red::Sum).unwrap();
+            assert_eq!(s, a);
+            let y = call(&[val(a.clone()), dim_arg(d)], "any", Red::Any).unwrap();
+            assert_eq!((y.dims(), y.class), (vec![2, 3, 4], Class::Logical));
+            assert!(y.data.iter().all(|&v| v == 1.0));
+        }
+        let row = val(Matrix::from_dims(
+            &[1, 3, 2],
+            vec![1.0, 0.0, 2.0, 3.0, 0.0, 4.0],
+        ));
+        let y = call(&[row.clone(), dim_arg(1.0)], "all", Red::All).unwrap();
+        assert_eq!(
+            (y.dims(), y.data),
+            (vec![1, 3, 2], vec![1.0, 0.0, 1.0, 1.0, 0.0, 1.0])
+        );
+        let (m, i) = two(&[val(a.clone()), val(Matrix::empty()), dim_arg(5.0)], true);
+        assert_eq!(m, a);
+        assert_eq!((i.dims(), i.data), (vec![2, 3, 4], vec![1.0; 24]));
+        let c = scan(&a, Some(4), true);
+        assert_eq!(c, a);
+        // Past `ndims` the argument is handed back, values and storage
+        // alike, as a matrix and a dimension past 2 always were: a `-0`
+        // stays `-0`, where along a dimension of size 1 within `ndims` it
+        // is reduced on its own to `+0`.
+        let neg = Matrix::scalar(-0.0);
+        let sign = |m: &Matrix| m.data[0].is_sign_negative();
+        for (kind, name) in [(Red::Sum, "sum"), (Red::Mean, "mean"), (Red::Prod, "prod")] {
+            let past = call(&[val(neg.clone()), dim_arg(3.0)], name, kind).unwrap();
+            assert!(sign(&past), "{name}");
+        }
+        assert!(sign(&scan(&neg, Some(3), true)));
+        let within = call(&[val(neg.clone()), dim_arg(1.0)], "sum", Red::Sum).unwrap();
+        assert!(!sign(&within));
+        assert!(!sign(&scan(&neg, Some(1), true)));
+        let pages = Matrix::from_dims(&[1, 1, 2], vec![-0.0, -0.0]);
+        let signs = |m: Matrix| {
+            m.data
+                .iter()
+                .map(|v| v.is_sign_negative())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signs(reduce(&pages, Some(4), sum0).unwrap()), [true, true]);
+        assert_eq!(
+            signs(reduce(&pages, Some(2), sum0).unwrap()),
+            [false, false]
+        );
+        let z = val(Matrix::complex_parts(1, 1, vec![1.0], vec![0.0]));
+        let p = call(&[z.clone(), dim_arg(3.0)], "prod", Red::Prod).unwrap();
+        assert!(p.is_complex());
+        let s = call(&[z, dim_arg(3.0)], "sum", Red::Sum).unwrap();
+        assert!(!s.is_complex());
+        // `any` and `all` along a dimension of size 1 reduce each element,
+        // a `NaN` ignored; past `ndims` they convert the argument, which
+        // refuses a `NaN`, as they always did.
+        let nan = val(Matrix::from_dims(&[1, 1, 2], vec![f64::NAN, 0.0]));
+        let y = call(&[nan.clone(), dim_arg(1.0)], "any", Red::Any).unwrap();
+        assert_eq!((y.dims(), y.data), (vec![1, 1, 2], vec![0.0, 0.0]));
+        let y = call(&[nan.clone(), dim_arg(2.0)], "all", Red::All).unwrap();
+        assert_eq!(y.data, [1.0, 0.0]);
+        for (kind, name) in [(Red::Any, "any"), (Red::All, "all")] {
+            let e = call(&[nan.clone(), dim_arg(4.0)], name, kind).unwrap_err();
+            assert_eq!(e.msg, "NaN's cannot be converted to logicals.", "{name}");
+        }
+        // The index of `max` past `ndims` is all 1s, an empty's empty.
+        let e = val(Matrix::new(0, 3, Vec::new()));
+        let (m, i) = two(&[e, val(Matrix::empty()), dim_arg(3.0)], true);
+        assert_eq!((m.dims(), i.dims()), (vec![0, 3], vec![0, 3]));
+        // A dimension of size 0: sum 0, prod 1, mean NaN, any false, all
+        // true, each the result's element, and max an empty along it.
+        let e = val(Matrix::from_dims(&[2, 0, 3], Vec::new()));
+        let s = call(&[e.clone(), dim_arg(2.0)], "sum", Red::Sum).unwrap();
+        assert_eq!((s.dims(), s.data), (vec![2, 1, 3], vec![0.0; 6]));
+        let p = call(&[e.clone(), dim_arg(2.0)], "prod", Red::Prod).unwrap();
+        assert_eq!(p.data, [1.0; 6]);
+        let m = call(&[e.clone(), dim_arg(2.0)], "mean", Red::Mean).unwrap();
+        assert!(m.data.iter().all(|v| v.is_nan()));
+        let y = call(&[e.clone(), dim_arg(2.0)], "any", Red::Any).unwrap();
+        assert_eq!(y.data, [0.0; 6]);
+        let y = call(&[e.clone(), dim_arg(2.0)], "all", Red::All).unwrap();
+        assert_eq!(y.data, [1.0; 6]);
+        let (m, i) = two(&[e.clone(), val(Matrix::empty()), dim_arg(2.0)], true);
+        assert_eq!((m.dims(), i.dims()), (vec![2, 0, 3], vec![2, 0, 3]));
+        let (m, _) = two(&[e, val(Matrix::empty()), dim_arg(3.0)], false);
+        assert_eq!(m.dims(), [2, 0]);
+        // An empty N-D shape that is not 0x0 takes the general rule.
+        let z = val(Matrix::from_dims(&[0, 0, 3], Vec::new()));
+        assert_eq!(call(&[z], "sum", Red::Sum).unwrap().dims(), [1, 0, 3]);
+        // A result too large to hold is judged before it is allocated.
+        let wide = Matrix::from_dims(&[0, 1 << 20, 1 << 20], Vec::new());
+        let e = reduce(&wide, Some(1), sum0).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 1x1048576x1048576 array exceeds the maximum array size."
+        );
+    }
+
+    #[test]
+    fn max_and_min_reduce_and_index_along_any_dimension() {
+        let a = nd24();
+        let (m, i) = two(&[val(a.clone()), val(Matrix::empty()), dim_arg(3.0)], true);
+        assert_eq!(m.data, [19.0, 20.0, 21.0, 22.0, 23.0, 24.0]);
+        assert_eq!((i.dims(), i.data), (vec![2, 3], vec![4.0; 6]));
+        let (m, i) = two(&[val(a.clone()), val(Matrix::empty()), dim_arg(2.0)], false);
+        assert_eq!(m.dims(), [2, 1, 4]);
+        assert_eq!(m.data, [1.0, 2.0, 7.0, 8.0, 13.0, 14.0, 19.0, 20.0]);
+        assert_eq!(i.data, [1.0; 8]);
+        let (m, _) = two(&[val(a.clone())], true);
+        assert_eq!(m.dims(), [1, 3, 4]);
+        // The two-array form broadcasts across every dimension.
+        let b = out(extremum(
+            &[val(a.clone()), val(Matrix::scalar(12.0))],
+            "max",
+            true,
+            1,
+        ));
+        assert_eq!(b.dims(), [2, 3, 4]);
+        assert_eq!(b.data[..12], [12.0; 12]);
+        assert_eq!(b.data[12], 13.0);
+        let col = val(Matrix::col(vec![10.0, 20.0]));
+        let b = out(extremum(&[val(a.clone()), col], "min", false, 1));
+        assert_eq!(b.data[..4], [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(b.data[22..], [10.0, 20.0]);
+        let e = extremum(
+            &[val(a), val(Matrix::filled_dims(&[2, 3, 5], 0.0))],
+            "max",
+            true,
+            1,
+        )
+        .unwrap_err()
+        .msg;
+        assert_eq!(
+            e,
+            "Arrays have incompatible sizes for operator 'max' (2x3x4 vs 2x3x5)."
+        );
+        // Two arrays and a dimension are refused, where the second array
+        // used to be dropped in silence; an empty second argument is the
+        // placeholder of the one-array form.
+        let (x, y) = (Matrix::row(vec![1.0, 5.0]), Matrix::row(vec![3.0, 4.0]));
+        for (name, is_max) in [("max", true), ("min", false)] {
+            for nargout in [1, 2] {
+                let args = [val(x.clone()), val(y.clone()), dim_arg(2.0)];
+                let e = extremum(&args, name, is_max, nargout).unwrap_err().msg;
+                assert_eq!(
+                    e,
+                    format!("{name} takes two arrays or one array and a dimension, not both.")
+                );
+            }
+            let nd = val(nd24());
+            let e = extremum(&[nd.clone(), nd, dim_arg(3.0)], name, is_max, 1);
+            assert!(e.unwrap_err().msg.starts_with(name));
+            let placeholder = val(Matrix::new(1, 0, Vec::new()));
+            let m = out(extremum(
+                &[val(x.clone()), placeholder, dim_arg(2.0)],
+                name,
+                is_max,
+                1,
+            ));
+            assert_eq!(m.data, [if is_max { 5.0 } else { 1.0 }]);
+        }
+    }
+
+    #[test]
+    fn the_element_wise_math_keeps_every_dimension() {
+        let a = nd24();
+        let dims = |m: Matrix| m.dims();
+        assert_eq!(
+            dims(out(unary(&[val(a.clone())], "floor", f64::floor))),
+            [2, 3, 4]
+        );
+        assert_eq!(
+            dims(out(complex_unary(&[val(a.clone())], "sqrt", C::sqrt))),
+            [2, 3, 4]
+        );
+        assert_eq!(
+            dims(out(round(&[val(a.clone()), val(Matrix::scalar(1.0))]))),
+            [2, 3, 4]
+        );
+        let n = out(mask(&[val(a.clone())], "isnan", f64::is_nan));
+        assert_eq!((n.dims(), n.class), (vec![2, 3, 4], Class::Logical));
+        let r = out(binary(
+            &[val(a.clone()), val(Matrix::scalar(5.0))],
+            "mod",
+            modulo,
+        ));
+        assert_eq!(r.dims(), [2, 3, 4]);
+        assert_eq!(r.data[..6], [1.0, 2.0, 3.0, 4.0, 0.0, 1.0]);
+        let mut z = a.clone();
+        z.im = Some(a.data.iter().map(|x| -x).collect());
+        let m = out(abs(&[val(z.clone())]));
+        assert_eq!(m.dims(), [2, 3, 4]);
+        assert!(near(m.data[23], 24.0 * 2f64.sqrt()));
+        let e = out(complex_unary(&[val(z)], "exp", C::exp));
+        assert_eq!(e.dims(), [2, 3, 4]);
+        let h = out(binary(
+            &[
+                val(Matrix::filled_dims(&[1, 1, 2], 3.0)),
+                val(Matrix::col(vec![4.0, 4.0])),
+            ],
+            "hypot",
+            f64::hypot,
+        ));
+        assert_eq!((h.dims(), h.data), (vec![2, 1, 2], vec![5.0; 4]));
     }
 
     // ---- the second output of max and min (cycle 03) -----------------

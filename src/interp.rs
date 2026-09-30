@@ -18,8 +18,8 @@ use crate::parser::{
     Stmt,
 };
 use crate::value::{
-    CellArray, Class, Format, Func, Matrix, StructArray, Value, blank, dims_product, nonfinite,
-    normalize_dims, with_format,
+    CellArray, Class, Format, Func, Matrix, StructArray, Value, along_dim, blank, dims_product,
+    nonfinite, normalize_dims, with_format,
 };
 
 /// Every fallible path in the interpreter returns this. It lives in
@@ -4228,15 +4228,6 @@ pub(crate) fn concat_rows(rows: Vec<Vec<Value>>) -> R<Value> {
     vcat(joined)
 }
 
-/// The refusal of an N-D operand by a bracket that joins it to anything
-/// (cycle 14): N-D concatenation is cycle 14b's.
-fn refuse_nd_concat(vals: &[Value]) -> R<()> {
-    if vals.iter().any(|v| matches!(v, Value::Mat(m) if m.is_nd())) {
-        bail!(error::nd_concatenation());
-    }
-    Ok(())
-}
-
 fn hcat(mut vals: Vec<Value>) -> R<Value> {
     if let Some(r) = concat_containers(&mut vals, false) {
         return r;
@@ -4246,16 +4237,12 @@ fn hcat(mut vals: Vec<Value>) -> R<Value> {
     if vals.iter().any(|v| matches!(v, Value::Func(_))) {
         bail!(error::handle_concatenation());
     }
-    // A bracket of one N-D array joins it to nothing, so `[A]` and
-    // `cell2mat({A})` are `A`, stored by the flag rule as any bracket's
-    // result is; with anything beside it, it is refused (cycle 14).
-    if let [Value::Mat(m)] = vals.as_slice() {
-        if m.is_nd() {
-            return Ok(Value::Mat(m.clone().normalized()));
-        }
-    }
-    refuse_nd_concat(&vals)?;
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
+    // With an N-D operand, `cat`'s rule along dimension 2 (cycle 14b);
+    // with none, the 2-D rule a bracket always had, its empties included.
+    if all.iter().any(Matrix::is_nd) {
+        return Ok(Value::Mat(concat(2, all)?));
+    }
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
@@ -4292,8 +4279,12 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     if let Some(r) = concat_containers(&mut vals, true) {
         return r;
     }
-    refuse_nd_concat(&vals)?;
     let all: Vec<Matrix> = vals.into_iter().map(Value::into_mat).collect::<R<_>>()?;
+    // With an N-D operand, `cat`'s rule along dimension 1 (cycle 14b);
+    // with none, the 2-D rule a bracket always had, its empties included.
+    if all.iter().any(Matrix::is_nd) {
+        return Ok(Value::Mat(concat(1, all)?));
+    }
     let class = concat_class(&all);
     let mats: Vec<Matrix> = all.into_iter().filter(|m| !m.is_empty()).collect();
     if mats.is_empty() {
@@ -4323,6 +4314,104 @@ fn vcat(mut vals: Vec<Value>) -> R<Value> {
     }
     let im = complex.then_some(im.data);
     Ok(Value::Mat(out.with_im(im).to_class(class)?))
+}
+
+/// The concatenation kernel of `cat(dim, A1, ..., An)` (cycle 14b), which
+/// the brackets share whenever an operand is N-D, `[a, b]` along dimension
+/// 2 and `[a; b]` along 1, so the two cannot disagree there. A bracket of
+/// 2-D operands alone keeps the 2-D rule it always had, in [`hcat`] and
+/// [`vcat`], whose answers differ from this rule only when every operand
+/// is empty: `[1:0]` is 0x0 and `[zeros(1, 0), zeros(0, 1)]` is 0x0, where
+/// `cat` of the same is 1x0 and an error. `dim` is one-based and at least
+/// 1.
+///
+/// Every dimension but `dim` must agree, a dimension past an array's
+/// `ndims` being 1, or it is `Dimensions of arrays being concatenated are
+/// not consistent.`; the result's size along `dim` is the sum of theirs.
+/// "When concatenating an empty array to a nonempty array, cat omits the
+/// empty array in the output" (the MathWorks `cat` page), which is the rule
+/// the brackets always followed: `[zeros(0, 5); ones(2, 3)]` is 2x3. When
+/// every array is empty the result is the empty their sizes give, joined
+/// by the same rule, the 2-D 0x0s among them left out as `[]` always is,
+/// and a 0x0 when nothing is left: `cat(3, [], [])` and `cat(3)` are `[]`.
+/// The class is [`concat_class`]'s, and a complex array makes the result
+/// complex, every other array's imaginary parts zero, stored by the flag
+/// rule; a number joining a char becomes the character with that code
+/// (`cat(2, 'a', 66)` is `'aB'`), and a complex one refuses to
+/// (`to_class`).
+///
+/// Each array is seen as `[before, n_i, after]` along `dim`
+/// ([`along_dim`]), `before` and `after` shared, so the result is, for
+/// each of the `after` blocks, each array's contiguous run of `before *
+/// n_i` elements in turn: one pass per element produced, and none at all
+/// for an empty result, whatever its sizes. The result's shape is judged by
+/// `check_dims` first; a `dim` past every array's `ndims` gives the result
+/// `dim` dimensions, so `dim` is judged against `args::MAX_NDIMS` before
+/// its list of sizes is made: `cat(2^21, 1, 2)` and `cat(1e300, 1, 2)` are
+/// `Arrays have at most 1048576 dimensions.`, never a request for that
+/// many sizes.
+pub(crate) fn concat(dim: usize, all: Vec<Matrix>) -> R<Matrix> {
+    let class = concat_class(&all);
+    let parts: Vec<Matrix> = if all.iter().any(|m| !m.is_empty()) {
+        all.into_iter().filter(|m| !m.is_empty()).collect()
+    } else {
+        all.into_iter()
+            .filter(|m| m.rows != 0 || m.cols != 0 || m.is_nd())
+            .collect()
+    };
+    let Some(first) = parts.first() else {
+        return Ok(Matrix::empty().with_class(class));
+    };
+    let k = dim.saturating_sub(1);
+    let first = first.dims();
+    let reach = parts.iter().map(Matrix::ndims).max().unwrap_or(2);
+    let size = |d: &[usize], j: usize| d.get(j).copied().unwrap_or(1);
+    let mut joined = 0usize;
+    for p in &parts {
+        let d = p.dims();
+        if (0..reach).any(|j| j != k && size(&d, j) != size(&first, j)) {
+            bail!(error::concat_dims());
+        }
+        joined = joined.saturating_add(size(&d, k));
+    }
+    let mut dims: Vec<usize> = (0..reach).map(|j| size(&first, j)).collect();
+    if k < reach {
+        dims[k] = joined;
+    } else if joined != 1 {
+        if dim > crate::builtins::args::MAX_NDIMS {
+            bail!(error::too_many_dims(crate::builtins::args::MAX_NDIMS));
+        }
+        dims.resize(k, 1);
+        dims.push(joined);
+    }
+    let asked: Vec<f64> = dims.iter().map(|&d| d as f64).collect();
+    let dims = normalize_dims(&crate::builtins::args::check_dims(&asked)?);
+    let total = dims_product(&dims);
+    let (before, _, after) = along_dim(&dims, dim);
+    // Each array's run of elements in one of the `after` blocks.
+    let runs: Vec<usize> = parts
+        .iter()
+        .map(|p| before.saturating_mul(size(&p.dims(), k)))
+        .collect();
+    let complex = parts.iter().any(Matrix::is_complex);
+    let mut data = Vec::with_capacity(total);
+    let mut im = Vec::with_capacity(if complex { total } else { 0 });
+    if total > 0 {
+        for a in 0..after {
+            for (p, &run) in parts.iter().zip(&runs) {
+                let span = a * run..(a + 1) * run;
+                data.extend_from_slice(&p.data[span.clone()]);
+                if complex {
+                    match &p.im {
+                        Some(v) => im.extend_from_slice(&v[span]),
+                        None => im.resize(im.len() + run, 0.0),
+                    }
+                }
+            }
+        }
+    }
+    let im = complex.then_some(im);
+    Matrix::from_dims(&dims, data).with_im(im).to_class(class)
 }
 
 /// Writes `s` to an interpreter's output sink: the body of
@@ -8566,17 +8655,41 @@ mod tests {
             err_msg(&format!("{a}A.'")),
             "Transpose is not defined for N-D arrays."
         );
-        let concat = "Concatenation of N-D arrays is not supported.";
-        assert_eq!(err_msg(&format!("{a}[A, 1]")), concat);
-        assert_eq!(err_msg(&format!("{a}[A; A]")), concat);
+        // Brackets join N-D arrays by `cat`'s rule since cycle 14b, and
+        // a mismatch is the inconsistent-dimensions message.
+        assert_eq!(
+            ok_out(&format!("{a}B = [A, A]; disp(size(B)); disp(B(:, :, 2))")),
+            "     2     4     2\n     5     7     5     7\n     6     8     6     8\n"
+        );
+        assert_eq!(
+            ok_out(&format!("{a}B = [A; A]; disp(size(B)); disp(B(:, 1, 2)')")),
+            "     4     2     2\n     5     6     5     6\n"
+        );
+        let mismatch = "Dimensions of arrays being concatenated are not consistent.";
+        assert_eq!(err_msg(&format!("{a}[A, 1]")), mismatch);
+        assert_eq!(err_msg(&format!("{a}[A; ones(2, 3)]")), mismatch);
         // A bracket of one joins nothing.
         assert_eq!(
             ok_out(&format!("{a}B = [A]; disp(size(B))")),
             "     2     2     2\n"
         );
+        // With no N-D operand a bracket keeps its 2-D rule, its empties
+        // included, where `cat`'s rule would change them.
+        let size = |src: &str| ok_out(&format!("disp(size({src}))"));
+        for src in [
+            "[1:0]",
+            "[zeros(1, 0), zeros(0, 1)]",
+            "[zeros(0, 3); zeros(0, 2)]",
+            "[zeros(1, 0), zeros(1, 0)]",
+            "cell2mat({zeros(3, 0), zeros(2, 0)})",
+        ] {
+            assert_eq!(size(src), "     0     0\n", "{src}");
+        }
+        assert_eq!(size("cat(2, 1:0)"), "     1     0\n");
+        assert_eq!(err_msg("cat(2, zeros(1, 0), zeros(0, 1))"), mismatch);
         assert_eq!(
-            err_msg(&format!("{a}sum(A)")),
-            "N-D arrays are not supported by 'sum'."
+            err_msg(&format!("{a}sort(A)")),
+            "N-D arrays are not supported by 'sort'."
         );
     }
 

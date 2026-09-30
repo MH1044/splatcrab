@@ -253,26 +253,41 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   thousand singleton subscripts and a growth past as many singleton
   dimensions within a bound, deletion along one dimension, the operators
   and `for`, the refusals, and a colon over an empty target taking the
-  right-hand side's extent.
+  right-hand side's extent; since cycle 14b brackets joining N-D arrays
+  along either dimension, and a mismatch refused.
 - `builtins/`: the builtins themselves, called directly as functions.
   `mod.rs` checks the registry holds every name exactly once and that every
   entry is callable; `args.rs` the message text of each helper and the size
   overflow guard, and since cycle 14 `check_dims` at and past `MAX_ELEMS`
-  and a size of 0 anywhere among huge ones;
+  and a size of 0 anywhere among huge ones, and since cycle 14b at and
+  past `MAX_NDIMS` dimensions;
   `core.rs` the constructors, and since cycle 14 their N-D sizes, the shape
   queries by the `size` page's rules and `values_equal` of arrays of
   different shapes and `whos` padding a column past any format width;
   since cycle 14 `sets.rs` and `strings.rs` a cell
   holding an N-D char, which is no character vector, and `strings.rs`
   `strcmp` and `strcmpi` comparing one by every dimension;
-  `math.rs` the reduction and scan dimension rules; `linalg.rs` sorting and
-  rearrangement. Since cycle 10 `complex.rs` checks the complex arithmetic,
-  the powers and the branch cuts with tolerances, and `fft` against the
+  `math.rs` the reduction and scan dimension rules, and since cycle 14b
+  the default dimension, the three-number view of every reduction checked
+  slice by slice against a direct sum, a dimension of size 1, past `ndims`
+  (the argument handed back, a `-0` and a complex storage kept, `any` and
+  `all` refusing a `NaN` there) and of size 0, `max` and `min` with their
+  index along any dimension and broadcasting, and refusing two arrays and
+  a dimension, and the element-wise math keeping every dimension;
+  `linalg.rs` sorting and rearrangement, and since cycle 14b `squeeze`,
+  `permute`'s index arithmetic element by element and every refusal of its
+  order, `cat`'s agreement rule, its empty rule and its dimension past
+  every argument's `ndims` judged against `MAX_NDIMS`, and `repmat` of
+  every dimension, its shape
+  judged before anything is allocated. Since cycle 10 `complex.rs` checks
+  the complex arithmetic, the powers and the branch cuts with tolerances,
+  and `fft` against the
   direct DFT for every length from 1 to 40 and at a prime length of
   100,003; `factor.rs` checks complex eigenvalues by the residual
   `A*v - lambda*v`; `mod.rs` checks the complex gate, and since cycle 14
   the N-D gate, refusing an N-D argument to a builtin not on `ND_OK` and
-  passing one on it, through `feval` too. Since cycle 11
+  passing one on it, through `feval` too, and since cycle 14b the names it
+  added and their count. Since cycle 11
   `printf.rs` checks every conversion, flag and escape and the width and
   precision bound, `*` fields included; `strings.rs` the `num2str` layouts,
   the string functions, `regexp`'s outputs and the refusal of a result too
@@ -283,8 +298,15 @@ Each source file carries its own `#[cfg(test)] mod tests` at the bottom.
   past its bound, each a clean error; `io.rs` the file-identifier table,
   lines, bytes and the end-of-file flag, `save` and `load` in both formats,
   and `input` from a reader and refused, each in a temporary folder of its
-  own. Since cycle 14 `mat.rs` and `io.rs` check that `save` refuses an
-  N-D array as a variable, a cell element or a field, and leaves no file.
+  own. Since cycle 14b `mat.rs` checks an N-D array written with its whole
+  dimensions array, word by word, and read back as a variable, a cell
+  element and a field, and a hostile dimensions array (a shape past the
+  cap, data shorter than the shape, a negative size, a hundred thousand
+  dimensions of 1, an empty whose sizes multiply past any memory, and a
+  cell or struct array of three dimensions) each a clean answer within a
+  bound, and a dimension past 2147483647 refused naming its variable
+  wherever it sits; `io.rs` checks `save` and `load` of an N-D array, and
+  that dimension and `-ascii` of one refused, leaving no file.
 - `json.rs`: a round trip of every value kind, each escape the writer makes
   and the parser reads, surrogate pairs, rejection of trailing garbage and of
   malformed numbers and strings, and the depth limit at and past its bound.

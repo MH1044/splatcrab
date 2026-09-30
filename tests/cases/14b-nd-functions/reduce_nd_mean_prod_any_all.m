@@ -1,0 +1,27 @@
+% covers: 2 - mean, prod, any and all of an N-D array along dimension 3, along the first dimension by default and along the first dimension whose size is not 1, any and all giving logicals, along a dimension past ndims the array itself, any and all giving A ~= 0 of every size, mean of a logical a double, and 'all' over every element
+A = reshape(1:24, 2, 3, 4);
+M = mean(A, 3)
+P = prod(2 * ones(2, 2, 2), 3)
+Y = any(A > 22, 3)
+disp(class(Y))
+W = all(A > 0, 3)
+N = any(A, 5);
+disp(class(N))
+disp(size(N))
+disp(isequal(N, A ~= 0))
+disp(isequal(all(A - 1, 5), A ~= 1))
+M1 = mean(A);
+disp(size(M1))
+disp(isequal(M1, sum(A) / 2))
+disp(mean(A, 'all'))
+disp(mean(reshape([1 2 6], 1, 1, 3)))
+disp(prod(3 * ones(1, 1, 3)))
+disp(any(reshape([0 0 1], 1, 1, 3)))
+disp(all(reshape([1 1 0], 1, 1, 3)))
+disp(isequal(prod(A, 4), A))
+disp(isequal(mean(A, 9), A))
+disp(mean(A > 12, 3))
+disp(class(mean(A > 12, 3)))
+disp(prod(2 * ones(2, 2, 2), 'all'))
+disp(any(A > 23, 'all'))
+disp(all(A > 1, 'all'))

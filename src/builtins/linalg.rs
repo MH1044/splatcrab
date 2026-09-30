@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 
 use super::args::{
-    at_most, check_dims, check_shape, dim, fmt_dim, mat, need, option, shape, size_list,
+    at_most, check_dims, check_shape, dim, fmt_dim, mat, need, option, shape_dims, size_list,
 };
 use super::complex::C;
 use super::core::eps_at;
@@ -43,7 +43,10 @@ pub fn register(r: &mut Registry) {
 
     // ---- rearrangement -----------------------------------------------
     add(r, "reshape", reshape, "reshape(A,r,c), reshape(A,sz), reshape(A,r,[]) - the elements of A in a new shape.");
-    add(r, "repmat", repmat, "repmat(A,n), repmat(A,r,c), repmat(A,sz) - tile A into a block matrix.");
+    add(r, "repmat", repmat, "repmat(A,n), repmat(A,r,c,...), repmat(A,sz) - tile A along every dimension given.");
+    add(r, "squeeze", squeeze, "squeeze(A) - A with its dimensions of length 1 removed; a 2-D array is returned as it is.");
+    add(r, "permute", permute, "permute(A,dimorder) - rearrange the dimensions of A: dimension i of the result is dimension dimorder(i) of A.");
+    add(r, "cat", cat, "cat(dim,A1,A2,...) - concatenate arrays along dimension dim.");
     add(r, "fliplr", fliplr, "fliplr(A) - reverse the order of the columns.");
     add(r, "flipud", flipud, "flipud(A) - reverse the order of the rows.");
 
@@ -745,25 +748,196 @@ fn reshape(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
 }
 
 /// `repmat(A, n)`, `repmat(A, r, c, ...)` and `repmat(A, sz)`, through the
-/// same size parser as the constructors.
+/// same size parser as the constructors. Since cycle 14b any number of
+/// counts, separate or in a size vector, and an N-D `A`: the result's size
+/// along each dimension is `A`'s times its count, a dimension past either
+/// being 1, and trailing sizes of 1 are dropped, as the constructors drop
+/// them, so `repmat(A, 1, 1, 2)` of a 2x3x4 is 2x3x8 and `repmat(1, 2, 3,
+/// 1)` is 2x3. The whole shape is judged by `check_dims` before anything
+/// is allocated, naming every size of the array asked for, never an
+/// intermediate: `repmat([1 2], 1e10, 1e10)` is `Requested
+/// 10000000000x20000000000 array exceeds the maximum array size.`
 fn repmat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
     need(a, 2, "repmat")?;
     let m = mat(a, 0, "repmat")?;
-    let (r, c) = shape(a, 1, "repmat", usize::MAX)?;
-    // Judge the shape that was actually asked for. Checking `m.rows * r` on
-    // its own reported "Requested 1x10000000000" for
-    // `repmat([1 2], 1e10, 1e10)`, naming an intermediate instead of the
-    // 10000000000x20000000000 array requested.
-    let (rows, cols) = check_shape(m.rows as f64 * r, m.cols as f64 * c)?;
-    let mut out = Matrix::filled(rows, cols, 0.0).with_class(m.class);
-    // An empty result has no columns worth visiting (cycle 13b).
-    let out_cols = if out.data.is_empty() { 0 } else { out.cols };
-    for j in 0..out_cols {
-        for i in 0..out.rows {
-            out.set(i, j, m.get(i % m.rows.max(1), j % m.cols.max(1)));
+    let counts = shape_dims(a, 1, "repmat")?;
+    let dims = m.dims();
+    let reach = counts.len().max(dims.len());
+    let size = |k: usize| dims.get(k).copied().unwrap_or(1);
+    let count = |k: usize| counts.get(k).copied().unwrap_or(1.0);
+    let mut asked: Vec<f64> = (0..reach).map(|k| size(k) as f64 * count(k)).collect();
+    while asked.len() > 2 && asked.last() == Some(&1.0) {
+        asked.pop();
+    }
+    let out_dims = check_dims(&asked)?;
+    // An empty result has nothing to tile, however large its sizes (cycle
+    // 13b).
+    if crate::value::dims_product(&out_dims) == 0 {
+        return one_as(Matrix::from_dims(&out_dims, Vec::new()).with_class(m.class));
+    }
+    // Every count is at least 1 here, so each step's array is no larger
+    // than the result, and a count of 1 costs nothing.
+    let mut data = m.data;
+    // The shape part way through, the dimensions below `k` already tiled.
+    let mut cur: Vec<usize> = (0..reach).map(size).collect();
+    for k in 0..reach {
+        let c = count(k) as usize;
+        if c > 1 {
+            data = tile(&data, &cur, k + 1, c);
+            cur[k] *= c;
         }
     }
-    one_as(out)
+    one_as(Matrix::from_dims(&out_dims, data).with_class(m.class))
+}
+
+/// `c` copies of an array of shape `dims` joined along dimension `d`: for
+/// each of the `after` blocks of the array seen as `[before, n, after]`
+/// (`value::along_dim`), its contiguous run of `before * n` elements `c`
+/// times over, which is `cat(d, A, A, ...)`.
+fn tile(data: &[f64], dims: &[usize], d: usize, c: usize) -> Vec<f64> {
+    let (before, n, after) = crate::value::along_dim(dims, d);
+    let run = before * n;
+    let mut out = Vec::with_capacity(data.len() * c);
+    for a in 0..after {
+        let block = &data[a * run..(a + 1) * run];
+        for _ in 0..c {
+            out.extend_from_slice(block);
+        }
+    }
+    out
+}
+
+/// `squeeze(A)`, by the MathWorks page (cycle 14b): "B = squeeze(A)
+/// returns an array with the same elements as the input array A, but with
+/// dimensions of length 1 removed", and "If A is a row vector, column
+/// vector, scalar, or an array with no dimensions of length 1, then
+/// squeeze returns the input A", as it does every 2-D array. A result with
+/// one dimension left is a column, as "a 1-by-1-by-3 array" becomes "a
+/// 3-by-1 column vector". No element moves, so class and complex storage
+/// are kept; a cell or a struct is refused as by every numeric builtin.
+fn squeeze(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 1, "squeeze")?;
+    at_most(a, 1, "squeeze")?;
+    let mut m = mat(a, 0, "squeeze")?;
+    if m.is_nd() {
+        let kept: Vec<usize> = m.dims().into_iter().filter(|&d| d != 1).collect();
+        // One dimension left is normalised to a column.
+        m.set_dims(&kept);
+    }
+    one_as(m)
+}
+
+/// `permute(A, dimorder)`, by the MathWorks page (cycle 14b): "the ith
+/// dimension of the output array is the dimension dimorder(i) from the
+/// input array", `dimorder` a row of positive integers holding each of 1
+/// to n exactly once, with n at least `ndims(A)`, a dimension past
+/// `ndims(A)` being of size 1. Anything else is `permute's dimension order
+/// must hold each of 1 to n once, with n at least ndims(A).` Class and
+/// complex storage are kept, and `permute(M, [2 1])` of a matrix is its
+/// plain transpose.
+fn permute(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 2, "permute")?;
+    at_most(a, 2, "permute")?;
+    let m = mat(a, 0, "permute")?;
+    let order = permute_order(&a[1], m.ndims())?;
+    one_as(permuted(&m, &order))
+}
+
+/// The zero-based order `permute` reads from `v`: a real row of positive
+/// integers holding each of 1 to n exactly once, with n at least `ndims`.
+/// A column, a char (whatever its codes), a repeat, a gap and a row too
+/// short are all the one refusal, judged before anything the order's
+/// length would size.
+fn permute_order(v: &Value, ndims: usize) -> R<Vec<usize>> {
+    let Value::Mat(o) = v else {
+        return Err(error::permute_order());
+    };
+    if o.class == Class::Char || o.is_complex() || o.is_nd() || o.rows != 1 || o.cols < ndims {
+        return Err(error::permute_order());
+    }
+    let n = o.cols;
+    let mut seen = vec![false; n];
+    let mut order = Vec::with_capacity(n);
+    for &x in &o.data {
+        if !(x >= 1.0 && x <= n as f64 && x.fract() == 0.0) {
+            return Err(error::permute_order());
+        }
+        let k = x as usize - 1;
+        if seen[k] {
+            return Err(error::permute_order());
+        }
+        seen[k] = true;
+        order.push(k);
+    }
+    Ok(order)
+}
+
+/// `m` permuted by `order`, zero-based and holding each of `0..n` once,
+/// `n` at least `m.ndims()`. Dimension `k` of the result is dimension
+/// `order[k]` of `m`, so result element `(j1, ..., jn)` is the element of
+/// `m` whose coordinate along dimension `order[k]` is `jk`: the result is
+/// written in its own column-major order while a counter walks `m`, moving
+/// by the stride of dimension `order[k]` along the result's `k`-th. The
+/// counter carries only through the dimensions past 1, as broadcasting's
+/// does, so a run of singletons costs nothing per step; an empty array is
+/// never walked.
+pub fn permuted(m: &Matrix, order: &[usize]) -> Matrix {
+    let dims = m.dims();
+    let size = |j: usize| dims.get(j).copied().unwrap_or(1);
+    let mut stride = Vec::with_capacity(order.len());
+    let mut acc = 1usize;
+    for j in 0..order.len() {
+        stride.push(acc);
+        acc = acc.saturating_mul(size(j));
+    }
+    let out_dims: Vec<usize> = order.iter().map(|&j| size(j)).collect();
+    let numel = m.numel();
+    let live: Vec<(usize, usize)> = order
+        .iter()
+        .filter(|&&j| size(j) > 1)
+        .map(|&j| (size(j), stride[j]))
+        .collect();
+    let place = |src: &[f64]| -> Vec<f64> {
+        let mut out = Vec::with_capacity(numel);
+        if numel == 0 {
+            return out;
+        }
+        let mut coord = vec![0usize; live.len()];
+        let mut at = 0usize;
+        for _ in 0..numel {
+            out.push(src[at]);
+            for (c, &(d, step)) in coord.iter_mut().zip(&live) {
+                *c += 1;
+                at += step;
+                if *c < d {
+                    break;
+                }
+                at -= step * d;
+                *c = 0;
+            }
+        }
+        out
+    };
+    let mut out = Matrix::from_dims(&out_dims, place(&m.data)).with_class(m.class);
+    // The storage as it was: `complex(1, 0)` permuted is still complex.
+    out.im = m.im.as_deref().map(place);
+    out
+}
+
+/// `cat(dim, A1, ..., An)` (cycle 14b): the arrays joined along `dim`, a
+/// positive integer that may be past every array's `ndims`, so `cat(3, A,
+/// B)` of two matrices makes pages. It is the kernel a bracket with an
+/// N-D operand uses, `interp::concat`, which holds the agreement rule, the
+/// empty rule, the class and complex rules and the bound on `dim`.
+/// `cat(dim)` with no arrays is `[]`, and with one array is that array.
+/// Every argument after `dim` must be an array.
+fn cat(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
+    need(a, 1, "cat")?;
+    let d = dim(a, 0, "cat")?;
+    let mats = (1..a.len())
+        .map(|i| mat(a, i, "cat"))
+        .collect::<R<Vec<Matrix>>>()?;
+    one_as(crate::interp::concat(d, mats)?)
 }
 
 fn fliplr(_: &mut Interp, a: &[Value], _: usize) -> R<Vec<Value>> {
@@ -1545,12 +1719,279 @@ mod tests {
             (2, 3)
         );
         assert_eq!(shape_of(repmat, &[v.clone(), num(2.0)]), (2, 4));
+        // A third count other than 1 tiles pages since cycle 14b.
+        let got = call(repmat, &[v, num(2.0), num(3.0), num(2.0)]).unwrap();
+        assert_eq!(got.dims(), [2, 6, 2]);
+    }
+
+    /// `A(i, j, k)` of `reshape(1:24, 2, 3, 4)` is `i + 2*(j-1) + 6*(k-1)`,
+    /// the spec's running example.
+    fn nd24() -> Matrix {
+        Matrix::from_dims(&[2, 3, 4], (1..=24).map(f64::from).collect())
+    }
+
+    fn nd(dims: &[usize]) -> Value {
+        let n = crate::value::dims_product(dims);
+        Value::Mat(Matrix::from_dims(dims, (1..=n).map(|k| k as f64).collect()))
+    }
+
+    /// Cycle 14b: `repmat` of any number of counts and of an N-D array,
+    /// every size judged before anything is allocated.
+    #[test]
+    fn repmat_tiles_every_dimension_and_judges_the_shape_first() {
+        let a = Value::Mat(nd24());
+        let got = call(repmat, &[a.clone(), num(1.0), num(1.0), num(2.0)]).unwrap();
+        assert_eq!(got.dims(), [2, 3, 8]);
+        // The second copy of the pages follows the first.
+        assert_eq!(got.data[..24], got.data[24..]);
+        assert_eq!(got.data[..24], nd24().data[..]);
+        let got = call(repmat, &[row(&[1.0, 2.0]), row(&[2.0, 1.0, 3.0])]).unwrap();
+        assert_eq!(got.dims(), [2, 2, 3]);
+        assert_eq!(got.data[..4], [1.0, 1.0, 2.0, 2.0]);
+        let got = call(repmat, &[a.clone(), num(2.0), num(1.0)]).unwrap();
+        assert_eq!(got.dims(), [4, 3, 4]);
+        // Each column of the page is doubled down its rows.
+        assert_eq!(got.data[..8], [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+        let got = call(repmat, &[row(&[1.0, 2.0]), num(1.0), num(1.0), num(2.0)]).unwrap();
         assert_eq!(
-            call(repmat, &[v, num(2.0), num(3.0), num(2.0)])
+            (got.dims(), got.data),
+            (vec![1, 2, 2], vec![1.0, 2.0, 1.0, 2.0])
+        );
+        // Trailing counts of 1 are dropped, and a count of 0 is empty.
+        let got = call(repmat, &[a.clone(), row(&[1.0, 1.0, 1.0, 1.0])]).unwrap();
+        assert_eq!(got, nd24());
+        let got = call(repmat, &[a.clone(), num(1.0), num(1.0), num(0.0)]).unwrap();
+        assert_eq!(got.dims(), [2, 3, 0]);
+        // The class is kept.
+        let t =
+            Value::Mat(Matrix::from_dims(&[1, 1, 2], vec![1.0, 0.0]).with_class(Class::Logical));
+        assert_eq!(call(repmat, &[t, num(2.0)]).unwrap().class, Class::Logical);
+        // Judged whole before anything is allocated, every size named.
+        let t = std::time::Instant::now();
+        let e = call(repmat, &[num(1.0), num(1e5), num(1e5), num(1e5)])
+            .unwrap_err()
+            .msg;
+        assert_eq!(
+            e,
+            "Requested 100000x100000x100000 array exceeds the maximum array size."
+        );
+        let e = call(repmat, &[a, num(1e5), num(1e5)]).unwrap_err().msg;
+        assert_eq!(
+            e,
+            "Requested 200000x300000x4 array exceeds the maximum array size."
+        );
+        // An empty result costs nothing, however large its other sizes.
+        let empty = Value::Mat(Matrix::new(0, 1, Vec::new()));
+        let got = call(repmat, &[empty, num(1.0), num(1e15), num(3.0)]).unwrap();
+        assert_eq!(got.dims(), [0, 1_000_000_000_000_000, 3]);
+        assert!(t.elapsed().as_secs() < 5, "{:?}", t.elapsed());
+    }
+
+    /// Cycle 14b: `squeeze` by the MathWorks page's rules.
+    #[test]
+    fn squeeze_removes_the_dimensions_of_length_one() {
+        let dims = |d: &[usize]| call(squeeze, &[nd(d)]).unwrap().dims();
+        assert_eq!(dims(&[1, 1, 3]), [3, 1]);
+        assert_eq!(dims(&[2, 1, 3]), [2, 3]);
+        assert_eq!(dims(&[1, 3, 1, 2]), [3, 2]);
+        assert_eq!(dims(&[1, 1, 1, 4]), [4, 1]);
+        assert_eq!(dims(&[1, 0, 3]), [0, 3]);
+        // A 2-D array is returned as it is, a row included.
+        assert_eq!(dims(&[2, 3]), [2, 3]);
+        assert_eq!(dims(&[1, 5]), [1, 5]);
+        assert_eq!(dims(&[1, 1]), [1, 1]);
+        // No element moves, and class and complex storage are kept.
+        let m = call(squeeze, &[nd(&[1, 3, 1, 2])]).unwrap();
+        assert_eq!(m.data, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let mut z = Matrix::from_dims(&[1, 1, 2], vec![1.0, 2.0]);
+        z.im = Some(vec![0.0, 0.0]);
+        let s = call(squeeze, &[Value::Mat(z)]).unwrap();
+        assert_eq!((s.dims(), s.im), (vec![2, 1], Some(vec![0.0, 0.0])));
+        let c = Matrix::from_dims(&[1, 1, 2], vec![97.0, 98.0]).with_class(Class::Char);
+        assert_eq!(call(squeeze, &[Value::Mat(c)]).unwrap().class, Class::Char);
+        // A cell is refused as every numeric builtin refuses one.
+        let cell = Value::cell(crate::value::CellArray::new(1, 1, vec![num(1.0)]));
+        assert!(call(squeeze, &[cell]).is_err());
+    }
+
+    /// Cycle 14b: `permute`'s index arithmetic, "the ith dimension of the
+    /// output array is the dimension dimorder(i) from the input array".
+    #[test]
+    fn permute_moves_each_element_to_its_permuted_subscript() {
+        let a = nd24();
+        let p = call(permute, &[Value::Mat(a.clone()), row(&[3.0, 1.0, 2.0])]).unwrap();
+        assert_eq!(p.dims(), [4, 2, 3]);
+        // P(k, i, j) is A(i, j, k), for every element.
+        for i in 0..2 {
+            for j in 0..3 {
+                for k in 0..4 {
+                    let at_a = i + 2 * (j + 3 * k);
+                    let at_p = k + 4 * (i + 2 * j);
+                    assert_eq!(p.data[at_p], a.data[at_a], "({i}, {j}, {k})");
+                }
+            }
+        }
+        assert_eq!(p.data[3 + 4 * (1 + 2 * 2)], 24.0);
+        assert_eq!(p.data[4 * 2], 3.0);
+        // Of a matrix, [2 1] is the plain transpose, imaginary signs kept.
+        let z = Matrix::complex_parts(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1.0; 6]);
+        let t = call(permute, &[Value::Mat(z.clone()), row(&[2.0, 1.0])]).unwrap();
+        assert_eq!(t, z.transpose());
+        // A dimension past ndims is of size 1; the identity order is A.
+        let m = call(permute, &[nd(&[2, 3]), row(&[3.0, 1.0, 2.0])]).unwrap();
+        assert_eq!(m.dims(), [1, 2, 3]);
+        let same = call(
+            permute,
+            &[Value::Mat(a.clone()), row(&[1.0, 2.0, 3.0, 4.0])],
+        )
+        .unwrap();
+        assert_eq!(same, a);
+        let c = call(permute, &[Value::str("ab"), row(&[2.0, 1.0])]).unwrap();
+        assert_eq!((c.dims(), c.class), (vec![2, 1], Class::Char));
+        // An empty array is never walked, whatever its sizes.
+        let e = Matrix::from_dims(&[0, 1 << 40, 3], Vec::new());
+        let got = call(permute, &[Value::Mat(e), row(&[3.0, 2.0, 1.0])]).unwrap();
+        assert_eq!(got.dims(), [3, 1 << 40, 0]);
+        // A run of singletons costs nothing per step.
+        let wide = Matrix::from_dims(&[2, 1, 1, 1, 3], vec![1.0; 6]);
+        let order: Vec<f64> = [5.0, 4.0, 3.0, 2.0, 1.0].to_vec();
+        let got = call(permute, &[Value::Mat(wide), row(&order)]).unwrap();
+        assert_eq!(got.dims(), [3, 1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn permute_refuses_every_other_order() {
+        let msg =
+            "permute's dimension order must hold each of 1 to n once, with n at least ndims(A).";
+        let a = Value::Mat(nd24());
+        for bad in [
+            row(&[1.0, 2.0]),
+            row(&[1.0, 1.0, 2.0]),
+            row(&[1.0, 2.0, 4.0]),
+            row(&[0.0, 1.0, 2.0]),
+            row(&[1.0, 2.0, 3.5]),
+            row(&[1.0, 2.0, f64::NAN]),
+            Value::Mat(Matrix::col(vec![1.0, 2.0, 3.0])),
+            Value::Mat(Matrix::empty()),
+            Value::str("abc"),
+            // A char is refused whatever its codes, 2, 1 and 3 included.
+            Value::Mat(Matrix::row(vec![2.0, 1.0, 3.0]).with_class(Class::Char)),
+            Value::cell(crate::value::CellArray::new(1, 1, vec![num(1.0)])),
+            Value::Mat(Matrix::complex_parts(
+                1,
+                3,
+                vec![1.0, 2.0, 3.0],
+                vec![1.0, 0.0, 0.0],
+            )),
+        ] {
+            let e = call(permute, &[a.clone(), bad.clone()]).unwrap_err().msg;
+            assert_eq!(e, msg, "{bad:?}");
+        }
+        // A matrix needs two, and one is too few.
+        assert_eq!(call(permute, &[num(1.0), num(1.0)]).unwrap_err().msg, msg);
+        assert!(call(permute, &[a]).is_err());
+    }
+
+    fn cat_of(d: f64, args: &[Value]) -> R<Matrix> {
+        let mut all = vec![num(d)];
+        all.extend_from_slice(args);
+        call(cat, &all)
+    }
+
+    /// Cycle 14b: `cat`'s agreement rule and its empty rule, which are the
+    /// brackets' own.
+    #[test]
+    fn cat_joins_along_any_dimension_when_the_others_agree() {
+        let a = Value::Mat(Matrix::new(2, 2, vec![1.0, 3.0, 2.0, 4.0]));
+        let b = Value::Mat(Matrix::new(2, 2, vec![5.0, 7.0, 6.0, 8.0]));
+        let p = cat_of(3.0, &[a.clone(), b.clone()]).unwrap();
+        assert_eq!(p.dims(), [2, 2, 2]);
+        assert_eq!(p.data, [1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0]);
+        let x = Value::Mat(nd24());
+        let v = cat_of(1.0, &[x.clone(), x.clone()]).unwrap();
+        assert_eq!(v.dims(), [4, 3, 4]);
+        // Each column of each page is the column of A twice.
+        assert_eq!(v.data[..8], [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+        let h = cat_of(2.0, &[nd(&[2, 2]), nd(&[2, 3])]).unwrap();
+        assert_eq!(h.dims(), [2, 5]);
+        assert_eq!(
+            cat_of(4.0, &[num(1.0), num(2.0)]).unwrap().dims(),
+            [1, 1, 1, 2]
+        );
+        // Every other dimension must agree, past ndims being 1.
+        let mismatch = "Dimensions of arrays being concatenated are not consistent.";
+        assert_eq!(
+            cat_of(3.0, &[nd(&[2, 2]), nd(&[2, 3])]).unwrap_err().msg,
+            mismatch
+        );
+        assert_eq!(
+            cat_of(1.0, &[x.clone(), nd(&[2, 3])]).unwrap_err().msg,
+            mismatch
+        );
+        assert_eq!(
+            cat_of(2.0, &[nd(&[2, 3, 2]), nd(&[2, 3, 3])])
                 .unwrap_err()
                 .msg,
-            "N-D arrays are not supported."
+            mismatch
         );
+        // An empty beside a nonempty array is left out; when every array is
+        // empty, the empty their sizes give, and `[]` when nothing is left.
+        assert_eq!(
+            cat_of(3.0, &[a.clone(), Value::Mat(Matrix::empty())])
+                .unwrap()
+                .dims(),
+            [2, 2]
+        );
+        assert_eq!(
+            cat_of(1.0, &[nd(&[0, 5]), a.clone()]).unwrap().dims(),
+            [2, 2]
+        );
+        let e = Value::Mat(Matrix::new(2, 0, Vec::new()));
+        assert_eq!(
+            cat_of(3.0, &[e.clone(), e.clone()]).unwrap().dims(),
+            [2, 0, 2]
+        );
+        assert_eq!(
+            cat_of(2.0, &[e.clone(), Value::Mat(Matrix::empty())])
+                .unwrap()
+                .dims(),
+            [2, 0]
+        );
+        assert_eq!(cat_of(3.0, &[]).unwrap(), Matrix::empty());
+        assert_eq!(
+            cat_of(2.0, &[Value::Mat(Matrix::empty())]).unwrap(),
+            Matrix::empty()
+        );
+        // One array is that array.
+        assert_eq!(cat_of(7.0, std::slice::from_ref(&x)).unwrap(), nd24());
+        // The class by the bracket rule, complex if any array is.
+        let c = cat_of(3.0, &[Value::str("ab"), Value::str("cd")]).unwrap();
+        assert_eq!((c.class, c.dims()), (Class::Char, vec![1, 2, 2]));
+        let t = Value::Mat(Matrix::from_bool(true));
+        assert_eq!(
+            cat_of(3.0, &[t.clone(), t.clone()]).unwrap().class,
+            Class::Logical
+        );
+        assert_eq!(cat_of(3.0, &[t, num(2.0)]).unwrap().class, Class::Double);
+        let z = Value::Mat(Matrix::complex_parts(1, 1, vec![1.0], vec![2.0]));
+        let j = cat_of(3.0, &[num(5.0), z]).unwrap();
+        assert_eq!((j.data, j.im), (vec![5.0, 1.0], Some(vec![0.0, 2.0])));
+        // A dimension past every array's makes that many dimensions, so it
+        // is judged against the cap on dimensions before any list of sizes
+        // is made; at the cap the list is made.
+        let cap = "Arrays have at most 1048576 dimensions.";
+        for d in [2f64.powi(20) + 1.0, 2f64.powi(21), 1e10, 1e300] {
+            let e = cat_of(d, &[num(1.0), num(2.0)]).unwrap_err().msg;
+            assert_eq!(e, cap, "{d}");
+        }
+        let at = cat_of(2f64.powi(20), &[num(1.0), num(2.0)]).unwrap();
+        assert_eq!((at.ndims(), at.data), (1 << 20, vec![1.0, 2.0]));
+        // Joining nothing along it makes no dimension, so one array is
+        // itself.
+        assert_eq!(cat_of(1e10, &[num(1.0)]).unwrap(), Matrix::scalar(1.0));
+        // The dimension is a positive integer.
+        assert!(cat_of(0.0, &[num(1.0)]).is_err());
+        assert!(cat_of(1.5, &[num(1.0)]).is_err());
     }
 
     // ---- more than one output (cycle 03) ------------------------------
